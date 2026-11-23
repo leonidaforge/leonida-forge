@@ -66,6 +66,10 @@ Low-effort, AI-generated pull requests submitted without meaningful human review
 
 **AI can assist your work. It should not replace your judgment.**
 
+## License
+
+Leonida Forge is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`). See [LICENSE.md](LICENSE.md).
+
 ## Disclaimer
 
 Leonida Forge is an independent, unofficial community project and is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
