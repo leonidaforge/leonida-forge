@@ -1,7 +1,8 @@
 //! Small styled building blocks shared by the windows.
 
 use gpui::{
-    AnyElement, Div, ElementId, Pixels, SharedString, Stateful, Svg, div, prelude::*, px, rgb, svg,
+    AnyElement, App, Div, ElementId, Pixels, SharedString, Stateful, Svg, Window, div, prelude::*,
+    px, rgb, svg,
 };
 
 pub mod assets;
@@ -146,4 +147,16 @@ pub fn centered_message(message: &'static str, detail: Option<String>) -> AnyEle
         .child(message)
         .children(detail.map(|detail| div().text_xs().child(detail)))
         .into_any_element()
+}
+
+/// Closes the window through GPUI instead of letting Windows destroy it first.
+///
+/// When `WM_CLOSE` reaches `DefWindowProc`, Windows destroys the window before
+/// GPUI tears it down, and gpui_windows then logs "invalid window handle"
+/// errors for the dead handle.
+pub fn close_through_gpui(window: &Window, cx: &App) {
+    window.on_window_should_close(cx, |window, _| {
+        window.remove_window();
+        false
+    });
 }

@@ -490,7 +490,10 @@ impl Explorer {
             return;
         }
         let options = window_options("Renderer Demo", size(px(1100.), px(720.)), cx);
-        match cx.open_window(options, |_, cx| cx.new(RendererDemo::new)) {
+        match cx.open_window(options, |window, cx| {
+            ui::close_through_gpui(window, cx);
+            cx.new(RendererDemo::new)
+        }) {
             Ok(handle) => self.renderer_demo = Some(handle),
             Err(err) => log::error!("failed to open renderer demo: {err:#}"),
         }
@@ -909,6 +912,7 @@ fn open_image_viewer(path: PathBuf, cx: &mut App) {
         .unwrap_or_else(|| path.display().to_string());
     let options = window_options(&title, size(px(960.), px(720.)), cx);
     if let Err(err) = cx.open_window(options, |window, cx| {
+        ui::close_through_gpui(window, cx);
         cx.new(|cx| ImageViewer::new(path, window, cx))
     }) {
         log::error!("failed to open image viewer: {err:#}");

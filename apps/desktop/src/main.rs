@@ -42,6 +42,7 @@ fn main() {
                 ..Default::default()
             };
             let window = cx.open_window(options, |window, cx| {
+                ui::close_through_gpui(window, cx);
                 let explorer = cx.new(|cx| Explorer::new(settings, settings_path, cx));
                 let focus_handle = explorer.read(cx).focus_handle().clone();
                 focus_handle.focus(window, cx);
