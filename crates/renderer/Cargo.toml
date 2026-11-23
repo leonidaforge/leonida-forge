@@ -1,0 +1,13 @@
+[package]
+name = "lforge-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+pollster.workspace = true
+wgpu.workspace = true

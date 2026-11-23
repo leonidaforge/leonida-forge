@@ -1,0 +1,34 @@
+[workspace]
+resolver = "3"
+members = ["apps/cli", "apps/desktop", "crates/core", "crates/renderer"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+repository = "https://github.com/leonidaforge/leonida-forge"
+publish = false
+
+[workspace.dependencies]
+lforge-core = { path = "crates/core" }
+lforge-renderer = { path = "crates/renderer" }
+
+bytemuck = { version = "1.25", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+futures = "0.3"
+glam = { version = "0.34", features = ["bytemuck"] }
+# GPUI is not published in a current form; pin the Zed revision it is taken from.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "f00a94318c059f03892e04f82343e899fbfaa844", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f00a94318c059f03892e04f82343e899fbfaa844", default-features = false }
+image = { version = "0.25", default-features = false }
+log = "0.4"
+pollster = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = "30.0"
+
+# Zed patches async-task for a waker identity fix that GPUI's executor relies on.
+# Patches of a dependency's workspace do not propagate, so it is repeated here.
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task", rev = "41fd3359c75e221bd8b187a8ee361aa309c1714c" }

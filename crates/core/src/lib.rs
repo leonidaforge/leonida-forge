@@ -1,0 +1,31 @@
+//! Application information shared by the desktop application and the CLI.
+
+use serde::Serialize;
+
+pub const APP_NAME: &str = "Leonida Forge";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub profile: &'static str,
+}
+
+impl BuildInfo {
+    pub fn current() -> Self {
+        Self {
+            name: APP_NAME,
+            version: VERSION,
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+        }
+    }
+}
