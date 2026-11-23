@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/renderer"]
+members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/renderer", "crates/rpf"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,11 +14,13 @@ publish = false
 lforge-binary = { path = "crates/binary" }
 lforge-core = { path = "crates/core" }
 lforge-renderer = { path = "crates/renderer" }
+lforge-rpf = { path = "crates/rpf" }
 
 bytemuck = { version = "1.25", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6", features = ["derive"] }
 env_logger = "0.11"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 futures = "0.3"
 glam = { version = "0.34", features = ["bytemuck"] }
 # GPUI is not published in a current form; pin the Zed revision it is taken from.

@@ -16,7 +16,9 @@ chrono.workspace = true
 clap.workspace = true
 lforge-binary.workspace = true
 lforge-core.workspace = true
+lforge-rpf.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 tempfile.workspace = true

@@ -308,6 +308,41 @@ mod tests {
     }
 
     #[test]
+    fn navigates_into_and_out_of_archives() {
+        let workspace = workspace();
+        let inside = p(r"D:\Games\GTA VI\data.rpf\Recovered Entries\XML");
+        let labels: Vec<_> = workspace
+            .breadcrumbs(&inside)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["GTA VI", "data.rpf", "Recovered Entries", "XML"]);
+        assert_eq!(
+            workspace.parent_within_root(&inside),
+            Some(p(r"D:\Games\GTA VI\data.rpf\Recovered Entries"))
+        );
+        assert_eq!(
+            workspace.ancestors_within_root(&inside)[1],
+            p(r"D:\Games\GTA VI\data.rpf")
+        );
+
+        let mut history = History::default();
+        history.push(p(r"D:\Games\GTA VI"));
+        history.push(p(r"D:\Games\GTA VI\data.rpf"));
+        history.push(inside.clone());
+        assert_eq!(
+            history.back(),
+            Some(p(r"D:\Games\GTA VI\data.rpf").as_path())
+        );
+        assert_eq!(history.back(), Some(p(r"D:\Games\GTA VI").as_path()));
+        assert_eq!(
+            history.forward(),
+            Some(p(r"D:\Games\GTA VI\data.rpf").as_path())
+        );
+        assert_eq!(history.forward(), Some(inside.as_path()));
+    }
+
+    #[test]
     fn labels_roots() {
         let workspace = workspace();
         assert_eq!(

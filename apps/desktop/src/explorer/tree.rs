@@ -102,6 +102,11 @@ impl Explorer {
                 kind: RowKind::Message("Loading…"),
                 expanded: false,
             }),
+            Some(Listing::Indexing(_)) => rows.push(TreeRow {
+                depth,
+                kind: RowKind::Message("Indexing…"),
+                expanded: false,
+            }),
             Some(Listing::Failed(_)) => rows.push(TreeRow {
                 depth,
                 kind: RowKind::Message("Cannot open folder"),

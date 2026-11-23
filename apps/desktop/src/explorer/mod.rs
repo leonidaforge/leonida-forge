@@ -10,8 +10,10 @@ mod preview;
 mod tree;
 
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
@@ -20,6 +22,8 @@ use gpui::{
     Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
     WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
 };
+
+use lforge_rpf::Progress;
 
 use crate::files::shell::ShellWorker;
 use crate::files::{self, Entry, EntryKind, Sort, SortKey, images};
@@ -59,8 +63,25 @@ pub fn bind_keys(cx: &mut App) {
 
 enum Listing {
     Loading,
+    /// Waiting for the archive at this path to be indexed.
+    Indexing(PathBuf),
     Loaded(Arc<Vec<Entry>>),
     Failed(String),
+}
+
+/// The result of listing a directory in the background.
+enum Loaded {
+    Entries(Vec<Entry>, Option<String>),
+    NeedsIndex(PathBuf),
+    Failed(String),
+}
+
+/// A background scan of one archive.
+struct IndexJob {
+    progress: Arc<Progress>,
+    cancel: Arc<AtomicBool>,
+    _work: Task<()>,
+    _ticker: Task<()>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -102,7 +123,10 @@ struct Layout {
 pub struct Explorer {
     workspace: Workspace,
     listings: HashMap<PathBuf, Listing>,
+    /// Explanations shown above a listing, see [`files::describe`].
+    notes: HashMap<PathBuf, String>,
     loading: HashSet<PathBuf>,
+    indexing: HashMap<PathBuf, IndexJob>,
     expanded: HashSet<PathBuf>,
     history: History,
     selected: Option<PathBuf>,
@@ -139,7 +163,9 @@ impl Explorer {
                 folders: settings.folders,
             },
             listings: HashMap::new(),
+            notes: HashMap::new(),
             loading: HashSet::new(),
+            indexing: HashMap::new(),
             expanded: HashSet::new(),
             history: History::default(),
             selected: None,
@@ -192,7 +218,13 @@ impl Explorer {
         let fallback = self.workspace.gta.clone();
         let exists = cx.background_spawn({
             let last = last.clone();
-            async move { last.is_some_and(|dir| files::list(&dir).is_ok()) }
+            async move {
+                last.is_some_and(|dir| match files::list(&dir) {
+                    Ok(_) => true,
+                    // Opening it again starts indexing.
+                    Err(err) => files::rpf::index_required(&err).is_some(),
+                })
+            }
         });
         cx.spawn(async move |this, cx| {
             let target = if exists.await { last } else { fallback };
@@ -214,7 +246,7 @@ impl Explorer {
     fn current_entries(&self) -> Option<&Arc<Vec<Entry>>> {
         match self.current_listing()? {
             Listing::Loaded(entries) => Some(entries),
-            Listing::Loading | Listing::Failed(_) => None,
+            Listing::Loading | Listing::Indexing(_) | Listing::Failed(_) => None,
         }
     }
 
@@ -223,7 +255,7 @@ impl Explorer {
         let parent = selected.parent()?;
         match self.listings.get(parent)? {
             Listing::Loaded(entries) => entries.iter().find(|entry| entry.path == selected),
-            Listing::Loading | Listing::Failed(_) => None,
+            Listing::Loading | Listing::Indexing(_) | Listing::Failed(_) => None,
         }
     }
 
@@ -238,9 +270,16 @@ impl Explorer {
         let task = cx.background_spawn({
             let dir = dir.clone();
             async move {
-                let mut entries = files::list(&dir)?;
-                files::sort_entries(&mut entries, sort);
-                std::io::Result::Ok(entries)
+                match files::list(&dir) {
+                    Ok(mut entries) => {
+                        files::sort_entries(&mut entries, sort);
+                        Loaded::Entries(entries, files::describe(&dir))
+                    }
+                    Err(err) => match files::rpf::index_required(&err) {
+                        Some(archive) => Loaded::NeedsIndex(archive.to_path_buf()),
+                        None => Loaded::Failed(err.to_string()),
+                    },
+                }
             }
         });
         cx.spawn(async move |this, cx| {
@@ -248,14 +287,22 @@ impl Explorer {
             this.update(cx, |this, cx| {
                 this.loading.remove(&dir);
                 let listing = match result {
-                    Ok(mut entries) => {
+                    Loaded::Entries(mut entries, note) => {
                         if this.sort != sort {
                             files::sort_entries(&mut entries, this.sort);
                         }
                         this.request_icons(&entries, cx);
+                        match note {
+                            Some(note) => this.notes.insert(dir.clone(), note),
+                            None => this.notes.remove(&dir),
+                        };
                         Listing::Loaded(Arc::new(entries))
                     }
-                    Err(err) => Listing::Failed(err.to_string()),
+                    Loaded::NeedsIndex(archive) => {
+                        this.start_indexing(archive.clone(), cx);
+                        Listing::Indexing(archive)
+                    }
+                    Loaded::Failed(err) => Listing::Failed(err),
                 };
                 this.listings.insert(dir, listing);
                 this.update_thumbnail(cx);
@@ -264,6 +311,99 @@ impl Explorer {
             .ok();
         })
         .detach();
+    }
+
+    /// Scans an archive in the background. Listings waiting for it are
+    /// loaded again when the scan ends.
+    fn start_indexing(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
+        if self.indexing.contains_key(&archive) {
+            return;
+        }
+        let progress = Arc::new(Progress::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = cx.background_spawn({
+            let (archive, progress, cancel) = (archive.clone(), progress.clone(), cancel.clone());
+            async move { files::rpf::build_index(&archive, &progress, &cancel) }
+        });
+        let work = cx.spawn({
+            let archive = archive.clone();
+            async move |this, cx| {
+                let result = work.await;
+                this.update(cx, |this, cx| this.finish_indexing(&archive, result, cx))
+                    .ok();
+            }
+        });
+        // Repaints while the scan runs, so the progress moves.
+        let ticker = cx.spawn({
+            let archive = archive.clone();
+            async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(250))
+                        .await;
+                    let running = this
+                        .update(cx, |this, cx| {
+                            cx.notify();
+                            this.indexing.contains_key(&archive)
+                        })
+                        .unwrap_or(false);
+                    if !running {
+                        break;
+                    }
+                }
+            }
+        });
+        self.indexing.insert(
+            archive,
+            IndexJob {
+                progress,
+                cancel,
+                _work: work,
+                _ticker: ticker,
+            },
+        );
+    }
+
+    fn finish_indexing(&mut self, archive: &Path, result: io::Result<()>, cx: &mut Context<Self>) {
+        self.indexing.remove(archive);
+        let waiting: Vec<PathBuf> = self
+            .listings
+            .iter()
+            .filter(|(_, listing)| matches!(listing, Listing::Indexing(a) if a == archive))
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        match result {
+            Ok(()) => {
+                for dir in waiting {
+                    self.load(dir, cx);
+                }
+            }
+            Err(err) => {
+                let message = if err.kind() == io::ErrorKind::Interrupted {
+                    "Indexing was cancelled. Press F5 to index the archive.".to_string()
+                } else {
+                    format!("The archive could not be indexed: {err}")
+                };
+                for dir in waiting {
+                    self.listings.insert(dir, Listing::Failed(message.clone()));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_indexing(&mut self, archive: &Path, cx: &mut Context<Self>) {
+        if let Some(job) = self.indexing.get(archive) {
+            job.cancel.store(true, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    /// The running scan of `archive`: its progress, if known yet, and
+    /// whether it was asked to stop.
+    fn indexing_state(&self, archive: &Path) -> Option<(Option<f32>, bool)> {
+        let job = self.indexing.get(archive)?;
+        Some((job.progress.fraction(), job.cancel.load(Ordering::Relaxed)))
     }
 
     /// Asks Windows for the icons of file types not seen before.
@@ -461,6 +601,7 @@ impl Explorer {
         let inside = |path: &Path| workspace.root_of(path).is_some();
         self.history.retain(inside);
         self.listings.retain(|path, _| inside(path));
+        self.notes.retain(|path, _| inside(path));
         self.expanded.retain(|path| inside(path));
     }
 
@@ -824,6 +965,10 @@ impl Explorer {
                 n => format!("{n} items"),
             },
             Some(Listing::Loading) => "Loading…".to_string(),
+            Some(Listing::Indexing(archive)) => match self.indexing_state(archive) {
+                Some((Some(fraction), _)) => format!("Indexing archive… {:.0}%", fraction * 100.0),
+                _ => "Indexing archive…".to_string(),
+            },
             Some(Listing::Failed(_)) => "Folder unavailable".to_string(),
             None => String::new(),
         };

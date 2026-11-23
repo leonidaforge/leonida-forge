@@ -860,7 +860,7 @@ impl BinaryInspector {
                 files::format_bytes_exact(len)
             )
         });
-        let location = match files::archive::locate(&self.path) {
+        let location = match files::locate_inner(&self.path) {
             Some((archive, inner)) => format!("{} in {}", inner.display(), archive.display()),
             None => self.path.display().to_string(),
         };

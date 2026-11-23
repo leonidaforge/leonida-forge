@@ -6,7 +6,9 @@
 
 pub mod archive;
 pub mod images;
+pub mod rpf;
 pub mod shell;
+mod zip;
 
 use std::cmp::Ordering;
 use std::fs;
@@ -35,6 +37,12 @@ pub struct Entry {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub type_name: String,
+    /// Format-specific properties for the preview pane. Entries that have
+    /// them also bring their own type name.
+    pub details: Vec<(&'static str, String)>,
+    /// Sorted by this instead of the name, for names that encode a number
+    /// natural order cannot see, such as hexadecimal offsets.
+    pub order: Option<u64>,
 }
 
 impl Entry {
@@ -53,6 +61,8 @@ impl Entry {
             size,
             modified,
             type_name,
+            details: Vec::new(),
+            order: None,
         }
     }
 
@@ -112,7 +122,7 @@ pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
         Some((archive, inner)) => archive::list(archive, inner)?,
         None => list_directory(path)?,
     };
-    for entry in &mut entries {
+    for entry in entries.iter_mut().filter(|entry| entry.details.is_empty()) {
         if let Some(name) = shell::type_name(entry) {
             entry.type_name = name;
         }
@@ -120,9 +130,24 @@ pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// Explains where the contents of a folder come from, when that is not
+/// obvious, e.g. for entries recovered from an RPF archive.
+pub fn describe(path: &Path) -> Option<String> {
+    let (archive, inner) = archive::locate(path)?;
+    match archive::format(archive)? {
+        archive::Format::Rpf9 => rpf::describe(archive, inner),
+        archive::Format::Zip => None,
+    }
+}
+
+/// Splits a path inside an archive. The archive file itself is a plain file.
+pub fn locate_inner(path: &Path) -> Option<(&Path, &Path)> {
+    archive::locate(path).filter(|(_, inner)| !inner.as_os_str().is_empty())
+}
+
 /// Reads a whole file, which may be inside an archive.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
-    match archive::locate(path) {
+    match locate_inner(path) {
         Some((archive, inner)) => archive::read(archive, inner),
         None => fs::read(path),
     }
@@ -137,7 +162,7 @@ pub struct BinaryFile {
 /// Opens a file for random access. Files inside archives are extracted to a
 /// temporary file first, within the archive size limit.
 pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
-    let (file, modified) = match archive::locate(path) {
+    let (file, modified) = match locate_inner(path) {
         Some((archive, inner)) => archive::extract(archive, inner)?,
         None => {
             let file = fs::File::open(path)?;
@@ -212,7 +237,10 @@ pub struct Sort {
 pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
     entries.sort_by(|a, b| {
         let ordering = match sort.key {
-            SortKey::Name => natural_cmp(&a.name, &b.name),
+            SortKey::Name => match (a.order, b.order) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                _ => natural_cmp(&a.name, &b.name),
+            },
             SortKey::Type => a.type_name.cmp(&b.type_name),
             SortKey::Size => a.size.cmp(&b.size),
             SortKey::Modified => a.modified.cmp(&b.modified),
@@ -389,6 +417,23 @@ mod tests {
     }
 
     #[test]
+    fn names_with_an_order_sort_by_it() {
+        let mut entries: Vec<Entry> = ["0x000A000000", "0x00000A0000", "0x00000B0000"]
+            .into_iter()
+            .map(|name| {
+                let mut entry = file(name, 1);
+                entry.order = u64::from_str_radix(&name[2..], 16).ok();
+                entry
+            })
+            .collect();
+        sort_entries(&mut entries, Sort::default());
+        assert_eq!(
+            names(&entries),
+            ["0x00000A0000", "0x00000B0000", "0x000A000000"]
+        );
+    }
+
+    #[test]
     fn lists_files_and_folders_with_unicode_names() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join("Ordner ä")).unwrap();
@@ -452,8 +497,8 @@ mod tests {
         assert!(open_binary(&temp.path().join("missing.bin")).is_err());
 
         let archive = temp.path().join("pack.zip");
-        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
-        zip.start_file("dir/inner.bin", zip::write::SimpleFileOptions::default())
+        let mut zip = ::zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        zip.start_file("dir/inner.bin", ::zip::write::SimpleFileOptions::default())
             .unwrap();
         std::io::Write::write_all(&mut zip, b"inside").unwrap();
         zip.finish().unwrap();
@@ -464,6 +509,9 @@ mod tests {
             b"inside"
         );
         assert!(open_binary(&archive.join("dir")).is_err());
+
+        let raw = open_binary(&archive).unwrap();
+        assert_eq!(raw.source.len(), fs::metadata(&archive).unwrap().len());
     }
 
     #[test]

@@ -197,6 +197,12 @@ impl Explorer {
         if let Some(modified) = entry.modified {
             properties.push(("Modified", files::format_modified(modified).into()));
         }
+        properties.extend(
+            entry
+                .details
+                .iter()
+                .map(|(label, value)| (*label, SharedString::from(value.clone()))),
+        );
         properties.push(("Path", entry.path.display().to_string().into()));
 
         div()

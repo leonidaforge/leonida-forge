@@ -35,7 +35,7 @@ Set `RUST_LOG=warn` to see log output from debug builds. Release builds have no 
 ## Binary Inspector
 
 Double-click a file the explorer cannot otherwise open, or right-click any file and choose **Open in Binary Inspector**.
-Files inside ZIP archives are extracted to a temporary file first, up to 512 MB.
+Files inside archives are extracted to a temporary file first, up to 512 MB.
 
 The CLI exposes the same operations on plain files:
 
@@ -48,6 +48,33 @@ lforge binary interpret example.bin --offset 0x10 --endian big --json
 ```
 
 Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage.
+
+## RPF9 archives
+
+The explorer opens GTA VI `.rpf` files like folders. Double-click one to browse it.
+To see the raw archive bytes, right-click it and choose **Open in Binary Inspector**.
+
+The RPF9 table of contents is encrypted, and Leonida Forge does not read it.
+It scans the archive data for zlib streams and lists what it finds instead.
+The first visit reads the whole archive. A 773 MB archive takes about 2 seconds from the disk cache.
+The index goes to `%APPDATA%\Leonida Forge\cache\rpf` and is reused until the archive's size or modification time changes.
+
+Inside an archive:
+
+- `Recovered Entries` has one folder per detected kind, such as `XML`, `PSO` or `Resources`.
+  Files are named after their archive offset, for example `0x000000B000.xml`. Original names and folders are unknown.
+- `Unrecovered Regions` holds bytes that are not zlib streams, shown as stored.
+
+An entry is complete when it starts with a known file signature and ends with a chunk shorter than 64 KiB.
+Resources are partial, because only their system page is recovered.
+Entries without a known signature are unverified and may be parts of larger files.
+
+```sh
+lforge archive info data.rpf --json    # header fields and a recovery summary
+lforge archive list data.rpf --json    # entries and unrecovered regions
+```
+
+`--no-cache` neither reads nor writes the index cache.
 
 ## AI Contributions
 

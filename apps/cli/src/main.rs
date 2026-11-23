@@ -1,3 +1,4 @@
+mod archive;
 mod binary;
 
 use std::process::ExitCode;
@@ -28,19 +29,27 @@ enum Command {
     /// Inspect binary files without modifying them
     #[command(subcommand)]
     Binary(binary::Command),
+    /// List what can be recovered from RPF9 archives, without modifying them
+    #[command(subcommand)]
+    Archive(archive::Command),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Info { json } => info(json),
-        Command::Binary(command) => match binary::run(command) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("error: {err}");
-                ExitCode::FAILURE
-            }
-        },
+        Command::Binary(command) => report(binary::run(command)),
+        Command::Archive(command) => report(archive::run(command)),
+    }
+}
+
+fn report(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 

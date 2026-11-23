@@ -2543,8 +2543,10 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "flate2",
  "lforge-binary",
  "lforge-core",
+ "lforge-rpf",
  "serde_json",
  "tempfile",
 ]
@@ -2562,6 +2564,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "env_logger",
+ "flate2",
  "futures",
  "gpui",
  "gpui_platform",
@@ -2570,6 +2573,7 @@ dependencies = [
  "lforge-binary",
  "lforge-core",
  "lforge-renderer",
+ "lforge-rpf",
  "log",
  "serde",
  "serde_json",
@@ -2586,6 +2590,16 @@ dependencies = [
  "glam",
  "pollster 1.0.3",
  "wgpu 30.0.2",
+]
+
+[[package]]
+name = "lforge-rpf"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "lforge-binary",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

@@ -72,11 +72,7 @@ impl Default for Settings {
 
 /// `%APPDATA%\Leonida Forge\settings.json`.
 pub fn default_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|app_data| {
-        PathBuf::from(app_data)
-            .join("Leonida Forge")
-            .join("settings.json")
-    })
+    lforge_core::data_dir().map(|dir| dir.join("settings.json"))
 }
 
 impl Settings {

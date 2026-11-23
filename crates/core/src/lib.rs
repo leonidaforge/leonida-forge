@@ -1,5 +1,7 @@
 //! Application information shared by the desktop application and the CLI.
 
+use std::path::PathBuf;
+
 use serde::Serialize;
 
 pub const APP_NAME: &str = "Leonida Forge";
@@ -28,4 +30,9 @@ impl BuildInfo {
             },
         }
     }
+}
+
+/// `%APPDATA%\Leonida Forge`, the only place the tools write to.
+pub fn data_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|app_data| PathBuf::from(app_data).join(APP_NAME))
 }

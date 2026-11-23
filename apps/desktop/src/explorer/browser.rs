@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -20,6 +20,12 @@ const GAP: f32 = 4.;
 const DETAILS_ROW_HEIGHT: f32 = 26.;
 const LIST_ROW_HEIGHT: f32 = 22.;
 const LIST_COLUMN_WIDTH: f32 = 240.;
+const LIST_COLUMN_GAP: f32 = 4.;
+const NOTE_HEIGHT: f32 = 44.;
+const PROGRESS_WIDTH: f32 = 280.;
+const INDEXING_NOTE: &str = "The table of contents of RPF9 archives is encrypted, so their \
+     contents are recovered by scanning the archive data. The result is kept until the archive \
+     changes.";
 const IMAGE_ICON_COLOR: u32 = 0x7fb4ff;
 const DETAILS_NAME_MIN_WIDTH: f32 = 110.;
 const DETAILS_TYPE_WIDTH: f32 = 130.;
@@ -204,16 +210,38 @@ impl Explorer {
         let entries = match self.listings.get(dir) {
             Some(Listing::Loaded(entries)) => entries.clone(),
             Some(Listing::Loading) | None => return ui::centered_message("Loading…", None),
+            Some(Listing::Indexing(archive)) => {
+                return self.render_indexing(archive.clone(), cx).into_any_element();
+            }
             Some(Listing::Failed(err)) => {
                 return ui::centered_message("This folder cannot be opened.", Some(err.clone()));
             }
         };
+        let note = self.notes.get(dir);
         if entries.is_empty() {
-            return ui::centered_message("This folder is empty.", None);
+            return match note {
+                // The note explains why nothing is listed; "empty" could be wrong.
+                Some(note) => div()
+                    .flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(
+                        div()
+                            .max_w(px(520.))
+                            .text_center()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(note.clone()),
+                    )
+                    .into_any_element(),
+                None => ui::centered_message("This folder is empty.", None),
+            };
         }
+        let list_height = layout.center_height - if note.is_some() { NOTE_HEIGHT } else { 0. };
 
         let reveal_ix = reveal.map(|reveal| entries.iter().position(|e| e.path == reveal));
-        match self.view_mode {
+        let content = match self.view_mode {
             ViewMode::Details => {
                 if let Some(ix) = reveal_ix {
                     self.browser_scroll.scroll_to_item(
@@ -231,7 +259,7 @@ impl Explorer {
                 if reveal_ix.is_some() {
                     self.list_scroll.set_offset(Point::default());
                 }
-                self.render_list(&entries, layout.center_height, cx)
+                self.render_list(&entries, layout.center, list_height, cx)
                     .into_any_element()
             }
             ViewMode::Icons | ViewMode::SmallIcons | ViewMode::Tiles => {
@@ -250,7 +278,92 @@ impl Explorer {
                 }
                 self.render_grid(entries, columns, cx).into_any_element()
             }
+        };
+        match note {
+            Some(note) => div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .h(px(NOTE_HEIGHT - 8.))
+                        .mx(px(PADDING))
+                        .mb_2()
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .bg(rgb(theme::SURFACE))
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(div().line_clamp(2).child(note.clone())),
+                )
+                .child(div().flex_1().min_h_0().child(content))
+                .into_any_element(),
+            None => content,
         }
+    }
+
+    /// Shown while an archive is scanned before its contents can be listed.
+    fn render_indexing(&self, archive: PathBuf, cx: &Context<Self>) -> impl IntoElement {
+        let state = self.indexing_state(&archive);
+        let running = state.is_some();
+        let (fraction, cancelling) = state.unwrap_or((None, false));
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(
+                div()
+                    .text_color(rgb(theme::TEXT))
+                    .child("Indexing archive…"),
+            )
+            .child(
+                div()
+                    .w(px(PROGRESS_WIDTH))
+                    .h(px(6.))
+                    .rounded_full()
+                    .bg(rgb(theme::SURFACE))
+                    .child(
+                        div()
+                            .h_full()
+                            .rounded_full()
+                            .bg(rgb(theme::ACCENT))
+                            .w(px(PROGRESS_WIDTH * fraction.unwrap_or(0.))),
+                    ),
+            )
+            .child(div().text_xs().child(match fraction {
+                Some(fraction) => format!("{:.0}%", fraction * 100.),
+                None => "Starting…".to_string(),
+            }))
+            .child(
+                div()
+                    .max_w(px(460.))
+                    .text_xs()
+                    .text_center()
+                    .child(INDEXING_NOTE),
+            )
+            .when(running && !cancelling, |el| {
+                el.child(
+                    ui::button("cancel-indexing", "Cancel").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.cancel_indexing(&archive, cx)
+                        },
+                    )),
+                )
+            })
+            .when(cancelling, |el| {
+                el.child(div().text_xs().child("Cancelling…"))
+            })
     }
 
     /// Shown when no directory is open.
@@ -406,9 +519,21 @@ impl Explorer {
             )
     }
 
-    /// Items flow top to bottom in columns, scrolling horizontally.
-    fn render_list(&self, entries: &[Entry], height: f32, cx: &Context<Self>) -> impl IntoElement {
+    /// Items flow top to bottom in columns, scrolling horizontally. Only the
+    /// columns in view are built, so large folders stay responsive.
+    fn render_list(
+        &self,
+        entries: &[Entry],
+        width: f32,
+        height: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let rows = (((height - 2. * PADDING) / LIST_ROW_HEIGHT) as usize).max(1);
+        let columns = entries.len().div_ceil(rows);
+        let stride = LIST_COLUMN_WIDTH + LIST_COLUMN_GAP;
+        let scrolled = (-f32::from(self.list_scroll.offset().x)).max(0.);
+        let first = ((scrolled / stride) as usize).min(columns);
+        let visible = ((width / stride).ceil() as usize + 1).min(columns - first);
         div()
             .id("list")
             .size_full()
@@ -418,25 +543,40 @@ impl Explorer {
             .child(
                 div()
                     .flex()
+                    .flex_none()
                     .h_full()
-                    .gap_1()
-                    .children(entries.chunks(rows).enumerate().map(|(column, chunk)| {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_none()
-                            .w(px(LIST_COLUMN_WIDTH))
-                            .children(chunk.iter().enumerate().map(|(row, entry)| {
-                                self.browser_item(column * rows + row, entry, cx)
+                    .w(px(columns as f32 * stride))
+                    .pl(px(first as f32 * stride))
+                    .gap(px(LIST_COLUMN_GAP))
+                    .children(
+                        entries
+                            .chunks(rows)
+                            .enumerate()
+                            .skip(first)
+                            .take(visible)
+                            .map(|(column, chunk)| {
+                                div()
                                     .flex()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .h(px(LIST_ROW_HEIGHT))
-                                    .px_1p5()
-                                    .child(self.entry_icon(entry, px(16.)))
-                                    .child(div().min_w_0().truncate().child(entry.name.clone()))
-                            }))
-                    })),
+                                    .flex_col()
+                                    .flex_none()
+                                    .w(px(LIST_COLUMN_WIDTH))
+                                    .children(chunk.iter().enumerate().map(|(row, entry)| {
+                                        self.browser_item(column * rows + row, entry, cx)
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .h(px(LIST_ROW_HEIGHT))
+                                            .px_1p5()
+                                            .child(self.entry_icon(entry, px(16.)))
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(entry.name.clone()),
+                                            )
+                                    }))
+                            }),
+                    ),
             )
     }
 
