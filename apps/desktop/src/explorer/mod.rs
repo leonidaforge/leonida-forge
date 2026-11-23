@@ -5,6 +5,7 @@
 
 mod browser;
 mod menu;
+mod navigation;
 mod preview;
 mod tree;
 
@@ -20,14 +21,15 @@ use gpui::{
     WindowBounds, WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
 };
 
-use crate::assets::Icon;
-use crate::fs::{self, Entry, Sort, SortKey};
-use crate::image_viewer::ImageViewer;
-use crate::navigation::{History, Workspace};
-use crate::renderer_demo::RendererDemo;
+use crate::files::shell::ShellWorker;
+use crate::files::{self, Entry, Sort, SortKey, images};
 use crate::settings::{Settings, ViewMode};
-use crate::theme;
 use crate::ui;
+use crate::ui::assets::Icon;
+use crate::ui::theme;
+use crate::viewers::ImageViewer;
+use crate::viewers::RendererDemo;
+use navigation::{History, Workspace};
 
 use preview::Thumbnail;
 
@@ -80,6 +82,12 @@ enum Divider {
     Preview,
 }
 
+/// The icons Windows shows for one file type.
+struct FileIcons {
+    small: Arc<RenderImage>,
+    large: Arc<RenderImage>,
+}
+
 /// Panel widths after fitting the stored widths into the window.
 struct Layout {
     tree: f32,
@@ -103,6 +111,10 @@ pub struct Explorer {
     open_menu: Option<Menu>,
     resizing: Option<Divider>,
     thumbnail: Option<Thumbnail>,
+    shell: Option<ShellWorker>,
+    /// Keyed by lowercase extension. `None` while loading, or when Windows
+    /// does not know the type.
+    file_icons: HashMap<String, Option<FileIcons>>,
     stale_images: Vec<Arc<RenderImage>>,
     /// Set by navigation so the next frame scrolls the tree and browser to it.
     reveal: Option<PathBuf>,
@@ -136,6 +148,10 @@ impl Explorer {
             open_menu: None,
             resizing: None,
             thumbnail: None,
+            shell: ShellWorker::start()
+                .inspect_err(|err| log::error!("failed to start shell thread: {err}"))
+                .ok(),
+            file_icons: HashMap::new(),
             stale_images: Vec::new(),
             reveal: None,
             tree_scroll: UniformListScrollHandle::new(),
@@ -173,7 +189,7 @@ impl Explorer {
         let fallback = self.workspace.gta.clone();
         let exists = cx.background_spawn({
             let last = last.clone();
-            async move { last.is_some_and(|dir| dir.is_dir()) }
+            async move { last.is_some_and(|dir| files::list(&dir).is_ok()) }
         });
         cx.spawn(async move |this, cx| {
             let target = if exists.await { last } else { fallback };
@@ -219,8 +235,8 @@ impl Explorer {
         let task = cx.background_spawn({
             let dir = dir.clone();
             async move {
-                let mut entries = fs::list_directory(&dir)?;
-                fs::sort_entries(&mut entries, sort);
+                let mut entries = files::list(&dir)?;
+                files::sort_entries(&mut entries, sort);
                 std::io::Result::Ok(entries)
             }
         });
@@ -231,8 +247,9 @@ impl Explorer {
                 let listing = match result {
                     Ok(mut entries) => {
                         if this.sort != sort {
-                            fs::sort_entries(&mut entries, this.sort);
+                            files::sort_entries(&mut entries, this.sort);
                         }
+                        this.request_icons(&entries, cx);
                         Listing::Loaded(Arc::new(entries))
                     }
                     Err(err) => Listing::Failed(err.to_string()),
@@ -244,6 +261,37 @@ impl Explorer {
             .ok();
         })
         .detach();
+    }
+
+    /// Asks Windows for the icons of file types not seen before.
+    fn request_icons(&mut self, entries: &[Entry], cx: &mut Context<Self>) {
+        let Some(shell) = &self.shell else {
+            return;
+        };
+        let new: HashSet<String> = entries
+            .iter()
+            .filter_map(Entry::extension)
+            .filter(|extension| !self.file_icons.contains_key(extension))
+            .collect();
+        for extension in new {
+            let icon = shell.icon(extension.clone());
+            self.file_icons.insert(extension.clone(), None);
+            cx.spawn(async move |this, cx| {
+                let Ok(Some(icon)) = icon.await else {
+                    return;
+                };
+                this.update(cx, |this, cx| {
+                    let icons = FileIcons {
+                        small: images::bitmap_to_render_image(icon.small),
+                        large: images::bitmap_to_render_image(icon.large),
+                    };
+                    this.file_icons.insert(extension, Some(icons));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     pub fn navigate(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
@@ -302,21 +350,8 @@ impl Explorer {
         cx.notify();
     }
 
-    /// Navigates to the parent of `file` and selects it.
-    fn reveal_file(&mut self, file: PathBuf, cx: &mut Context<Self>) {
-        let Some(parent) = file.parent().map(Path::to_path_buf) else {
-            return;
-        };
-        if self.current_dir() == Some(parent.as_path()) {
-            self.select(Some(file), cx);
-        } else {
-            self.history.push(parent);
-            self.enter_current(Some(file), cx);
-        }
-    }
-
     fn open_entry(&mut self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) {
-        if entry.is_dir() {
+        if entry.is_container() {
             self.navigate(entry.path.clone(), cx);
         } else if entry.is_supported_image() {
             open_image_viewer(entry.path.clone(), cx);
@@ -352,7 +387,7 @@ impl Explorer {
         for listing in self.listings.values_mut() {
             if let Listing::Loaded(entries) = listing {
                 let entries: &mut Vec<Entry> = Arc::make_mut(entries);
-                fs::sort_entries(entries, sort);
+                files::sort_entries(entries, sort);
             }
         }
         self.schedule_save(cx);
@@ -799,7 +834,7 @@ impl Explorer {
             None => String::new(),
         };
         let selection = self.selected_entry().map(|entry| match entry.size {
-            Some(size) => format!("1 item selected ({})", fs::format_size(size)),
+            Some(size) => format!("1 item selected ({})", files::format_size(size)),
             None => "1 item selected".to_string(),
         });
         let location = self.current_dir().and_then(|dir| {

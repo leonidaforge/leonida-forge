@@ -3,10 +3,10 @@ use gpui::{
 };
 
 use super::{Explorer, MENU_BAR_HEIGHT, Menu};
-use crate::fs::{Sort, SortKey};
+use crate::files::{Sort, SortKey};
 use crate::settings::ViewMode;
-use crate::theme;
 use crate::ui;
+use crate::ui::theme;
 
 impl Explorer {
     pub(super) fn render_menu_bar(&self, cx: &Context<Self>) -> impl IntoElement {

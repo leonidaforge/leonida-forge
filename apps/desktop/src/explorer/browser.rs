@@ -3,16 +3,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, ClickEvent, Context, Div, FontWeight, MouseButton, Point, ScrollStrategy,
-    Stateful, anchored, deferred, div, prelude::*, px, rgb, uniform_list,
+    Anchor, AnyElement, ClickEvent, Context, Div, FontWeight, MouseButton, Pixels, Point,
+    ScrollStrategy, Stateful, anchored, deferred, div, img, prelude::*, px, rgb, uniform_list,
 };
 
 use super::{BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
-use crate::assets::Icon;
-use crate::fs::{self, Entry, EntryKind, SortKey};
+use crate::files::{self, Entry, EntryKind, SortKey};
 use crate::settings::ViewMode;
-use crate::theme;
 use crate::ui;
+use crate::ui::assets::Icon;
+use crate::ui::theme;
 
 const PADDING: f32 = 8.;
 const GAP: f32 = 4.;
@@ -34,16 +34,40 @@ fn grid_cell(mode: ViewMode) -> Option<(f32, f32)> {
     }
 }
 
-pub(super) fn entry_icon(entry: &Entry) -> (Icon, u32) {
+/// The built-in icon for types Windows does not know.
+fn fallback_icon(entry: &Entry) -> (Icon, u32) {
     match entry.kind {
         EntryKind::Directory => (Icon::Folder, theme::FOLDER),
         EntryKind::Unavailable => (Icon::FileMissing, theme::TEXT_MUTED),
         EntryKind::File if entry.is_supported_image() => (Icon::FileImage, IMAGE_ICON_COLOR),
-        EntryKind::File => (Icon::File, theme::TEXT_MUTED),
+        EntryKind::Archive | EntryKind::File => (Icon::File, theme::TEXT_MUTED),
     }
 }
 
 impl Explorer {
+    /// The icon Windows shows for the entry's type, or a built-in one.
+    /// Folders always use the built-in icon so they match the theme.
+    pub(super) fn entry_icon(&self, entry: &Entry, size: Pixels) -> AnyElement {
+        let icons = entry
+            .extension()
+            .and_then(|extension| self.file_icons.get(&extension))
+            .and_then(Option::as_ref);
+        match icons {
+            Some(icons) if !entry.is_dir() => {
+                let image = if size > px(24.) {
+                    icons.large.clone()
+                } else {
+                    icons.small.clone()
+                };
+                img(image).flex_none().size(size).into_any_element()
+            }
+            _ => {
+                let (glyph, color) = fallback_icon(entry);
+                ui::icon(glyph, size, color).into_any_element()
+            }
+        }
+    }
+
     pub(super) fn render_browser(
         &self,
         layout: &Layout,
@@ -339,7 +363,6 @@ impl Explorer {
     }
 
     fn render_details_row(&self, ix: usize, entry: &Entry, cx: &Context<Self>) -> impl IntoElement {
-        let (glyph, color) = entry_icon(entry);
         let cell = || div().px_2().truncate();
         self.browser_item(ix, entry, cx)
             .flex()
@@ -353,27 +376,32 @@ impl Explorer {
                     .gap_2()
                     .flex_1()
                     .min_w(px(DETAILS_NAME_MIN_WIDTH))
-                    .child(ui::icon(glyph, px(16.), color))
+                    .child(self.entry_icon(entry, px(16.)))
                     .child(div().min_w_0().truncate().child(entry.name.clone())),
             )
             .child(
                 cell()
                     .w(px(DETAILS_TYPE_WIDTH))
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(entry.type_name()),
+                    .child(entry.type_name.clone()),
             )
             .child(
                 cell()
                     .w(px(DETAILS_SIZE_WIDTH))
                     .flex()
                     .justify_end()
-                    .child(entry.size.map(fs::format_size).unwrap_or_default()),
+                    .child(entry.size.map(files::format_size).unwrap_or_default()),
             )
             .child(
                 cell()
                     .w(px(DETAILS_MODIFIED_WIDTH))
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(entry.modified.map(fs::format_modified).unwrap_or_default()),
+                    .child(
+                        entry
+                            .modified
+                            .map(files::format_modified)
+                            .unwrap_or_default(),
+                    ),
             )
     }
 
@@ -398,14 +426,13 @@ impl Explorer {
                             .flex_none()
                             .w(px(LIST_COLUMN_WIDTH))
                             .children(chunk.iter().enumerate().map(|(row, entry)| {
-                                let (glyph, color) = entry_icon(entry);
                                 self.browser_item(column * rows + row, entry, cx)
                                     .flex()
                                     .items_center()
                                     .gap_1p5()
                                     .h(px(LIST_ROW_HEIGHT))
                                     .px_1p5()
-                                    .child(ui::icon(glyph, px(16.), color))
+                                    .child(self.entry_icon(entry, px(16.)))
                                     .child(div().min_w_0().truncate().child(entry.name.clone()))
                             }))
                     })),
@@ -454,7 +481,6 @@ impl Explorer {
         mode: ViewMode,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        let (glyph, color) = entry_icon(entry);
         let item = self
             .browser_item(ix, entry, cx)
             .flex_none()
@@ -467,7 +493,7 @@ impl Explorer {
                 .gap_1()
                 .pt_2()
                 .px_1()
-                .child(ui::icon(glyph, px(48.), color))
+                .child(self.entry_icon(entry, px(48.)))
                 .child(
                     div()
                         .w_full()
@@ -481,7 +507,7 @@ impl Explorer {
                 .items_center()
                 .gap_2()
                 .px_2()
-                .child(ui::icon(glyph, px(36.), color))
+                .child(self.entry_icon(entry, px(36.)))
                 .child(
                     div()
                         .flex()
@@ -493,13 +519,13 @@ impl Explorer {
                                 .text_xs()
                                 .text_color(rgb(theme::TEXT_MUTED))
                                 .truncate()
-                                .child(entry.type_name()),
+                                .child(entry.type_name.clone()),
                         )
                         .children(entry.size.map(|size| {
                             div()
                                 .text_xs()
                                 .text_color(rgb(theme::TEXT_MUTED))
-                                .child(fs::format_size(size))
+                                .child(files::format_size(size))
                         })),
                 ),
             _ => item
@@ -507,7 +533,7 @@ impl Explorer {
                 .items_center()
                 .gap_2()
                 .px_1p5()
-                .child(ui::icon(glyph, px(20.), color))
+                .child(self.entry_icon(entry, px(20.)))
                 .child(div().min_w_0().truncate().child(entry.name.clone())),
         }
     }

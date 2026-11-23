@@ -1,4 +1,12 @@
-//! Read-only directory listing and sorting.
+//! Read-only access to directories and archives.
+//!
+//! A path may continue inside an archive file, e.g. `mods\pack.zip\cars`.
+//! [`list`] and [`read`] resolve such paths, so callers treat archives like
+//! folders.
+
+pub mod archive;
+pub mod images;
+pub mod shell;
 
 use std::cmp::Ordering;
 use std::fs;
@@ -11,6 +19,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Directory,
+    /// An archive file that can be browsed like a directory.
+    Archive,
     File,
     /// The entry exists but its metadata cannot be read, e.g. a broken link.
     Unavailable,
@@ -23,33 +33,42 @@ pub struct Entry {
     pub kind: EntryKind,
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
+    pub type_name: String,
 }
 
 impl Entry {
+    pub fn new(
+        name: String,
+        path: PathBuf,
+        kind: EntryKind,
+        size: Option<u64>,
+        modified: Option<SystemTime>,
+    ) -> Self {
+        let type_name = fallback_type_name(kind, extension(&path).as_deref());
+        Self {
+            name,
+            path,
+            kind,
+            size,
+            modified,
+            type_name,
+        }
+    }
+
     pub fn is_dir(&self) -> bool {
         self.kind == EntryKind::Directory
+    }
+
+    /// Directories and archives, which can be opened like folders.
+    pub fn is_container(&self) -> bool {
+        matches!(self.kind, EntryKind::Directory | EntryKind::Archive)
     }
 
     pub fn extension(&self) -> Option<String> {
         if self.is_dir() {
             return None;
         }
-        self.path
-            .extension()
-            .map(|ext| ext.to_string_lossy().to_lowercase())
-    }
-
-    pub fn type_name(&self) -> String {
-        match self.kind {
-            EntryKind::Directory => "File folder".to_string(),
-            EntryKind::Unavailable => "Unavailable".to_string(),
-            EntryKind::File => match self.extension().as_deref() {
-                Some("png") => "PNG image".to_string(),
-                Some("jpg" | "jpeg") => "JPEG image".to_string(),
-                Some(ext) => format!("{} file", ext.to_uppercase()),
-                None => "File".to_string(),
-            },
-        }
+        extension(&self.path)
     }
 
     pub fn is_supported_image(&self) -> bool {
@@ -57,14 +76,54 @@ impl Entry {
     }
 }
 
-pub fn is_supported_image(path: &Path) -> bool {
+fn extension(path: &Path) -> Option<String> {
     path.extension()
         .map(|ext| ext.to_string_lossy().to_lowercase())
-        .is_some_and(|ext| matches!(ext.as_str(), "png" | "jpg" | "jpeg"))
 }
 
-/// Lists the direct children of `dir`. Never recurses.
-pub fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
+/// The type name used when Windows does not know the file type.
+fn fallback_type_name(kind: EntryKind, extension: Option<&str>) -> String {
+    match kind {
+        EntryKind::Directory => "File folder".to_string(),
+        EntryKind::Unavailable => "Unavailable".to_string(),
+        EntryKind::Archive | EntryKind::File => match extension {
+            Some("png") => "PNG image".to_string(),
+            Some("jpg" | "jpeg") => "JPEG image".to_string(),
+            Some(ext) => format!("{} file", ext.to_uppercase()),
+            None => "File".to_string(),
+        },
+    }
+}
+
+pub fn is_supported_image(path: &Path) -> bool {
+    extension(path).is_some_and(|ext| matches!(ext.as_str(), "png" | "jpg" | "jpeg"))
+}
+
+/// Lists the direct children of a directory, or of a folder inside an archive.
+/// Type names come from Windows where it knows the file type.
+pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
+    let mut entries = match archive::locate(path) {
+        Some((archive, inner)) => archive::list(archive, inner)?,
+        None => list_directory(path)?,
+    };
+    for entry in &mut entries {
+        if let Some(name) = shell::type_name(entry) {
+            entry.type_name = name;
+        }
+    }
+    Ok(entries)
+}
+
+/// Reads a whole file, which may be inside an archive.
+pub fn read(path: &Path) -> io::Result<Vec<u8>> {
+    match archive::locate(path) {
+        Some((archive, inner)) => archive::read(archive, inner),
+        None => fs::read(path),
+    }
+}
+
+/// Lists the direct children of a directory on disk. Never recurses.
+fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in fs::read_dir(dir)? {
         let item = match item {
@@ -87,26 +146,18 @@ pub fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
 }
 
 fn entry_from_metadata(path: PathBuf, name: String, metadata: io::Result<fs::Metadata>) -> Entry {
-    match metadata {
-        Ok(metadata) => Entry {
-            name,
-            path,
-            kind: if metadata.is_dir() {
-                EntryKind::Directory
-            } else {
-                EntryKind::File
-            },
-            size: metadata.is_file().then_some(metadata.len()),
-            modified: metadata.modified().ok(),
-        },
-        Err(_) => Entry {
-            name,
-            path,
-            kind: EntryKind::Unavailable,
-            size: None,
-            modified: None,
-        },
-    }
+    let Ok(metadata) = metadata else {
+        return Entry::new(name, path, EntryKind::Unavailable, None, None);
+    };
+    let kind = if metadata.is_dir() {
+        EntryKind::Directory
+    } else if archive::is_archive(&path) {
+        EntryKind::Archive
+    } else {
+        EntryKind::File
+    };
+    let size = metadata.is_file().then_some(metadata.len());
+    Entry::new(name, path, kind, size, metadata.modified().ok())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -130,7 +181,7 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
     entries.sort_by(|a, b| {
         let ordering = match sort.key {
             SortKey::Name => natural_cmp(&a.name, &b.name),
-            SortKey::Type => a.type_name().cmp(&b.type_name()),
+            SortKey::Type => a.type_name.cmp(&b.type_name),
             SortKey::Size => a.size.cmp(&b.size),
             SortKey::Modified => a.modified.cmp(&b.modified),
         };
@@ -226,23 +277,23 @@ mod tests {
     use std::time::Duration;
 
     fn file(name: &str, size: u64) -> Entry {
-        Entry {
-            name: name.into(),
-            path: PathBuf::from(name),
-            kind: EntryKind::File,
-            size: Some(size),
-            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(size)),
-        }
+        Entry::new(
+            name.into(),
+            PathBuf::from(name),
+            EntryKind::File,
+            Some(size),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(size)),
+        )
     }
 
     fn dir(name: &str) -> Entry {
-        Entry {
-            name: name.into(),
-            path: PathBuf::from(name),
-            kind: EntryKind::Directory,
-            size: None,
-            modified: None,
-        }
+        Entry::new(
+            name.into(),
+            PathBuf::from(name),
+            EntryKind::Directory,
+            None,
+            None,
+        )
     }
 
     fn names(entries: &[Entry]) -> Vec<&str> {
@@ -311,20 +362,24 @@ mod tests {
         fs::create_dir(temp.path().join("Ordner ä")).unwrap();
         fs::write(temp.path().join("テクスチャ.png"), [0u8; 3]).unwrap();
         fs::write(temp.path().join("vehicles.rpf"), [0u8; 5]).unwrap();
+        fs::write(temp.path().join("Pack.ZIP"), [0u8; 1]).unwrap();
 
+        // `list_directory` keeps the fallback type names; `list` adds Windows names.
         let mut entries = list_directory(temp.path()).unwrap();
         sort_entries(&mut entries, Sort::default());
 
         assert_eq!(
             names(&entries),
-            ["Ordner ä", "vehicles.rpf", "テクスチャ.png"]
+            ["Ordner ä", "Pack.ZIP", "vehicles.rpf", "テクスチャ.png"]
         );
         assert_eq!(entries[0].kind, EntryKind::Directory);
         assert_eq!(entries[0].size, None);
-        assert_eq!(entries[1].type_name(), "RPF file");
-        assert_eq!(entries[1].size, Some(5));
-        assert!(entries[2].is_supported_image());
-        assert!(entries[2].modified.is_some());
+        assert_eq!(entries[1].kind, EntryKind::Archive);
+        assert!(entries[1].is_container());
+        assert_eq!(entries[2].type_name, "RPF file");
+        assert_eq!(entries[2].size, Some(5));
+        assert!(entries[3].is_supported_image());
+        assert!(entries[3].modified.is_some());
     }
 
     #[test]

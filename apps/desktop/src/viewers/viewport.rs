@@ -17,7 +17,7 @@ use gpui::{
 use image::{Frame as ImageFrame, RgbaImage};
 use lforge_renderer::{Frame, OrbitCamera, Renderer};
 
-use crate::theme;
+use crate::ui::theme;
 
 const ORBIT_RADIANS_PER_PIXEL: f32 = 0.01;
 const ZOOM_PER_PIXEL: f32 = 0.0025;

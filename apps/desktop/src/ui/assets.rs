@@ -18,7 +18,7 @@ macro_rules! icons {
         }
 
         const ICONS: &[(&str, &[u8])] = &[
-            $((concat!("icons/", $file, ".svg"), include_bytes!(concat!("../assets/icons/", $file, ".svg"))),)*
+            $((concat!("icons/", $file, ".svg"), include_bytes!(concat!("../../assets/icons/", $file, ".svg"))),)*
         ];
     };
 }

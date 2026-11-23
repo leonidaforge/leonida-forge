@@ -1,12 +1,13 @@
 //! Image decoding for previews and the image viewer.
 
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
 use gpui::RenderImage;
 use image::{DynamicImage, Frame, ImageFormat, ImageReader, RgbaImage};
+
+use super::shell::Bitmap;
 
 pub struct DecodedImage {
     pub image: Arc<RenderImage>,
@@ -15,13 +16,13 @@ pub struct DecodedImage {
     pub height: u32,
 }
 
-/// Decodes the image at full resolution.
+/// Decodes the image at full resolution. The file may be inside an archive.
 pub fn load(path: &Path) -> Result<DecodedImage, String> {
-    let reader = open(path)?;
-    let image = reader.decode().map_err(|err| err.to_string())?;
+    let bytes = super::read(path).map_err(|err| err.to_string())?;
+    let image = reader(&bytes)?.decode().map_err(|err| err.to_string())?;
     let (width, height) = (image.width(), image.height());
     Ok(DecodedImage {
-        image: to_render_image(image.into_rgba8()),
+        image: rgba_to_render_image(image.into_rgba8()),
         width,
         height,
     })
@@ -32,12 +33,13 @@ pub fn load(path: &Path) -> Result<DecodedImage, String> {
 /// JPEGs are decoded at a reduced scale, so large photos are never decoded in
 /// full. PNG has no reduced decoding, so it is decoded fully and then scaled.
 pub fn load_thumbnail(path: &Path, max_side: u32) -> Result<DecodedImage, String> {
-    let (width, height) = open(path)?
+    let bytes = super::read(path).map_err(|err| err.to_string())?;
+    let (width, height) = reader(&bytes)?
         .into_dimensions()
         .map_err(|err| err.to_string())?;
-    let image = match open(path)?.format() {
-        Some(ImageFormat::Jpeg) => decode_scaled_jpeg(path, max_side)?,
-        _ => open(path)?.decode().map_err(|err| err.to_string())?,
+    let image = match reader(&bytes)?.format() {
+        Some(ImageFormat::Jpeg) => decode_scaled_jpeg(&bytes, max_side)?,
+        _ => reader(&bytes)?.decode().map_err(|err| err.to_string())?,
     };
     let thumbnail = if image.width() > max_side || image.height() > max_side {
         image.thumbnail(max_side, max_side)
@@ -45,21 +47,37 @@ pub fn load_thumbnail(path: &Path, max_side: u32) -> Result<DecodedImage, String
         image
     };
     Ok(DecodedImage {
-        image: to_render_image(thumbnail.into_rgba8()),
+        image: rgba_to_render_image(thumbnail.into_rgba8()),
         width,
         height,
     })
 }
 
-fn open(path: &Path) -> Result<ImageReader<BufReader<File>>, String> {
+/// Reads only the image header of a file on disk.
+pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     ImageReader::open(path)
-        .and_then(|reader| reader.with_guessed_format())
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Shell bitmaps are already in the BGRA layout GPUI expects.
+pub fn bitmap_to_render_image(bitmap: Bitmap) -> Arc<RenderImage> {
+    let buffer = RgbaImage::from_raw(bitmap.width, bitmap.height, bitmap.pixels)
+        .expect("shell bitmaps hold width * height * 4 bytes");
+    Arc::new(RenderImage::new([Frame::new(buffer)]))
+}
+
+fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>, String> {
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
         .map_err(|err| err.to_string())
 }
 
-fn decode_scaled_jpeg(path: &Path, max_side: u32) -> Result<DynamicImage, String> {
-    let file = File::open(path).map_err(|err| err.to_string())?;
-    let mut decoder = jpeg_decoder::Decoder::new(BufReader::new(file));
+fn decode_scaled_jpeg(bytes: &[u8], max_side: u32) -> Result<DynamicImage, String> {
+    let mut decoder = jpeg_decoder::Decoder::new(bytes);
     let side = u16::try_from(max_side).unwrap_or(u16::MAX);
     decoder.scale(side, side).map_err(|err| err.to_string())?;
     let pixels = decoder.decode().map_err(|err| err.to_string())?;
@@ -73,15 +91,13 @@ fn decode_scaled_jpeg(path: &Path, max_side: u32) -> Result<DynamicImage, String
             image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
         }
         // CMYK and 16-bit JPEGs are rare; let the regular decoder handle them.
-        _ => {
-            return open(path)?.decode().map_err(|err| err.to_string());
-        }
+        _ => return reader(bytes)?.decode().map_err(|err| err.to_string()),
     };
     image.ok_or_else(|| "JPEG data does not match its header".to_string())
 }
 
 /// GPUI expects BGRA pixels.
-fn to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
+fn rgba_to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
     for pixel in rgba.pixels_mut() {
         pixel.0.swap(0, 2);
     }

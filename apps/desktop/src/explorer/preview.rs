@@ -1,14 +1,15 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use gpui::{Context, FontWeight, ObjectFit, SharedString, Task, div, img, prelude::*, px, rgb};
+use gpui::{
+    Context, FontWeight, ObjectFit, RenderImage, SharedString, Task, div, img, prelude::*, px, rgb,
+};
 
-use super::{Explorer, browser::entry_icon};
-use crate::fs::{self, Entry};
-use crate::images::{self, DecodedImage};
-use crate::theme;
-use crate::ui;
+use super::Explorer;
+use crate::files::{self, Entry, EntryKind, images};
+use crate::ui::theme;
 
-/// Longest side of decoded thumbnails, in pixels.
+/// Longest side of requested thumbnails, in pixels.
 const THUMBNAIL_SIZE: u32 = 512;
 
 pub(super) struct Thumbnail {
@@ -19,47 +20,81 @@ pub(super) struct Thumbnail {
 
 enum ThumbnailState {
     Loading,
-    Ready(DecodedImage),
+    Ready {
+        image: Arc<RenderImage>,
+        dimensions: Option<(u32, u32)>,
+    },
+    /// Neither Windows nor Leonida Forge can render this file.
+    None,
     Failed(String),
 }
 
 impl Explorer {
-    /// Starts or drops the thumbnail so it matches the selected entry.
+    /// Starts or drops the thumbnail so it matches the selected file.
+    ///
+    /// Windows renders the thumbnail when a thumbnail provider knows the file
+    /// type. PNG and JPEG files fall back to the built-in decoder, which also
+    /// reads images inside archives.
     pub(super) fn update_thumbnail(&mut self, cx: &mut Context<Self>) {
         let wanted = self
             .selected_entry()
-            .filter(|entry| entry.is_supported_image())
-            .map(|entry| entry.path.clone());
-        if self.thumbnail.as_ref().map(|thumbnail| &thumbnail.path) == wanted.as_ref() {
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|entry| (entry.path.clone(), entry.is_supported_image()));
+        if self.thumbnail.as_ref().map(|thumbnail| &thumbnail.path)
+            == wanted.as_ref().map(|(path, _)| path)
+        {
             return;
         }
         if let Some(Thumbnail {
-            state: ThumbnailState::Ready(decoded),
+            state: ThumbnailState::Ready { image, .. },
             ..
         }) = self.thumbnail.take()
         {
-            self.stale_images.push(decoded.image);
+            self.stale_images.push(image);
         }
-        let Some(path) = wanted else {
+        let Some((path, is_image)) = wanted else {
             return;
         };
 
-        let decode = cx.background_spawn({
-            let path = path.clone();
-            async move { images::load_thumbnail(&path, THUMBNAIL_SIZE) }
-        });
+        let from_shell = self
+            .shell
+            .as_ref()
+            .map(|shell| shell.thumbnail(path.clone(), THUMBNAIL_SIZE));
         let task = cx.spawn({
             let path = path.clone();
             async move |this, cx| {
-                let result = decode.await;
+                let from_shell = match from_shell {
+                    Some(receiver) => receiver.await.ok().flatten(),
+                    None => None,
+                };
+                let state = cx
+                    .background_spawn({
+                        let path = path.clone();
+                        async move {
+                            match from_shell {
+                                Some(bitmap) => ThumbnailState::Ready {
+                                    image: images::bitmap_to_render_image(bitmap),
+                                    dimensions: images::dimensions(&path),
+                                },
+                                None if is_image => {
+                                    match images::load_thumbnail(&path, THUMBNAIL_SIZE) {
+                                        Ok(decoded) => ThumbnailState::Ready {
+                                            image: decoded.image,
+                                            dimensions: Some((decoded.width, decoded.height)),
+                                        },
+                                        Err(err) => ThumbnailState::Failed(err),
+                                    }
+                                }
+                                None => ThumbnailState::None,
+                            }
+                        }
+                    })
+                    .await;
                 this.update(cx, |this, cx| {
                     if let Some(thumbnail) = &mut this.thumbnail
                         && thumbnail.path == path
                     {
-                        thumbnail.state = match result {
-                            Ok(decoded) => ThumbnailState::Ready(decoded),
-                            Err(err) => ThumbnailState::Failed(err),
-                        };
+                        thumbnail.state = state;
                         cx.notify();
                     }
                 })
@@ -107,7 +142,6 @@ impl Explorer {
     }
 
     fn render_entry_preview(&self, entry: &Entry) -> impl IntoElement {
-        let (glyph, color) = entry_icon(entry);
         let thumbnail = self
             .thumbnail
             .as_ref()
@@ -115,7 +149,7 @@ impl Explorer {
             .map(|thumbnail| &thumbnail.state);
 
         let picture = match thumbnail {
-            Some(ThumbnailState::Ready(decoded)) => img(decoded.image.clone())
+            Some(ThumbnailState::Ready { image, .. }) => img(image.clone())
                 .size_full()
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
@@ -124,7 +158,7 @@ impl Explorer {
                 .flex_col()
                 .items_center()
                 .gap_2()
-                .child(ui::icon(glyph, px(56.), color))
+                .child(self.entry_icon(entry, px(56.)))
                 .child(
                     div()
                         .text_xs()
@@ -132,34 +166,36 @@ impl Explorer {
                         .child("Preview unavailable"),
                 )
                 .into_any_element(),
-            Some(ThumbnailState::Loading) | None => {
-                ui::icon(glyph, px(64.), color).into_any_element()
+            Some(ThumbnailState::Loading | ThumbnailState::None) | None => {
+                self.entry_icon(entry, px(64.)).into_any_element()
             }
         };
 
-        let mut properties: Vec<(&str, SharedString)> = vec![("Type", entry.type_name().into())];
+        let mut properties: Vec<(&str, SharedString)> =
+            vec![("Type", entry.type_name.clone().into())];
         if let Some(size) = entry.size {
             properties.push((
                 "Size",
                 format!(
                     "{} ({} bytes)",
-                    fs::format_size(size),
-                    fs::format_bytes_exact(size)
+                    files::format_size(size),
+                    files::format_bytes_exact(size)
                 )
                 .into(),
             ));
         }
-        if let Some(ThumbnailState::Ready(decoded)) = thumbnail {
-            properties.push((
-                "Dimensions",
-                format!("{} × {}", decoded.width, decoded.height).into(),
-            ));
+        if let Some(ThumbnailState::Ready {
+            dimensions: Some((width, height)),
+            ..
+        }) = thumbnail
+        {
+            properties.push(("Dimensions", format!("{width} × {height}").into()));
         }
         if let Some(ThumbnailState::Failed(err)) = thumbnail {
             properties.push(("Image", err.clone().into()));
         }
         if let Some(modified) = entry.modified {
-            properties.push(("Modified", fs::format_modified(modified).into()));
+            properties.push(("Modified", files::format_modified(modified).into()));
         }
         properties.push(("Path", entry.path.display().to_string().into()));
 
@@ -192,7 +228,7 @@ impl Explorer {
                     .items_center()
                     .gap_2()
                     .mt_3()
-                    .child(ui::icon(glyph, px(24.), color))
+                    .child(self.entry_icon(entry, px(24.)))
                     .child(
                         div()
                             .flex()
@@ -207,7 +243,7 @@ impl Explorer {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(theme::TEXT_MUTED))
-                                    .child(entry.type_name()),
+                                    .child(entry.type_name.clone()),
                             ),
                     ),
             )

@@ -3,9 +3,9 @@
 use gpui::{Context, Div, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb};
 use lforge_core::VERSION;
 
-use crate::theme;
+use super::viewport::{RendererStatus, Viewport};
 use crate::ui;
-use crate::viewport::{RendererStatus, Viewport};
+use crate::ui::theme;
 
 pub struct RendererDemo {
     viewport: Entity<Viewport>,

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fs::Sort;
+use crate::files::Sort;
 
 pub const DEFAULT_TREE_WIDTH: f32 = 240.;
 pub const DEFAULT_PREVIEW_WIDTH: f32 = 320.;
@@ -114,7 +114,7 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::SortKey;
+    use crate::files::SortKey;
 
     #[test]
     fn missing_file_gives_defaults() {

@@ -1,23 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod assets;
 mod explorer;
-mod fs;
-mod image_viewer;
-mod images;
-mod navigation;
-mod renderer_demo;
+mod files;
 mod settings;
-mod theme;
 mod ui;
-mod viewport;
+mod viewers;
 
 use gpui::{App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size};
 use lforge_core::APP_NAME;
 
-use crate::assets::Assets;
 use crate::explorer::Explorer;
 use crate::settings::Settings;
+use crate::ui::assets::Assets;
 
 fn main() {
     env_logger::init();

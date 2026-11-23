@@ -4,8 +4,10 @@ use gpui::{
     AnyElement, Div, ElementId, Pixels, SharedString, Stateful, Svg, div, prelude::*, px, rgb, svg,
 };
 
-use crate::assets::Icon;
-use crate::theme;
+pub mod assets;
+pub mod theme;
+
+use assets::Icon;
 
 pub fn icon(icon: Icon, size: Pixels, color: u32) -> Svg {
     svg()

@@ -2,16 +2,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    ClickEvent, Context, MouseButton, MouseDownEvent, ScrollStrategy, div, prelude::*, px, rgb,
-    uniform_list,
+    Context, MouseButton, MouseDownEvent, ScrollStrategy, div, prelude::*, px, rgb, uniform_list,
 };
 
-use super::{Explorer, Listing, Menu, browser::entry_icon};
-use crate::assets::Icon;
-use crate::fs::Entry;
-use crate::navigation::GTA_ROOT_LABEL;
-use crate::theme;
+use super::navigation::GTA_ROOT_LABEL;
+use super::{Explorer, Listing, Menu};
+use crate::files::Entry;
 use crate::ui;
+use crate::ui::assets::Icon;
+use crate::ui::theme;
 
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 14.;
@@ -42,12 +41,8 @@ impl TreeRow {
         }
     }
 
-    fn expandable(&self) -> bool {
-        match &self.kind {
-            RowKind::Root { .. } => true,
-            RowKind::Entry(entry) => entry.is_dir(),
-            RowKind::UnconfiguredGta | RowKind::Message(_) => false,
-        }
+    fn is_container(&self) -> bool {
+        matches!(self.kind, RowKind::Root { .. } | RowKind::Entry(_))
     }
 }
 
@@ -85,13 +80,13 @@ impl Explorer {
         }
     }
 
-    /// Only directories the user expanded are visited, so junction loops
-    /// cannot cause runaway recursion.
+    /// Lists folders and archives only. Only containers the user expanded are
+    /// visited, so junction loops cannot cause runaway recursion.
     fn push_children(&self, rows: &mut Vec<TreeRow>, dir: &Path, depth: usize) {
         match self.listings.get(dir) {
             Some(Listing::Loaded(entries)) => {
-                for entry in entries.iter() {
-                    let expanded = entry.is_dir() && self.expanded.contains(&entry.path);
+                for entry in entries.iter().filter(|entry| entry.is_container()) {
+                    let expanded = self.expanded.contains(&entry.path);
                     rows.push(TreeRow {
                         depth,
                         kind: RowKind::Entry(entry.clone()),
@@ -165,24 +160,31 @@ impl Explorer {
     fn render_tree_row(&self, ix: usize, row: &TreeRow, cx: &Context<Self>) -> impl IntoElement {
         let path = row.path().map(Path::to_path_buf);
         let current = path.is_some() && path.as_deref() == self.current_dir();
-        let selected = path.is_some() && path == self.selected;
-        // The current folder is filled unless one of its items is selected.
-        let highlighted = selected || (current && self.selected.is_none());
+        // Until a container is listed, assume it has subfolders.
+        let expandable = row.is_container()
+            && path
+                .as_ref()
+                .and_then(|path| match self.listings.get(path) {
+                    Some(Listing::Loaded(entries)) => {
+                        Some(entries.iter().any(|entry| entry.is_container()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(true);
         let root_unavailable = matches!(row.kind, RowKind::Root { .. })
             && path
                 .as_ref()
                 .is_some_and(|path| matches!(self.listings.get(path), Some(Listing::Failed(_))));
 
-        let (glyph, color) = match &row.kind {
+        let icon = match &row.kind {
             RowKind::UnconfiguredGta | RowKind::Root { gta: true, .. } => {
-                (Some(Icon::Gamepad), theme::ACCENT)
+                Some(ui::icon(Icon::Gamepad, px(16.), theme::ACCENT).into_any_element())
             }
-            RowKind::Root { gta: false, .. } => (Some(Icon::Folder), theme::FOLDER),
-            RowKind::Entry(entry) => {
-                let (glyph, color) = entry_icon(entry);
-                (Some(glyph), color)
+            RowKind::Root { gta: false, .. } => {
+                Some(ui::icon(Icon::Folder, px(16.), theme::FOLDER).into_any_element())
             }
-            RowKind::Message(_) => (None, theme::TEXT_MUTED),
+            RowKind::Entry(entry) => Some(self.entry_icon(entry, px(16.))),
+            RowKind::Message(_) => None,
         };
         let (label, note) = match &row.kind {
             RowKind::UnconfiguredGta => (GTA_ROOT_LABEL.to_string(), Some("Set folder…")),
@@ -203,7 +205,7 @@ impl Explorer {
             .justify_center()
             .size(px(16.))
             .rounded_sm()
-            .when(row.expandable(), |el| {
+            .when(expandable, |el| {
                 let dir = path.clone();
                 el.hover(|s| s.bg(rgb(theme::HOVER)))
                     .child(ui::icon(
@@ -238,16 +240,15 @@ impl Explorer {
             .rounded_sm()
             .border_1()
             .border_color(gpui::transparent_black())
-            .when(highlighted, |el| {
+            .when(current, |el| {
                 el.bg(rgb(theme::SELECTION))
                     .border_color(rgb(theme::SELECTION_BORDER))
             })
-            .when(current && !highlighted, |el| el.bg(rgb(theme::HOVER)))
-            .when(!highlighted && !is_message, |el| {
+            .when(!current && !is_message, |el| {
                 el.hover(|s| s.bg(rgb(theme::HOVER)))
             })
             .child(chevron)
-            .children(glyph.map(|glyph| ui::icon(glyph, px(16.), color)))
+            .children(icon)
             .child(
                 div()
                     .min_w_0()
@@ -269,27 +270,10 @@ impl Explorer {
                     .child(note)
             }))
             .when(!is_message, |el| {
-                let kind_click = match &row.kind {
-                    RowKind::UnconfiguredGta => None,
-                    RowKind::Root { path, .. } => Some((path.clone(), None)),
-                    RowKind::Entry(entry) => Some((entry.path.clone(), Some(entry.clone()))),
-                    RowKind::Message(_) => None,
-                };
-                el.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    match &kind_click {
-                        None => this.choose_gta_folder(cx),
-                        Some((dir, None)) => this.navigate(dir.clone(), cx),
-                        Some((_, Some(entry))) if entry.is_dir() => {
-                            this.navigate(entry.path.clone(), cx)
-                        }
-                        Some((_, Some(entry))) => {
-                            if event.click_count() >= 2 {
-                                this.open_entry(entry, window, cx);
-                            } else {
-                                this.reveal_file(entry.path.clone(), cx);
-                            }
-                        }
-                    }
+                let target = path.clone();
+                el.on_click(cx.listener(move |this, _, _, cx| match &target {
+                    Some(dir) => this.navigate(dir.clone(), cx),
+                    None => this.choose_gta_folder(cx),
                 }))
             })
             .when_some(

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use gpui::{Context, ScrollEvent, Task, Window, div, img, prelude::*, px, rgb};
 
-use crate::images::{self, DecodedImage};
-use crate::theme;
+use crate::files::images::{self, DecodedImage};
 use crate::ui;
+use crate::ui::theme;
 
 const TOOLBAR_HEIGHT: f32 = 40.;
 const STATUS_BAR_HEIGHT: f32 = 26.;

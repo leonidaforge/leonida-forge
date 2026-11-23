@@ -30,6 +30,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.27"
 wgpu = "30.0"
+windows = "0.62"
+zip = { version = "9.4", default-features = false, features = ["deflate"] }
 
 # Zed patches async-task for a waker identity fix that GPUI's executor relies on.
 # Patches of a dependency's workspace do not propagate, so it is repeated here.
