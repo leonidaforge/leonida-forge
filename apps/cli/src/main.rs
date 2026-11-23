@@ -1,3 +1,5 @@
+mod binary;
+
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -7,7 +9,8 @@ use lforge_core::BuildInfo;
 #[command(
     name = "lforge",
     version,
-    about = "Leonida Forge command-line interface"
+    about = "Leonida Forge command-line interface",
+    after_help = "Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -22,12 +25,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect binary files without modifying them
+    #[command(subcommand)]
+    Binary(binary::Command),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Info { json } => info(json),
+        Command::Binary(command) => match binary::run(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

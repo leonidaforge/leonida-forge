@@ -32,6 +32,23 @@ Debug builds have a **Tools > Renderer Demo** window for the 3D renderer.
 Set `WGPU_BACKEND` (for example `vulkan`) to run it on a backend other than Direct3D 12.
 Set `RUST_LOG=warn` to see log output from debug builds. Release builds have no console.
 
+## Binary Inspector
+
+Double-click a file the explorer cannot otherwise open, or right-click any file and choose **Open in Binary Inspector**.
+Files inside ZIP archives are extracted to a temporary file first, up to 512 MB.
+
+The CLI exposes the same operations on plain files:
+
+```sh
+lforge binary info example.bin --json          # size, signature bytes, SHA-256
+lforge binary dump example.bin --offset 0x10 --length 128
+lforge binary search example.bin --hex "52 50 46 37"
+lforge binary search example.bin --text example --json
+lforge binary interpret example.bin --offset 0x10 --endian big --json
+```
+
+Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage.
+
 ## AI Contributions
 
 **AI-enabled, not AI-driven.**

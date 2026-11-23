@@ -96,7 +96,7 @@ impl Explorer {
 
         div().child(deferred(overlay).priority(1)).when_some(
             match menu {
-                Menu::Root { position, .. } => Some(*position),
+                Menu::Root { position, .. } | Menu::Entry { position, .. } => Some(*position),
                 _ => None,
             },
             |el, position| {
@@ -118,6 +118,10 @@ impl Explorer {
         match menu {
             Menu::File => {
                 let folder_root = self.current_folder_root();
+                let inspectable = self
+                    .selected_entry()
+                    .filter(|entry| entry.is_inspectable())
+                    .map(|entry| entry.path.clone());
                 panel
                     .child(
                         ui::menu_item("set-gta", "Set GTA VI Folder…", false, true, None).on_click(
@@ -140,6 +144,22 @@ impl Explorer {
                         .when_some(folder_root, |el, root| {
                             el.on_click(self.menu_action(
                                 move |this, _, cx| this.remove_folder(root.clone(), cx),
+                                cx,
+                            ))
+                        }),
+                    )
+                    .child(ui::menu_separator())
+                    .child(
+                        ui::menu_item(
+                            "open-in-inspector",
+                            "Open in Binary Inspector",
+                            false,
+                            inspectable.is_some(),
+                            None,
+                        )
+                        .when_some(inspectable, |el, path| {
+                            el.on_click(self.menu_action(
+                                move |_, _, cx| super::open_binary_inspector(path.clone(), cx),
                                 cx,
                             ))
                         }),
@@ -244,6 +264,29 @@ impl Explorer {
                             )),
                     )
                 }
+            }
+            Menu::Entry { entry, .. } => {
+                let open = entry.clone();
+                let path = entry.path.clone();
+                panel
+                    .child(
+                        ui::menu_item("open-entry", "Open", false, true, None).on_click(
+                            self.menu_action(move |this, _, cx| this.open_entry(&open, cx), cx),
+                        ),
+                    )
+                    .child(
+                        ui::menu_item(
+                            "open-in-inspector",
+                            "Open in Binary Inspector",
+                            false,
+                            true,
+                            None,
+                        )
+                        .on_click(self.menu_action(
+                            move |_, _, cx| super::open_binary_inspector(path.clone(), cx),
+                            cx,
+                        )),
+                    )
             }
         }
     }

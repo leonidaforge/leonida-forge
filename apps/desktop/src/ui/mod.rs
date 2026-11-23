@@ -6,6 +6,7 @@ use gpui::{
 };
 
 pub mod assets;
+pub mod text_field;
 pub mod theme;
 
 use assets::Icon;

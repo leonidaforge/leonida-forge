@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "apps/desktop", "crates/core", "crates/renderer"]
+members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/renderer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,6 +10,7 @@ repository = "https://github.com/leonidaforge/leonida-forge"
 publish = false
 
 [workspace.dependencies]
+lforge-binary = { path = "crates/binary" }
 lforge-core = { path = "crates/core" }
 lforge-renderer = { path = "crates/renderer" }
 
@@ -25,9 +26,11 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f00a9431
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 log = "0.4"
+memchr = "2.8"
 pollster = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tempfile = "3.27"
 wgpu = "30.0"
 windows = "0.62"

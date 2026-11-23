@@ -14,6 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use lforge_binary::Source;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,11 @@ impl Entry {
     pub fn is_supported_image(&self) -> bool {
         self.kind == EntryKind::File && is_supported_image(&self.path)
     }
+
+    /// Regular files, including archives, can be opened as raw bytes.
+    pub fn is_inspectable(&self) -> bool {
+        matches!(self.kind, EntryKind::File | EntryKind::Archive)
+    }
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -120,6 +126,32 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
         Some((archive, inner)) => archive::read(archive, inner),
         None => fs::read(path),
     }
+}
+
+/// A file opened for random access, possibly extracted from an archive.
+pub struct BinaryFile {
+    pub source: Source,
+    pub modified: Option<SystemTime>,
+}
+
+/// Opens a file for random access. Files inside archives are extracted to a
+/// temporary file first, within the archive size limit.
+pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
+    let (file, modified) = match archive::locate(path) {
+        Some((archive, inner)) => archive::extract(archive, inner)?,
+        None => {
+            let file = fs::File::open(path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err(io::Error::other("not a regular file"));
+            }
+            (file, metadata.modified().ok())
+        }
+    };
+    Ok(BinaryFile {
+        source: Source::from_file(file)?,
+        modified,
+    })
 }
 
 /// Lists the direct children of a directory on disk. Never recurses.
@@ -407,6 +439,31 @@ mod tests {
         }
         let entries = list_directory(temp.path()).unwrap();
         assert_eq!(entries[0].kind, EntryKind::Unavailable);
+    }
+
+    #[test]
+    fn opens_plain_and_archived_files_for_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("plain.bin"), b"LFG\0").unwrap();
+        let plain = open_binary(&temp.path().join("plain.bin")).unwrap();
+        assert_eq!(plain.source.len(), 4);
+        assert!(plain.modified.is_some());
+        assert!(open_binary(temp.path()).is_err());
+        assert!(open_binary(&temp.path().join("missing.bin")).is_err());
+
+        let archive = temp.path().join("pack.zip");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        zip.start_file("dir/inner.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"inside").unwrap();
+        zip.finish().unwrap();
+
+        let mut inner = open_binary(&archive.join("dir").join("inner.bin")).unwrap();
+        assert_eq!(
+            lforge_binary::read_at(&mut inner.source, 0, 64).unwrap(),
+            b"inside"
+        );
+        assert!(open_binary(&archive.join("dir")).is_err());
     }
 
     #[test]

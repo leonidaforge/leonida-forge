@@ -11,6 +11,11 @@ name = "lforge"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
+lforge-binary.workspace = true
 lforge-core.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -28,6 +28,7 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             explorer::bind_keys(cx);
+            viewers::binary::bind_keys(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,

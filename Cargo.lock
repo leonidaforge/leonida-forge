@@ -2529,12 +2529,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
+name = "lforge-binary"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "lforge-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
+ "lforge-binary",
  "lforge-core",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2555,6 +2567,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "jpeg-decoder",
+ "lforge-binary",
  "lforge-core",
  "lforge-renderer",
  "log",

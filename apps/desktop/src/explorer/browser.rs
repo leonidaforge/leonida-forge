@@ -3,8 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpui::{
-    Anchor, AnyElement, ClickEvent, Context, Div, FontWeight, MouseButton, Pixels, Point,
-    ScrollStrategy, Stateful, anchored, deferred, div, img, prelude::*, px, rgb, uniform_list,
+    Anchor, AnyElement, ClickEvent, Context, Div, FontWeight, MouseButton, MouseDownEvent, Pixels,
+    Point, ScrollStrategy, Stateful, anchored, deferred, div, img, prelude::*, px, rgb,
+    uniform_list,
 };
 
 use super::{BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
@@ -538,11 +539,11 @@ impl Explorer {
         }
     }
 
-    /// A selectable item. Double-clicking opens it.
+    /// A selectable item. Double-clicking opens it; right-clicking a file
+    /// opens its context menu.
     fn browser_item(&self, ix: usize, entry: &Entry, cx: &Context<Self>) -> Stateful<Div> {
         let selected = self.selected.as_ref() == Some(&entry.path);
-        let entry = entry.clone();
-        div()
+        let item = div()
             .id(("entry", ix))
             .rounded_sm()
             .border_1()
@@ -552,14 +553,29 @@ impl Explorer {
                     .border_color(rgb(theme::SELECTION_BORDER))
             })
             .when(!selected, |el| el.hover(|s| s.bg(rgb(theme::HOVER))))
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                if event.click_count() >= 2 {
-                    this.open_entry(&entry, window, cx);
-                } else {
-                    this.select(Some(entry.path.clone()), cx);
-                }
-            }))
+            .when(entry.is_inspectable(), |el| {
+                let entry = entry.clone();
+                el.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.select(Some(entry.path.clone()), cx);
+                        this.open_menu = Some(Menu::Entry {
+                            entry: entry.clone(),
+                            position: event.position,
+                        });
+                    }),
+                )
+            });
+        let entry = entry.clone();
+        item.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            if event.click_count() >= 2 {
+                this.open_entry(&entry, cx);
+            } else {
+                this.select(Some(entry.path.clone()), cx);
+            }
+        }))
     }
 }
 

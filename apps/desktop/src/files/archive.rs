@@ -14,7 +14,7 @@ use zip::ZipArchive;
 
 use super::{Entry, EntryKind};
 
-/// Files inside archives are read into memory, so cap what one read may allocate.
+/// Caps what reading one file from an archive may allocate in memory or on disk.
 const MAX_READ: u64 = 512 * 1024 * 1024;
 
 pub fn is_archive(path: &Path) -> bool {
@@ -80,7 +80,40 @@ pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
 /// Reads one file from the archive into memory.
 pub fn read(archive: &Path, inner: &Path) -> io::Result<Vec<u8>> {
     let mut zip = open(archive)?;
-    let index = (0..zip.len())
+    let index = find(&mut zip, inner)?;
+    let file = zip.by_index(index).map_err(io::Error::other)?;
+    check_size(file.size(), MAX_READ)?;
+    let mut bytes = Vec::with_capacity(file.size() as usize);
+    file.take(MAX_READ).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Decompresses one file into an anonymous temporary file, for random access
+/// without holding it in memory. Windows deletes the temporary file when its
+/// last handle closes, also when the process exits abnormally.
+pub fn extract(archive: &Path, inner: &Path) -> io::Result<(File, Option<SystemTime>)> {
+    extract_limited(archive, inner, MAX_READ)
+}
+
+fn extract_limited(
+    archive: &Path,
+    inner: &Path,
+    limit: u64,
+) -> io::Result<(File, Option<SystemTime>)> {
+    let mut zip = open(archive)?;
+    let index = find(&mut zip, inner)?;
+    let file = zip.by_index(index).map_err(io::Error::other)?;
+    check_size(file.size(), limit)?;
+    let modified = file.last_modified().and_then(to_system_time);
+    let mut temp = tempfile::tempfile()?;
+    // The declared size may be wrong, so the copy is capped as well.
+    let copied = io::copy(&mut file.take(limit + 1), &mut temp)?;
+    check_size(copied, limit)?;
+    Ok((temp, modified))
+}
+
+fn find(zip: &mut ZipArchive<BufReader<File>>, inner: &Path) -> io::Result<usize> {
+    (0..zip.len())
         .find(|&index| {
             zip.by_index_raw(index)
                 .ok()
@@ -92,16 +125,17 @@ pub fn read(archive: &Path, inner: &Path) -> io::Result<Vec<u8>> {
                 io::ErrorKind::NotFound,
                 "the file does not exist in the archive",
             )
-        })?;
-    let file = zip.by_index(index).map_err(io::Error::other)?;
-    if file.size() > MAX_READ {
-        return Err(io::Error::other(
-            "the file is too large to read from the archive",
-        ));
+        })
+}
+
+fn check_size(size: u64, limit: u64) -> io::Result<()> {
+    if size > limit {
+        return Err(io::Error::other(format!(
+            "the file is too large to read from the archive (limit {})",
+            super::format_size(limit)
+        )));
     }
-    let mut bytes = Vec::with_capacity(file.size() as usize);
-    file.take(MAX_READ).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(())
 }
 
 fn open(archive: &Path) -> io::Result<ZipArchive<BufReader<File>>> {
@@ -205,6 +239,57 @@ mod tests {
             names(&list(&archive, Path::new("")).unwrap()),
             ["inside.txt"]
         );
+    }
+
+    #[test]
+    fn extracts_entries_for_random_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pack.zip");
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 7) as u8).collect();
+        write_zip(&archive, &[("a/data.bin", &data), ("other.bin", b"x")]);
+
+        let (file, modified) = extract(&archive, Path::new("a/data.bin")).unwrap();
+        assert!(modified.is_some());
+        let mut source = lforge_binary::Source::from_file(file).unwrap();
+        assert_eq!(source.len(), data.len() as u64);
+        assert_eq!(
+            lforge_binary::read_at(&mut source, 99_998, 16).unwrap(),
+            &data[99_998..]
+        );
+        assert!(extract(&archive, Path::new("a/missing.bin")).is_err());
+        assert!(extract(&archive, Path::new("a")).is_err());
+    }
+
+    #[test]
+    fn rejects_entries_over_the_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("bomb.zip");
+        write_zip(&archive, &[("zeros.bin", &[0u8; 4096])]);
+        let err = extract_limited(&archive, Path::new("zeros.bin"), 4095).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+        assert!(extract_limited(&archive, Path::new("zeros.bin"), 4096).is_ok());
+    }
+
+    #[test]
+    fn rejects_corrupt_and_truncated_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pack.zip");
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        write_zip(&archive, &[("data.bin", &data)]);
+        let bytes = std::fs::read(&archive).unwrap();
+
+        let truncated = temp.path().join("truncated.zip");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(extract(&truncated, Path::new("data.bin")).is_err());
+
+        // Damage the compressed data but keep the directory intact.
+        let mut damaged = bytes.clone();
+        for byte in &mut damaged[100..200] {
+            *byte ^= 0x5A;
+        }
+        let corrupt = temp.path().join("corrupt.zip");
+        std::fs::write(&corrupt, &damaged).unwrap();
+        assert!(extract(&corrupt, Path::new("data.bin")).is_err());
     }
 
     #[test]

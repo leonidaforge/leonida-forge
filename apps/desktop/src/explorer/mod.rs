@@ -16,19 +16,18 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, Context, DispatchPhase, Entity, FocusHandle, KeyBinding, MouseButton,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, PromptLevel, RenderImage,
-    ScrollHandle, Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, RenderImage, ScrollHandle,
+    Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
+    WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
 };
 
 use crate::files::shell::ShellWorker;
-use crate::files::{self, Entry, Sort, SortKey, images};
+use crate::files::{self, Entry, EntryKind, Sort, SortKey, images};
 use crate::settings::{Settings, ViewMode};
 use crate::ui;
 use crate::ui::assets::Icon;
 use crate::ui::theme;
-use crate::viewers::ImageViewer;
-use crate::viewers::RendererDemo;
+use crate::viewers::{BinaryInspector, ImageViewer, RendererDemo};
 use navigation::{History, Workspace};
 
 use preview::Thumbnail;
@@ -72,6 +71,10 @@ enum Menu {
     Sort,
     Root {
         root: PathBuf,
+        position: Point<Pixels>,
+    },
+    Entry {
+        entry: Entry,
         position: Point<Pixels>,
     },
 }
@@ -350,25 +353,13 @@ impl Explorer {
         cx.notify();
     }
 
-    fn open_entry(&mut self, entry: &Entry, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_entry(&mut self, entry: &Entry, cx: &mut Context<Self>) {
         if entry.is_container() {
             self.navigate(entry.path.clone(), cx);
         } else if entry.is_supported_image() {
             open_image_viewer(entry.path.clone(), cx);
-        } else {
-            let detail = match entry.extension() {
-                Some(ext) => format!("Leonida Forge cannot open .{ext} files yet."),
-                None => "Leonida Forge cannot open this file type yet.".to_string(),
-            };
-            let answer = window.prompt(
-                PromptLevel::Info,
-                &format!("Cannot open {}", entry.name),
-                Some(&detail),
-                &["OK"],
-                cx,
-            );
-            // GPUI cancels the dialog when the receiver is dropped.
-            cx.spawn(async move |_, _| answer.await.ok()).detach();
+        } else if entry.kind == EntryKind::File {
+            open_binary_inspector(entry.path.clone(), cx);
         }
     }
 
@@ -905,12 +896,29 @@ fn window_options(title: &str, window_size: gpui::Size<Pixels>, cx: &App) -> Win
     }
 }
 
-fn open_image_viewer(path: PathBuf, cx: &mut App) {
-    let title = path
-        .file_name()
+fn window_title(path: &Path) -> String {
+    path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    let options = window_options(&title, size(px(960.), px(720.)), cx);
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Opens any regular file, including archive entries and images, as bytes.
+fn open_binary_inspector(path: PathBuf, cx: &mut App) {
+    let mut options = window_options(&window_title(&path), size(px(1200.), px(760.)), cx);
+    options.window_min_size = Some(size(px(720.), px(420.)));
+    if let Err(err) = cx.open_window(options, |window, cx| {
+        ui::close_through_gpui(window, cx);
+        let inspector = cx.new(|cx| BinaryInspector::new(path, window, cx));
+        let focus_handle = inspector.read(cx).focus_handle().clone();
+        focus_handle.focus(window, cx);
+        inspector
+    }) {
+        log::error!("failed to open binary inspector: {err:#}");
+    }
+}
+
+fn open_image_viewer(path: PathBuf, cx: &mut App) {
+    let options = window_options(&window_title(&path), size(px(960.), px(720.)), cx);
     if let Err(err) = cx.open_window(options, |window, cx| {
         ui::close_through_gpui(window, cx);
         cx.new(|cx| ImageViewer::new(path, window, cx))
