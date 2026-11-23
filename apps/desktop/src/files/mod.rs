@@ -1,8 +1,8 @@
 //! Read-only access to directories and archives.
 //!
-//! A path may continue inside an archive file, e.g. `mods\pack.zip\cars`.
-//! [`list`] and [`read`] resolve such paths, so callers treat archives like
-//! folders.
+//! A path may continue inside an archive file, and inside archives stored in
+//! it, e.g. `mods\pack.zip\cars\data.rpf\Recovered Entries`. [`list`] and
+//! [`read`] resolve such paths, so callers treat archives like folders.
 
 pub mod archive;
 pub mod images;
@@ -16,6 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use archive::{Identified, Location};
 use lforge_binary::Source;
 use serde::{Deserialize, Serialize};
 
@@ -118,9 +119,22 @@ pub fn is_supported_image(path: &Path) -> bool {
 /// Lists the direct children of a directory, or of a folder inside an archive.
 /// Type names come from Windows where it knows the file type.
 pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
-    let mut entries = match archive::locate(path) {
-        Some((archive, inner)) => archive::list(archive, inner)?,
-        None => list_directory(path)?,
+    let mut entries = match archive::locate(path)? {
+        Location::Archive(archive) => archive::list(&archive, Path::new(""))?,
+        Location::Inside(archive, inner) => {
+            if archive::is_file(&archive, &inner)? {
+                // Possibly an archive that has not been decompressed yet.
+                return Err(archive::needs_prepare(path.to_path_buf()));
+            }
+            archive::list(&archive, &inner)?
+        }
+        Location::Plain if path.is_file() => {
+            return Err(archive::not_an_archive(
+                path,
+                &archive::identify_file(path)?,
+            ));
+        }
+        Location::Plain => list_directory(path)?,
     };
     for entry in entries.iter_mut().filter(|entry| entry.details.is_empty()) {
         if let Some(name) = shell::type_name(entry) {
@@ -133,23 +147,45 @@ pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
 /// Explains where the contents of a folder come from, when that is not
 /// obvious, e.g. for entries recovered from an RPF archive.
 pub fn describe(path: &Path) -> Option<String> {
-    let (archive, inner) = archive::locate(path)?;
-    match archive::format(archive)? {
-        archive::Format::Rpf9 => rpf::describe(archive, inner),
-        archive::Format::Zip => None,
+    match archive::locate(path).ok()? {
+        Location::Archive(archive) => archive::describe(&archive, Path::new("")),
+        Location::Inside(archive, inner) => archive::describe(&archive, &inner),
+        Location::Plain => None,
     }
 }
 
-/// Splits a path inside an archive. The archive file itself is a plain file.
-pub fn locate_inner(path: &Path) -> Option<(&Path, &Path)> {
-    archive::locate(path).filter(|(_, inner)| !inner.as_os_str().is_empty())
+/// Identifies a file by its contents, wherever it is stored. Files inside
+/// archives are identified from their first bytes, so archives among them
+/// are only fully checked when they are opened.
+pub fn identify(path: &Path) -> io::Result<Identified> {
+    match archive::locate_prepared(path)? {
+        Location::Archive(archive) => Ok(Identified::Archive(archive.format)),
+        Location::Inside(archive, inner) if archive::is_file(&archive, &inner)? => {
+            archive::sniff(&archive, &inner)
+        }
+        Location::Plain if path.is_file() => archive::identify_file(path),
+        Location::Inside(..) | Location::Plain => Ok(Identified::Unknown),
+    }
+}
+
+/// The file on disk that `path` is stored in, and the path inside it, for
+/// paths inside archives. Does not read any file.
+pub fn split_location(path: &Path) -> Option<(&Path, &Path)> {
+    let file = path.ancestors().find(|ancestor| ancestor.is_file())?;
+    let inner = path.strip_prefix(file).ok()?;
+    (!inner.as_os_str().is_empty()).then_some((file, inner))
 }
 
 /// Reads a whole file, which may be inside an archive.
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
-    match locate_inner(path) {
-        Some((archive, inner)) => archive::read(archive, inner),
-        None => fs::read(path),
+    match archive::locate_prepared(path)? {
+        Location::Plain => fs::read(path),
+        Location::Archive(archive) => archive::read_all(&archive),
+        Location::Inside(archive, inner) => {
+            let mut bytes = Vec::new();
+            archive::copy(&archive, &inner, &mut bytes, archive::MAX_READ)?;
+            Ok(bytes)
+        }
     }
 }
 
@@ -160,11 +196,26 @@ pub struct BinaryFile {
 }
 
 /// Opens a file for random access. Files inside archives are extracted to a
-/// temporary file first, within the archive size limit.
+/// temporary file first, within the archive size limit. Windows deletes the
+/// temporary file when its last handle closes, also when the process exits
+/// abnormally.
 pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
-    let (file, modified) = match locate_inner(path) {
-        Some((archive, inner)) => archive::extract(archive, inner)?,
-        None => {
+    let location = archive::locate_prepared(path)?;
+    if let Location::Archive(archive) = &location
+        && archive.depth > 1
+    {
+        return Ok(BinaryFile {
+            source: archive.source.clone(),
+            modified: None,
+        });
+    }
+    let (file, modified) = match location {
+        Location::Inside(archive, inner) => {
+            let mut out = io::BufWriter::new(tempfile::tempfile()?);
+            let modified = archive::copy(&archive, &inner, &mut out, archive::MAX_READ)?;
+            (out.into_inner().map_err(|err| err.into_error())?, modified)
+        }
+        Location::Plain | Location::Archive(_) => {
             let file = fs::File::open(path)?;
             let metadata = file.metadata()?;
             if !metadata.is_file() {
@@ -182,7 +233,9 @@ pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
 /// Lists the direct children of a directory on disk. Never recurses.
 fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for item in fs::read_dir(dir)? {
+    let items: Vec<_> = fs::read_dir(dir)?.collect();
+    let many = archive::too_many_to_identify(items.len());
+    for item in items {
         let item = match item {
             Ok(item) => item,
             Err(err) => {
@@ -197,18 +250,23 @@ fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
             Ok(file_type) if file_type.is_symlink() => fs::metadata(&path),
             _ => item.metadata(),
         };
-        entries.push(entry_from_metadata(path, name, metadata));
+        entries.push(entry_from_metadata(path, name, metadata, many));
     }
     Ok(entries)
 }
 
-fn entry_from_metadata(path: PathBuf, name: String, metadata: io::Result<fs::Metadata>) -> Entry {
+fn entry_from_metadata(
+    path: PathBuf,
+    name: String,
+    metadata: io::Result<fs::Metadata>,
+    many: bool,
+) -> Entry {
     let Ok(metadata) = metadata else {
         return Entry::new(name, path, EntryKind::Unavailable, None, None);
     };
     let kind = if metadata.is_dir() {
         EntryKind::Directory
-    } else if archive::is_archive(&path) {
+    } else if metadata.is_file() && archive::is_archive_on_disk(&path, many) {
         EntryKind::Archive
     } else {
         EntryKind::File
@@ -439,7 +497,9 @@ mod tests {
         fs::create_dir(temp.path().join("Ordner ä")).unwrap();
         fs::write(temp.path().join("テクスチャ.png"), [0u8; 3]).unwrap();
         fs::write(temp.path().join("vehicles.rpf"), [0u8; 5]).unwrap();
-        fs::write(temp.path().join("Pack.ZIP"), [0u8; 1]).unwrap();
+        zip::tests::write_zip(&temp.path().join("Pack.ZIP"), &[("a.txt", b"a")]);
+        // An archive extension alone does not make an archive.
+        fs::write(temp.path().join("fake.zip"), [0u8; 1]).unwrap();
 
         // `list_directory` keeps the fallback type names; `list` adds Windows names.
         let mut entries = list_directory(temp.path()).unwrap();
@@ -447,8 +507,16 @@ mod tests {
 
         assert_eq!(
             names(&entries),
-            ["Ordner ä", "Pack.ZIP", "vehicles.rpf", "テクスチャ.png"]
+            [
+                "Ordner ä",
+                "fake.zip",
+                "Pack.ZIP",
+                "vehicles.rpf",
+                "テクスチャ.png"
+            ]
         );
+        assert_eq!(entries[1].kind, EntryKind::File);
+        entries.remove(1);
         assert_eq!(entries[0].kind, EntryKind::Directory);
         assert_eq!(entries[0].size, None);
         assert_eq!(entries[1].kind, EntryKind::Archive);

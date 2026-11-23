@@ -1,8 +1,8 @@
 //! Indexes persisted between runs, so an archive is scanned once per change.
 //!
 //! A cache file holds the stream, region and resource tables, not archive
-//! data. It is used only if the archive still has the size and modification
-//! time it had when the scan started.
+//! data. It is used only if its [`CacheKey`] version and archive length still
+//! match the archive.
 
 use std::fs;
 use std::io;
@@ -16,39 +16,60 @@ use super::{Error, HEADER_LEN, Header, Index, Kind, Progress, Region, Resource, 
 use crate::resource::{Layout, Page, PageMap, PageMapError, Pointers, Segment};
 
 const MAGIC: &[u8; 8] = b"LFRPFIDX";
-/// Version 1 indexes did not reconstruct resources.
-const VERSION: u32 = 2;
+/// Version 1 indexes did not reconstruct resources. Version 2 indexes were
+/// stamped with a file size and modification time instead of a [`CacheKey`].
+const VERSION: u32 = 3;
 const STREAM_LEN: usize = 8 + 4 + 4 + 1;
 const REGION_LEN: usize = 8 + 8;
 /// A resource record with no pages.
 const MIN_RESOURCE_LEN: usize = 4 + 1 + 4 + 1 + 1 + 1 + 1 + 4 * 4 + 1 + 2;
+const MAX_VERSION_LEN: usize = 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stamp {
-    len: u64,
-    secs: u64,
-    nanos: u32,
+/// What an index was built from. An archive inside another archive has no
+/// path of its own, so it is identified by where it is found instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheKey {
+    /// Names the cache file. Different archives must have different locations.
+    pub location: String,
+    /// Changes whenever the archive may have changed, e.g. the size and
+    /// modification time of the file it is stored in.
+    pub version: Vec<u8>,
 }
 
-fn stamp(archive: &Path) -> io::Result<Stamp> {
-    let metadata = fs::metadata(archive)?;
+impl CacheKey {
+    /// Keyed by the absolute path, versioned by size and modification time.
+    pub fn for_file(archive: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(archive)?;
+        Ok(Self {
+            location: file_location(archive),
+            version: file_version(&metadata)?,
+        })
+    }
+}
+
+/// The location of a file on disk: its absolute path in lowercase, as
+/// Windows paths are case-insensitive.
+pub fn file_location(path: &Path) -> String {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute.to_string_lossy().to_lowercase()
+}
+
+/// The size and modification time of a file, as [`CacheKey::version`] bytes.
+pub fn file_version(metadata: &fs::Metadata) -> io::Result<Vec<u8>> {
     let modified = metadata
         .modified()?
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?;
-    Ok(Stamp {
-        len: metadata.len(),
-        secs: modified.as_secs(),
-        nanos: modified.subsec_nanos(),
-    })
+    let mut version = Vec::with_capacity(20);
+    version.extend_from_slice(&metadata.len().to_le_bytes());
+    version.extend_from_slice(&modified.as_secs().to_le_bytes());
+    version.extend_from_slice(&modified.subsec_nanos().to_le_bytes());
+    Ok(version)
 }
 
-/// The cache file for `archive`, named after a hash of its absolute path.
-fn cache_file(cache_dir: &Path, archive: &Path) -> PathBuf {
-    let absolute = std::path::absolute(archive).unwrap_or_else(|_| archive.to_path_buf());
-    // Windows paths are case-insensitive.
-    let key = absolute.to_string_lossy().to_lowercase();
-    let digest = Sha256::digest(key.as_bytes());
+/// The cache file for `key`, named after a hash of its location.
+fn cache_file(cache_dir: &Path, key: &CacheKey) -> PathBuf {
+    let digest = Sha256::digest(key.location.as_bytes());
     let name: String = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -56,29 +77,24 @@ fn cache_file(cache_dir: &Path, archive: &Path) -> PathBuf {
     cache_dir.join(format!("{name}.lfidx"))
 }
 
-/// The persisted index of `archive`, if it is still valid.
-pub fn load_cached(cache_dir: &Path, archive: &Path) -> Option<Index> {
-    let stamp = stamp(archive).ok()?;
-    let bytes = fs::read(cache_file(cache_dir, archive)).ok()?;
-    decode(&bytes, stamp)
+/// The persisted index for `key`, if it was built from an archive of
+/// `archive_len` bytes with the same version.
+pub fn load(cache_dir: &Path, key: &CacheKey, archive_len: u64) -> Option<Index> {
+    let bytes = fs::read(cache_file(cache_dir, key)).ok()?;
+    decode(&bytes, key, archive_len)
 }
 
-/// Persists `index`, which must have been built from `archive` as it is now.
-/// The file is written next to its final name and renamed into place, so
-/// readers never see a partial file.
-pub fn store_cached(cache_dir: &Path, archive: &Path, index: &Index) -> io::Result<()> {
-    let stamp = stamp(archive)?;
-    if stamp.len != index.archive_len {
-        return Err(io::Error::other("the archive changed during the scan"));
+/// Persists `index`, which must have been built from the archive `key`
+/// describes. The file is written next to its final name and renamed into
+/// place, so readers never see a partial file.
+pub fn store(cache_dir: &Path, key: &CacheKey, index: &Index) -> io::Result<()> {
+    if key.version.len() > MAX_VERSION_LEN {
+        return Err(io::Error::other("the cache key version is too long"));
     }
-    store(cache_dir, archive, index, stamp)
-}
-
-fn store(cache_dir: &Path, archive: &Path, index: &Index, stamp: Stamp) -> io::Result<()> {
     fs::create_dir_all(cache_dir)?;
-    let path = cache_file(cache_dir, archive);
+    let path = cache_file(cache_dir, key);
     let temp = path.with_extension("lfidx.tmp");
-    fs::write(&temp, encode(index, stamp))?;
+    fs::write(&temp, encode(index, key))?;
     fs::rename(&temp, &path)
 }
 
@@ -98,31 +114,36 @@ pub fn open(
     progress: &Progress,
     cancel: &AtomicBool,
 ) -> Result<(Index, Origin), Error> {
-    let before = stamp(archive)?;
+    let before = CacheKey::for_file(archive)?;
+    let len = fs::metadata(archive)?.len();
     if let Some(dir) = cache_dir
-        && let Some(index) = load_cached(dir, archive)
+        && let Some(index) = load(dir, &before, len)
     {
         return Ok((index, Origin::Cache));
     }
     let source = lforge_binary::Source::open(archive)?;
     let index = scan(source, progress, cancel)?;
     if let Some(dir) = cache_dir
-        && stamp(archive).is_ok_and(|after| after == before)
+        && CacheKey::for_file(archive).is_ok_and(|after| after == before)
+        && index.archive_len == len
     {
-        let _ = store(dir, archive, &index, before);
+        let _ = store(dir, &before, &index);
     }
     Ok((index, Origin::Scan))
 }
 
-fn encode(index: &Index, stamp: Stamp) -> Vec<u8> {
+fn encode(index: &Index, key: &CacheKey) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        64 + HEADER_LEN + index.streams.len() * STREAM_LEN + index.regions.len() * REGION_LEN,
+        64 + key.version.len()
+            + HEADER_LEN
+            + index.streams.len() * STREAM_LEN
+            + index.regions.len() * REGION_LEN,
     );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.extend_from_slice(&stamp.len.to_le_bytes());
-    out.extend_from_slice(&stamp.secs.to_le_bytes());
-    out.extend_from_slice(&stamp.nanos.to_le_bytes());
+    out.extend_from_slice(&index.archive_len.to_le_bytes());
+    out.extend_from_slice(&(key.version.len() as u32).to_le_bytes());
+    out.extend_from_slice(&key.version);
     out.extend_from_slice(index.header.bytes());
     out.extend_from_slice(&(index.streams.len() as u64).to_le_bytes());
     for stream in &index.streams {
@@ -314,20 +335,18 @@ impl<'a> Reader<'a> {
 
 /// Decodes a cache file. Anything unexpected, including a stale stamp,
 /// makes the cache unusable rather than an error.
-fn decode(bytes: &[u8], expected: Stamp) -> Option<Index> {
+fn decode(bytes: &[u8], key: &CacheKey, archive_len: u64) -> Option<Index> {
     let mut reader = Reader { bytes };
     if reader.take(MAGIC.len())? != MAGIC || reader.u32()? != VERSION {
         return None;
     }
-    let stamp = Stamp {
-        len: reader.u64()?,
-        secs: reader.u64()?,
-        nanos: reader.u32()?,
-    };
-    if stamp != expected {
+    if reader.u64()? != archive_len {
         return None;
     }
-    let archive_len = stamp.len;
+    let version_len = usize::try_from(reader.u32()?).ok()?;
+    if reader.take(version_len)? != key.version.as_slice() {
+        return None;
+    }
     let header = Header::parse(reader.take(HEADER_LEN)?, archive_len).ok()?;
 
     let count = reader.count(STREAM_LEN)?;
@@ -387,6 +406,11 @@ mod tests {
     use super::*;
     use crate::rpf::tests::{add_resource, archive, system_data, zlib};
 
+    /// Bytes before the RPF header in a cache file for `key`.
+    fn prefix(key: &CacheKey) -> usize {
+        8 + 4 + 8 + 4 + key.version.len()
+    }
+
     #[test]
     fn round_trips_and_rejects_stale_or_damaged_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -405,25 +429,25 @@ mod tests {
         assert_eq!(origin, Origin::Cache);
         assert_eq!(cached, index);
 
-        let stamp = stamp(&path).unwrap();
-        let bytes = encode(&index, stamp);
-        assert_eq!(decode(&bytes, stamp), Some(index.clone()));
-        let stale = Stamp {
-            secs: stamp.secs + 1,
-            ..stamp
-        };
-        assert_eq!(decode(&bytes, stale), None);
-        assert_eq!(decode(&bytes[..bytes.len() - 1], stamp), None);
+        let key = CacheKey::for_file(&path).unwrap();
+        let len = index.archive_len;
+        let bytes = encode(&index, &key);
+        assert_eq!(decode(&bytes, &key, len), Some(index.clone()));
+        let mut stale = key.clone();
+        stale.version[8] ^= 1;
+        assert_eq!(decode(&bytes, &stale, len), None);
+        assert_eq!(decode(&bytes, &key, len + 16), None);
+        assert_eq!(decode(&bytes[..bytes.len() - 1], &key, len), None);
         let mut extra = bytes.clone();
         extra.push(0);
-        assert_eq!(decode(&extra, stamp), None);
+        assert_eq!(decode(&extra, &key, len), None);
         let mut bad_kind = bytes.clone();
-        let kind_at = 8 + 4 + 8 + 8 + 4 + HEADER_LEN + 8 + 16;
+        let kind_at = prefix(&key) + HEADER_LEN + 8 + 16;
         bad_kind[kind_at] = 0xFF;
-        assert_eq!(decode(&bad_kind, stamp), None);
+        assert_eq!(decode(&bad_kind, &key, len), None);
         let mut huge_count = bytes;
-        huge_count[8 + 4 + 8 + 8 + 4 + HEADER_LEN..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(decode(&huge_count, stamp), None);
+        huge_count[prefix(&key) + HEADER_LEN..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode(&huge_count, &key, len), None);
     }
 
     #[test]
@@ -440,28 +464,31 @@ mod tests {
         assert_eq!(index.resources.len(), 1);
         assert_eq!(index.resources[0].layout.pages.len(), 3);
 
-        let stamp = stamp(&path).unwrap();
-        let encoded = encode(&index, stamp);
-        assert_eq!(decode(&encoded, stamp), Some(index));
+        let key = CacheKey::for_file(&path).unwrap();
+        let len = index.archive_len;
+        let encoded = encode(&index, &key);
+        assert_eq!(decode(&encoded, &key, len), Some(index));
 
-        // Indexes from the previous recovery are not current.
-        let mut old = encoded.clone();
-        old[8..12].copy_from_slice(&1u32.to_le_bytes());
-        assert_eq!(decode(&old, stamp), None);
+        // Indexes from earlier formats are not current.
+        for version in [1u32, 2] {
+            let mut old = encoded.clone();
+            old[8..12].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(decode(&old, &key, len), None);
+        }
 
         // The last page record: a segment byte and a stream count.
         let last = encoded.len() - 5;
         let mut past_end = encoded.clone();
         past_end[last + 1..].copy_from_slice(&2u32.to_le_bytes());
-        assert_eq!(decode(&past_end, stamp), None);
+        assert_eq!(decode(&past_end, &key, len), None);
         let mut bad_segment = encoded.clone();
         bad_segment[last] = 2;
-        assert_eq!(decode(&bad_segment, stamp), None);
+        assert_eq!(decode(&bad_segment, &key, len), None);
         // A third system page, although the page map declares one.
         let mut too_many = encoded;
         too_many[last - 5] = 0;
         too_many[last] = 0;
-        assert_eq!(decode(&too_many, stamp), None);
+        assert_eq!(decode(&too_many, &key, len), None);
     }
 
     #[test]
@@ -481,15 +508,51 @@ mod tests {
     }
 
     #[test]
-    fn cache_keys_ignore_case() {
+    fn keyed_indexes_are_kept_apart_and_follow_their_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let one = crate::rpf::scan(
+            std::io::Cursor::new(archive(&[zlib(b"one")])),
+            &Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let two = crate::rpf::scan(
+            std::io::Cursor::new(archive(&[zlib(b"two"), zlib(b"three")])),
+            &Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        // Two nested archives with the same generated name in different folders.
+        let key = |location: &str, version: u8| CacheKey {
+            location: location.to_string(),
+            version: vec![version; 20],
+        };
+        let a = key(r"d:\outer.rpf|A\0x0000001000.bin", 1);
+        let b = key(r"d:\outer.rpf|B\0x0000001000.bin", 1);
+        store(&cache, &a, &one).unwrap();
+        store(&cache, &b, &two).unwrap();
+        assert_eq!(load(&cache, &a, one.archive_len), Some(one.clone()));
+        assert_eq!(load(&cache, &b, two.archive_len), Some(two));
+        // The outer archive changed.
+        let changed = key(r"d:\outer.rpf|A\0x0000001000.bin", 2);
+        assert_eq!(load(&cache, &changed, one.archive_len), None);
+    }
+
+    #[test]
+    fn file_locations_ignore_case() {
         let dir = Path::new(r"C:\cache");
+        let key = |path: &str| CacheKey {
+            location: file_location(Path::new(path)),
+            version: Vec::new(),
+        };
         assert_eq!(
-            cache_file(dir, Path::new(r"D:\Game\Data.RPF")),
-            cache_file(dir, Path::new(r"d:\game\data.rpf"))
+            cache_file(dir, &key(r"D:\Game\Data.RPF")),
+            cache_file(dir, &key(r"d:\game\data.rpf"))
         );
         assert_ne!(
-            cache_file(dir, Path::new(r"D:\Game\a.rpf")),
-            cache_file(dir, Path::new(r"D:\Game\b.rpf"))
+            cache_file(dir, &key(r"D:\Game\a.rpf")),
+            cache_file(dir, &key(r"D:\Game\b.rpf"))
         );
     }
 }

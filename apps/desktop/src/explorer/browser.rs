@@ -23,9 +23,9 @@ const LIST_COLUMN_WIDTH: f32 = 240.;
 const LIST_COLUMN_GAP: f32 = 4.;
 const NOTE_HEIGHT: f32 = 44.;
 const PROGRESS_WIDTH: f32 = 280.;
-const INDEXING_NOTE: &str = "The table of contents of RPF9 archives is encrypted, so their \
-     contents are recovered by scanning the archive data. The result is kept until the archive \
-     changes.";
+const INDEXING_NOTE: &str = "Archives stored in other archives are decompressed to a temporary \
+     file first. The table of contents of RPF9 archives is encrypted, so their contents are \
+     recovered by scanning the archive data. The result is kept until the archive changes.";
 const IMAGE_ICON_COLOR: u32 = 0x7fb4ff;
 const DETAILS_NAME_MIN_WIDTH: f32 = 110.;
 const DETAILS_TYPE_WIDTH: f32 = 130.;
@@ -307,7 +307,8 @@ impl Explorer {
         }
     }
 
-    /// Shown while an archive is scanned before its contents can be listed.
+    /// Shown while an archive is decompressed or scanned before its contents
+    /// can be listed.
     fn render_indexing(&self, archive: PathBuf, cx: &Context<Self>) -> impl IntoElement {
         let state = self.indexing_state(&archive);
         let running = state.is_some();
@@ -321,11 +322,10 @@ impl Explorer {
             .gap_3()
             .p_4()
             .text_color(rgb(theme::TEXT_MUTED))
-            .child(
-                div()
-                    .text_color(rgb(theme::TEXT))
-                    .child("Indexing archive…"),
-            )
+            .child(div().text_color(rgb(theme::TEXT)).child(match fraction {
+                Some(_) => "Indexing archive…",
+                None => "Opening archive…",
+            }))
             .child(
                 div()
                     .w(px(PROGRESS_WIDTH))

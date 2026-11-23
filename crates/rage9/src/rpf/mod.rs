@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::Status;
 use crate::resource::{Layout, Page, Segment};
-pub use cache::{Origin, load_cached, open, store_cached};
+pub use cache::{CacheKey, Origin, file_location, file_version, load, open, store};
 pub use scan::scan;
 
 pub const MAGIC: [u8; 4] = *b"9FPR";

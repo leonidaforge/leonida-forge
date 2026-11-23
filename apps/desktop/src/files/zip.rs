@@ -4,22 +4,24 @@
 //! show up on the next listing.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, BufReader, Read};
-use std::path::{Component, Path};
+use std::io::{self, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{Local, NaiveDate, TimeZone};
+use lforge_binary::Source;
 use zip::ZipArchive;
 
-use super::archive::{MAX_READ, check_size};
+use super::archive::{Archive, check_size};
 use super::{Entry, EntryKind};
+
+type Zip = ZipArchive<BufReader<Source>>;
 
 /// Lists the direct children of `inner`. Folders that the archive only
 /// implies through the paths of their files are listed as well.
-pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
+pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
     let mut zip = open(archive)?;
-    let dir = archive.join(inner);
+    let dir = archive.path.join(inner);
     let mut children: BTreeMap<String, Entry> = BTreeMap::new();
     let mut found = inner.as_os_str().is_empty();
 
@@ -61,46 +63,59 @@ pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
     Ok(children.into_values().collect())
 }
 
-/// Reads one file from the archive into memory.
-pub fn read(archive: &Path, inner: &Path) -> io::Result<Vec<u8>> {
+/// The shortest leading part of `inner` that names a file in the archive.
+pub fn file_prefix(archive: &Archive, inner: &Path) -> io::Result<Option<PathBuf>> {
+    let mut zip = open(archive)?;
+    let mut shortest: Option<PathBuf> = None;
+    for index in 0..zip.len() {
+        let file = zip.by_index_raw(index).map_err(io::Error::other)?;
+        if file.is_dir() {
+            continue;
+        }
+        let Some(name) = file.enclosed_name() else {
+            continue;
+        };
+        if inner.starts_with(&name)
+            && shortest
+                .as_ref()
+                .is_none_or(|s| name.components().count() < s.components().count())
+        {
+            shortest = Some(name);
+        }
+    }
+    Ok(shortest)
+}
+
+pub fn file_len(archive: &Archive, inner: &Path) -> io::Result<u64> {
     let mut zip = open(archive)?;
     let index = find(&mut zip, inner)?;
-    let file = zip.by_index(index).map_err(io::Error::other)?;
-    check_size(file.size(), MAX_READ)?;
-    let mut bytes = Vec::with_capacity(file.size() as usize);
-    file.take(MAX_READ).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok(zip.by_index_raw(index).map_err(io::Error::other)?.size())
 }
 
-/// Decompresses one file into an anonymous temporary file, for random access
-/// without holding it in memory. Windows deletes the temporary file when its
-/// last handle closes, also when the process exits abnormally.
-pub fn extract(archive: &Path, inner: &Path) -> io::Result<(File, Option<SystemTime>)> {
-    extract_limited(archive, inner, MAX_READ)
-}
-
-fn extract_limited(
-    archive: &Path,
+/// Decompresses one file into `out`, within `limit` bytes.
+pub fn copy(
+    archive: &Archive,
     inner: &Path,
+    out: &mut dyn Write,
     limit: u64,
-) -> io::Result<(File, Option<SystemTime>)> {
+) -> io::Result<Option<SystemTime>> {
     let mut zip = open(archive)?;
     let index = find(&mut zip, inner)?;
     let file = zip.by_index(index).map_err(io::Error::other)?;
     check_size(file.size(), limit)?;
     let modified = file.last_modified().and_then(to_system_time);
-    let mut temp = tempfile::tempfile()?;
     // The declared size may be wrong, so the copy is capped as well.
-    let copied = io::copy(&mut file.take(limit + 1), &mut temp)?;
+    let copied = io::copy(&mut file.take(limit.saturating_add(1)), out)?;
     check_size(copied, limit)?;
-    Ok((temp, modified))
+    Ok(modified)
 }
 
-fn find(zip: &mut ZipArchive<BufReader<File>>, inner: &Path) -> io::Result<usize> {
+fn find(zip: &mut Zip, inner: &Path) -> io::Result<usize> {
     (0..zip.len())
         .find(|&index| {
             zip.by_index_raw(index)
                 .ok()
+                .filter(|file| !file.is_dir())
                 .and_then(|file| file.enclosed_name())
                 .is_some_and(|name| name == inner)
         })
@@ -112,9 +127,8 @@ fn find(zip: &mut ZipArchive<BufReader<File>>, inner: &Path) -> io::Result<usize
         })
 }
 
-fn open(archive: &Path) -> io::Result<ZipArchive<BufReader<File>>> {
-    let file = File::open(archive)?;
-    ZipArchive::new(BufReader::new(file)).map_err(io::Error::other)
+fn open(archive: &Archive) -> io::Result<Zip> {
+    ZipArchive::new(BufReader::new(archive.source.clone())).map_err(io::Error::other)
 }
 
 /// ZIP timestamps carry no time zone; by convention they are local time.
@@ -130,15 +144,15 @@ fn to_system_time(time: zip::DateTime) -> Option<SystemTime> {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::files::archive::locate;
-    use std::io::Write;
-    use std::path::PathBuf;
+    use crate::files::{self, archive};
+    use std::fs;
     use zip::write::SimpleFileOptions;
 
-    pub(crate) fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
-        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+    pub(crate) fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut out);
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, data) in files {
@@ -150,10 +164,22 @@ pub(super) mod tests {
             }
         }
         zip.finish().unwrap();
+        out.into_inner()
+    }
+
+    pub(crate) fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        fs::write(path, zip_bytes(files)).unwrap();
     }
 
     fn names(entries: &[Entry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn opened(path: &Path) -> Archive {
+        match archive::locate(path).unwrap() {
+            archive::Location::Archive(archive) => archive,
+            other => panic!("not an archive: {other:?}"),
+        }
     }
 
     #[test]
@@ -170,17 +196,17 @@ pub(super) mod tests {
             ],
         );
 
-        let root = list(&archive, Path::new("")).unwrap();
+        let root = files::list(&archive).unwrap();
         assert_eq!(names(&root), ["cars", "empty", "readme.txt"]);
         assert_eq!(root[0].kind, EntryKind::Directory);
         assert_eq!(root[0].path, archive.join("cars"));
         assert_eq!(root[2].size, Some(2));
         assert!(root[2].modified.is_some());
 
-        let cars = list(&archive, Path::new("cars")).unwrap();
+        let cars = files::list(&archive.join("cars")).unwrap();
         assert_eq!(names(&cars), ["models", "テクスチャ.png"]);
-        assert!(list(&archive, Path::new("empty")).unwrap().is_empty());
-        assert!(list(&archive, Path::new("missing")).is_err());
+        assert!(files::list(&archive.join("empty")).unwrap().is_empty());
+        assert!(files::list(&archive.join("missing")).is_err());
     }
 
     #[test]
@@ -190,19 +216,20 @@ pub(super) mod tests {
         write_zip(&archive, &[("cars/models/car.bin", b"12345")]);
         let inside = archive.join("cars").join("models");
 
-        assert_eq!(
-            locate(&inside),
-            Some((archive.as_path(), Path::new(r"cars\models")))
-        );
-        assert_eq!(locate(temp.path()), None);
-        assert_eq!(
-            super::super::read(&inside.join("car.bin")).unwrap(),
-            b"12345"
-        );
-        assert!(read(&archive, Path::new("cars/missing.bin")).is_err());
-
-        let entries = super::super::list(&inside).unwrap();
-        assert_eq!(names(&entries), ["car.bin"]);
+        match archive::locate(&inside).unwrap() {
+            archive::Location::Inside(found, inner) => {
+                assert_eq!(found.path, archive);
+                assert_eq!(inner, Path::new(r"cars\models"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            archive::locate(temp.path()).unwrap(),
+            archive::Location::Plain
+        ));
+        assert_eq!(files::read(&inside.join("car.bin")).unwrap(), b"12345");
+        assert!(files::read(&archive.join("cars/missing.bin")).is_err());
+        assert_eq!(names(&files::list(&inside).unwrap()), ["car.bin"]);
     }
 
     #[test]
@@ -210,10 +237,7 @@ pub(super) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("evil.zip");
         write_zip(&archive, &[("../outside.txt", b"x"), ("inside.txt", b"y")]);
-        assert_eq!(
-            names(&list(&archive, Path::new("")).unwrap()),
-            ["inside.txt"]
-        );
+        assert_eq!(names(&files::list(&archive).unwrap()), ["inside.txt"]);
     }
 
     #[test]
@@ -223,39 +247,38 @@ pub(super) mod tests {
         let data: Vec<u8> = (0..100_000u32).map(|i| (i % 7) as u8).collect();
         write_zip(&archive, &[("a/data.bin", &data), ("other.bin", b"x")]);
 
-        let (file, modified) = extract(&archive, Path::new("a/data.bin")).unwrap();
-        assert!(modified.is_some());
-        let mut source = lforge_binary::Source::from_file(file).unwrap();
-        assert_eq!(source.len(), data.len() as u64);
+        let mut file = files::open_binary(&archive.join("a/data.bin")).unwrap();
+        assert!(file.modified.is_some());
+        assert_eq!(file.source.len(), data.len() as u64);
         assert_eq!(
-            lforge_binary::read_at(&mut source, 99_998, 16).unwrap(),
+            lforge_binary::read_at(&mut file.source, 99_998, 16).unwrap(),
             &data[99_998..]
         );
-        assert!(extract(&archive, Path::new("a/missing.bin")).is_err());
-        assert!(extract(&archive, Path::new("a")).is_err());
+        assert!(files::open_binary(&archive.join("a/missing.bin")).is_err());
+        assert!(files::open_binary(&archive.join("a")).is_err());
     }
 
     #[test]
     fn rejects_entries_over_the_limit() {
         let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("bomb.zip");
-        write_zip(&archive, &[("zeros.bin", &[0u8; 4096])]);
-        let err = extract_limited(&archive, Path::new("zeros.bin"), 4095).unwrap_err();
+        let path = temp.path().join("bomb.zip");
+        write_zip(&path, &[("zeros.bin", &[0u8; 4096])]);
+        let archive = opened(&path);
+        let inner = Path::new("zeros.bin");
+        let err = copy(&archive, inner, &mut io::sink(), 4095).unwrap_err();
         assert!(err.to_string().contains("too large"));
-        assert!(extract_limited(&archive, Path::new("zeros.bin"), 4096).is_ok());
+        assert!(copy(&archive, inner, &mut io::sink(), 4096).is_ok());
     }
 
     #[test]
     fn rejects_corrupt_and_truncated_archives() {
         let temp = tempfile::tempdir().unwrap();
-        let archive = temp.path().join("pack.zip");
         let data: Vec<u8> = (0..50_000u32).map(|i| (i * 31 % 251) as u8).collect();
-        write_zip(&archive, &[("data.bin", &data)]);
-        let bytes = std::fs::read(&archive).unwrap();
+        let bytes = zip_bytes(&[("data.bin", &data)]);
 
         let truncated = temp.path().join("truncated.zip");
-        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
-        assert!(extract(&truncated, Path::new("data.bin")).is_err());
+        fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        assert!(files::read(&truncated.join("data.bin")).is_err());
 
         // Damage the compressed data but keep the directory intact.
         let mut damaged = bytes.clone();
@@ -263,19 +286,18 @@ pub(super) mod tests {
             *byte ^= 0x5A;
         }
         let corrupt = temp.path().join("corrupt.zip");
-        std::fs::write(&corrupt, &damaged).unwrap();
-        assert!(extract(&corrupt, Path::new("data.bin")).is_err());
+        fs::write(&corrupt, &damaged).unwrap();
+        assert!(files::list(&corrupt).is_ok());
+        assert!(files::open_binary(&corrupt.join("data.bin")).is_err());
     }
 
     #[test]
-    fn rejects_files_that_are_not_archives() {
+    fn files_with_an_archive_name_but_other_contents_are_plain() {
         let temp = tempfile::tempdir().unwrap();
         let archive = temp.path().join("broken.zip");
-        std::fs::write(&archive, b"not a zip").unwrap();
-        assert!(list(&archive, Path::new("")).is_err());
-        assert_eq!(
-            locate(&archive.join("x")).map(|(a, _)| a.to_path_buf()),
-            Some(PathBuf::from(&archive))
-        );
+        fs::write(&archive, b"not a zip").unwrap();
+        assert!(files::list(&archive).is_err());
+        assert!(files::read(&archive.join("x")).is_err());
+        assert_eq!(files::read(&archive).unwrap(), b"not a zip");
     }
 }

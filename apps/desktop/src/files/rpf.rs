@@ -2,7 +2,7 @@
 //!
 //! Listing needs an index, which takes a scan of the whole archive. Until
 //! [`build_index`] has run, listings fail with an error that
-//! [`index_required`] recognises, so the explorer can show progress and offer
+//! [`super::archive::prepare_required`] recognises, so the explorer can show progress and offer
 //! cancellation instead of blocking.
 //!
 //! The archive's own names and folders are unknown. Inside an archive,
@@ -13,19 +13,16 @@
 //! across scans.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::SystemTime;
 
-use lforge_binary::Source;
 use lforge_rage9::resource::{Page, Segment};
-use lforge_rage9::rpf::{self, Index, Kind, Progress, Region, Resource, Status, Stream};
+use lforge_rage9::rpf::{self, CacheKey, Index, Kind, Progress, Region, Resource, Status, Stream};
 
-use super::archive::{MAX_READ, check_size};
+use super::archive::{Archive, Stamp, check_size, needs_prepare};
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
 pub const RECOVERED: &str = "Recovered Entries";
@@ -40,29 +37,6 @@ const SOURCE_NOTE: &str = "Recovered from a zlib stream in the archive data. The
 const RESOURCE_SOURCE_NOTE: &str = "Reconstructed from consecutive zlib streams in the archive \
      data: the system pages, then the graphics pages, as pointers in the resource address them. \
      The name is the archive offset; the original name and folder are unknown.";
-
-/// The archive has to be indexed before its contents can be listed.
-#[derive(Debug)]
-struct IndexRequired {
-    archive: PathBuf,
-}
-
-impl fmt::Display for IndexRequired {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} has not been indexed yet", self.archive.display())
-    }
-}
-
-impl std::error::Error for IndexRequired {}
-
-/// The archive that has to be indexed before the listing that failed with
-/// `err` can succeed.
-pub fn index_required(err: &io::Error) -> Option<&Path> {
-    let inner = err.get_ref()?.downcast_ref::<IndexRequired>()?;
-    Some(&inner.archive)
-}
-
-type Stamp = (u64, Option<SystemTime>);
 
 struct Cached {
     stamp: Stamp,
@@ -82,11 +56,6 @@ fn indexes() -> std::sync::MutexGuard<'static, Indexes> {
     INDEXES.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-fn stamp(archive: &Path) -> io::Result<Stamp> {
-    let metadata = fs::metadata(archive)?;
-    Ok((metadata.len(), metadata.modified().ok()))
-}
-
 fn cache_dir() -> Option<PathBuf> {
     // Tests must not write to the user profile.
     if cfg!(test) {
@@ -95,15 +64,31 @@ fn cache_dir() -> Option<PathBuf> {
     lforge_core::data_dir().map(|dir| dir.join("cache").join("rpf"))
 }
 
-fn remember(archive: &Path, stamp: Stamp, index: Index) -> Arc<Index> {
+/// Identifies an archive by its full path through the archives it is
+/// stored in, and versions it by the file on disk they all come from.
+fn cache_key(archive: &Archive) -> io::Result<CacheKey> {
+    let mut location = rpf::file_location(&archive.root);
+    let nested = archive.nested_path();
+    if !nested.as_os_str().is_empty() {
+        // Names inside archives may differ only in case.
+        location.push('|');
+        location.push_str(&nested.to_string_lossy());
+    }
+    Ok(CacheKey {
+        location,
+        version: rpf::file_version(&fs::metadata(&archive.root)?)?,
+    })
+}
+
+fn remember(archive: &Archive, index: Index) -> Arc<Index> {
     let index = Arc::new(index);
     let mut indexes = indexes();
     indexes.clock += 1;
     let last_used = indexes.clock;
     indexes.by_archive.insert(
-        archive.to_path_buf(),
+        archive.path.clone(),
         Cached {
-            stamp,
+            stamp: archive.stamp,
             index: index.clone(),
             last_used,
         },
@@ -122,34 +107,42 @@ fn remember(archive: &Path, stamp: Stamp, index: Index) -> Arc<Index> {
 
 /// The index of `archive` from memory or the cache file, if it still matches
 /// the archive. Never scans.
-fn index(archive: &Path) -> io::Result<Arc<Index>> {
-    let stamp = stamp(archive)?;
+fn index(archive: &Archive) -> io::Result<Arc<Index>> {
+    let len = archive.source.len();
     {
         let mut indexes = indexes();
         indexes.clock += 1;
         let now = indexes.clock;
-        if let Some(cached) = indexes.by_archive.get_mut(archive)
-            && cached.stamp == stamp
+        if let Some(cached) = indexes.by_archive.get_mut(&archive.path)
+            && cached.stamp == archive.stamp
+            && cached.index.archive_len == len
         {
             cached.last_used = now;
             return Ok(cached.index.clone());
         }
     }
     if let Some(dir) = cache_dir()
-        && let Some(index) = rpf::load_cached(&dir, archive)
+        && let Some(index) = rpf::load(&dir, &cache_key(archive)?, len)
     {
-        return Ok(remember(archive, stamp, index));
+        return Ok(remember(archive, index));
     }
-    Err(io::Error::other(IndexRequired {
-        archive: archive.to_path_buf(),
-    }))
+    Err(needs_prepare(archive.path.clone()))
 }
 
-/// Scans `archive`, or loads its cache file, and keeps the index in memory.
-pub fn build_index(archive: &Path, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
-    let stamp = stamp(archive)?;
-    let (index, _) = rpf::open(archive, cache_dir().as_deref(), progress, cancel)?;
-    remember(archive, stamp, index);
+/// Scans `archive`, unless its index is in memory or in the cache, and keeps
+/// the index in memory.
+pub fn build_index(archive: &Archive, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
+    if index(archive).is_ok() {
+        return Ok(());
+    }
+    let key = cache_key(archive)?;
+    let index = rpf::scan(archive.source.clone(), progress, cancel)?;
+    if let Some(dir) = cache_dir()
+        && cache_key(archive).is_ok_and(|after| after == key)
+    {
+        let _ = rpf::store(&dir, &key, &index);
+    }
+    remember(archive, index);
     Ok(())
 }
 
@@ -465,9 +458,9 @@ fn region_file(dir: &Path, region: &Region) -> Entry {
     file
 }
 
-pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
+pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
     let index = index(archive)?;
-    let dir = archive.join(inner);
+    let dir = archive.path.join(inner);
     let entries = match resolve(&index, inner).ok_or_else(not_found)? {
         Node::Root => {
             let mut folders = Vec::new();
@@ -523,47 +516,87 @@ pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Writes one recovered entry or region to `out`, within [`MAX_READ`].
-fn copy(archive: &Path, inner: &Path, out: &mut dyn Write) -> io::Result<()> {
+/// Writes one recovered entry, page or region to `out`, within `limit`.
+pub fn copy(archive: &Archive, inner: &Path, out: &mut dyn Write, limit: u64) -> io::Result<()> {
     let index = index(archive)?;
-    let source = Source::open(archive)?;
+    let source = archive.source.clone();
     match resolve(&index, inner).ok_or_else(not_found)? {
         Node::Entry(entry) => {
-            check_size(entry.len, MAX_READ)?;
-            rpf::read_entry(source, &index, entry, MAX_READ, out)?;
+            check_size(entry.len, limit)?;
+            rpf::read_entry(source, &index, entry, limit, out)?;
         }
         Node::Page(resource, position) => {
             let (page, streams) = index
                 .resource_pages(resource)
                 .nth(position)
                 .ok_or_else(not_found)?;
-            check_size(page.len, MAX_READ)?;
-            rpf::read_streams(source, &index, streams, MAX_READ, out)?;
+            check_size(page.len, limit)?;
+            rpf::read_streams(source, &index, streams, limit, out)?;
         }
         Node::Region(region) => {
-            check_size(region.len, MAX_READ)?;
-            rpf::read_region(source, region, MAX_READ, out)?;
+            check_size(region.len, limit)?;
+            rpf::read_region(source, region, limit, out)?;
         }
         _ => return Err(io::Error::other("not a file")),
     }
     Ok(())
 }
 
-pub fn read(archive: &Path, inner: &Path) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    copy(archive, inner, &mut bytes)?;
-    Ok(bytes)
+fn file_node_len(node: &Node, index: &Index) -> Option<u64> {
+    match node {
+        Node::Entry(entry) => Some(entry.len),
+        Node::Page(resource, position) => index
+            .resource_pages(resource)
+            .nth(*position)
+            .map(|(page, _)| page.len),
+        Node::Region(region) => Some(region.len),
+        _ => None,
+    }
 }
 
-pub fn extract(archive: &Path, inner: &Path) -> io::Result<File> {
-    let mut out = BufWriter::new(tempfile::tempfile()?);
-    copy(archive, inner, &mut out)?;
-    out.into_inner().map_err(|err| err.into_error())
+/// The shortest leading part of `inner` that names a file in the archive.
+pub fn file_prefix(archive: &Archive, inner: &Path) -> io::Result<Option<PathBuf>> {
+    let index = index(archive)?;
+    let mut prefix = PathBuf::new();
+    for component in inner.components() {
+        prefix.push(component);
+        let Some(node) = resolve(&index, &prefix) else {
+            return Ok(None);
+        };
+        if file_node_len(&node, &index).is_some() {
+            return Ok(Some(prefix));
+        }
+    }
+    Ok(None)
+}
+
+pub fn file_len(archive: &Archive, inner: &Path) -> io::Result<u64> {
+    let index = index(archive)?;
+    let node = resolve(&index, inner).ok_or_else(not_found)?;
+    file_node_len(&node, &index).ok_or_else(|| io::Error::other("not a file"))
+}
+
+/// Why an archive recovered from the entry at `inner` may be incomplete.
+pub fn caveat(archive: &Archive, inner: &Path) -> Option<String> {
+    let index = index(archive).ok()?;
+    let Node::Entry(entry) = resolve(&index, inner)? else {
+        return None;
+    };
+    let why = match entry.status {
+        Status::Complete => return None,
+        Status::Partial => "its last chunk was not found",
+        Status::Unverified => "its streams cannot be verified to form one whole file",
+    };
+    Some(format!(
+        "This archive was recovered from an RPF9 entry that is {}: {why}. Parts of it may be \
+         missing.",
+        entry.status.name()
+    ))
 }
 
 /// Explains where the contents of an archive folder come from. Returns
 /// `None` until the archive is indexed.
-pub fn describe(archive: &Path, inner: &Path) -> Option<String> {
+pub fn describe(archive: &Archive, inner: &Path) -> Option<String> {
     let index = index(archive).ok()?;
     let percent = |part: u64| match index.data_len() {
         0 => 0.0,
@@ -603,15 +636,16 @@ pub fn describe(archive: &Path, inner: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
 
     use crate::files;
+    use crate::files::archive::{self, prepare_required};
 
-    fn zlib(data: &[u8]) -> Vec<u8> {
+    pub(crate) fn zlib(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
@@ -619,19 +653,28 @@ mod tests {
 
     /// A header, a table of contents of 0x60 bytes, then `parts` at aligned
     /// offsets starting at 0x100.
-    fn write_rpf(path: &Path, parts: &[Vec<u8>]) -> Vec<u64> {
+    pub(crate) fn rpf_bytes(parts: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x40];
         bytes[..4].copy_from_slice(b"9FPR");
         bytes[4..8].copy_from_slice(&0xA0u32.to_le_bytes());
         bytes.resize(0xA0, 0x5A);
         bytes.resize(0x100, 0);
-        let mut offsets = Vec::new();
         for part in parts {
-            offsets.push(bytes.len() as u64);
             bytes.extend_from_slice(part);
             bytes.resize(bytes.len().next_multiple_of(16), 0);
         }
-        fs::write(path, bytes).unwrap();
+        bytes
+    }
+
+    /// Writes [`rpf_bytes`] and returns the offset of each part.
+    fn write_rpf(path: &Path, parts: &[Vec<u8>]) -> Vec<u64> {
+        let mut offsets = Vec::new();
+        let mut offset = 0x100u64;
+        for part in parts {
+            offsets.push(offset);
+            offset = (offset + part.len() as u64).next_multiple_of(16);
+        }
+        fs::write(path, rpf_bytes(parts)).unwrap();
         offsets
     }
 
@@ -640,7 +683,7 @@ mod tests {
     }
 
     fn build(path: &Path) {
-        build_index(path, &Progress::default(), &AtomicBool::new(false)).unwrap();
+        archive::prepare(path, &Progress::default(), &AtomicBool::new(false)).unwrap();
     }
 
     #[test]
@@ -654,7 +697,7 @@ mod tests {
         );
 
         let err = files::list(&archive).unwrap_err();
-        assert_eq!(index_required(&err), Some(archive.as_path()));
+        assert_eq!(prepare_required(&err), Some(archive.as_path()));
         assert!(files::describe(&archive).is_none());
         build(&archive);
 
@@ -781,7 +824,7 @@ mod tests {
         assert!(files::list(&archive).is_ok());
         write_rpf(&archive, &[zlib(b"first"), zlib(b"second, longer")]);
         let err = files::list(&archive).unwrap_err();
-        assert_eq!(index_required(&err), Some(archive.as_path()));
+        assert_eq!(prepare_required(&err), Some(archive.as_path()));
     }
 
     #[test]
@@ -791,9 +834,10 @@ mod tests {
         let noise: Vec<u8> = (0..3_000_000u64).map(|i| (i * 7919 % 251) as u8).collect();
         let parts: Vec<Vec<u8>> = noise.chunks(0x10000).map(zlib).collect();
         write_rpf(&archive, &parts);
-        let err = build_index(&archive, &Progress::default(), &AtomicBool::new(true)).unwrap_err();
+        let err =
+            archive::prepare(&archive, &Progress::default(), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
-        assert!(index_required(&files::list(&archive).unwrap_err()).is_some());
+        assert!(prepare_required(&files::list(&archive).unwrap_err()).is_some());
     }
 
     #[test]

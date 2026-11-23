@@ -343,6 +343,58 @@ mod tests {
     }
 
     #[test]
+    fn navigates_through_nested_archives() {
+        let workspace = workspace();
+        let rpf = p(r"D:\Games\GTA VI\data.rpf");
+        let folder = rpf.join(r"Recovered Entries\Unidentified");
+        let zip = folder.join("0x0000001000.bin");
+        let inner_rpf = zip.join(r"cars\vehicles.rpf");
+        let inside = inner_rpf.join(r"Recovered Entries\XML");
+
+        let labels: Vec<_> = workspace
+            .breadcrumbs(&inside)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "GTA VI",
+                "data.rpf",
+                "Recovered Entries",
+                "Unidentified",
+                "0x0000001000.bin",
+                "cars",
+                "vehicles.rpf",
+                "Recovered Entries",
+                "XML"
+            ]
+        );
+        // Up from an archive leads to the folder that holds it, inside its
+        // parent archive.
+        assert_eq!(workspace.parent_within_root(&zip), Some(folder.clone()));
+        assert_eq!(
+            workspace.parent_within_root(&inner_rpf),
+            Some(zip.join("cars"))
+        );
+        // The tree expands every archive on the way.
+        let ancestors = workspace.ancestors_within_root(&inside);
+        for archive in [&rpf, &zip, &inner_rpf] {
+            assert!(ancestors.contains(archive));
+        }
+
+        let mut history = History::default();
+        for path in [&folder, &zip, &inner_rpf, &inside] {
+            history.push(path.clone());
+        }
+        assert_eq!(history.back(), Some(inner_rpf.as_path()));
+        assert_eq!(history.back(), Some(zip.as_path()));
+        assert_eq!(history.back(), Some(folder.as_path()));
+        assert_eq!(history.forward(), Some(zip.as_path()));
+        assert_eq!(history.forward(), Some(inner_rpf.as_path()));
+    }
+
+    #[test]
     fn labels_roots() {
         let workspace = workspace();
         assert_eq!(

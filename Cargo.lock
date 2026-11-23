@@ -2555,7 +2555,9 @@ dependencies = [
 name = "lforge-core"
 version = "0.1.0"
 dependencies = [
+ "lforge-rage9",
  "serde",
+ "zip",
 ]
 
 [[package]]

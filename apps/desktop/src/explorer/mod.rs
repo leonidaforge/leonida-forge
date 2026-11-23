@@ -25,6 +25,7 @@ use gpui::{
 
 use lforge_rage9::rpf::Progress;
 
+use crate::files::archive::Identified;
 use crate::files::shell::ShellWorker;
 use crate::files::{self, Entry, EntryKind, Sort, SortKey, images};
 use crate::settings::{Settings, ViewMode};
@@ -63,7 +64,7 @@ pub fn bind_keys(cx: &mut App) {
 
 enum Listing {
     Loading,
-    /// Waiting for the archive at this path to be indexed.
+    /// Waiting for the archive at this path to be decompressed or indexed.
     Indexing(PathBuf),
     Loaded(Arc<Vec<Entry>>),
     Failed(String),
@@ -222,7 +223,7 @@ impl Explorer {
                 last.is_some_and(|dir| match files::list(&dir) {
                     Ok(_) => true,
                     // Opening it again starts indexing.
-                    Err(err) => files::rpf::index_required(&err).is_some(),
+                    Err(err) => files::archive::prepare_required(&err).is_some(),
                 })
             }
         });
@@ -275,7 +276,7 @@ impl Explorer {
                         files::sort_entries(&mut entries, sort);
                         Loaded::Entries(entries, files::describe(&dir))
                     }
-                    Err(err) => match files::rpf::index_required(&err) {
+                    Err(err) => match files::archive::prepare_required(&err) {
                         Some(archive) => Loaded::NeedsIndex(archive.to_path_buf()),
                         None => Loaded::Failed(err.to_string()),
                     },
@@ -313,7 +314,8 @@ impl Explorer {
         .detach();
     }
 
-    /// Scans an archive in the background. Listings waiting for it are
+    /// Opens an archive in the background: decompresses it from the archive
+    /// it is stored in and scans it, as needed. Listings waiting for it are
     /// loaded again when the scan ends.
     fn start_indexing(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
         if self.indexing.contains_key(&archive) {
@@ -323,7 +325,7 @@ impl Explorer {
         let cancel = Arc::new(AtomicBool::new(false));
         let work = cx.background_spawn({
             let (archive, progress, cancel) = (archive.clone(), progress.clone(), cancel.clone());
-            async move { files::rpf::build_index(&archive, &progress, &cancel) }
+            async move { files::archive::prepare(&archive, &progress, &cancel) }
         });
         let work = cx.spawn({
             let archive = archive.clone();
@@ -333,7 +335,7 @@ impl Explorer {
                     .ok();
             }
         });
-        // Repaints while the scan runs, so the progress moves.
+        // Repaints while the archive is opened, so the progress moves.
         let ticker = cx.spawn({
             let archive = archive.clone();
             async move |this, cx| {
@@ -380,9 +382,9 @@ impl Explorer {
             }
             Err(err) => {
                 let message = if err.kind() == io::ErrorKind::Interrupted {
-                    "Indexing was cancelled. Press F5 to index the archive.".to_string()
+                    "Opening the archive was cancelled. Press F5 to open it.".to_string()
                 } else {
-                    format!("The archive could not be indexed: {err}")
+                    format!("The archive could not be opened: {err}")
                 };
                 for dir in waiting {
                     self.listings.insert(dir, Listing::Failed(message.clone()));
@@ -493,13 +495,56 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Opens archives as folders, whatever their name, and other files in
+    /// their viewer. Files are identified by their contents in the
+    /// background first.
     fn open_entry(&mut self, entry: &Entry, cx: &mut Context<Self>) {
         if entry.is_container() {
             self.navigate(entry.path.clone(), cx);
-        } else if entry.is_supported_image() {
-            open_image_viewer(entry.path.clone(), cx);
-        } else if entry.kind == EntryKind::File {
-            open_binary_inspector(entry.path.clone(), cx);
+            return;
+        }
+        if entry.kind != EntryKind::File {
+            return;
+        }
+        let path = entry.path.clone();
+        let image = entry.is_supported_image();
+        let identified = cx.background_spawn({
+            let path = path.clone();
+            async move { files::identify(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let identified = identified.await;
+            this.update(cx, |this, cx| match identified {
+                Ok(Identified::Archive(_)) => {
+                    this.mark_archive(&path);
+                    this.navigate(path, cx);
+                }
+                // Opening it explains why it is not a valid archive.
+                Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                Ok(Identified::Unknown) if image => open_image_viewer(path, cx),
+                Ok(Identified::Unknown) => open_binary_inspector(path, cx),
+                Err(err) => {
+                    log::warn!("could not identify {}: {err}", path.display());
+                    open_binary_inspector(path, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Shows a file found to be an archive as one, also in the tree.
+    fn mark_archive(&mut self, path: &Path) {
+        let Some(Listing::Loaded(entries)) =
+            path.parent().and_then(|dir| self.listings.get_mut(dir))
+        else {
+            return;
+        };
+        if let Some(entry) = Arc::make_mut(entries)
+            .iter_mut()
+            .find(|entry| entry.path == path)
+        {
+            entry.kind = EntryKind::Archive;
         }
     }
 
@@ -967,7 +1012,7 @@ impl Explorer {
             Some(Listing::Loading) => "Loading…".to_string(),
             Some(Listing::Indexing(archive)) => match self.indexing_state(archive) {
                 Some((Some(fraction), _)) => format!("Indexing archive… {:.0}%", fraction * 100.0),
-                _ => "Indexing archive…".to_string(),
+                _ => "Opening archive…".to_string(),
             },
             Some(Listing::Failed(_)) => "Folder unavailable".to_string(),
             None => String::new(),

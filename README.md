@@ -51,7 +51,10 @@ Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a c
 
 ## RPF9 archives
 
-The explorer opens GTA VI `.rpf` files like folders. Double-click one to browse it.
+The explorer opens RPF9 and ZIP archives like folders. Double-click one to browse it.
+Archives are recognised by their contents, so the file extension does not matter.
+Archives stored in other archives open the same way, up to 8 levels deep.
+The explorer decompresses each one to a temporary file, up to 512 MB each and 2 GB per chain.
 To see the raw archive bytes, right-click it and choose **Open in Binary Inspector**.
 
 The RPF9 table of contents is encrypted, and Leonida Forge does not read it.

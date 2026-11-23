@@ -1,4 +1,7 @@
-//! Application information shared by the desktop application and the CLI.
+//! Application information and file identification shared by the desktop
+//! application and the CLI.
+
+pub mod archive;
 
 use std::path::PathBuf;
 
