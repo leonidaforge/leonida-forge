@@ -14,7 +14,10 @@ use std::thread;
 
 use flate2::{Decompress, FlushDecompress, Status as ZlibStatus};
 
-use crate::{ALIGN, Error, Header, Index, Kind, Progress, Region, Stream, align_up, read_header};
+use super::{
+    ALIGN, Error, Header, Index, Kind, Progress, Region, Stream, align_up, read_header, reconstruct,
+};
+use crate::resource;
 
 const BLOCK_LEN: usize = 1024 * 1024;
 pub(crate) const SCRATCH_LEN: usize = 64 * 1024;
@@ -50,7 +53,7 @@ impl<S: Read + Seek> Window<S> {
 
     /// The bytes from `pos` to the end of the buffer, refilled so that at
     /// least `min` bytes are available unless the data ends first.
-    fn at(&mut self, pos: u64, min: usize) -> io::Result<&[u8]> {
+    pub(crate) fn at(&mut self, pos: u64, min: usize) -> io::Result<&[u8]> {
         let end = self.start + self.buf.len() as u64;
         let needed = pos.saturating_add(min as u64).min(self.len);
         if pos < self.start || needed > end {
@@ -117,7 +120,7 @@ fn is_zlib_header(bytes: &[u8]) -> bool {
         && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0
 }
 
-pub(crate) fn classify(offset: u64, head: &[u8]) -> Kind {
+pub(crate) fn classify(head: &[u8]) -> Kind {
     let body = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
     if body.starts_with(b"<?xml") {
         return Kind::Xml;
@@ -134,14 +137,7 @@ pub(crate) fn classify(offset: u64, head: &[u8]) -> Kind {
     if head.starts_with(b"DDS ") {
         return Kind::Dds;
     }
-    let u32_at = |at: usize| {
-        head.get(at..at + 4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
-    };
-    if offset % 4096 == 0x10
-        && u32_at(8).is_some_and(|pointer| pointer >> 28 == 5)
-        && u32_at(12) == Some(0)
-    {
+    if resource::page_map_offset(head).is_some() {
         return Kind::Resource;
     }
     let probe = &head[..head.len().min(TEXT_PROBE_LEN)];
@@ -243,8 +239,9 @@ pub(crate) fn scan_from<S: Read + Seek + Clone + Send>(
     if cancelled {
         return Err(Error::Cancelled);
     }
-    let (streams, regions) = merge(start, segments);
-    Ok(Index::new(len, header, streams, regions))
+    let (mut streams, regions) = merge(start, segments);
+    let resources = reconstruct::resolve(source, len, &mut streams, cancel)?;
+    Ok(Index::new(len, header, streams, resources, regions))
 }
 
 fn scan_segment<S: Read + Seek>(
@@ -298,7 +295,7 @@ fn scan_segment<S: Read + Seek>(
                     offset: pos,
                     stored_len,
                     len: stream_len,
-                    kind: classify(pos, &head),
+                    kind: classify(&head),
                 });
                 pos = next;
                 continue;

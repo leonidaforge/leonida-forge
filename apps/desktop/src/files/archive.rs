@@ -33,7 +33,7 @@ fn has_rpf9_signature(path: &Path) -> bool {
     let mut signature = [0u8; 4];
     File::open(path)
         .and_then(|mut file| file.read_exact(&mut signature))
-        .is_ok_and(|()| lforge_rpf::is_rpf9(&signature))
+        .is_ok_and(|()| lforge_rage9::rpf::is_rpf9(&signature))
 }
 
 pub fn is_archive(path: &Path) -> bool {

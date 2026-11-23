@@ -63,15 +63,23 @@ Inside an archive:
 
 - `Recovered Entries` has one folder per detected kind, such as `XML`, `PSO` or `Resources`.
   Files are named after their archive offset, for example `0x000000B000.xml`. Original names and folders are unknown.
+- `Resource Pages` has one file per page of each reconstructed resource.
 - `Unrecovered Regions` holds bytes that are not zlib streams, shown as stored.
 
 An entry is complete when it starts with a known file signature and ends with a chunk shorter than 64 KiB.
-Resources are partial, because only their system page is recovered.
 Entries without a known signature are unverified and may be parts of larger files.
 
+A RAGE resource is stored as one zlib stream per page, system pages first.
+Leonida Forge reads the page counts from the resource's page map and takes the pages from the streams that follow.
+A resource file holds its system pages, then its graphics pages.
+A resource is complete when every declared page is there and the page sizes fit the pattern seen in GTA VI data.
+It is partial when pages are missing, and unverified when its page map fails validation.
+These rules come from observed data, not from game code.
+
 ```sh
-lforge archive info data.rpf --json    # header fields and a recovery summary
-lforge archive list data.rpf --json    # entries and unrecovered regions
+lforge archive info data.rpf --json            # header fields and a recovery summary
+lforge archive list data.rpf --json            # entries, resource pages and unrecovered regions
+lforge archive resource data.rpf 0x2010 --json # pages and checks of one resource
 ```
 
 `--no-cache` neither reads nor writes the index cache.

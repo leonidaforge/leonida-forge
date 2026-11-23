@@ -1,8 +1,8 @@
 //! Indexes persisted between runs, so an archive is scanned once per change.
 //!
-//! A cache file holds the stream and region tables, not archive data. It is
-//! used only if the archive still has the size and modification time it had
-//! when the scan started.
+//! A cache file holds the stream, region and resource tables, not archive
+//! data. It is used only if the archive still has the size and modification
+//! time it had when the scan started.
 
 use std::fs;
 use std::io;
@@ -12,12 +12,16 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
-use crate::{Error, HEADER_LEN, Header, Index, Kind, Progress, Region, Stream, scan};
+use super::{Error, HEADER_LEN, Header, Index, Kind, Progress, Region, Resource, Stream, scan};
+use crate::resource::{Layout, Page, PageMap, PageMapError, Pointers, Segment};
 
 const MAGIC: &[u8; 8] = b"LFRPFIDX";
-const VERSION: u32 = 1;
+/// Version 1 indexes did not reconstruct resources.
+const VERSION: u32 = 2;
 const STREAM_LEN: usize = 8 + 4 + 4 + 1;
 const REGION_LEN: usize = 8 + 8;
+/// A resource record with no pages.
+const MIN_RESOURCE_LEN: usize = 4 + 1 + 4 + 1 + 1 + 1 + 1 + 4 * 4 + 1 + 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Stamp {
@@ -132,7 +136,150 @@ fn encode(index: &Index, stamp: Stamp) -> Vec<u8> {
         out.extend_from_slice(&region.offset.to_le_bytes());
         out.extend_from_slice(&region.len.to_le_bytes());
     }
+    out.extend_from_slice(&(index.resources.len() as u64).to_le_bytes());
+    for resource in &index.resources {
+        encode_resource(resource, &mut out);
+    }
     out
+}
+
+fn encode_resource(resource: &Resource, out: &mut Vec<u8>) {
+    let layout = &resource.layout;
+    out.extend_from_slice(&resource.first_stream.to_le_bytes());
+    let (code, map) = match layout.page_map {
+        Ok(map) => (0, map),
+        Err(err) => (
+            match err {
+                PageMapError::Outside => 1,
+                PageMapError::NonZero => 2,
+                PageMapError::NoSystemPage => 3,
+            },
+            PageMap {
+                offset: 0,
+                system_pages: 0,
+                graphics_pages: 0,
+            },
+        ),
+    };
+    out.push(code);
+    out.extend_from_slice(&map.offset.to_le_bytes());
+    out.push(map.system_pages);
+    out.push(map.graphics_pages);
+    out.push(layout.tag.is_some().into());
+    out.push(layout.tag.unwrap_or(0));
+    let pointers = layout.pointers;
+    for count in [
+        pointers.system,
+        pointers.graphics,
+        pointers.system_outside,
+        pointers.graphics_outside,
+    ] {
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    out.push(pointers.checked.into());
+    out.extend_from_slice(&(layout.pages.len() as u16).to_le_bytes());
+    for page in &layout.pages {
+        out.push(match page.segment {
+            Segment::System => 0,
+            Segment::Graphics => 1,
+        });
+        out.extend_from_slice(&page.stream_count.to_le_bytes());
+    }
+}
+
+/// Decodes one resource whose streams must follow `cut`, the first stream
+/// not claimed by the previous resource.
+fn decode_resource(reader: &mut Reader, streams: &[Stream], cut: usize) -> Option<Resource> {
+    let first_stream = reader.u32()?;
+    let first = usize::try_from(first_stream).ok()?;
+    let code = reader.u8()?;
+    let map = PageMap {
+        offset: reader.u32()?,
+        system_pages: reader.u8()?,
+        graphics_pages: reader.u8()?,
+    };
+    let page_map = match code {
+        0 => Ok(map),
+        1 => Err(PageMapError::Outside),
+        2 => Err(PageMapError::NonZero),
+        3 => Err(PageMapError::NoSystemPage),
+        _ => return None,
+    };
+    let tag = match (reader.u8()?, reader.u8()?) {
+        (0, _) => None,
+        (1, value) => Some(value),
+        _ => return None,
+    };
+    let pointers = Pointers {
+        system: reader.u32()?,
+        graphics: reader.u32()?,
+        system_outside: reader.u32()?,
+        graphics_outside: reader.u32()?,
+        checked: match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        },
+    };
+    let page_count = u16::from_le_bytes(reader.take(2)?.try_into().ok()?);
+    if first < cut || streams.get(first)?.kind != Kind::Resource || page_count == 0 {
+        return None;
+    }
+    let mut pages = Vec::with_capacity(page_count.into());
+    let mut next = first;
+    for _ in 0..page_count {
+        let segment = match reader.u8()? {
+            0 => Segment::System,
+            1 => Segment::Graphics,
+            _ => return None,
+        };
+        let stream_count = reader.u32()?;
+        let end = next.checked_add(usize::try_from(stream_count).ok()?)?;
+        let claimed = streams.get(next..end).filter(|s| !s.is_empty())?;
+        if next > first && !streams[next - 1].is_followed_by(&claimed[0]) {
+            return None;
+        }
+        if claimed
+            .windows(2)
+            .any(|pair| !pair[0].is_followed_by(&pair[1]))
+            || claimed[usize::from(next == first)..]
+                .iter()
+                .any(|stream| stream.kind.is_file_start())
+        {
+            return None;
+        }
+        pages.push(Page {
+            segment,
+            stream_count,
+            len: claimed.iter().map(|s| u64::from(s.len)).sum(),
+        });
+        next = end;
+    }
+    let system = pages
+        .iter()
+        .take_while(|page| page.segment == Segment::System)
+        .count();
+    let graphics = pages.len() - system;
+    let consistent = match page_map {
+        Ok(map) => {
+            map.system_pages > 0
+                && system >= 1
+                && system <= usize::from(map.system_pages)
+                && graphics <= usize::from(map.graphics_pages)
+                && (graphics == 0 || system == usize::from(map.system_pages))
+        }
+        Err(_) => pages.len() == 1 && system == 1,
+    };
+    consistent.then(|| Resource {
+        offset: streams[first].offset,
+        first_stream,
+        layout: Layout {
+            page_map,
+            pages,
+            pointers,
+            tag,
+        },
+    })
 }
 
 struct Reader<'a> {
@@ -216,16 +363,29 @@ fn decode(bytes: &[u8], expected: Stamp) -> Option<Index> {
         cut = end;
         regions.push(region);
     }
-    if !reader.bytes.is_empty() {
+
+    let count = reader.count(MIN_RESOURCE_LEN)?;
+    let mut resources: Vec<Resource> = Vec::with_capacity(count);
+    let mut cut = 0;
+    for _ in 0..count {
+        let resource = decode_resource(&mut reader, &streams, cut)?;
+        cut = resource.first_stream as usize + resource.layout.stream_count() as usize;
+        resources.push(resource);
+    }
+    let heads = streams
+        .iter()
+        .filter(|stream| stream.kind == Kind::Resource)
+        .count();
+    if heads != resources.len() || !reader.bytes.is_empty() {
         return None;
     }
-    Some(Index::new(archive_len, header, streams, regions))
+    Some(Index::new(archive_len, header, streams, resources, regions))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{archive, zlib};
+    use crate::rpf::tests::{add_resource, archive, system_data, zlib};
 
     #[test]
     fn round_trips_and_rejects_stale_or_damaged_files() {
@@ -264,6 +424,44 @@ mod tests {
         let mut huge_count = bytes;
         huge_count[8 + 4 + 8 + 8 + 4 + HEADER_LEN..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(decode(&huge_count, stamp), None);
+    }
+
+    #[test]
+    fn resources_round_trip_and_inconsistent_records_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.rpf");
+        let mut bytes = archive(&[]);
+        let mut system = system_data(0x100, 0xC0, 1, 2);
+        system[0x10..0x14].copy_from_slice(b"0DRP");
+        add_resource(&mut bytes, &[system, vec![3; 0x2_0000], vec![4; 0x7000]]);
+        bytes.resize(bytes.len().next_multiple_of(16), 0);
+        fs::write(&path, &bytes).unwrap();
+        let (index, _) = open(&path, None, &Progress::default(), &AtomicBool::new(false)).unwrap();
+        assert_eq!(index.resources.len(), 1);
+        assert_eq!(index.resources[0].layout.pages.len(), 3);
+
+        let stamp = stamp(&path).unwrap();
+        let encoded = encode(&index, stamp);
+        assert_eq!(decode(&encoded, stamp), Some(index));
+
+        // Indexes from the previous recovery are not current.
+        let mut old = encoded.clone();
+        old[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode(&old, stamp), None);
+
+        // The last page record: a segment byte and a stream count.
+        let last = encoded.len() - 5;
+        let mut past_end = encoded.clone();
+        past_end[last + 1..].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(decode(&past_end, stamp), None);
+        let mut bad_segment = encoded.clone();
+        bad_segment[last] = 2;
+        assert_eq!(decode(&bad_segment, stamp), None);
+        // A third system page, although the page map declares one.
+        let mut too_many = encoded;
+        too_many[last - 5] = 0;
+        too_many[last] = 0;
+        assert_eq!(decode(&too_many, stamp), None);
     }
 
     #[test]

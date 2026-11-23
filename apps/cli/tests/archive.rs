@@ -186,3 +186,96 @@ fn rejects_files_that_are_not_rpf9_archives() {
         assert!(stderr.contains(message), "{stderr}");
     }
 }
+
+/// A resource at 0x1010 that declares two graphics pages but has only one.
+fn partial_resource(dir: &Path) -> (std::path::PathBuf, Vec<u64>) {
+    let path = dir.join("resource.rpf");
+    let mut system = vec![0u8; 0x100];
+    system[8..16].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+    system[0xC8] = 1;
+    system[0xC9] = 2;
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..4].copy_from_slice(b"9FPR");
+    bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes.resize(0x1010, 0);
+    let mut offsets = Vec::new();
+    for page in [system, vec![0xAB; 0x2_0000]] {
+        bytes.resize(bytes.len().next_multiple_of(16), 0);
+        offsets.push(bytes.len() as u64);
+        bytes.extend_from_slice(&zlib(&page));
+    }
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    std::fs::write(&path, bytes).unwrap();
+    (path, offsets)
+}
+
+#[test]
+fn reports_reconstructed_resources() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, offsets) = partial_resource(temp.path());
+    let path = path.to_str().unwrap();
+
+    let info = json(&lforge(
+        &["archive", "info", path, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(info["resources"]["count"], 1);
+    assert_eq!(info["resources"]["partial"], 1);
+    assert_eq!(info["resources"]["graphics_size"], 0x2_0000);
+
+    let listing = json(&lforge(
+        &["archive", "list", path, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    let entries = listing["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["kind"], "resource");
+    assert_eq!(entries[0]["status"], "partial");
+    assert_eq!(entries[0]["resource"]["pages"].as_array().unwrap().len(), 2);
+
+    let id = format!("0x{:X}", offsets[0]);
+    let report = json(&lforge(
+        &["archive", "resource", path, &id, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(report["offset"], offsets[0]);
+    assert_eq!(report["status"], "partial");
+    assert_eq!(report["system_size"], 0x100);
+    assert_eq!(report["page_map"]["graphics_pages"], 2);
+    assert_eq!(report["pages"][1]["segment"], "graphics");
+    assert_eq!(report["pages"][1]["offset"], offsets[1]);
+    assert_eq!(report["issues"][0], "1 of 2 graphics pages found");
+
+    // A page id leads to its resource.
+    let by_page = json(&lforge(
+        &[
+            "archive",
+            "resource",
+            path,
+            &offsets[1].to_string(),
+            "--json",
+            "--no-cache",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(by_page, report);
+
+    let text = lforge(
+        &["archive", "resource", path, &id, "--no-cache"],
+        temp.path(),
+    );
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(stdout.contains("status:      partial"), "{stdout}");
+    assert!(stdout.contains("warning: 1 of 2 graphics pages found"));
+
+    let missing = lforge(
+        &["archive", "resource", path, "0x40", "--no-cache"],
+        temp.path(),
+    );
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .contains("no resource")
+    );
+}

@@ -1,5 +1,5 @@
 [package]
-name = "lforge-rpf"
+name = "lforge-rage9"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

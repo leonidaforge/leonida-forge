@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/renderer", "crates/rpf"]
+members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/renderer", "crates/rage9"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +14,7 @@ publish = false
 lforge-binary = { path = "crates/binary" }
 lforge-core = { path = "crates/core" }
 lforge-renderer = { path = "crates/renderer" }
-lforge-rpf = { path = "crates/rpf" }
+lforge-rage9 = { path = "crates/rage9" }
 
 bytemuck = { version = "1.25", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

@@ -2546,7 +2546,7 @@ dependencies = [
  "flate2",
  "lforge-binary",
  "lforge-core",
- "lforge-rpf",
+ "lforge-rage9",
  "serde_json",
  "tempfile",
 ]
@@ -2572,14 +2572,24 @@ dependencies = [
  "jpeg-decoder",
  "lforge-binary",
  "lforge-core",
+ "lforge-rage9",
  "lforge-renderer",
- "lforge-rpf",
  "log",
  "serde",
  "serde_json",
  "tempfile",
  "windows",
  "zip",
+]
+
+[[package]]
+name = "lforge-rage9"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "lforge-binary",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2590,16 +2600,6 @@ dependencies = [
  "glam",
  "pollster 1.0.3",
  "wgpu 30.0.2",
-]
-
-[[package]]
-name = "lforge-rpf"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "lforge-binary",
- "sha2",
- "tempfile",
 ]
 
 [[package]]

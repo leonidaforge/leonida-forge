@@ -4,20 +4,24 @@
 //! can be listed is recovered from the data area instead: file data is stored
 //! as zlib streams at 16-byte aligned offsets, and files larger than 64 KiB
 //! are split into one stream per 64 KiB chunk. [`scan`] finds these streams,
-//! checks each one by inflating it completely, and groups consecutive chunks
-//! into [`Entry`] values.
+//! checks each one by inflating it completely, reconstructs resources from
+//! their page streams, and groups the remaining consecutive chunks into
+//! [`Entry`] values.
 //!
 //! Recovered entries have no original names or paths. They are identified by
 //! the archive offset of their first stream. Bytes outside all recovered
 //! streams that are not zero padding are reported as [`Region`] values.
 
 mod cache;
+mod reconstruct;
 mod scan;
 
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use crate::Status;
+use crate::resource::{Layout, Page, Segment};
 pub use cache::{Origin, load_cached, open, store_cached};
 pub use scan::scan;
 
@@ -161,8 +165,8 @@ pub enum Kind {
     Rbf,
     Png,
     Dds,
-    /// A block at a 4 KiB boundary plus 0x10 whose `u32` at 8 is a pointer
-    /// with the high nibble 5, as RAGE resource system pages are described.
+    /// The start of RAGE resource system data, after 16 zero bytes; see
+    /// [`crate::resource`].
     Resource,
     /// Printable text without a recognised file signature.
     Text,
@@ -221,29 +225,6 @@ impl Kind {
     }
 }
 
-/// How much of an entry is known to be recovered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
-    /// Starts with a file signature and ends with a short chunk.
-    Complete,
-    /// Starts with a file signature, but its end, or for resources its
-    /// remaining pages, could not be established.
-    Partial,
-    /// No file signature: either a whole file of an unknown type or a part of
-    /// a file whose start was not recovered.
-    Unverified,
-}
-
-impl Status {
-    pub fn name(self) -> &'static str {
-        match self {
-            Status::Complete => "complete",
-            Status::Partial => "partial",
-            Status::Unverified => "unverified",
-        }
-    }
-}
-
 /// One zlib stream that inflated completely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stream {
@@ -258,9 +239,32 @@ impl Stream {
     pub fn aligned_end(&self) -> Option<u64> {
         align_up(self.offset.checked_add(self.stored_len.into())?)
     }
+
+    /// Whether `next` starts at the first aligned offset after this stream.
+    pub fn is_followed_by(&self, next: &Stream) -> bool {
+        self.aligned_end() == Some(next.offset)
+    }
 }
 
-/// Consecutive streams that hold one file, or what was recovered of it.
+/// A resource reconstructed from consecutive streams: its system pages, then
+/// its graphics pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    /// The archive offset of the first system stream, which is also the
+    /// offset of its entry.
+    pub offset: u64,
+    first_stream: u32,
+    pub layout: Layout,
+}
+
+impl Resource {
+    pub fn status(&self) -> Status {
+        self.layout.status()
+    }
+}
+
+/// Consecutive streams that hold one file or resource, or what was recovered
+/// of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The archive offset of the first stream. Unique within an archive.
@@ -269,7 +273,7 @@ pub struct Entry {
     stream_count: u32,
     pub kind: Kind,
     pub status: Status,
-    /// Inflated size in bytes.
+    /// Inflated size in bytes. For resources, system and graphics data.
     pub len: u64,
     /// Compressed size in bytes.
     pub stored_len: u64,
@@ -295,23 +299,28 @@ pub struct Index {
     pub archive_len: u64,
     pub header: Header,
     pub streams: Vec<Stream>,
+    /// Sorted by offset. Their streams are not part of any other entry.
+    pub resources: Vec<Resource>,
     pub entries: Vec<Entry>,
     pub regions: Vec<Region>,
 }
 
 impl Index {
-    /// `streams` must be sorted by offset and must not overlap.
+    /// `streams` must be sorted by offset and must not overlap. `resources`
+    /// must be sorted and claim disjoint runs of streams.
     pub(crate) fn new(
         archive_len: u64,
         header: Header,
         streams: Vec<Stream>,
+        resources: Vec<Resource>,
         regions: Vec<Region>,
     ) -> Self {
-        let entries = group(&streams);
+        let entries = group(&streams, &resources);
         Self {
             archive_len,
             header,
             streams,
+            resources,
             entries,
             regions,
         }
@@ -338,6 +347,45 @@ impl Index {
         Some(&self.regions[ix])
     }
 
+    pub fn resource_at(&self, offset: u64) -> Option<&Resource> {
+        let ix = self
+            .resources
+            .binary_search_by_key(&offset, |resource| resource.offset)
+            .ok()?;
+        Some(&self.resources[ix])
+    }
+
+    /// The pages of `resource` with their streams, in storage order.
+    pub fn resource_pages<'a>(
+        &'a self,
+        resource: &'a Resource,
+    ) -> impl Iterator<Item = (&'a Page, &'a [Stream])> + 'a {
+        let mut next = resource.first_stream as usize;
+        resource.layout.pages.iter().map(move |page| {
+            let streams = &self.streams[next..next + page.stream_count as usize];
+            next += page.stream_count as usize;
+            (page, streams)
+        })
+    }
+
+    /// The resource page whose first stream is at `offset`, with the
+    /// resource and the page's position among all pages of the resource.
+    pub fn page_at(&self, offset: u64) -> Option<(&Resource, usize, &Page, &[Stream])> {
+        let stream = self
+            .streams
+            .binary_search_by_key(&offset, |stream| stream.offset)
+            .ok()?;
+        let ix = self
+            .resources
+            .partition_point(|resource| resource.first_stream as usize <= stream)
+            .checked_sub(1)?;
+        let resource = &self.resources[ix];
+        self.resource_pages(resource)
+            .enumerate()
+            .find(|(_, (_, streams))| streams[0].offset == offset)
+            .map(|(position, (page, streams))| (resource, position, page, streams))
+    }
+
     /// Bytes after the table of contents.
     pub fn data_len(&self) -> u64 {
         self.archive_len.saturating_sub(self.header.data_start())
@@ -356,15 +404,37 @@ impl Index {
     }
 }
 
-/// Joins a stream to the previous entry when it directly follows a full
-/// 64 KiB chunk and does not itself look like the start of a file.
-fn group(streams: &[Stream]) -> Vec<Entry> {
+/// One entry per resource for the streams it claims. Other streams join the
+/// previous entry when they directly follow a full 64 KiB chunk and do not
+/// themselves look like the start of a file.
+fn group(streams: &[Stream], resources: &[Resource]) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
-    for (ix, stream) in streams.iter().enumerate() {
-        let continues = ix > 0 && {
+    let mut resources = resources.iter().peekable();
+    // Whether the last entry is a plain file that the next stream may continue.
+    let mut open = false;
+    let mut ix = 0;
+    while ix < streams.len() {
+        if let Some(resource) = resources.next_if(|r| r.first_stream as usize == ix) {
+            let count = resource.layout.stream_count();
+            let claimed = &streams[ix..ix + count as usize];
+            entries.push(Entry {
+                offset: resource.offset,
+                first_stream: ix as u32,
+                stream_count: count,
+                kind: Kind::Resource,
+                status: resource.status(),
+                len: claimed.iter().map(|s| u64::from(s.len)).sum(),
+                stored_len: claimed.iter().map(|s| u64::from(s.stored_len)).sum(),
+            });
+            open = false;
+            ix += count as usize;
+            continue;
+        }
+        let stream = &streams[ix];
+        let continues = open && {
             let previous = &streams[ix - 1];
             previous.len == CHUNK_LEN
-                && previous.aligned_end() == Some(stream.offset)
+                && previous.is_followed_by(stream)
                 && !stream.kind.is_file_start()
         };
         match entries.last_mut() {
@@ -383,12 +453,16 @@ fn group(streams: &[Stream]) -> Vec<Entry> {
                 stored_len: stream.stored_len.into(),
             }),
         }
+        open = true;
+        ix += 1;
     }
     for entry in &mut entries {
+        if entry.kind == Kind::Resource {
+            continue;
+        }
         let last = &streams[(entry.first_stream + entry.stream_count - 1) as usize];
         entry.status = match entry.kind {
             Kind::Text | Kind::Binary => Status::Unverified,
-            Kind::Resource => Status::Partial,
             _ if last.len == CHUNK_LEN => Status::Partial,
             _ => Status::Complete,
         };
@@ -420,25 +494,23 @@ impl Progress {
     }
 }
 
-/// Inflates one entry into `out` and checks it against the index. Returns the
-/// number of bytes written.
-pub fn read_entry<S: Read + Seek>(
+/// Inflates `streams`, for example those of one resource page, into `out`,
+/// checking each against the index.
+pub fn read_streams<S: Read + Seek>(
     mut source: S,
     index: &Index,
-    entry: &Entry,
+    streams: &[Stream],
     limit: u64,
     out: &mut dyn Write,
 ) -> Result<u64, Error> {
-    if entry.len > limit {
-        return Err(Error::TooLarge {
-            len: entry.len,
-            limit,
-        });
+    let len: u64 = streams.iter().map(|s| u64::from(s.len)).sum();
+    if len > limit {
+        return Err(Error::TooLarge { len, limit });
     }
     check_len(&mut source, index)?;
     let mut window = scan::Window::new(source, index.archive_len);
     let mut scratch = vec![0; scan::SCRATCH_LEN];
-    for stream in index.entry_streams(entry) {
+    for stream in streams {
         let inflated = scan::inflate(
             &mut window,
             stream.offset,
@@ -453,7 +525,20 @@ pub fn read_entry<S: Read + Seek>(
             )));
         }
     }
-    Ok(entry.len)
+    Ok(len)
+}
+
+/// Inflates one entry into `out` and checks it against the index. Returns the
+/// number of bytes written. A resource is written as its system pages
+/// followed by its graphics pages, the layout its pointers refer to.
+pub fn read_entry<S: Read + Seek>(
+    source: S,
+    index: &Index,
+    entry: &Entry,
+    limit: u64,
+    out: &mut dyn Write,
+) -> Result<u64, Error> {
+    read_streams(source, index, index.entry_streams(entry), limit, out)
 }
 
 fn check_len(source: &mut impl Seek, index: &Index) -> Result<(), Error> {
@@ -500,5 +585,15 @@ pub fn read_region<S: Read + Seek>(
     Ok(copied)
 }
 
+/// The segment and 1-based position of `page` within its segment.
+pub fn page_label(layout: &Layout, position: usize) -> (Segment, usize) {
+    let page = &layout.pages[position];
+    let before = layout.pages[..position]
+        .iter()
+        .filter(|other| other.segment == page.segment)
+        .count();
+    (page.segment, before + 1)
+}
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

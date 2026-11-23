@@ -7,8 +7,9 @@ use std::sync::atomic::AtomicBool;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
+use super::scan::{Window, classify, inflate, scan_from};
 use super::*;
-use crate::scan::{Window, classify, inflate, scan_from};
+use crate::resource::PageMapError;
 
 /// The fake table of contents ends here; data starts at the next 16 bytes.
 const TOC_END: u32 = 0x9C;
@@ -201,38 +202,291 @@ fn a_gap_ends_a_chunked_file() {
 #[test]
 fn classifies_conservatively() {
     let mut system_page = vec![0u8; 64];
-    system_page[8..12].copy_from_slice(&0x5000_9D00u32.to_le_bytes());
-    assert_eq!(classify(0x2010, &system_page), Kind::Resource);
-    assert_eq!(classify(0x2000, &system_page), Kind::Binary);
+    system_page[8..12].copy_from_slice(&0x5000_0030u32.to_le_bytes());
+    assert_eq!(classify(&system_page), Kind::Resource);
     system_page[12] = 1;
-    assert_eq!(classify(0x2010, &system_page), Kind::Binary);
+    assert_eq!(classify(&system_page), Kind::Binary);
+    system_page[12] = 0;
+    system_page[0] = 1;
+    assert_eq!(classify(&system_page), Kind::Binary);
 
-    assert_eq!(classify(0, b"<?xml version"), Kind::Xml);
-    assert_eq!(classify(0, b"\xEF\xBB\xBF<?xml version"), Kind::Xml);
+    assert_eq!(classify(b"<?xml version"), Kind::Xml);
+    assert_eq!(classify(b"\xEF\xBB\xBF<?xml version"), Kind::Xml);
     // Markup without a declaration may be the middle of a file.
-    assert_eq!(classify(0, b"<Item>value</Item>"), Kind::Text);
-    assert_eq!(classify(0, b"PSIN\x00\x00"), Kind::Pso);
-    assert_eq!(classify(0, b"RBF0\x00"), Kind::Rbf);
-    assert_eq!(classify(0, b"DDS \x7C"), Kind::Dds);
-    assert_eq!(classify(0, &[0u8, 1, 2, 3]), Kind::Binary);
-    assert_eq!(classify(0, b""), Kind::Binary);
+    assert_eq!(classify(b"<Item>value</Item>"), Kind::Text);
+    assert_eq!(classify(b"PSIN\x00\x00"), Kind::Pso);
+    assert_eq!(classify(b"RBF0\x00"), Kind::Rbf);
+    assert_eq!(classify(b"DDS \x7C"), Kind::Dds);
+    assert_eq!(classify(&[0u8, 1, 2, 3]), Kind::Binary);
+    assert_eq!(classify(b""), Kind::Binary);
+}
+
+fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// System data of `len` bytes with a page map at `map_at` that declares
+/// `system` and `graphics` pages.
+pub(crate) fn system_data(len: usize, map_at: usize, system: u8, graphics: u8) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    put_u64(&mut bytes, 8, 0x5000_0000 + map_at as u64);
+    bytes[map_at + 8] = system;
+    bytes[map_at + 9] = graphics;
+    bytes
+}
+
+/// Appends 16 zero bytes at the next 4 KiB boundary and then `pages` as
+/// consecutive streams. Returns the offsets of the streams.
+pub(crate) fn add_resource(bytes: &mut Vec<u8>, pages: &[Vec<u8>]) -> Vec<u64> {
+    let start = bytes.len().next_multiple_of(0x1000) + 16;
+    bytes.resize(start, 0);
+    add_streams(bytes, pages)
+}
+
+fn add_streams(bytes: &mut Vec<u8>, data: &[Vec<u8>]) -> Vec<u64> {
+    data.iter()
+        .map(|data| {
+            pad(bytes);
+            let offset = bytes.len() as u64;
+            bytes.extend_from_slice(&zlib(data));
+            offset
+        })
+        .collect()
+}
+
+fn empty_archive() -> Vec<u8> {
+    let mut bytes = header(0x40);
+    bytes.resize(0x800, 0);
+    bytes
+}
+
+fn graphics(len: usize, seed: u32) -> Vec<u8> {
+    noise(len, seed)
 }
 
 #[test]
-fn resources_are_partial() {
-    let mut page = vec![0u8; 3000];
-    page[8..12].copy_from_slice(&0x5000_0100u32.to_le_bytes());
-    let mut bytes = header(0x40);
-    bytes.resize(0x1010, 0);
-    bytes.extend_from_slice(&zlib(&page));
+fn reconstructs_system_and_graphics_pages() {
+    let mut system = system_data(0x200, 0x1C0, 1, 2);
+    put_u64(&mut system, 0x20, 0x6000_0000 + 0x2_0010);
+    let pages = vec![system.clone(), graphics(0x2_0000, 1), graphics(0x7000, 2)];
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &pages);
+    // A small file packed directly after the resource.
+    let after = add_streams(&mut bytes, &[b"some text after it".to_vec()]);
+    pad(&mut bytes);
+    let index = scan_bytes(bytes.clone());
+
+    assert_eq!(index.resources.len(), 1);
+    let resource = &index.resources[0];
+    assert_eq!(resource.offset, offsets[0]);
+    assert_eq!(
+        resource.status(),
+        Status::Complete,
+        "{:?}",
+        resource.layout.issues()
+    );
+    assert_eq!(resource.layout.segment_len(Segment::System), 0x200);
+    assert_eq!(resource.layout.segment_len(Segment::Graphics), 0x2_7000);
+
+    assert_eq!(index.entries.len(), 2);
+    let entry = index.entry_at(offsets[0]).unwrap();
+    assert_eq!(
+        (entry.kind, entry.status),
+        (Kind::Resource, Status::Complete)
+    );
+    assert_eq!(entry.stream_count(), 3);
+    assert_eq!(entry.len, 0x2_7200);
+    assert_eq!(read(&bytes, &index, entry), pages.concat());
+    let text = index.entry_at(after[0]).unwrap();
+    assert_eq!(text.kind, Kind::Text);
+
+    let (owner, position, page, streams) = index.page_at(offsets[2]).unwrap();
+    assert_eq!(owner.offset, offsets[0]);
+    assert_eq!(position, 2);
+    assert_eq!((page.segment, page.len), (Segment::Graphics, 0x7000));
+    assert_eq!(page_label(&owner.layout, position), (Segment::Graphics, 2));
+    let mut out = Vec::new();
+    read_streams(Cursor::new(&bytes), &index, streams, u64::MAX, &mut out).unwrap();
+    assert_eq!(out, pages[2]);
+    assert!(index.page_at(after[0]).is_none());
+    assert!(index.page_at(offsets[0] + 16).is_none());
+}
+
+#[test]
+fn system_only_resources_are_complete() {
+    let mut bytes = empty_archive();
+    let mut system = system_data(0x100, 0x80, 1, 0);
+    system[0x10..0x14].copy_from_slice(b"0DRP");
+    system[0x14] = 0x7A;
+    let offsets = add_resource(&mut bytes, &[system]);
     pad(&mut bytes);
     let index = scan_bytes(bytes);
-    assert_eq!(index.entries.len(), 1);
-    assert_eq!(index.entries[0].offset, 0x1010);
-    assert_eq!(
-        (index.entries[0].kind, index.entries[0].status),
-        (Kind::Resource, Status::Partial)
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Complete);
+    assert_eq!(resource.layout.tag, Some(0x7A));
+    assert_eq!(resource.layout.segment_len(Segment::Graphics), 0);
+}
+
+#[test]
+fn missing_graphics_pages_leave_a_partial_resource() {
+    let mut bytes = empty_archive();
+    let system = system_data(0x100, 0xC0, 1, 2);
+    let mut damaged = zlib(&graphics(0x7000, 3));
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xFF;
+    let offsets = add_resource(&mut bytes, &[system, graphics(0x2_0000, 4)]);
+    // The second page does not inflate; the next stream follows a gap.
+    pad(&mut bytes);
+    bytes.extend_from_slice(&damaged);
+    bytes.extend_from_slice(&[0u8; 48]);
+    let later = add_streams(&mut bytes, &[graphics(0x3000, 5)]);
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 2);
+    assert!(
+        resource
+            .layout
+            .issues()
+            .contains(&crate::resource::Issue::MissingPages {
+                segment: Segment::Graphics,
+                declared: 2,
+                found: 1
+            })
     );
+    // A stream that is merely nearby is not taken as the missing page.
+    let next = index.entry_at(later[0]).unwrap();
+    assert_eq!((next.kind, next.status), (Kind::Text, Status::Unverified));
+    assert_eq!(index.entries.len(), 2);
+}
+
+#[test]
+fn pages_of_64_kib_are_not_joined_like_file_chunks() {
+    // Two system pages, the first exactly one 64 KiB chunk long, and a page
+    // map in the second. Grouping as file chunks would hide the second page.
+    let mut system = system_data(0x1_0000 + 0x300, 0x1_0200, 2, 1);
+    put_u64(&mut system, 0x20, 0x5000_0000 + 0x1_0100);
+    let (first, second) = system.split_at(0x1_0000);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(
+        &mut bytes,
+        &[first.to_vec(), second.to_vec(), graphics(0x900, 6)],
+    );
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(
+        resource.status(),
+        Status::Complete,
+        "{:?}",
+        resource.layout.issues()
+    );
+    let pages: Vec<_> = index
+        .resource_pages(resource)
+        .map(|(page, streams)| (page.segment, streams[0].offset))
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            (Segment::System, offsets[0]),
+            (Segment::System, offsets[1]),
+            (Segment::Graphics, offsets[2])
+        ]
+    );
+}
+
+#[test]
+fn neighbouring_streams_with_the_wrong_sizes_are_not_pages() {
+    let mut bytes = empty_archive();
+    let system = system_data(0x100, 0xC0, 1, 2);
+    // Neither stream fits the size pattern of two graphics pages.
+    let offsets = add_resource(
+        &mut bytes,
+        &[system, graphics(0x1_8000, 7), graphics(0x2_0000, 8)],
+    );
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Unverified);
+}
+
+#[test]
+fn a_resource_shape_without_zero_bytes_before_it_is_not_a_resource() {
+    let mut bytes = empty_archive();
+    let offsets = add_streams(
+        &mut bytes,
+        &[b"text".to_vec(), system_data(0x100, 0xC0, 1, 0)],
+    );
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    assert!(index.resources.is_empty());
+    assert_eq!(index.entry_at(offsets[1]).unwrap().kind, Kind::Binary);
+    assert!(index.streams.iter().all(|s| s.kind != Kind::Resource));
+}
+
+#[test]
+fn an_invalid_page_map_leaves_an_unverified_candidate() {
+    let mut bytes = empty_archive();
+    let mut system = system_data(0x100, 0xC0, 1, 1);
+    system[0xC0] = 0x33;
+    let offsets = add_resource(&mut bytes, &[system, graphics(0x1000, 9)]);
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Unverified);
+    assert_eq!(resource.layout.page_map, Err(PageMapError::NonZero));
+    // Without a page map nothing after the first stream is attributed.
+    assert_eq!(index.entry_at(offsets[0]).unwrap().stream_count(), 1);
+    assert_eq!(index.entry_at(offsets[1]).unwrap().kind, Kind::Text);
+}
+
+#[test]
+fn a_page_map_past_the_recovered_data_leaves_an_unverified_candidate() {
+    let mut bytes = empty_archive();
+    let mut system = vec![0u8; 0x100];
+    put_u64(&mut system, 8, 0x5000_8000);
+    let offsets = add_resource(&mut bytes, &[system]);
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.layout.page_map, Err(PageMapError::Outside));
+    assert_eq!(resource.status(), Status::Unverified);
+}
+
+#[test]
+fn the_start_of_another_file_ends_a_resource() {
+    let mut bytes = empty_archive();
+    let system = system_data(0x100, 0xC0, 1, 1);
+    let offsets = add_resource(
+        &mut bytes,
+        &[system, b"<?xml version=\"1.0\"?><a/>".to_vec()],
+    );
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    assert_eq!(
+        index.resource_at(offsets[0]).unwrap().status(),
+        Status::Partial
+    );
+    assert_eq!(index.entry_at(offsets[1]).unwrap().kind, Kind::Xml);
+}
+
+#[test]
+fn cancelled_reconstruction_yields_no_resources() {
+    let mut bytes = empty_archive();
+    add_resource(&mut bytes, &[system_data(0x100, 0xC0, 1, 0)]);
+    pad(&mut bytes);
+    let mut streams = scan_bytes(bytes.clone()).streams;
+    streams[0].kind = Kind::Resource;
+    let len = bytes.len() as u64;
+    let result = reconstruct::resolve(
+        Cursor::new(bytes),
+        len,
+        &mut streams,
+        &AtomicBool::new(true),
+    );
+    assert!(matches!(result, Err(Error::Cancelled)));
 }
 
 #[test]
@@ -477,4 +731,59 @@ fn handles_offsets_past_4_gib() {
     let mut out = Vec::new();
     read_entry(source, &index, entry, u64::MAX, &mut out).unwrap();
     assert!(out.ends_with(b"end of the file"));
+}
+
+#[test]
+fn reconstructs_resources_past_4_gib() {
+    let base: u64 = 5 * 1024 * 1024 * 1024 + 0x10;
+    let system = zlib(&system_data(0x100, 0xC0, 1, 1));
+    let page = zlib(&graphics(0x3000, 11));
+    let page_at = (base + system.len() as u64).next_multiple_of(ALIGN);
+    let len = page_at + page.len() as u64 + 0x100;
+    let source = Sparse {
+        len,
+        patches: Arc::new(vec![(0, header(0x40)), (base, system), (page_at, page)]),
+        pos: 0,
+    };
+    let header = read_header(&mut source.clone()).unwrap();
+    let index = scan_from(
+        source.clone(),
+        header,
+        len,
+        base - 0x10,
+        4096,
+        &Progress::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let resource = index.resource_at(base).unwrap();
+    assert_eq!(resource.status(), Status::Complete);
+    let (owner, position, _, streams) = index.page_at(page_at).unwrap();
+    assert_eq!((owner.offset, position), (base, 1));
+    let mut out = Vec::new();
+    read_streams(source, &index, streams, u64::MAX, &mut out).unwrap();
+    assert_eq!(out, graphics(0x3000, 11));
+}
+
+#[test]
+fn a_page_that_starts_like_a_resource_still_belongs_to_its_resource() {
+    let mut system = system_data(0x1_0000 + 0x800, 0x1_0700, 2, 0);
+    // The second page starts with a zero u64 and a system pointer, but has
+    // no zeroed prefix.
+    put_u64(&mut system, 0x1_0008, 0x5000_0100);
+    let (first, second) = system.split_at(0x1_0000);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &[first.to_vec(), second.to_vec()]);
+    pad(&mut bytes);
+    let index = scan_bytes(bytes);
+    assert_eq!(index.resources.len(), 1);
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(
+        resource.status(),
+        Status::Complete,
+        "{:?}",
+        resource.layout.issues()
+    );
+    assert_eq!(resource.layout.pages.len(), 2);
+    assert_eq!(index.streams[1].kind, Kind::Binary);
 }

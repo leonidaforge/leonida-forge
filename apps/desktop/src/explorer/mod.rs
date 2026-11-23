@@ -23,7 +23,7 @@ use gpui::{
     WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
 };
 
-use lforge_rpf::Progress;
+use lforge_rage9::rpf::Progress;
 
 use crate::files::shell::ShellWorker;
 use crate::files::{self, Entry, EntryKind, Sort, SortKey, images};

@@ -6,9 +6,11 @@
 //! cancellation instead of blocking.
 //!
 //! The archive's own names and folders are unknown. Inside an archive,
-//! `Recovered Entries` holds one virtual folder per kind of entry, and
-//! `Unrecovered Regions` holds byte ranges that could not be decoded. Files are
-//! named after their archive offset, which stays the same across scans.
+//! `Recovered Entries` holds one virtual folder per kind of entry,
+//! `Resource Pages` holds the page streams of reconstructed resources one by
+//! one, and `Unrecovered Regions` holds byte ranges that could not be
+//! decoded. Files are named after their archive offset, which stays the same
+//! across scans.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,18 +22,24 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use lforge_binary::Source;
-use lforge_rpf::{Index, Kind, Progress, Region, Status};
+use lforge_rage9::resource::{Page, Segment};
+use lforge_rage9::rpf::{self, Index, Kind, Progress, Region, Resource, Status, Stream};
 
 use super::archive::{MAX_READ, check_size};
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
 pub const RECOVERED: &str = "Recovered Entries";
+pub const PAGES: &str = "Resource Pages";
 pub const UNRECOVERED: &str = "Unrecovered Regions";
 /// Indexes kept in memory; older ones are reloaded from the cache file.
 const MAX_IN_MEMORY: usize = 8;
 
 const SOURCE_NOTE: &str = "Recovered from a zlib stream in the archive data. The name is the \
      archive offset; the original name and folder are unknown.";
+
+const RESOURCE_SOURCE_NOTE: &str = "Reconstructed from consecutive zlib streams in the archive \
+     data: the system pages, then the graphics pages, as pointers in the resource address them. \
+     The name is the archive offset; the original name and folder are unknown.";
 
 /// The archive has to be indexed before its contents can be listed.
 #[derive(Debug)]
@@ -128,7 +136,7 @@ fn index(archive: &Path) -> io::Result<Arc<Index>> {
         }
     }
     if let Some(dir) = cache_dir()
-        && let Some(index) = lforge_rpf::load_cached(&dir, archive)
+        && let Some(index) = rpf::load_cached(&dir, archive)
     {
         return Ok(remember(archive, stamp, index));
     }
@@ -140,7 +148,7 @@ fn index(archive: &Path) -> io::Result<Arc<Index>> {
 /// Scans `archive`, or loads its cache file, and keeps the index in memory.
 pub fn build_index(archive: &Path, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
     let stamp = stamp(archive)?;
-    let (index, _) = lforge_rpf::open(archive, cache_dir().as_deref(), progress, cancel)?;
+    let (index, _) = rpf::open(archive, cache_dir().as_deref(), progress, cancel)?;
     remember(archive, stamp, index);
     Ok(())
 }
@@ -165,24 +173,32 @@ fn type_name(kind: Kind, status: Status) -> String {
         Kind::Rbf => "RBF data",
         Kind::Png => "PNG image",
         Kind::Dds => "DDS texture",
-        Kind::Resource => "Resource system data",
+        Kind::Resource => "RAGE resource",
         Kind::Text => "Text",
         Kind::Binary => "Binary data",
     };
-    match (kind, status) {
-        (Kind::Resource, _) | (_, Status::Complete) => name.to_string(),
-        (_, Status::Partial) => format!("{name} (partial)"),
-        (_, Status::Unverified) => format!("{name} (unverified)"),
+    match status {
+        Status::Complete => name.to_string(),
+        Status::Partial => format!("{name} (partial)"),
+        Status::Unverified => format!("{name} (unverified)"),
     }
 }
 
 fn status_text(kind: Kind, status: Status) -> &'static str {
     match (kind, status) {
+        (Kind::Resource, Status::Complete) => {
+            "Complete: the page map is valid, every declared page was found and the page sizes fit \
+             the observed pattern"
+        }
+        (Kind::Resource, Status::Partial) => {
+            "Partial: the page map declares pages that were not found next to the resource"
+        }
+        (Kind::Resource, Status::Unverified) => {
+            "Unverified: the page map could not be validated, or the page sizes do not fit the \
+             observed pattern"
+        }
         (_, Status::Complete) => {
             "Complete: starts with a file signature and ends with a short chunk"
-        }
-        (Kind::Resource, _) => {
-            "Partial: system data only; the other pages of the resource are not reconstructed"
         }
         (_, Status::Partial) => {
             "Partial: starts with a file signature, but the end could not be verified"
@@ -213,8 +229,11 @@ enum Node<'a> {
     Root,
     Recovered,
     Kind(Kind),
+    Pages,
     Regions,
-    Entry(&'a lforge_rpf::Entry),
+    Entry(&'a rpf::Entry),
+    /// A resource and the position of the page among its pages.
+    Page(&'a Resource, usize),
     Region(&'a Region),
 }
 
@@ -234,6 +253,7 @@ fn resolve<'a>(index: &'a Index, inner: &Path) -> Option<Node<'a>> {
     match parts.as_slice() {
         [] => Some(Node::Root),
         [RECOVERED] => Some(Node::Recovered),
+        [PAGES] => Some(Node::Pages),
         [UNRECOVERED] => Some(Node::Regions),
         [RECOVERED, folder] => kind_of(folder).map(Node::Kind),
         [RECOVERED, folder, name] => {
@@ -241,6 +261,9 @@ fn resolve<'a>(index: &'a Index, inner: &Path) -> Option<Node<'a>> {
             let entry = index.entry_at(parse_file_name(name, kind.extension())?)?;
             (entry.kind == kind).then_some(Node::Entry(entry))
         }
+        [PAGES, name] => index
+            .page_at(parse_file_name(name, "bin")?)
+            .map(|(resource, position, ..)| Node::Page(resource, position)),
         [UNRECOVERED, name] => index
             .region_at(parse_file_name(name, "bin")?)
             .map(Node::Region),
@@ -279,7 +302,77 @@ fn compressed(len: u64) -> String {
     format!("{} ({} bytes)", format_size(len), format_bytes_exact(len))
 }
 
-fn entry_file(dir: &Path, entry: &lforge_rpf::Entry) -> Entry {
+fn segment_text(resource: &Resource, segment: Segment) -> String {
+    let layout = &resource.layout;
+    let len = layout.segment_len(segment);
+    let pages = layout.segment_pages(segment).count();
+    format!(
+        "{} ({} bytes) in {}",
+        format_size(len),
+        format_bytes_exact(len),
+        count(pages, "page", "pages")
+    )
+}
+
+fn resource_details(index: &Index, resource: &Resource) -> Vec<(&'static str, String)> {
+    let layout = &resource.layout;
+    let mut details = vec![
+        ("System data", segment_text(resource, Segment::System)),
+        ("Graphics data", segment_text(resource, Segment::Graphics)),
+        (
+            "Page map",
+            match layout.page_map {
+                Ok(map) => format!(
+                    "At {:#x} in the system data; declares {} and {}",
+                    map.offset,
+                    count(map.system_pages.into(), "system page", "system pages"),
+                    count(map.graphics_pages.into(), "graphics page", "graphics pages"),
+                ),
+                Err(err) => format!("Not validated: {}", err.describe()),
+            },
+        ),
+        (
+            "Pages",
+            index
+                .resource_pages(resource)
+                .map(|(page, streams)| {
+                    format!("{:#x} ({})", streams[0].offset, page.segment.name())
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    ];
+    if let Some(tag) = layout.tag {
+        details.push(("Marker", format!("0DRP {tag:#04x} (meaning unknown)")));
+    }
+    let pointers = layout.pointers;
+    details.push((
+        "Pointer-like values",
+        format!(
+            "{} system, {} graphics; {} and {} point outside{}",
+            pointers.system,
+            pointers.graphics,
+            pointers.system_outside,
+            pointers.graphics_outside,
+            if pointers.checked {
+                ""
+            } else {
+                " (not all checked)"
+            }
+        ),
+    ));
+    let issues: Vec<String> = layout
+        .issues()
+        .iter()
+        .map(|issue| issue.describe())
+        .collect();
+    if !issues.is_empty() {
+        details.push(("Warnings", issues.join("; ")));
+    }
+    details
+}
+
+fn entry_file(dir: &Path, index: &Index, entry: &rpf::Entry) -> Entry {
     let name = file_name(entry.offset, entry.kind.extension());
     let mut file = Entry::new(
         name.clone(),
@@ -293,9 +386,60 @@ fn entry_file(dir: &Path, entry: &lforge_rpf::Entry) -> Entry {
     file.details = vec![
         ("Status", status_text(entry.kind, entry.status).to_string()),
         ("Offset", format!("{:#x}", entry.offset)),
+    ];
+    let source = match index.resource_at(entry.offset) {
+        Some(resource) => {
+            file.details.extend(resource_details(index, resource));
+            RESOURCE_SOURCE_NOTE
+        }
+        None => SOURCE_NOTE,
+    };
+    file.details.extend([
         ("Compressed", compressed(entry.stored_len)),
         ("Streams", entry.stream_count().to_string()),
-        ("Source", SOURCE_NOTE.to_string()),
+        ("Source", source.to_string()),
+    ]);
+    file
+}
+
+fn page_file(
+    dir: &Path,
+    resource: &Resource,
+    position: usize,
+    page: &Page,
+    streams: &[Stream],
+) -> Entry {
+    let offset = streams[0].offset;
+    let name = file_name(offset, "bin");
+    let mut file = Entry::new(
+        name.clone(),
+        dir.join(&name),
+        EntryKind::File,
+        Some(page.len),
+        None,
+    );
+    let (segment, number) = rpf::page_label(&resource.layout, position);
+    let of = resource.layout.segment_pages(segment).count();
+    file.type_name = match segment {
+        Segment::System => "Resource system page",
+        Segment::Graphics => "Resource graphics page",
+    }
+    .to_string();
+    file.order = Some(offset);
+    let stored: u64 = streams.iter().map(|s| u64::from(s.stored_len)).sum();
+    file.details = vec![
+        (
+            "Resource",
+            format!(
+                "{} ({})",
+                file_name(resource.offset, Kind::Resource.extension()),
+                resource.status().name()
+            ),
+        ),
+        ("Page", format!("{} page {number} of {of}", segment.name())),
+        ("Offset", format!("{offset:#x}")),
+        ("Compressed", compressed(stored)),
+        ("Streams", page.stream_count.to_string()),
     ];
     file
 }
@@ -331,6 +475,10 @@ pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
                 let contents = count(index.entries.len(), "recovered entry", "recovered entries");
                 folders.push(folder(&dir, RECOVERED, contents));
             }
+            let pages: usize = index.resources.iter().map(|r| r.layout.pages.len()).sum();
+            if pages > 0 {
+                folders.push(folder(&dir, PAGES, count(pages, "page", "pages")));
+            }
             if !index.regions.is_empty() {
                 let contents = count(index.regions.len(), "region", "regions");
                 folders.push(folder(&dir, UNRECOVERED, contents));
@@ -348,14 +496,27 @@ pub fn list(archive: &Path, inner: &Path) -> io::Result<Vec<Entry>> {
             .entries
             .iter()
             .filter(|entry| entry.kind == kind)
-            .map(|entry| entry_file(&dir, entry))
+            .map(|entry| entry_file(&dir, &index, entry))
+            .collect(),
+        Node::Pages => index
+            .resources
+            .iter()
+            .flat_map(|resource| {
+                index
+                    .resource_pages(resource)
+                    .enumerate()
+                    .map(move |(position, (page, streams))| (resource, position, page, streams))
+            })
+            .map(|(resource, position, page, streams)| {
+                page_file(&dir, resource, position, page, streams)
+            })
             .collect(),
         Node::Regions => index
             .regions
             .iter()
             .map(|region| region_file(&dir, region))
             .collect(),
-        Node::Entry(_) | Node::Region(_) => {
+        Node::Entry(_) | Node::Page(..) | Node::Region(_) => {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
         }
     };
@@ -369,11 +530,19 @@ fn copy(archive: &Path, inner: &Path, out: &mut dyn Write) -> io::Result<()> {
     match resolve(&index, inner).ok_or_else(not_found)? {
         Node::Entry(entry) => {
             check_size(entry.len, MAX_READ)?;
-            lforge_rpf::read_entry(source, &index, entry, MAX_READ, out)?;
+            rpf::read_entry(source, &index, entry, MAX_READ, out)?;
+        }
+        Node::Page(resource, position) => {
+            let (page, streams) = index
+                .resource_pages(resource)
+                .nth(position)
+                .ok_or_else(not_found)?;
+            check_size(page.len, MAX_READ)?;
+            rpf::read_streams(source, &index, streams, MAX_READ, out)?;
         }
         Node::Region(region) => {
             check_size(region.len, MAX_READ)?;
-            lforge_rpf::read_region(source, region, MAX_READ, out)?;
+            rpf::read_region(source, region, MAX_READ, out)?;
         }
         _ => return Err(io::Error::other("not a file")),
     }
@@ -413,12 +582,22 @@ pub fn describe(archive: &Path, inner: &Path) -> Option<String> {
             count(index.entries.len(), "entry", "entries"),
             percent(index.recovered_len()),
         ),
+        Node::Pages => format!(
+            "The page streams of {}, one file per page, in archive order. Each resource in \
+             Recovered Entries holds its system pages followed by its graphics pages; here they \
+             can be inspected separately.",
+            count(
+                index.resources.len(),
+                "reconstructed resource",
+                "reconstructed resources"
+            ),
+        ),
         Node::Regions => format!(
             "Bytes outside the recovered streams that are not zero padding ({:.1}% of the archive \
              data). They are not zlib streams and are shown as stored, without decoding.",
             percent(index.unrecovered_len()),
         ),
-        Node::Entry(_) | Node::Region(_) => return None,
+        Node::Entry(_) | Node::Page(..) | Node::Region(_) => return None,
     };
     Some(note)
 }
@@ -615,5 +794,88 @@ mod tests {
         let err = build_index(&archive, &Progress::default(), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(index_required(&files::list(&archive).unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn resources_and_their_pages_can_be_browsed_and_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("textures.rpf");
+        let mut system = vec![0u8; 0x100];
+        system[8..16].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+        system[0xC8] = 1;
+        system[0xC9] = 1;
+        let graphics: Vec<u8> = (0..0x3000u32).map(|i| (i % 251) as u8).collect();
+        let mut bytes = vec![0u8; 0x40];
+        bytes[..4].copy_from_slice(b"9FPR");
+        bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+        // 16 zero bytes in front of the first system stream.
+        bytes.resize(0x1010, 0);
+        let mut offsets = Vec::new();
+        for page in [&system, &graphics] {
+            bytes.resize(bytes.len().next_multiple_of(16), 0);
+            offsets.push(bytes.len() as u64);
+            bytes.extend_from_slice(&zlib(page));
+        }
+        bytes.resize(bytes.len().next_multiple_of(16), 0);
+        fs::write(&archive, bytes).unwrap();
+        build(&archive);
+
+        assert_eq!(names(&files::list(&archive).unwrap()), [RECOVERED, PAGES]);
+        assert_eq!(
+            names(&files::list(&archive.join(RECOVERED)).unwrap()),
+            ["Resources"]
+        );
+        let resources = files::list(&archive.join(RECOVERED).join("Resources")).unwrap();
+        assert_eq!(resources.len(), 1);
+        let resource = &resources[0];
+        assert_eq!(resource.type_name, "RAGE resource");
+        assert_eq!(resource.size, Some(0x3100));
+        let detail = |entry: &Entry, label: &str| {
+            entry
+                .details
+                .iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, value)| value.clone())
+        };
+        assert!(detail(resource, "Status").unwrap().starts_with("Complete"));
+        assert!(
+            detail(resource, "Graphics data")
+                .unwrap()
+                .contains("1 page")
+        );
+        assert_eq!(
+            files::read(&resource.path).unwrap(),
+            [system.clone(), graphics.clone()].concat()
+        );
+
+        let pages = files::list(&archive.join(PAGES)).unwrap();
+        assert_eq!(
+            names(&pages),
+            [
+                format!("0x{:010X}.bin", offsets[0]),
+                format!("0x{:010X}.bin", offsets[1])
+            ]
+        );
+        assert_eq!(pages[1].type_name, "Resource graphics page");
+        assert_eq!(detail(&pages[1], "Page").unwrap(), "graphics page 1 of 1");
+        assert_eq!(files::read(&pages[1].path).unwrap(), graphics);
+        let mut inspected = files::open_binary(&pages[0].path).unwrap();
+        assert_eq!(
+            lforge_binary::read_at(&mut inspected.source, 0, 0x100).unwrap(),
+            system
+        );
+        assert!(
+            files::describe(&archive.join(PAGES))
+                .unwrap()
+                .contains("1 reconstructed resource")
+        );
+        assert!(
+            files::read(
+                &archive
+                    .join(PAGES)
+                    .join(format!("0x{:010X}.bin", offsets[1] + 16))
+            )
+            .is_err()
+        );
     }
 }
