@@ -1,43 +1,21 @@
-use gpui::{
-    App, ClickEvent, Context, Div, Entity, FontWeight, SharedString, Window, div, prelude::*, px,
-    rgb,
-};
-use lforge_core::{APP_NAME, VERSION};
+//! Development window for the Phase 0 cube renderer.
+
+use gpui::{Context, Div, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb};
+use lforge_core::VERSION;
 
 use crate::theme;
+use crate::ui;
 use crate::viewport::{RendererStatus, Viewport};
 
-pub struct Workspace {
+pub struct RendererDemo {
     viewport: Entity<Viewport>,
 }
 
-impl Workspace {
+impl RendererDemo {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let viewport = cx.new(Viewport::new);
         cx.observe(&viewport, |_, _, cx| cx.notify()).detach();
         Self { viewport }
-    }
-
-    fn header(&self) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_2()
-            .h(px(36.))
-            .px_3()
-            .bg(rgb(theme::PANEL))
-            .border_b_1()
-            .border_color(rgb(theme::BORDER))
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(APP_NAME))
-            .child(div().text_color(rgb(theme::TEXT_MUTED)).child(VERSION))
-    }
-
-    fn explorer(&self) -> impl IntoElement {
-        panel("Explorer")
-            .w(px(240.))
-            .border_r_1()
-            .child(muted_line("No archive open."))
     }
 
     fn properties(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -69,22 +47,22 @@ impl Workspace {
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .child(button(
-                        "auto-rotate",
-                        rotate_label,
-                        cx.listener(|this, _, _, cx| {
-                            this.viewport
-                                .update(cx, |viewport, cx| viewport.toggle_auto_rotate(cx));
-                        }),
-                    ))
-                    .child(button(
-                        "reset-camera",
-                        "Reset view",
-                        cx.listener(|this, _, _, cx| {
-                            this.viewport
-                                .update(cx, |viewport, cx| viewport.reset_camera(cx));
-                        }),
-                    )),
+                    .child(
+                        ui::button("auto-rotate", rotate_label).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.viewport
+                                    .update(cx, |viewport, cx| viewport.toggle_auto_rotate(cx));
+                            },
+                        )),
+                    )
+                    .child(
+                        ui::button("reset-camera", "Reset view").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.viewport
+                                    .update(cx, |viewport, cx| viewport.reset_camera(cx));
+                            },
+                        )),
+                    ),
             )
             .child(section("Renderer"))
             .child(property("Adapter", adapter))
@@ -133,7 +111,7 @@ impl Workspace {
     }
 }
 
-impl Render for Workspace {
+impl Render for RendererDemo {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
@@ -143,13 +121,11 @@ impl Render for Workspace {
             .text_color(rgb(theme::TEXT))
             .font_family(theme::UI_FONT)
             .text_sm()
-            .child(self.header())
             .child(
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.explorer())
                     .child(
                         div()
                             .flex_1()
@@ -215,30 +191,4 @@ fn property(label: &'static str, value: impl Into<SharedString>) -> impl IntoEle
                 .font_family(theme::MONO_FONT)
                 .child(value.into()),
         )
-}
-
-fn muted_line(text: &'static str) -> impl IntoElement {
-    div()
-        .px_3()
-        .py_1()
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(text)
-}
-
-fn button(
-    id: &'static str,
-    label: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .hover(|style| style.bg(rgb(theme::HOVER)))
-        .cursor_pointer()
-        .child(label)
-        .on_click(on_click)
 }

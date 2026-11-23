@@ -1,0 +1,144 @@
+//! Image decoding for previews and the image viewer.
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
+
+use gpui::RenderImage;
+use image::{DynamicImage, Frame, ImageFormat, ImageReader, RgbaImage};
+
+pub struct DecodedImage {
+    pub image: Arc<RenderImage>,
+    /// Dimensions of the source image, not of the decoded data.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Decodes the image at full resolution.
+pub fn load(path: &Path) -> Result<DecodedImage, String> {
+    let reader = open(path)?;
+    let image = reader.decode().map_err(|err| err.to_string())?;
+    let (width, height) = (image.width(), image.height());
+    Ok(DecodedImage {
+        image: to_render_image(image.into_rgba8()),
+        width,
+        height,
+    })
+}
+
+/// Decodes a thumbnail that fits in `max_side` × `max_side`.
+///
+/// JPEGs are decoded at a reduced scale, so large photos are never decoded in
+/// full. PNG has no reduced decoding, so it is decoded fully and then scaled.
+pub fn load_thumbnail(path: &Path, max_side: u32) -> Result<DecodedImage, String> {
+    let (width, height) = open(path)?
+        .into_dimensions()
+        .map_err(|err| err.to_string())?;
+    let image = match open(path)?.format() {
+        Some(ImageFormat::Jpeg) => decode_scaled_jpeg(path, max_side)?,
+        _ => open(path)?.decode().map_err(|err| err.to_string())?,
+    };
+    let thumbnail = if image.width() > max_side || image.height() > max_side {
+        image.thumbnail(max_side, max_side)
+    } else {
+        image
+    };
+    Ok(DecodedImage {
+        image: to_render_image(thumbnail.into_rgba8()),
+        width,
+        height,
+    })
+}
+
+fn open(path: &Path) -> Result<ImageReader<BufReader<File>>, String> {
+    ImageReader::open(path)
+        .and_then(|reader| reader.with_guessed_format())
+        .map_err(|err| err.to_string())
+}
+
+fn decode_scaled_jpeg(path: &Path, max_side: u32) -> Result<DynamicImage, String> {
+    let file = File::open(path).map_err(|err| err.to_string())?;
+    let mut decoder = jpeg_decoder::Decoder::new(BufReader::new(file));
+    let side = u16::try_from(max_side).unwrap_or(u16::MAX);
+    decoder.scale(side, side).map_err(|err| err.to_string())?;
+    let pixels = decoder.decode().map_err(|err| err.to_string())?;
+    let info = decoder.info().ok_or("missing JPEG header")?;
+    let (width, height) = (u32::from(info.width), u32::from(info.height));
+    let image = match info.pixel_format {
+        jpeg_decoder::PixelFormat::RGB24 => {
+            image::RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
+        }
+        jpeg_decoder::PixelFormat::L8 => {
+            image::GrayImage::from_raw(width, height, pixels).map(DynamicImage::ImageLuma8)
+        }
+        // CMYK and 16-bit JPEGs are rare; let the regular decoder handle them.
+        _ => {
+            return open(path)?.decode().map_err(|err| err.to_string());
+        }
+    };
+    image.ok_or_else(|| "JPEG data does not match its header".to_string())
+}
+
+/// GPUI expects BGRA pixels.
+fn to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
+    for pixel in rgba.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new([Frame::new(rgba)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageBuffer, Rgb, Rgba};
+
+    #[test]
+    fn png_thumbnail_keeps_source_dimensions_and_aspect() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("wide.png");
+        ImageBuffer::from_pixel(400, 100, Rgba([255u8, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+
+        let thumbnail = load_thumbnail(&path, 64).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (400, 100));
+        let size = thumbnail.image.size(0);
+        assert_eq!((size.width.0, size.height.0), (64, 16));
+        // GPUI expects BGRA, so red is stored third.
+        assert_eq!(
+            &thumbnail.image.as_bytes(0).unwrap()[..4],
+            &[0, 0, 255, 255]
+        );
+    }
+
+    #[test]
+    fn jpeg_thumbnail_is_decoded_at_reduced_scale() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("photo.jpg");
+        ImageBuffer::from_pixel(1024, 512, Rgb([10u8, 200, 30]))
+            .save(&path)
+            .unwrap();
+
+        let thumbnail = load_thumbnail(&path, 128).unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (1024, 512));
+        let size = thumbnail.image.size(0);
+        assert_eq!((size.width.0, size.height.0), (128, 64));
+    }
+
+    #[test]
+    fn full_load_and_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("small.png");
+        ImageBuffer::from_pixel(3, 2, Rgba([0u8, 0, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let image = load(&path).unwrap();
+        assert_eq!((image.width, image.height), (3, 2));
+
+        let broken = temp.path().join("broken.png");
+        std::fs::write(&broken, b"not a png").unwrap();
+        assert!(load_thumbnail(&broken, 64).is_err());
+        assert!(load(&temp.path().join("missing.png")).is_err());
+    }
+}

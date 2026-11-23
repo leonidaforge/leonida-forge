@@ -11,11 +11,18 @@ name = "leonida-forge"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 env_logger.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
+jpeg-decoder.workspace = true
 lforge-core.workspace = true
 lforge-renderer.workspace = true
 log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

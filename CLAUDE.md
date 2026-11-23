@@ -26,6 +26,7 @@ Write documentation for developers who need to use or maintain the software, not
   - `crates/renderer` MUST NOT depend on GPUI.
   - `apps/cli` MUST NOT initialize GPUI or wgpu.
 - GPUI comes from a pinned Zed git revision. Bump `gpui` and `gpui_platform` together, and check Zed's `[patch.crates-io]` for entries that the root `Cargo.toml` must mirror.
-- Keep the desktop UI thread free of blocking work. GPU setup and rendering run on the renderer thread.
+- File access MUST be read-only. Never write to, rename or delete anything inside a workspace root. Settings go to `%APPDATA%` only.
+- Keep the desktop UI thread free of blocking work. Filesystem access, image decoding and rendering run on background threads.
 - Before committing, run the CI checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Commit messages follow Conventional Commits.

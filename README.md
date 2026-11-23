@@ -27,7 +27,9 @@ cargo test --workspace
 ```
 
 The desktop executable is `leonida-forge.exe` and the CLI is `lforge.exe`.
-Set `WGPU_BACKEND` (for example `vulkan`) to use a renderer backend other than Direct3D 12.
+The desktop app stores its settings in `%APPDATA%\Leonida Forge\settings.json`.
+Debug builds have a **Tools > Renderer Demo** window for the 3D renderer.
+Set `WGPU_BACKEND` (for example `vulkan`) to run it on a backend other than Direct3D 12.
 Set `RUST_LOG=warn` to see log output from debug builds. Release builds have no console.
 
 ## AI Contributions
