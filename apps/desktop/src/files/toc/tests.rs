@@ -210,14 +210,18 @@ fn detail<'a>(entry: &'a Entry, label: &str) -> &'a str {
 }
 
 /// Lists `path`, opening the archives it needs first, as the explorer does.
+/// What was opened may be evicted before the listing, so it is opened again
+/// then.
 fn list_opened(path: &Path) -> Vec<Entry> {
-    match files::list(path) {
-        Err(err) if prepare_required(&err).is_some() => {
-            archive::prepare(path, &Progress::default(), &AtomicBool::new(false)).unwrap();
-            files::list(path).unwrap()
+    for _ in 0..10 {
+        match files::list(path) {
+            Err(err) if prepare_required(&err).is_some() => {
+                archive::prepare(path, &Progress::default(), &AtomicBool::new(false)).unwrap();
+            }
+            result => return result.unwrap(),
         }
-        result => result.unwrap(),
     }
+    panic!("{} could not be listed", path.display());
 }
 
 fn opened(path: &Path) -> Archive {
@@ -520,6 +524,8 @@ fn encrypted_tables_are_never_read_in_full() {
     assert_eq!(full_reads(), before);
 }
 
+/// Counts reads, so it relies on its archive staying in memory. Tests get
+/// enough room in the cache for that.
 #[test]
 fn usable_tables_are_read_once_until_something_changes() {
     let temp = tempfile::tempdir().unwrap();
@@ -572,7 +578,7 @@ fn passes_other_than_decryption_are_named_as_such() {
     assert_eq!(full_reads(), before);
 }
 
-fn deflate(data: &[u8]) -> Vec<u8> {
+pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     io::Write::write_all(&mut encoder, data).unwrap();
@@ -694,7 +700,7 @@ fn decoded_entries_read_and_hold_archives() {
 const COMPANION_MAGIC: [u8; 8] = [0, 0, 0, 0x39, 0x56, 0x46, 0x50, 0x52];
 
 /// `archive` with a companion header: the payloads at the same offsets.
-fn companion_of(archive: &[u8], identifier: u64) -> Vec<u8> {
+pub(crate) fn companion_of(archive: &[u8], identifier: u64) -> Vec<u8> {
     let mut bytes = archive.to_vec();
     bytes[..8].copy_from_slice(&COMPANION_MAGIC);
     bytes[8..16].copy_from_slice(&identifier.to_le_bytes());

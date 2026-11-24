@@ -33,7 +33,8 @@ pub const PAGES: &str = "Resource Pages";
 pub const UNRECOVERED: &str = "Unrecovered Regions";
 /// Indexes kept in memory; older ones are reloaded from the cache file.
 /// Tests run at the same time and share this cache, so they get room enough
-/// not to push out each other's indexes.
+/// not to push out each other's indexes. Eviction is tested on purpose in
+/// `files::eviction` and with small limits in this module's tests.
 const MAX_IN_MEMORY: usize = if cfg!(test) { 4096 } else { 8 };
 
 const SOURCE_NOTE: &str = "Recovered from a zlib stream in the archive data. The name is the \
@@ -98,29 +99,42 @@ fn cache_key(archive: &Archive) -> io::Result<CacheKey> {
     Ok(CacheKey { location, version })
 }
 
-fn remember(archive: &Archive, contents: Contents) -> Contents {
-    let mut indexes = indexes();
-    indexes.clock += 1;
-    let last_used = indexes.clock;
-    indexes.by_archive.insert(
-        archive.path.clone(),
-        Cached {
-            stamp: archive.stamp,
-            dependencies: archive.dependencies.clone(),
-            contents: contents.clone(),
-            last_used,
-        },
-    );
-    if indexes.by_archive.len() > MAX_IN_MEMORY
-        && let Some(oldest) = indexes
-            .by_archive
-            .iter()
-            .min_by_key(|(_, cached)| cached.last_used)
-            .map(|(path, _)| path.clone())
-    {
-        indexes.by_archive.remove(&oldest);
+impl Indexes {
+    /// Keeps `cached`, then drops the least recently used other entry if more
+    /// than `max` remain. The new entry itself is never dropped.
+    fn insert(&mut self, path: PathBuf, mut cached: Cached, max: usize) {
+        self.clock += 1;
+        cached.last_used = self.clock;
+        self.by_archive.insert(path.clone(), cached);
+        if self.by_archive.len() > max
+            && let Some(oldest) = self
+                .by_archive
+                .iter()
+                .filter(|(other, _)| **other != path)
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(path, _)| path.clone())
+        {
+            self.by_archive.remove(&oldest);
+        }
     }
+}
+
+fn remember(archive: &Archive, contents: Contents) -> Contents {
+    let cached = Cached {
+        stamp: archive.stamp,
+        dependencies: archive.dependencies.clone(),
+        contents: contents.clone(),
+        last_used: 0,
+    };
+    indexes().insert(archive.path.clone(), cached, MAX_IN_MEMORY);
     contents
+}
+
+/// Drops what is kept in memory for the archive at `path`, as eviction
+/// would.
+#[cfg(test)]
+pub(crate) fn forget(path: &Path) {
+    indexes().by_archive.remove(path);
 }
 
 fn in_memory(archive: &Archive) -> Option<Contents> {
@@ -1012,5 +1026,49 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+
+    fn recovered_contents() -> Contents {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&rpf_bytes(&[zlib(b"text")])).unwrap();
+        let source = lforge_binary::Source::from_file(file).unwrap();
+        let index = rpf::scan(source, &Progress::default(), &AtomicBool::new(false)).unwrap();
+        Contents::Recovered(Arc::new(index), Arc::from("reason"))
+    }
+
+    fn cached(contents: &Contents) -> Cached {
+        Cached {
+            stamp: (0, None),
+            dependencies: Vec::new(),
+            contents: contents.clone(),
+            last_used: 0,
+        }
+    }
+
+    #[test]
+    fn indexes_drop_the_least_recently_used() {
+        let contents = recovered_contents();
+        let mut indexes = Indexes::default();
+        for name in ["a", "b", "c"] {
+            indexes.insert(PathBuf::from(name), cached(&contents), 2);
+        }
+        let mut names: Vec<_> = indexes.by_archive.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, [PathBuf::from("b"), PathBuf::from("c")]);
+        indexes.clock += 1;
+        indexes
+            .by_archive
+            .get_mut(Path::new("b"))
+            .unwrap()
+            .last_used = indexes.clock;
+        indexes.insert(PathBuf::from("d"), cached(&contents), 2);
+        let mut names: Vec<_> = indexes.by_archive.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, [PathBuf::from("b"), PathBuf::from("d")]);
+        // The new entry stays; the least recently used other one goes.
+        indexes.insert(PathBuf::from("e"), cached(&contents), 2);
+        let mut names: Vec<_> = indexes.by_archive.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, [PathBuf::from("d"), PathBuf::from("e")]);
     }
 }

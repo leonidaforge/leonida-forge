@@ -5,6 +5,8 @@
 //! [`read`] resolve such paths, so callers treat archives like folders.
 
 pub mod archive;
+#[cfg(test)]
+mod eviction;
 pub mod images;
 pub mod rpf;
 pub mod shell;

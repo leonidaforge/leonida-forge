@@ -40,7 +40,8 @@ pub const MAX_CHAIN: u64 = 2 * 1024 * 1024 * 1024;
 /// alive until they are no longer used.
 const MAX_KEPT: u64 = 2 * 1024 * 1024 * 1024;
 /// Tests run at the same time and share this cache, so they get room enough
-/// not to push out each other's archives.
+/// not to push out each other's archives. Eviction is tested on purpose in
+/// `files::eviction` and with small limits in this module's tests.
 const MAX_KEPT_COUNT: usize = if cfg!(test) { 4096 } else { 32 };
 /// In folders with more files, only files with an archive extension are
 /// checked, so listing them does not open every file. Opening any file still
@@ -608,27 +609,41 @@ fn kept_archives() -> MutexGuard<'static, KeptArchives> {
     KEPT.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-fn keep(path: PathBuf, mut archive: Kept) {
-    let mut kept = kept_archives();
-    kept.clock += 1;
-    archive.last_used = kept.clock;
-    kept.by_path.insert(path.clone(), archive);
-    loop {
-        let total: u64 = kept.by_path.values().map(|kept| kept.decompressed).sum();
-        if total <= MAX_KEPT && kept.by_path.len() <= MAX_KEPT_COUNT {
-            break;
+impl KeptArchives {
+    /// Keeps `archive`, then drops the least recently used other archives
+    /// until at most `max_count` remain and their temporary files take at
+    /// most `max_bytes`. The new archive itself is never dropped.
+    fn insert(&mut self, path: PathBuf, mut archive: Kept, max_bytes: u64, max_count: usize) {
+        self.clock += 1;
+        archive.last_used = self.clock;
+        self.by_path.insert(path.clone(), archive);
+        loop {
+            let total: u64 = self.by_path.values().map(|kept| kept.decompressed).sum();
+            if total <= max_bytes && self.by_path.len() <= max_count {
+                break;
+            }
+            let Some(oldest) = self
+                .by_path
+                .iter()
+                .filter(|(other, _)| **other != path)
+                .min_by_key(|(_, kept)| kept.last_used)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.by_path.remove(&oldest);
         }
-        let Some(oldest) = kept
-            .by_path
-            .iter()
-            .filter(|(other, _)| **other != path)
-            .min_by_key(|(_, kept)| kept.last_used)
-            .map(|(path, _)| path.clone())
-        else {
-            break;
-        };
-        kept.by_path.remove(&oldest);
     }
+}
+
+fn keep(path: PathBuf, archive: Kept) {
+    kept_archives().insert(path, archive, MAX_KEPT, MAX_KEPT_COUNT);
+}
+
+/// Drops the kept archive at `path`, as eviction would.
+#[cfg(test)]
+pub(crate) fn forget_kept(path: &Path) {
+    kept_archives().by_path.remove(path);
 }
 
 /// The kept archive at `inner` in `parent`, if it was opened from the same
@@ -691,14 +706,16 @@ pub(crate) mod tests {
     }
 
     /// Lists `path`, opening the archives it needs first, as the explorer does.
+    /// What was opened may be evicted before the listing, so it is opened
+    /// again then.
     fn list_opened(path: &Path) -> Vec<Entry> {
-        match files::list(path) {
-            Err(err) if prepare_required(&err).is_some() => {
-                open(path);
-                files::list(path).unwrap()
+        for _ in 0..MAX_ATTEMPTS {
+            match files::list(path) {
+                Err(err) if prepare_required(&err).is_some() => open(path),
+                result => return result.unwrap(),
             }
-            result => result.unwrap(),
         }
+        panic!("{} could not be listed", path.display());
     }
 
     fn identified(path: &Path) -> Identified {
@@ -1159,5 +1176,59 @@ pub(crate) mod tests {
         let err = prepare(&big, &Progress::default(), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Interrupted);
         assert!(prepare_required(&files::list(&big).unwrap_err()).is_some());
+    }
+
+    fn kept_entry(decompressed: u64) -> Kept {
+        Kept {
+            stamp: (0, None),
+            format: Format::Zip,
+            source: Source::from_file(tempfile::tempfile().unwrap()).unwrap(),
+            decompressed,
+            caveat: None,
+            dependencies: Vec::new(),
+            last_used: 0,
+        }
+    }
+
+    fn kept_paths(kept: &KeptArchives) -> Vec<String> {
+        let mut paths: Vec<String> = kept
+            .by_path
+            .keys()
+            .map(|path| path.display().to_string())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn kept_archives_drop_the_least_recently_used() {
+        let mut kept = KeptArchives::default();
+        for name in ["a", "b", "c"] {
+            kept.insert(PathBuf::from(name), kept_entry(0), u64::MAX, 2);
+        }
+        assert_eq!(kept_paths(&kept), ["b", "c"]);
+        // Using an archive makes it recent, as `kept` does.
+        kept.clock += 1;
+        kept.by_path.get_mut(Path::new("b")).unwrap().last_used = kept.clock;
+        kept.insert(PathBuf::from("d"), kept_entry(0), u64::MAX, 2);
+        assert_eq!(kept_paths(&kept), ["b", "d"]);
+        // A replaced archive is not counted twice.
+        kept.insert(PathBuf::from("d"), kept_entry(0), u64::MAX, 2);
+        assert_eq!(kept_paths(&kept), ["b", "d"]);
+    }
+
+    #[test]
+    fn kept_archives_are_limited_by_size() {
+        let mut kept = KeptArchives::default();
+        kept.insert(PathBuf::from("view"), kept_entry(0), 100, 10);
+        kept.insert(PathBuf::from("a"), kept_entry(60), 100, 10);
+        kept.insert(PathBuf::from("b"), kept_entry(30), 100, 10);
+        assert_eq!(kept_paths(&kept), ["a", "b", "view"]);
+        kept.insert(PathBuf::from("c"), kept_entry(30), 100, 10);
+        // The oldest go first, the view too, until the temporary files fit.
+        assert_eq!(kept_paths(&kept), ["b", "c"]);
+        // An archive larger than the limit is kept alone.
+        kept.insert(PathBuf::from("huge"), kept_entry(500), 100, 10);
+        assert_eq!(kept_paths(&kept), ["huge"]);
     }
 }
