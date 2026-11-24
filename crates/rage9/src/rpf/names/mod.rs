@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use super::metadata::{Error, Metadata};
+use super::metadata::{Entry, Error, Metadata};
 
 /// The type ID of nested archives, extension `rpf`.
 pub const RPF_TYPE: u8 = 0;
@@ -347,6 +347,13 @@ pub struct Matches {
     pub candidates: Vec<Result<CandidateMatch, Unresolved>>,
 }
 
+impl Matches {
+    /// The match result of the entry in row `row`.
+    pub fn row(&self, row: u32) -> Option<&Row> {
+        self.rows.iter().find(|r| r.index == row)
+    }
+}
+
 /// Matches candidates against the rows of decoded metadata. `prefix` is the
 /// effective prefix of the archive. Rows are searched exhaustively, without
 /// the engine's sorted lookup.
@@ -356,18 +363,39 @@ pub fn match_candidates(
     types: &Types,
     candidates: &[Candidate],
 ) -> Result<Matches, Error> {
-    let mut rows = Vec::with_capacity(metadata.rows() as usize);
-    let mut index: HashMap<(Key, u8), Vec<u32>> = HashMap::new();
-    for row in 0..metadata.rows() {
-        let type_id = metadata.location(row)?.type_id;
-        let name_hash = metadata.name_hash(row)?;
-        let name_key = metadata.name_key(row)?;
+    let entries: Vec<Entry> = metadata.entries().collect();
+    match_entries(&entries, prefix, types, candidates)
+}
+
+/// [`match_candidates`] over entries that were already read. Every entry
+/// needs a location record and well-formed name fields.
+pub fn match_entries(
+    entries: &[Entry],
+    prefix: &MountPrefix,
+    types: &Types,
+    candidates: &[Candidate],
+) -> Result<Matches, Error> {
+    let mut rows = Vec::with_capacity(entries.len());
+    let mut index: HashMap<(Key, u8), Vec<usize>> = HashMap::new();
+    for (position, entry) in entries.iter().enumerate() {
+        let type_id = match &entry.location {
+            Ok(Some(location)) => location.type_id,
+            Ok(None) => {
+                return Err(Error::Invalid(format!(
+                    "row {} has no location record",
+                    entry.row
+                )));
+            }
+            Err(reason) => return Err(Error::Invalid(reason.clone())),
+        };
+        let name_hash = entry.name_hash.clone().map_err(Error::Invalid)?;
+        let name_key = entry.name_key.clone().map_err(Error::Invalid)?;
         let keys = [name_hash.map(Key::Hash64), name_key.map(Key::Key32)];
         for key in keys.into_iter().flatten() {
-            index.entry((key, type_id)).or_default().push(row);
+            index.entry((key, type_id)).or_default().push(position);
         }
         rows.push(Row {
-            index: row,
+            index: entry.row,
             type_id,
             name_hash,
             name_key,
@@ -380,24 +408,27 @@ pub fn match_candidates(
     let results = candidates
         .iter()
         .enumerate()
-        .map(|(position, candidate)| {
+        .map(|(number, candidate)| {
             let address = types.resolve(prefix, candidate)?;
             let matched = index
                 .get(&(address.key, address.type_id))
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default();
             let folded: Vec<u8> = address.stem.iter().copied().map(fold).collect();
-            for &row in &matched {
-                let row = row as usize;
-                rows[row].candidates.push(position);
-                match &first_stem[row] {
-                    Some(stem) => rows[row].ambiguous |= *stem != folded,
-                    None => first_stem[row] = Some(folded.clone()),
+            for &position in matched {
+                let row = &mut rows[position];
+                row.candidates.push(number);
+                match &first_stem[position] {
+                    Some(stem) => row.ambiguous |= *stem != folded,
+                    None => first_stem[position] = Some(folded.clone()),
                 }
             }
             Ok(CandidateMatch {
                 address,
-                rows: matched,
+                rows: matched
+                    .iter()
+                    .map(|&position| rows[position].index)
+                    .collect(),
             })
         })
         .collect();

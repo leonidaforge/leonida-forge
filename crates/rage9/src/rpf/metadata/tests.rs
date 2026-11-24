@@ -1233,3 +1233,354 @@ mod embedded {
         );
     }
 }
+
+mod pipeline {
+    //! Source, header, decoded metadata, entries, names and raw payloads,
+    //! on one synthetic archive.
+
+    use std::io::Write;
+
+    use lforge_binary::Source;
+
+    use super::*;
+    use crate::rpf::names::{
+        self, Candidate, Class, MountPrefix, RPF_TYPE, Types, Unresolved, hash64, joaat,
+    };
+
+    const PAYLOADS: usize = 0x1000;
+    const TEXTURE: u8 = 7;
+
+    struct Spec {
+        layout: RecordLayout,
+        payload: Vec<u8>,
+        type_id: u8,
+        mode: u8,
+        hash: Option<u64>,
+        key: Option<u32>,
+        source: Option<u32>,
+        chunks: bool,
+        transform: bool,
+        /// Overrides the logical size.
+        logical: Option<u64>,
+        /// Moves the payload offset this many 16-byte units further.
+        shift: u32,
+    }
+
+    fn spec(layout: RecordLayout, payload: Vec<u8>, type_id: u8) -> Spec {
+        Spec {
+            layout,
+            payload,
+            type_id,
+            mode: 0,
+            hash: None,
+            key: None,
+            source: None,
+            chunks: false,
+            transform: false,
+            logical: None,
+            shift: 0,
+        }
+    }
+
+    /// One column with a value for each row where `value` gives one.
+    fn column(key: u64, width: u16, values: Vec<Option<Vec<u8>>>) -> Column {
+        let elements: Vec<Vec<u8>> = values
+            .iter()
+            .map(|v| v.clone().unwrap_or_else(|| vec![0; usize::from(width)]))
+            .collect();
+        let elements: Vec<&[u8]> = elements.iter().map(Vec::as_slice).collect();
+        let cells: Vec<Option<u32>> = values
+            .iter()
+            .enumerate()
+            .map(|(n, v)| v.as_ref().map(|_| n as u32))
+            .collect();
+        Column::new(key, width, &elements, &cells)
+    }
+
+    fn archive(specs: &[Spec]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut records: Vec<(RecordLayout, Vec<u8>)> = Vec::new();
+        for spec in specs {
+            let offset16 = ((PAYLOADS + data.len()) / 16) as u32 + spec.shift;
+            let stored16 = spec.payload.len().div_ceil(16) as u32;
+            let logical = spec.logical.unwrap_or(spec.payload.len() as u64);
+            let (t, m) = (spec.type_id, spec.mode);
+            let record = match spec.layout {
+                RecordLayout::A => record_a(stored16, offset16, logical, t, m),
+                RecordLayout::F => record_f(offset16.into(), stored16.into(), logical, t, m),
+                RecordLayout::R => {
+                    assert_eq!(logical % 16, 0);
+                    record_r([logical as u32, 0, stored16, offset16], t, m)
+                }
+            };
+            records.push((spec.layout, record));
+            data.extend_from_slice(&spec.payload);
+            data.resize(data.len().next_multiple_of(16), 0);
+        }
+        let location = |layout: RecordLayout| {
+            records
+                .iter()
+                .map(|(l, record)| (*l == layout).then(|| record.clone()))
+                .collect::<Vec<_>>()
+        };
+        let each =
+            |value: &dyn Fn(&Spec) -> Option<Vec<u8>>| specs.iter().map(value).collect::<Vec<_>>();
+        let chunk = chunk_value(8, 1, 3, &[0x0100 | (0x2345 << 16)]);
+        let mut bytes = Build::default().build(&[
+            column(keys::LOCATION_R, 20, location(RecordLayout::R)),
+            column(keys::LOCATION_F, 24, location(RecordLayout::F)),
+            column(keys::LOCATION_A, 16, location(RecordLayout::A)),
+            column(
+                keys::NAME_HASH,
+                8,
+                each(&|s| s.hash.map(|h| h.to_le_bytes().to_vec())),
+            ),
+            column(
+                keys::NAME_KEY,
+                4,
+                each(&|s| s.key.map(|k| k.to_le_bytes().to_vec())),
+            ),
+            column(
+                keys::READ_SOURCE,
+                4,
+                each(&|s| s.source.map(|i| i.to_le_bytes().to_vec())),
+            ),
+            column(
+                keys::PAYLOAD_TRANSFORM,
+                1,
+                each(&|s| s.transform.then(|| vec![1])),
+            ),
+            column(
+                keys::CHUNK_TABLE,
+                chunk.len() as u16,
+                each(&|s| s.chunks.then(|| chunk.clone())),
+            ),
+        ]);
+        assert!(bytes.len() <= PAYLOADS);
+        bytes.resize(PAYLOADS, 0);
+        bytes.extend_from_slice(&data);
+        bytes
+    }
+
+    fn file(bytes: &[u8]) -> Source {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        Source::from_file(file).unwrap()
+    }
+
+    fn nested() -> Vec<u8> {
+        Build::default().build(&[Column::new(KEY_X, 4, &[&[9, 8, 7, 6]], &[Some(0)])])
+    }
+
+    fn specs() -> Vec<Spec> {
+        let raw = |layout, payload: &[u8], type_id| spec(layout, payload.to_vec(), type_id);
+        let dup = hash64(b"dup");
+        vec![
+            // 0: a nested archive.
+            Spec {
+                hash: Some(hash64(b"Packs/Inner")),
+                ..raw(RecordLayout::A, &nested(), RPF_TYPE)
+            },
+            // 1: a 32-bit-class entry in an R record.
+            Spec {
+                key: Some(joaat(b"textures/sky")),
+                ..raw(RecordLayout::R, &[0x5A; 32], TEXTURE)
+            },
+            // 2: compressed, in an F record.
+            Spec {
+                mode: 1,
+                hash: Some(hash64(b"packed")),
+                ..raw(RecordLayout::F, b"not really zlib", RPF_TYPE)
+            },
+            // 3: chunked.
+            Spec {
+                chunks: true,
+                ..raw(RecordLayout::A, &[1; 16], RPF_TYPE)
+            },
+            // 4: behind the payload transform.
+            Spec {
+                transform: true,
+                ..raw(RecordLayout::A, &[2; 16], RPF_TYPE)
+            },
+            // 5: read through alternate source 2.
+            Spec {
+                source: Some(2),
+                ..raw(RecordLayout::A, &[3; 16], RPF_TYPE)
+            },
+            // 6 and 7: the same name hash and type.
+            Spec {
+                hash: Some(dup),
+                ..raw(RecordLayout::A, &[4; 16], RPF_TYPE)
+            },
+            Spec {
+                hash: Some(dup),
+                ..raw(RecordLayout::F, &[5; 16], RPF_TYPE)
+            },
+            // 8: a logical size above the stored size.
+            Spec {
+                logical: Some(17),
+                ..raw(RecordLayout::A, &[6; 16], RPF_TYPE)
+            },
+            // 9: a payload offset past the end of the archive.
+            Spec {
+                shift: 0x10_0000,
+                ..raw(RecordLayout::A, &[7; 16], RPF_TYPE)
+            },
+        ]
+    }
+
+    const ARCHIVE_PATH: &[u8] = b"dev:/synthetic/Packs/sample.rpf";
+
+    #[test]
+    fn reads_entries_names_and_raw_payloads() {
+        let archive = archive(&specs());
+        let mut bytes = vec![0xEE; 0x70];
+        bytes.extend_from_slice(&archive);
+        let file = file(&bytes);
+        let view = file.slice(0x70, archive.len() as u64).unwrap();
+        drop(file);
+
+        let header = crate::rpf::read_header(&mut view.clone()).unwrap();
+        let stored = Stored::read(&mut view.clone(), 1 << 20).unwrap();
+        assert_eq!(header.toc_end(), u64::from(stored.prefix().metadata_len));
+        assert!(stored.processing().is_none());
+        let metadata = stored.decode().unwrap();
+        let entries: Vec<Entry> = metadata.entries().collect();
+        assert_eq!(entries.len(), 10);
+        assert_eq!(metadata.entry(3).unwrap(), entries[3]);
+        invalid_reason(metadata.entry(10));
+
+        // Fields, as stored.
+        let location = |n: usize| entries[n].location.clone().unwrap().unwrap();
+        assert_eq!(location(0).layout, RecordLayout::A);
+        assert_eq!(location(1).layout, RecordLayout::R);
+        assert_eq!(location(2).layout, RecordLayout::F);
+        assert_eq!(location(0).payload_offset, PAYLOADS as u64);
+        assert_eq!(location(0).logical_len, nested().len() as u64);
+        assert_eq!(location(1).stored_len, 32);
+        assert_eq!((location(2).mode, entries[2].type_id()), (1, Some(0)));
+        assert_eq!(entries[1].type_id(), Some(TEXTURE));
+        assert_eq!(entries[1].name_hash, Ok(None));
+        assert_eq!(entries[1].name_key, Ok(Some(joaat(b"textures/sky"))));
+        assert_eq!(entries[3].chunks.clone().unwrap().unwrap().encoding, 3);
+        assert_eq!(entries[4].payload_transform, Ok(true));
+        assert_eq!(entries[5].read_source, Ok(Some(2)));
+        assert_eq!(entries[0].read_source, Ok(None));
+
+        // Names.
+        let mut types = Types::default();
+        types.insert_extension(b"ytd", TEXTURE);
+        types.insert_class(TEXTURE, Class::Key32);
+        let candidates = [
+            Candidate::Path(b"dev:/synthetic/Packs/packs/inner.rpf"),
+            Candidate::Path(b"dev:/synthetic/Packs/textures/sky.ytd"),
+            Candidate::Path(b"dev:/synthetic/Packs/missing.rpf"),
+            Candidate::Path(b"dev:/synthetic/Packs/model.ydr"),
+            Candidate::Path(b"dev:/synthetic/Packs/dup.rpf"),
+            Candidate::Path(b"dev:/synthetic/Packs/PACKS\\INNER.rpf"),
+        ];
+        let prefix = MountPrefix::from_archive_path(ARCHIVE_PATH).unwrap();
+        let matches = names::match_entries(&entries, &prefix, &types, &candidates).unwrap();
+        assert_eq!(matches.row(0).unwrap().candidates, [0, 5]);
+        assert!(!matches.row(0).unwrap().ambiguous);
+        assert_eq!(matches.row(1).unwrap().candidates, [1]);
+        assert!(matches.row(3).unwrap().candidates.is_empty());
+        let rows = |n: usize| matches.candidates[n].as_ref().unwrap().rows.clone();
+        assert!(rows(2).is_empty());
+        assert_eq!(rows(4), [6, 7]);
+        assert_eq!(
+            matches.candidates[3],
+            Err(Unresolved::UnknownExtension(b"ydr".to_vec()))
+        );
+        // The same result straight from the metadata.
+        let direct = names::match_candidates(&metadata, &prefix, &types, &candidates).unwrap();
+        assert_eq!(direct, matches);
+
+        // Raw payloads.
+        let mut inner = entries[0].raw_source(&view, &[]).unwrap();
+        let inner = Stored::read(&mut inner, 1 << 20).unwrap().decode().unwrap();
+        assert_eq!(inner.field(0, KEY_X).unwrap(), Some(&[9, 8, 7, 6][..]));
+        let mut sky = entries[1].raw_source(&view, &[]).unwrap();
+        assert_eq!(lforge_binary::read_at(&mut sky, 0, 64).unwrap(), [0x5A; 32]);
+        for (row, expected) in [
+            (2, "compressed"),
+            (3, "in chunks"),
+            (4, "behind the payload transform"),
+        ] {
+            match entries[row].raw_source(&view, &[]) {
+                Err(Error::Encoded { encoding, .. }) => assert_eq!(encoding, expected),
+                other => panic!("row {row}: {other:?}"),
+            }
+        }
+        for alternates in [&[][..], &[view.clone(), view.clone()]] {
+            assert!(matches!(
+                entries[5].raw_source(&view, alternates),
+                Err(Error::ReadSource { row: 5, index: 2 })
+            ));
+        }
+        let alternates = [view.clone(), view.clone(), view.clone()];
+        let mut third = entries[5].raw_source(&view, &alternates).unwrap();
+        assert_eq!(lforge_binary::read_at(&mut third, 0, 64).unwrap(), [3; 16]);
+        assert!(invalid_reason(entries[8].raw_range()).contains("exceeds its stored size"));
+        assert!(entries[9].raw_range().is_ok());
+        let reason = invalid_reason(entries[9].raw_source(&view, &[]));
+        assert!(reason.contains("after the end of the archive"), "{reason}");
+    }
+
+    #[test]
+    fn distinguishes_missing_and_malformed_fields() {
+        // A name hash column too narrow for a u64, and a row without any
+        // location record.
+        let columns = [
+            Column::new(keys::NAME_HASH, 4, &[&[1, 2, 3, 4]], &[Some(0), None]),
+            Column::new(
+                keys::LOCATION_A,
+                16,
+                &[&record_a(1, 0x100, 16, 0, 0)],
+                &[Some(0), None],
+            ),
+        ];
+        let metadata = Build::default().metadata(&columns);
+        let entries: Vec<Entry> = metadata.entries().collect();
+        assert!(entries[0].name_hash.is_err());
+        assert!(entries[0].location.as_ref().unwrap().is_some());
+        assert_eq!(entries[1].name_hash, Ok(None));
+        assert_eq!(entries[1].location, Ok(None));
+        assert_eq!(entries[1].type_id(), None);
+        assert!(invalid_reason(entries[1].raw_range()).contains("no location record"));
+        // Name matching needs every row to be well formed.
+        invalid_reason(names::match_entries(
+            &entries,
+            &MountPrefix::EMPTY,
+            &Types::default(),
+            &[],
+        ));
+    }
+
+    #[test]
+    fn processed_metadata_yields_no_entries() {
+        let mut bytes = archive(&specs());
+        bytes[0x2E] = 9;
+        let stored = Stored::read(&mut file(&bytes), 1 << 20).unwrap();
+        assert!(!stored.processing().is_none());
+        assert!(matches!(
+            stored.clone().decode(),
+            Err(Error::Transformed(_))
+        ));
+        // Without a cipher source there is nothing to run the passes with.
+        struct NoCiphers;
+        impl transform::CipherSource for NoCiphers {
+            type Block = transform::tests::Toy;
+            fn static_descriptor(&self, _: u8) -> Option<(u32, transform::Block)> {
+                None
+            }
+            fn cbc_block(&self, _: u32) -> Option<Self::Block> {
+                None
+            }
+        }
+        assert!(matches!(
+            stored.transform(&NoCiphers),
+            Err(Error::Cipher(transform::Error::NoStaticDescriptor(4)))
+        ));
+    }
+}

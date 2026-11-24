@@ -18,8 +18,10 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use super::{HEADER_LEN, MAGIC};
+pub use entry::{Entry, Field};
 use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 
+mod entry;
 pub mod transform;
 
 /// Field keys whose meaning is established.
@@ -924,13 +926,20 @@ impl Metadata {
     }
 
     /// The location record of the first layout present, in the order R, F, A.
-    pub fn location(&self, row: u32) -> Result<Location, Error> {
+    /// `None` if the row has none.
+    pub fn location_record(&self, row: u32) -> Result<Option<Location>, Error> {
         for layout in RecordLayout::PRIORITY {
             if let Some(value) = self.field(row, layout.key())? {
-                return Location::parse(layout, value);
+                return Location::parse(layout, value).map(Some);
             }
         }
-        Err(invalid(format!("row {row} has no location record")))
+        Ok(None)
+    }
+
+    /// Like [`Metadata::location_record`], but a row without one is an error.
+    pub fn location(&self, row: u32) -> Result<Location, Error> {
+        self.location_record(row)?
+            .ok_or_else(|| invalid(format!("row {row} has no location record")))
     }
 
     pub fn payload_transform(&self, row: u32) -> Result<bool, Error> {
@@ -950,64 +959,32 @@ impl Metadata {
         Ok(index.filter(|&index| index != u32::MAX))
     }
 
-    /// The archive-relative range of an entry stored as it is: from its
-    /// payload offset, its logical size, as the engine reads a nested archive.
-    /// Fails with [`Error::Encoded`] for an entry that is compressed, chunked
-    /// or behind the payload transform. The range is not checked against a
-    /// source; [`Metadata::raw_source`] does that.
-    pub fn raw_range(&self, row: u32) -> Result<Range<u64>, Error> {
-        let location = self.location(row)?;
-        let encoding = if location.is_compressed() {
-            Some("compressed")
-        } else if self.chunk_table(row)?.is_some() {
-            Some("in chunks")
-        } else if self.payload_transform(row)? {
-            Some("behind the payload transform")
-        } else {
-            None
-        };
-        if let Some(encoding) = encoding {
-            return Err(Error::Encoded { row, encoding });
+    /// The fields of one row. Fails only for a row past the end.
+    pub fn entry(&self, row: u32) -> Result<Entry, Error> {
+        if row >= self.prefix.rows {
+            return Err(invalid(format!("row {row} of {}", self.prefix.rows)));
         }
-        if location.logical_len > location.stored_len {
-            return Err(invalid(format!(
-                "entry {row} is stored as it is, but its logical size {:#x} exceeds its stored size {:#x}",
-                location.logical_len, location.stored_len
-            )));
-        }
-        let start = location.payload_offset;
-        let end = start
-            .checked_add(location.logical_len)
-            .ok_or_else(|| invalid(format!("the range of entry {row} overflows")))?;
-        Ok(start..end)
+        Ok(Entry::read(self, row))
     }
 
-    /// The bytes of an entry stored as it is, as a view of the source it is
-    /// read through: `main`, or `alternates[i]` for read source `i`. The
-    /// range is the same in every source. An alternate that is not supplied
-    /// fails with [`Error::ReadSource`] rather than falling back to `main`.
+    /// Every row, in row order.
+    pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        (0..self.prefix.rows).map(|row| Entry::read(self, row))
+    }
+
+    /// See [`Entry::raw_range`].
+    pub fn raw_range(&self, row: u32) -> Result<Range<u64>, Error> {
+        self.entry(row)?.raw_range()
+    }
+
+    /// See [`Entry::raw_source`].
     pub fn raw_source(
         &self,
         row: u32,
         main: &lforge_binary::Source,
         alternates: &[lforge_binary::Source],
     ) -> Result<lforge_binary::Source, Error> {
-        let range = self.raw_range(row)?;
-        let source = match self.read_source(row)? {
-            None => main,
-            Some(index) => usize::try_from(index)
-                .ok()
-                .and_then(|i| alternates.get(i))
-                .ok_or(Error::ReadSource { row, index })?,
-        };
-        if range.end > source.len() {
-            return Err(invalid(format!(
-                "entry {row} ends at {:#x}, after the end of the archive ({:#x})",
-                range.end,
-                source.len()
-            )));
-        }
-        Ok(source.slice(range.start, range.end - range.start)?)
+        self.entry(row)?.raw_source(main, alternates)
     }
 
     /// The chunk table. Its entries are addressed relative to the value and
