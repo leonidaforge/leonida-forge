@@ -87,6 +87,17 @@ lforge archive resource data.rpf 0x2010 --json # pages and checks of one resourc
 
 `--no-cache` neither reads nor writes the index cache.
 
+`lforge archive recover` exports one recovered entry at a time, for archives whose native table of contents cannot be decrypted.
+
+```sh
+lforge archive recover data.rpf --list --json             # the recovery candidates
+lforge archive recover data.rpf --id 0x0000000080 --output file.bin
+```
+
+A candidate is one recovered entry, identified by the archive offset of its first stream. The scan produces the same offset again for unchanged data, so the id is stable across scans. `--list` reports each candidate's observed properties, the offset, byte range, zlib compression, compressed and decoded sizes, and whether the bytes start with a known file signature, apart from its inferred ones, the content kind and the completeness status. Candidates are not native entries. They have no original names or paths, and the list is not a complete archive inventory.
+
+`recover --id ID --output FILE` re-decodes one candidate and writes its bytes with the same output safety as `archive extract`. The streams are checked against the index as they are read, the output goes through a temporary file and replaces an existing file only with `--overwrite`, and a failed decode leaves no partial file. A partial or unverified candidate is written with a note that bytes may be missing. A decode that succeeds is not proof that the bytes are an authentic original file.
+
 Where the table of contents is stored without encryption, it can be read directly instead of scanned.
 
 ```sh

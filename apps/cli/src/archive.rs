@@ -6,13 +6,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use clap::Subcommand;
+use clap::{ArgGroup, Subcommand};
 use lforge_rage9::Status;
 use lforge_rage9::resource::Segment;
 use lforge_rage9::rpf::{self, Index, Origin, Progress, Resource};
 use serde_json::{Value, json};
 
-use crate::{extract, metadata};
+use crate::{extract, metadata, recover};
 
 /// How the contents of an RPF9 archive are obtained, for users who expect a
 /// file listing.
@@ -99,6 +99,33 @@ pub enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// List scan-recovery candidates, or export one of them. These are entries
+    /// recovered from the data area, not native table-of-contents entries
+    #[command(group(
+        ArgGroup::new("recover_mode").required(true).args(["list", "id"])
+    ))]
+    Recover {
+        file: PathBuf,
+        /// List the recovery candidates
+        #[arg(long, conflicts_with_all = ["output", "overwrite"])]
+        list: bool,
+        /// Export the candidate with this id, its archive offset as
+        /// `recover --list` reports it
+        #[arg(long, value_parser = lforge_binary::parse_offset, requires = "output")]
+        id: Option<u64>,
+        /// Where to write the exported candidate
+        #[arg(long, requires = "id")]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long, requires = "id")]
+        overwrite: bool,
+        /// Neither read nor write the index cache
+        #[arg(long)]
+        no_cache: bool,
+        /// Print the candidate list as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(command: Command) -> Result<(), String> {
@@ -146,17 +173,34 @@ pub fn run(command: Command) -> Result<(), String> {
             output,
             overwrite,
         } => extract::run(&file, row, &output, overwrite),
+        Command::Recover {
+            file,
+            list,
+            id,
+            output,
+            overwrite,
+            no_cache,
+            json,
+        } => recover::run(recover::Options {
+            file,
+            list,
+            id,
+            output,
+            overwrite,
+            no_cache,
+            json,
+        }),
     }
 }
 
 /// The stable identifier of an entry, page or region: its archive offset.
-fn id(offset: u64) -> String {
+pub(crate) fn id(offset: u64) -> String {
     format!("0x{offset:010X}")
 }
 
 /// Loads the cached index or scans the archive, showing progress on a
 /// terminal. Ctrl+C ends a scan without writing a cache file.
-fn index(path: &Path, no_cache: bool) -> Result<(Index, Origin), String> {
+pub(crate) fn index(path: &Path, no_cache: bool) -> Result<(Index, Origin), String> {
     let mut source = lforge_binary::Source::open(path)
         .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -570,7 +614,7 @@ fn resource(path: &Path, offset: u64, no_cache: bool, json: bool) -> Result<(), 
 }
 
 /// Piping into `head` closes stdout early; that is not a failure.
-fn ignore_broken_pipe(err: io::Error) -> io::Result<()> {
+pub(crate) fn ignore_broken_pipe(err: io::Error) -> io::Result<()> {
     if err.kind() == io::ErrorKind::BrokenPipe {
         Ok(())
     } else {

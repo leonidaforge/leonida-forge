@@ -3,6 +3,8 @@ mod binary;
 mod extract;
 mod metadata;
 mod native;
+mod output;
+mod recover;
 
 use std::process::ExitCode;
 
