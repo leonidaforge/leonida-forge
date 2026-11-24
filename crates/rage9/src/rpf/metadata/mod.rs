@@ -30,6 +30,8 @@ pub mod keys {
     pub const LOCATION_A: u64 = 0x4EAA_16DD_8299_95BC;
     pub const CHUNK_TABLE: u64 = 0xE0C1_2D7A_5D48_84C5;
     pub const PAYLOAD_TRANSFORM: u64 = 0x2860_30A3_58A7_89FB;
+    /// The 32-bit key of rows whose type uses the 32-bit class.
+    pub const NAME_KEY: u64 = 0xB707_6B62_45D3_5FB5;
 }
 
 pub const DESCRIPTOR_LEN: usize = 24;
@@ -890,6 +892,12 @@ impl Metadata {
     pub fn name_hash(&self, row: u32) -> Result<Option<u64>, Error> {
         self.field(row, keys::NAME_HASH)?
             .map(|value| u64_at(value, 0).ok_or_else(|| invalid("name hash shorter than 8 bytes")))
+            .transpose()
+    }
+
+    pub fn name_key(&self, row: u32) -> Result<Option<u32>, Error> {
+        self.field(row, keys::NAME_KEY)?
+            .map(|value| u32_at(value, 0).ok_or_else(|| invalid("name key shorter than 4 bytes")))
             .transpose()
     }
 
