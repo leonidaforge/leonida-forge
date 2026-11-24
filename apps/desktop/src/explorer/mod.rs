@@ -124,6 +124,52 @@ enum ExportState {
     Failed(String),
 }
 
+/// The single export slot. A save dialog holds it while it is open, so a
+/// second request can neither open another dialog nor start an export. The
+/// generation identifies the request whose dialog is open.
+#[derive(Default)]
+struct ExportRequests {
+    next_generation: u64,
+    pending: Option<u64>,
+}
+
+impl ExportRequests {
+    /// Takes the slot for a save dialog, or refuses when an export is running
+    /// or another dialog is still open.
+    fn begin(&mut self, current: Option<&ExportState>) -> Option<u64> {
+        if self.pending.is_some() || !can_start_export(current) {
+            return None;
+        }
+        self.next_generation += 1;
+        self.pending = Some(self.next_generation);
+        Some(self.next_generation)
+    }
+
+    /// Whether a new export is blocked, either by a running export or by an
+    /// open save dialog.
+    fn busy(&self, current: Option<&ExportState>) -> bool {
+        self.pending.is_some() || !can_start_export(current)
+    }
+
+    /// Releases the slot for the dialog of `generation` and says whether its
+    /// export may start. A late result for a cancelled or replaced request
+    /// starts nothing, so no destination is written for it.
+    fn finish(&mut self, generation: u64, current: Option<&ExportState>) -> bool {
+        if self.pending != Some(generation) {
+            return false;
+        }
+        self.pending = None;
+        can_start_export(current)
+    }
+
+    /// Releases the slot when a dialog returns without a destination.
+    fn cancel(&mut self, generation: u64) {
+        if self.pending == Some(generation) {
+            self.pending = None;
+        }
+    }
+}
+
 /// What to show when an export ends. Separated from the UI so the decision is
 /// testable.
 enum ExportOutcome {
@@ -164,7 +210,7 @@ pub struct Explorer {
     open_menu: Option<Menu>,
     resizing: Option<Divider>,
     export: Option<Export>,
-    export_generation: u64,
+    export_requests: ExportRequests,
     thumbnail: Option<Thumbnail>,
     shell: Option<ShellWorker>,
     /// Keyed by lowercase extension. `None` while loading, or when Windows
@@ -205,7 +251,7 @@ impl Explorer {
             open_menu: None,
             resizing: None,
             export: None,
-            export_generation: 0,
+            export_requests: ExportRequests::default(),
             thumbnail: None,
             shell: ShellWorker::start()
                 .inspect_err(|err| log::error!("failed to start shell thread: {err}"))
@@ -808,52 +854,83 @@ impl Explorer {
         }
     }
 
-    /// Whether an export is running. Only one runs at a time, so the Save As
-    /// actions are disabled while one is in progress (see [`can_start_export`]).
+    /// Whether an export is running or its save dialog is open. Only one
+    /// runs at a time, so the Save As actions are disabled while either is
+    /// pending (see [`ExportRequests`]).
     fn exporting(&self) -> bool {
-        !can_start_export(self.export.as_ref().map(|export| &export.state))
+        self.export_requests
+            .busy(self.export.as_ref().map(|export| &export.state))
     }
 
     /// Asks where to save `entry`, then exports it in the background. Only
     /// regular files are exportable; directories and archives open as folders.
-    /// Refuses to start while another export is running, so a second Save As
-    /// never takes over or cancels an export already in progress.
+    /// The request takes the single export slot before the dialog opens, so a
+    /// second Save As is refused while a dialog or an export is pending.
     fn start_export(&mut self, entry: &Entry, cx: &mut Context<Self>) {
-        if entry.kind != EntryKind::File || self.exporting() {
+        if entry.kind != EntryKind::File {
             return;
         }
+        let current = self.export.as_ref().map(|export| &export.state);
+        let Some(generation) = self.export_requests.begin(current) else {
+            return;
+        };
         let source = entry.path.clone();
         let label = entry.name.clone();
         let caveat = export_caveat(entry);
         let dir = initial_export_dir(&source);
+        // Generated names for recovered and native RPF9 entries; a ZIP entry's
+        // own name otherwise. Only a suggestion: the dialog returns the
+        // destination, and no entry name is joined to a path.
         let prompt = cx.prompt_for_new_path(&dir, Some(entry.name.as_str()));
         cx.spawn(async move |this, cx| {
             let dest = match prompt.await {
                 Ok(Ok(Some(dest))) => dest,
-                Ok(Ok(None)) | Err(_) => return,
+                Ok(Ok(None)) | Err(_) => {
+                    this.update(cx, |this, cx| {
+                        this.export_requests.cancel(generation);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
                 Ok(Err(err)) => {
                     log::error!("save dialog failed: {err:#}");
+                    this.update(cx, |this, cx| {
+                        this.export_requests.cancel(generation);
+                        cx.notify();
+                    })
+                    .ok();
                     return;
                 }
             };
             this.update(cx, |this, cx| {
-                this.run_export(source, label, caveat, dest, cx)
+                this.run_export(generation, source, label, caveat, dest, cx)
             })
             .ok();
         })
         .detach();
     }
 
+    /// Starts the export for the dialog request `generation`. Rechecks the
+    /// invariant at the actual start, so a request that lost the slot while
+    /// its dialog was delayed cannot replace the running export or write its
+    /// destination.
     fn run_export(
         &mut self,
+        generation: u64,
         source: PathBuf,
         label: String,
         caveat: Option<String>,
         dest: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        self.export_generation += 1;
-        let generation = self.export_generation;
+        let current = self.export.as_ref().map(|export| &export.state);
+        if !self.export_requests.finish(generation, current) {
+            log::warn!(
+                "an export request lost its slot before it started; its destination was not written"
+            );
+            return;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let task = cx.spawn({
             let cancel = cancel.clone();
@@ -1481,6 +1558,55 @@ mod export_tests {
         assert!(can_start_export(Some(&ExportState::Failed("error".into()))));
         // A running export owns the single slot until it finishes.
         assert!(!can_start_export(Some(&ExportState::Running)));
+    }
+
+    #[test]
+    fn overlapping_save_dialogs_share_one_slot() {
+        let mut requests = ExportRequests::default();
+        let first = requests.begin(None).unwrap();
+        // The first dialog still holds the slot, so a second request is
+        // refused and never opens a second dialog.
+        assert!(requests.busy(None));
+        assert!(requests.begin(None).is_none());
+        assert!(
+            requests
+                .begin(Some(&ExportState::Done("saved".into())))
+                .is_none()
+        );
+
+        // When the first dialog returns, only its export may start.
+        assert!(requests.finish(first, None));
+        assert!(!requests.busy(None));
+        // Its export now runs, and blocks a new request.
+        assert!(requests.begin(Some(&ExportState::Running)).is_none());
+    }
+
+    #[test]
+    fn a_delayed_or_cancelled_dialog_never_writes_its_destination() {
+        let mut requests = ExportRequests::default();
+        let cancelled = requests.begin(None).unwrap();
+        requests.cancel(cancelled);
+        assert!(!requests.busy(None));
+        // A result arriving after the dialog was cancelled starts nothing.
+        assert!(!requests.finish(cancelled, None));
+
+        // A later request owns the slot; the old result cannot take it.
+        let current = requests.begin(None).unwrap();
+        assert_ne!(cancelled, current);
+        assert!(!requests.finish(cancelled, None));
+        assert!(requests.pending == Some(current));
+        assert!(requests.finish(current, None));
+    }
+
+    #[test]
+    fn a_delayed_dialog_cannot_replace_a_running_export() {
+        let mut requests = ExportRequests::default();
+        let delayed = requests.begin(None).unwrap();
+        // Even if the slot were somehow already writing, the delayed request
+        // must not report that it may start.
+        assert!(!requests.finish(delayed, Some(&ExportState::Running)));
+        // The running export keeps the slot.
+        assert!(requests.busy(Some(&ExportState::Running)));
     }
 
     #[test]
