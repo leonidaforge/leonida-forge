@@ -1584,3 +1584,252 @@ mod pipeline {
         ));
     }
 }
+
+mod probing {
+    //! How much of the metadata area deciding its processing reads.
+
+    use std::io::{Read, Seek, SeekFrom};
+
+    use super::*;
+
+    /// Counts the bytes read through it.
+    struct Counting<R> {
+        inner: R,
+        read: u64,
+    }
+
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    fn counting(bytes: Vec<u8>) -> Counting<Cursor<Vec<u8>>> {
+        Counting {
+            inner: Cursor::new(bytes),
+            read: 0,
+        }
+    }
+
+    fn metadata(selector: u8, a_ids: Vec<u16>) -> Vec<u8> {
+        let columns = [Column::new(KEY_X, 4, &[&[1, 2, 3, 4]], &[Some(0)])];
+        Build {
+            selector,
+            a_ids,
+            ..Build::default()
+        }
+        .build(&columns)
+    }
+
+    /// The metadata followed by payload bytes.
+    fn archive(metadata: &[u8]) -> Vec<u8> {
+        let mut bytes = metadata.to_vec();
+        bytes.resize(bytes.len() + 0x1000, 0xAB);
+        bytes
+    }
+
+    #[test]
+    fn the_static_pass_is_decided_from_the_header() {
+        let metadata = metadata(9, vec![2, 3, 4, 6]);
+        let mut source = counting(archive(&metadata));
+        let probe = Stored::probe(&mut source).unwrap();
+        assert_eq!(source.read, HEADER_LEN as u64);
+        let stored = Stored::from_bytes(metadata).unwrap();
+        assert_eq!(probe.processing, stored.processing());
+        assert_eq!(probe.processing.archive_pass, None);
+        assert_eq!(&probe.layout, stored.layout());
+        assert_eq!(probe.archive_descriptor, None);
+    }
+
+    #[test]
+    fn selector_zero_needs_the_a_table() {
+        let metadata = metadata(0, vec![2, 3, 6]);
+        let mut source = counting(archive(&metadata));
+        let probe = Stored::probe(&mut source).unwrap();
+        assert_eq!(source.read, (HEADER_LEN + 3 * 8) as u64);
+        let stored = Stored::from_bytes(metadata).unwrap();
+        assert_eq!(probe.processing, stored.processing());
+        assert!(probe.processing.is_none());
+        // The stored bytes may be usable, so they are read in full.
+        assert!(stored.decode().is_ok());
+    }
+
+    #[test]
+    fn selector_zero_with_an_archive_descriptor() {
+        let mut metadata = metadata(0, vec![1, 2, 6]);
+        let b = Stored::from_bytes(metadata.clone())
+            .unwrap()
+            .layout()
+            .b_block
+            .start;
+        set_u32(&mut metadata, b, 0x77);
+        set_u16(&mut metadata, b + 4, 16);
+        metadata[b + 6..b + 22].fill(0x96);
+        let mut source = counting(archive(&metadata));
+        let probe = Stored::probe(&mut source).unwrap();
+        assert_eq!(
+            source.read,
+            (HEADER_LEN + 3 * 8 + transform::CipherDescriptor::LEN) as u64
+        );
+        assert_eq!(
+            probe.processing,
+            Processing {
+                static_pass: false,
+                archive_pass: Some(true),
+            }
+        );
+        let descriptor = probe.archive_descriptor.unwrap();
+        assert_eq!((descriptor.key_id, descriptor.kind), (0x77, 16));
+
+        // A sub-block 1 outside the metadata area is not read.
+        set_u32(&mut metadata, 0x40 + 4, 0xFFFF_0000);
+        let mut source = counting(archive(&metadata));
+        let probe = Stored::probe(&mut source).unwrap();
+        assert_eq!(probe.processing.archive_pass, Some(true));
+        assert_eq!(probe.archive_descriptor, None);
+        assert_eq!(source.read, (HEADER_LEN + 3 * 8) as u64);
+    }
+
+    /// Zeros of any length behind a header.
+    struct Sparse {
+        header: Vec<u8>,
+        len: u64,
+        pos: u64,
+    }
+
+    impl Read for Sparse {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf
+                .len()
+                .min(usize::try_from(self.len.saturating_sub(self.pos)).unwrap_or(usize::MAX));
+            for (i, byte) in buf[..n].iter_mut().enumerate() {
+                let at = self.pos as usize + i;
+                *byte = self.header.get(at).copied().unwrap_or(0);
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Sparse {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.pos = match pos {
+                SeekFrom::Start(offset) => offset,
+                SeekFrom::End(delta) => self.len.checked_add_signed(delta).unwrap(),
+                SeekFrom::Current(delta) => self.pos.checked_add_signed(delta).unwrap(),
+            };
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn a_large_declared_metadata_area_is_not_read() {
+        let len = 0x7000_0000u32;
+        let mut header = vec![0u8; HEADER_LEN];
+        header[..4].copy_from_slice(&MAGIC);
+        set_u32(&mut header, 4, len);
+        set_u32(&mut header, 8, len);
+        header[0x2C] = 1;
+        header[0x2D] = 1;
+        header[0x2E] = 9;
+        let sparse = |header: &[u8]| Counting {
+            inner: Sparse {
+                header: header.to_vec(),
+                len: u64::from(len) + 0x40,
+                pos: 0,
+            },
+            read: 0,
+        };
+        let mut source = sparse(&header);
+        let probe = Stored::probe(&mut source).unwrap();
+        assert!(probe.processing.static_pass);
+        assert_eq!(source.read, HEADER_LEN as u64);
+        // Reading it in full stops at the limit, after the header.
+        let mut source = sparse(&header);
+        assert!(matches!(
+            Stored::read(&mut source, 1 << 20),
+            Err(Error::TooLarge { .. })
+        ));
+        assert_eq!(source.read, HEADER_LEN as u64);
+        // With selector 0 only the A table is read in addition.
+        header[0x2E] = 0;
+        let mut source = sparse(&header);
+        assert!(Stored::probe(&mut source).unwrap().processing.is_none());
+        assert_eq!(source.read, HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn describes_the_passes_without_calling_all_of_them_encryption() {
+        let probe = |metadata: Vec<u8>| Stored::probe(&mut counting(archive(&metadata))).unwrap();
+        let reason = |metadata| probe(metadata).unsupported();
+        // Static descriptor 4 has cipher type 16, 1 has type 3, others type 0.
+        for (selector, expected) in [
+            (
+                9,
+                "it is encrypted: the static pass decrypts it with cipher type 16",
+            ),
+            (
+                3,
+                "it is encrypted: the static pass decrypts it with cipher type 3",
+            ),
+            (1, "a no-op cipher"),
+            (5, "a no-op cipher"),
+        ] {
+            let text = reason(metadata(selector, vec![2, 3, 4, 6])).unwrap();
+            assert!(text.contains(expected), "{selector}: {text}");
+        }
+        assert!(!reason(metadata(1, vec![2])).unwrap().contains("encrypted"));
+        assert_eq!(reason(metadata(0, vec![2, 3, 6])), None);
+
+        let with_descriptor = |kind: u16| {
+            let mut metadata = metadata(0, vec![1, 2, 6]);
+            set_u16(&mut metadata, 0x60 + 4, kind);
+            metadata
+        };
+        for (kind, expected) in [
+            (
+                16,
+                "it is encrypted: the archive pass decrypts it with cipher type 16",
+            ),
+            (
+                0,
+                "the archive pass processes it with cipher type 0, a no-op cipher",
+            ),
+            (2, "algorithm 0x2, which is not supported"),
+            (13, "invalid cipher type 13"),
+        ] {
+            let text = reason(with_descriptor(kind)).unwrap();
+            assert!(text.contains(expected), "{kind}: {text}");
+        }
+    }
+
+    #[test]
+    fn malformed_and_truncated_headers_are_errors() {
+        let metadata = metadata(9, vec![2, 3, 4, 6]);
+        let mut truncated = counting(metadata[..0x20].to_vec());
+        assert!(matches!(Stored::probe(&mut truncated), Err(Error::Io(_))));
+        // The metadata area ends after the end of the data.
+        let short = counting(metadata[..metadata.len() - 1].to_vec());
+        let reason = invalid_reason(Stored::probe(&mut { short }));
+        assert!(reason.contains("end of the file"), "{reason}");
+        let mut bad = metadata.clone();
+        bad[0x2C] = 3;
+        assert!(invalid_reason(Stored::probe(&mut counting(bad))).contains("index width"));
+        let mut not_rpf = metadata.clone();
+        not_rpf[0] = 0;
+        invalid_reason(Stored::probe(&mut counting(not_rpf)));
+        // Regions outside their areas fail like a full read.
+        let mut regions = metadata;
+        set_u16(&mut regions, 0x20, 40);
+        let reason = invalid_reason(Stored::probe(&mut counting(regions)));
+        assert!(reason.contains("primary regions"), "{reason}");
+    }
+}

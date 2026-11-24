@@ -320,6 +320,67 @@ impl fmt::Display for Processing {
     }
 }
 
+/// What the header and, where it is needed, the `A` table tell about the
+/// stored metadata, read without the rest of the metadata area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub prefix: Prefix,
+    pub layout: Layout,
+    pub processing: Processing,
+    /// `B` sub-block 1 as stored, the cipher descriptor of the archive pass.
+    /// `None` if it is absent, lies inside the static pass or is not inside
+    /// the metadata area.
+    pub archive_descriptor: Option<CipherDescriptor>,
+}
+
+impl Probe {
+    /// Why the stored bytes are not what the engine reads, or `None` if no
+    /// pass applies. Only the CBC algorithm is described as encryption.
+    pub fn unsupported(&self) -> Option<String> {
+        let describe = |pass: &str, kind: u16| match Algorithm::of(kind) {
+            Ok(Algorithm::Cbc) => format!(
+                "it is encrypted: the {pass} decrypts it with cipher type {kind}, whose key is not available"
+            ),
+            Ok(Algorithm::Identity) => format!(
+                "the {pass} processes it with cipher type {kind}, a no-op cipher, but the engine's key lookup for it is not reproduced"
+            ),
+            Ok(Algorithm::Untraced(id)) => format!(
+                "the {pass} processes it with cipher type {kind}, algorithm {id:#x}, which is not supported"
+            ),
+            Err(err) => format!("the {pass} uses an {err}"),
+        };
+        if self.processing.static_pass {
+            let index = self.prefix.selector >> 1;
+            return Some(describe("static pass", transform::static_kind(index)));
+        }
+        if self.processing.archive_pass != Some(true) {
+            return None;
+        }
+        Some(match &self.archive_descriptor {
+            Some(descriptor) => describe("archive pass", descriptor.kind),
+            None => "the archive pass processes it with a cipher descriptor that lies outside the metadata area".to_string(),
+        })
+    }
+}
+
+/// The `B` offset of the first `A` record for sub-block `id`. Like the
+/// engine, this does not require the offset to lie in the `B` block.
+fn find_sub_block(a_table: &[u8], id: u16) -> Option<u32> {
+    a_table
+        .as_chunks::<A_RECORD_LEN>()
+        .0
+        .iter()
+        .find(|record| u16_at(*record, 0) == Some(id))
+        .and_then(|record| u32_at(record, 4))
+}
+
+fn read_range(source: &mut (impl Read + Seek), range: Range<usize>) -> Result<Vec<u8>, Error> {
+    source.seek(SeekFrom::Start(range.start as u64))?;
+    let mut bytes = vec![0; range.len()];
+    source.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// The metadata area as stored in the archive.
 #[derive(Debug, Clone)]
 pub struct Stored {
@@ -334,15 +395,8 @@ impl Stored {
     /// [`lforge_binary::Source::slice`] of it, which keeps all offsets
     /// archive-relative.
     pub fn read(source: &mut (impl Read + Seek), limit: u64) -> Result<Self, Error> {
-        let archive_len = source.seek(SeekFrom::End(0))?;
-        source.seek(SeekFrom::Start(0))?;
-        let mut header = [0; HEADER_LEN];
-        source.read_exact(&mut header)?;
-        let prefix = Prefix::parse(&header)?;
+        let prefix = Self::read_prefix(source)?;
         let len = u64::from(prefix.metadata_len);
-        if len > archive_len {
-            return Err(invalid("the metadata area ends after the end of the file"));
-        }
         if len > limit {
             return Err(Error::TooLarge { len, limit });
         }
@@ -350,6 +404,53 @@ impl Stored {
         let mut bytes = Vec::with_capacity(to_usize(len)?);
         source.take(len).read_to_end(&mut bytes)?;
         Self::from_bytes(bytes)
+    }
+
+    /// The prefix of a metadata area that lies inside `source`.
+    fn read_prefix(source: &mut (impl Read + Seek)) -> Result<Prefix, Error> {
+        let archive_len = source.seek(SeekFrom::End(0))?;
+        source.seek(SeekFrom::Start(0))?;
+        let mut header = [0; HEADER_LEN];
+        source.read_exact(&mut header)?;
+        let prefix = Prefix::parse(&header)?;
+        if u64::from(prefix.metadata_len) > archive_len {
+            return Err(invalid("the metadata area ends after the end of the file"));
+        }
+        Ok(prefix)
+    }
+
+    /// Which processing passes apply, without reading the whole metadata
+    /// area: the header, and only if `hdr[0x2E]` is zero, the `A` table and
+    /// `B` sub-block 1, which the static pass would otherwise process. The
+    /// checks are those of [`Stored::read`], except for its size limit, as
+    /// nothing else is read.
+    pub fn probe(source: &mut (impl Read + Seek)) -> Result<Probe, Error> {
+        let prefix = Self::read_prefix(source)?;
+        let layout = Layout::new(&prefix)?;
+        let mut probe = Probe {
+            prefix,
+            processing: Processing {
+                static_pass: prefix.selector != 0,
+                archive_pass: None,
+            },
+            layout,
+            archive_descriptor: None,
+        };
+        if probe.processing.static_pass {
+            return Ok(probe);
+        }
+        let a_table = read_range(source, probe.layout.a_table.clone())?;
+        let offset = find_sub_block(&a_table, DESCRIPTOR_SUB_BLOCK);
+        probe.processing.archive_pass = Some(offset.is_some());
+        let descriptor = offset.and_then(|offset| {
+            let start = probe.layout.b_block.start.checked_add(offset as usize)?;
+            let end = start.checked_add(CipherDescriptor::LEN)?;
+            (end as u64 <= u64::from(prefix.metadata_len)).then_some(start..end)
+        });
+        if let Some(range) = descriptor {
+            probe.archive_descriptor = CipherDescriptor::parse(&read_range(source, range)?);
+        }
+        Ok(probe)
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
@@ -393,18 +494,12 @@ impl Stored {
         self.sub_block(&self.bytes, id).is_some()
     }
 
-    /// The `B` offset of the first `A` record for sub-block `id` in `bytes`.
-    /// Like the engine, this does not require the offset to lie in the `B`
-    /// block.
+    /// The `B` offset of sub-block `id`, from the `A` table in `bytes`.
     fn sub_block(&self, bytes: &[u8], id: u16) -> Option<u32> {
-        bytes
-            .get(self.layout.a_table.clone())
-            .unwrap_or_default()
-            .as_chunks::<A_RECORD_LEN>()
-            .0
-            .iter()
-            .find(|record| u16_at(*record, 0) == Some(id))
-            .and_then(|record| u32_at(record, 4))
+        find_sub_block(
+            bytes.get(self.layout.a_table.clone()).unwrap_or_default(),
+            id,
+        )
     }
 
     /// Step 1 spans. They start at the `A` table and `B` block of the layout.
