@@ -445,6 +445,24 @@ impl<W: Write> Write for Cancellable<'_, W> {
     }
 }
 
+/// Counts the bytes passed through to `out`.
+struct Counting<'a> {
+    out: &'a mut dyn Write,
+    written: u64,
+}
+
+impl Write for Counting<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.out.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
+    }
+}
+
 pub fn check_size(size: u64, limit: u64) -> io::Result<()> {
     if size > limit {
         return Err(io::Error::other(format!(
@@ -687,6 +705,77 @@ pub fn read_all(archive: &Archive) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     io::copy(&mut source, &mut bytes)?;
     Ok(bytes)
+}
+
+/// Streams the decoded contents of the file at `path` into `out`, opening the
+/// archives it is stored in first and revalidating their sources. Stops with
+/// [`io::ErrorKind::Interrupted`] once `cancel` is set. Returns the number of
+/// bytes written.
+///
+/// Reuses the readers [`copy`] uses, so native table-of-contents entries,
+/// scan-recovered entries, resource pages and regions, and ZIP entries are all
+/// decoded through their existing paths, honouring companion read sources and
+/// the read limit. Only the file at `path` is read; no unrelated entry is
+/// decoded.
+pub fn export_to(path: &Path, out: &mut dyn Write, cancel: &AtomicBool) -> io::Result<u64> {
+    export_to_within(path, out, MAX_READ, cancel)
+}
+
+fn export_to_within(
+    path: &Path,
+    out: &mut dyn Write,
+    limit: u64,
+    cancel: &AtomicBool,
+) -> io::Result<u64> {
+    for _ in 0..MAX_ATTEMPTS {
+        let location = match locate(path) {
+            Ok(location) => location,
+            Err(err) => match prepare_required(&err) {
+                Some(archive) => {
+                    let archive = archive.to_path_buf();
+                    prepare(&archive, &Progress::default(), cancel)?;
+                    continue;
+                }
+                None => return Err(err),
+            },
+        };
+        let mut counting = Counting { out, written: 0 };
+        match location {
+            Location::Inside(archive, inner) => {
+                copy_cancellable(&archive, &inner, &mut counting, limit, cancel)?;
+            }
+            // A file that is itself an archive: its own bytes, not its contents.
+            Location::Archive(archive) => {
+                check_size(archive.source.len(), limit)?;
+                let mut source = archive.source.clone();
+                source.seek(SeekFrom::Start(0))?;
+                copy_reader(&mut source, &mut counting, cancel)?;
+            }
+            Location::Plain => {
+                let mut file = File::open(path)?;
+                copy_reader(&mut file, &mut counting, cancel)?;
+            }
+        }
+        return Ok(counting.written);
+    }
+    Err(io::Error::other("the archive could not be opened"))
+}
+
+/// Copies all of `reader` into `out`, stopping with
+/// [`io::ErrorKind::Interrupted`] once `cancel` is set.
+fn copy_reader(
+    reader: &mut dyn io::Read,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    let mut sink = Cancellable { out, cancel };
+    match io::copy(reader, &mut sink) {
+        Ok(_) => Ok(()),
+        Err(err) if err.get_ref().is_some_and(|e| e.is::<Cancelled>()) => {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1304,38 @@ pub(crate) mod tests {
         // A replaced archive is not counted twice.
         kept.insert(PathBuf::from("d"), kept_entry(0), u64::MAX, 2);
         assert_eq!(kept_paths(&kept), ["b", "d"]);
+    }
+
+    #[test]
+    fn export_to_enforces_the_read_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("data.rpf");
+        let xml = b"<?xml version=\"1.0\"?><root-with-enough-bytes/>";
+        fs::write(&archive, rpf_bytes(&[zlib(xml)])).unwrap();
+        open(&archive);
+        let entry = archive
+            .join(rpf::RECOVERED)
+            .join("XML")
+            .join(format!("0x{:010X}.xml", 0x100));
+        let cancel = AtomicBool::new(false);
+        let mut out = Vec::new();
+        let err = export_to_within(&entry, &mut out, (xml.len() - 1) as u64, &cancel).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        out.clear();
+        let written = export_to_within(&entry, &mut out, xml.len() as u64, &cancel).unwrap();
+        assert_eq!(written, xml.len() as u64);
+        assert_eq!(out, xml);
+    }
+
+    #[test]
+    fn export_to_copies_a_plain_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("plain.bin");
+        fs::write(&file, b"plain bytes on disk").unwrap();
+        let mut out = Vec::new();
+        let written = export_to(&file, &mut out, &AtomicBool::new(false)).unwrap();
+        assert_eq!(written, 19);
+        assert_eq!(out, b"plain bytes on disk");
     }
 
     #[test]

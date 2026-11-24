@@ -16,7 +16,9 @@ mod zip;
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use archive::{Identified, Location};
@@ -233,6 +235,32 @@ pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
     })
 }
 
+/// Streams the decoded contents of the file at `source` into a temporary file
+/// in `dest`'s directory, then moves it onto `dest` once the whole payload has
+/// been written. Returns the number of bytes written.
+///
+/// A failed or cancelled export removes the temporary file and leaves `dest`
+/// untouched, so no partial final file remains. An existing `dest` is replaced
+/// only after a complete export; the caller is expected to have confirmed the
+/// overwrite through the save dialog. Reuses the archive readers, so native,
+/// scan-recovered and ZIP contents are decoded through their existing paths
+/// (see [`archive::export_to`]).
+pub fn export(source: &Path, dest: &Path, cancel: &AtomicBool) -> io::Result<u64> {
+    let dir = match dest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
+    let written = {
+        let mut out = io::BufWriter::new(temp.as_file_mut());
+        let written = archive::export_to(source, &mut out, cancel)?;
+        out.flush()?;
+        written
+    };
+    temp.persist(dest).map_err(|err| err.error)?;
+    Ok(written)
+}
+
 /// Lists the direct children of a directory on disk. Never recurses.
 fn list_directory(dir: &Path) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
@@ -390,6 +418,156 @@ pub fn format_bytes_exact(bytes: u64) -> String {
 pub fn format_modified(time: SystemTime) -> String {
     let local: chrono::DateTime<chrono::Local> = time.into();
     local.format("%d.%m.%Y %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::files::rpf::tests::{rpf_bytes, zlib};
+    use crate::files::toc::tests::{
+        Spec, companion_of, deflate, native_rpf, native_rpf_with, spec,
+    };
+    use crate::files::zip::tests::zip_bytes;
+    use lforge_rage9::rpf::names::RPF_TYPE;
+
+    fn no_cancel() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
+    /// The offset-named path of the single recovered entry of an RPF9 archive
+    /// written by `rpf_bytes` with one part, which lands at offset 0x100.
+    fn recovered(archive: &Path, folder: &str, ext: &str) -> PathBuf {
+        archive
+            .join(rpf::RECOVERED)
+            .join(folder)
+            .join(format!("0x{:010X}.{ext}", 0x100))
+    }
+
+    /// Entries in `dir` that are neither the archive nor the destination: a
+    /// temporary file left behind is one of these.
+    fn stray_entries(dir: &Path, keep: &[&Path]) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| !keep.iter().any(|kept| *kept == entry.path()))
+            .count()
+    }
+
+    #[test]
+    fn exports_a_recovered_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("data.rpf");
+        let xml = b"<?xml version=\"1.0\"?><root/>";
+        fs::write(&archive, rpf_bytes(&[zlib(xml)])).unwrap();
+        let dest = temp.path().join("out.xml");
+        let written = export(&recovered(&archive, "XML", "xml"), &dest, &no_cancel()).unwrap();
+        assert_eq!(written, xml.len() as u64);
+        assert_eq!(fs::read(&dest).unwrap(), xml);
+    }
+
+    #[test]
+    fn exports_native_stored_and_nested_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        // A native table-of-contents entry, stored.
+        let native = temp.path().join("native.rpf");
+        fs::write(&native, native_rpf(&[spec(b"stored payload", 0)])).unwrap();
+        let dest = temp.path().join("row.bin");
+        export(&native.join("Row 00000"), &dest, &no_cancel()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"stored payload");
+
+        // A recovered entry of an RPF9 archive stored inside a ZIP.
+        let xml = b"<?xml version=\"1.0\"?><nested/>";
+        let outer = temp.path().join("outer.zip");
+        fs::write(
+            &outer,
+            zip_bytes(&[("inner.rpf", &rpf_bytes(&[zlib(xml)]))]),
+        )
+        .unwrap();
+        let entry = recovered(&outer.join("inner.rpf"), "XML", "xml");
+        let nested = temp.path().join("nested.xml");
+        export(&entry, &nested, &no_cancel()).unwrap();
+        assert_eq!(fs::read(&nested).unwrap(), xml);
+    }
+
+    #[test]
+    fn a_failed_export_keeps_the_destination_and_leaves_no_temporary() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("unsupported.rpf");
+        fs::write(
+            &archive,
+            native_rpf(&[Spec {
+                mode: 2,
+                ..spec(b"cannot decode this", RPF_TYPE)
+            }]),
+        )
+        .unwrap();
+        let dest = temp.path().join("out.bin");
+        fs::write(&dest, b"existing").unwrap();
+        let err = export(&archive.join("Row 00000"), &dest, &no_cancel()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(fs::read(&dest).unwrap(), b"existing");
+        assert_eq!(stray_entries(temp.path(), &[&archive, &dest]), 0);
+    }
+
+    #[test]
+    fn a_cancelled_export_writes_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 256) as u8).collect();
+        let archive = temp.path().join("deflate.rpf");
+        fs::write(
+            &archive,
+            native_rpf(&[Spec {
+                mode: 1,
+                logical: Some(data.len() as u64),
+                ..spec(&deflate(&data), 0)
+            }]),
+        )
+        .unwrap();
+        let dest = temp.path().join("out.bin");
+        let err = export(&archive.join("Row 00000"), &dest, &AtomicBool::new(true)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(!dest.exists());
+        assert_eq!(stray_entries(temp.path(), &[&archive]), 0);
+    }
+
+    #[test]
+    fn export_replaces_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("native.rpf");
+        fs::write(&archive, native_rpf(&[spec(b"fresh bytes", 0)])).unwrap();
+        let dest = temp.path().join("out.bin");
+        fs::write(&dest, b"old and longer content").unwrap();
+        export(&archive.join("Row 00000"), &dest, &no_cancel()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"fresh bytes");
+    }
+
+    #[test]
+    fn a_missing_companion_refuses_export() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = b"companion-sourced payload".to_vec();
+        let full = native_rpf_with(
+            &[Spec {
+                source: Some(0),
+                ..spec(&text, 0)
+            }],
+            &[(b"data.dat", 7)],
+        );
+        let archive = temp.path().join("main.rpf");
+        fs::write(&archive, &full).unwrap();
+        let companion = temp.path().join("data.dat");
+        fs::write(&companion, companion_of(&full, 7)).unwrap();
+
+        let dest = temp.path().join("out.bin");
+        export(&archive.join("Row 00000"), &dest, &no_cancel()).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), text);
+
+        // With the companion gone, the source can no longer be validated.
+        fs::remove_file(&companion).unwrap();
+        let stale = temp.path().join("stale.bin");
+        let err = export(&archive.join("Row 00000"), &stale, &no_cancel()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(!stale.exists());
+    }
 }
 
 #[cfg(test)]

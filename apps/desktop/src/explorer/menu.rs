@@ -3,7 +3,7 @@ use gpui::{
 };
 
 use super::{Explorer, MENU_BAR_HEIGHT, Menu};
-use crate::files::{Sort, SortKey};
+use crate::files::{EntryKind, Sort, SortKey};
 use crate::settings::ViewMode;
 use crate::ui;
 use crate::ui::theme;
@@ -122,6 +122,10 @@ impl Explorer {
                     .selected_entry()
                     .filter(|entry| entry.is_inspectable())
                     .map(|entry| entry.path.clone());
+                let exportable = self
+                    .selected_entry()
+                    .filter(|entry| entry.kind == EntryKind::File)
+                    .cloned();
                 panel
                     .child(
                         ui::menu_item("set-gta", "Set GTA VI Folder…", false, true, None).on_click(
@@ -162,6 +166,23 @@ impl Explorer {
                                 move |_, _, cx| super::open_binary_inspector(path.clone(), cx),
                                 cx,
                             ))
+                        }),
+                    )
+                    .child(
+                        ui::menu_item(
+                            "save-selection-as",
+                            "Save Selection As…",
+                            false,
+                            exportable.is_some(),
+                            None,
+                        )
+                        .when_some(exportable, |el, entry| {
+                            el.on_click(
+                                self.menu_action(
+                                    move |this, _, cx| this.start_export(&entry, cx),
+                                    cx,
+                                ),
+                            )
                         }),
                     )
                     .child(ui::menu_separator())
@@ -268,6 +289,7 @@ impl Explorer {
             Menu::Entry { entry, .. } => {
                 let open = entry.clone();
                 let path = entry.path.clone();
+                let exportable = (entry.kind == EntryKind::File).then(|| entry.clone());
                 panel
                     .child(
                         ui::menu_item("open-entry", "Open", false, true, None).on_click(
@@ -287,6 +309,16 @@ impl Explorer {
                             cx,
                         )),
                     )
+                    .when_some(exportable, |panel, entry| {
+                        panel.child(
+                            ui::menu_item("save-entry-as", "Save As…", false, true, None).on_click(
+                                self.menu_action(
+                                    move |this, _, cx| this.start_export(&entry, cx),
+                                    cx,
+                                ),
+                            ),
+                        )
+                    })
             }
         }
     }

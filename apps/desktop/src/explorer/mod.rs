@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, DispatchPhase, Entity, FocusHandle, KeyBinding, MouseButton,
+    App, Bounds, Context, DispatchPhase, Entity, FocusHandle, FontWeight, KeyBinding, MouseButton,
     MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, RenderImage, ScrollHandle,
     Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
     WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
@@ -107,6 +107,31 @@ enum Divider {
     Preview,
 }
 
+/// A running or finished export of one file to a chosen destination.
+struct Export {
+    /// Distinguishes this export from a later one, so a stale callback does
+    /// not touch the current state.
+    generation: u64,
+    label: String,
+    cancel: Arc<AtomicBool>,
+    state: ExportState,
+    _task: Task<()>,
+}
+
+enum ExportState {
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+/// What to show when an export ends. Separated from the UI so the decision is
+/// testable.
+enum ExportOutcome {
+    Done(String),
+    Failed(String),
+    Cancelled,
+}
+
 /// The icons Windows shows for one file type.
 struct FileIcons {
     small: Arc<RenderImage>,
@@ -138,6 +163,8 @@ pub struct Explorer {
     preview_width: f32,
     open_menu: Option<Menu>,
     resizing: Option<Divider>,
+    export: Option<Export>,
+    export_generation: u64,
     thumbnail: Option<Thumbnail>,
     shell: Option<ShellWorker>,
     /// Keyed by lowercase extension. `None` while loading, or when Windows
@@ -177,6 +204,8 @@ impl Explorer {
             preview_width: settings.preview_width,
             open_menu: None,
             resizing: None,
+            export: None,
+            export_generation: 0,
             thumbnail: None,
             shell: ShellWorker::start()
                 .inspect_err(|err| log::error!("failed to start shell thread: {err}"))
@@ -778,6 +807,130 @@ impl Explorer {
             cx.notify();
         }
     }
+
+    /// Asks where to save `entry`, then exports it in the background. Only
+    /// regular files are exportable; directories and archives open as folders.
+    fn start_export(&mut self, entry: &Entry, cx: &mut Context<Self>) {
+        if entry.kind != EntryKind::File {
+            return;
+        }
+        let source = entry.path.clone();
+        let label = entry.name.clone();
+        let caveat = export_caveat(entry);
+        let dir = initial_export_dir(&source);
+        let prompt = cx.prompt_for_new_path(&dir, Some(entry.name.as_str()));
+        cx.spawn(async move |this, cx| {
+            let dest = match prompt.await {
+                Ok(Ok(Some(dest))) => dest,
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(err)) => {
+                    log::error!("save dialog failed: {err:#}");
+                    return;
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.run_export(source, label, caveat, dest, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn run_export(
+        &mut self,
+        source: PathBuf,
+        label: String,
+        caveat: Option<String>,
+        dest: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.export_generation += 1;
+        let generation = self.export_generation;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = cx.spawn({
+            let cancel = cancel.clone();
+            async move |this, cx| {
+                let result = cx
+                    .background_spawn({
+                        let (source, dest) = (source, dest.clone());
+                        async move { files::export(&source, &dest, &cancel) }
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.finish_export(generation, &dest, caveat.as_deref(), result, cx)
+                })
+                .ok();
+            }
+        });
+        self.export = Some(Export {
+            generation,
+            label,
+            cancel,
+            state: ExportState::Running,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    fn finish_export(
+        &mut self,
+        generation: u64,
+        dest: &Path,
+        caveat: Option<&str>,
+        result: io::Result<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.export.as_ref().map(|export| export.generation) != Some(generation) {
+            return;
+        }
+        match export_outcome(result, caveat, dest) {
+            ExportOutcome::Cancelled => self.export = None,
+            ExportOutcome::Done(message) => {
+                if let Some(export) = &mut self.export {
+                    export.state = ExportState::Done(message);
+                }
+                // A result that needs no action clears itself after a moment.
+                self.dismiss_export_later(generation, cx);
+            }
+            ExportOutcome::Failed(message) => {
+                if let Some(export) = &mut self.export {
+                    export.state = ExportState::Failed(message);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn dismiss_export_later(&self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(6)).await;
+            this.update(cx, |this, cx| {
+                if this
+                    .export
+                    .as_ref()
+                    .is_some_and(|e| e.generation == generation)
+                {
+                    this.export = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn cancel_export(&mut self, cx: &mut Context<Self>) {
+        if let Some(export) = &self.export {
+            export.cancel.store(true, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    fn dismiss_export(&mut self, cx: &mut Context<Self>) {
+        if self.export.take().is_some() {
+            cx.notify();
+        }
+    }
 }
 
 impl Render for Explorer {
@@ -830,6 +983,9 @@ impl Render for Explorer {
             )
             .child(self.render_status_bar())
             .child(self.render_resize_tracker(cx))
+            .when(self.export.is_some(), |el| {
+                el.child(self.render_export_toast(cx))
+            })
             .when_some(self.open_menu.clone(), |el, menu| {
                 el.child(self.render_menu_overlay(&menu, cx))
             })
@@ -1068,6 +1224,82 @@ impl Explorer {
             })
             .child(format!("{} view", self.view_mode.label()))
     }
+
+    /// A small card in the corner showing an export's progress or result. It
+    /// floats over the layout, so it never shifts the panels.
+    fn render_export_toast(&self, cx: &Context<Self>) -> impl IntoElement {
+        let export = self.export.as_ref();
+        let running = matches!(export.map(|e| &e.state), Some(ExportState::Running));
+        let cancelling = export.is_some_and(|e| e.cancel.load(Ordering::Relaxed));
+        let failed = matches!(export.map(|e| &e.state), Some(ExportState::Failed(_)));
+        let lines: Vec<String> = match export.map(|e| &e.state) {
+            Some(ExportState::Running) if cancelling => vec!["Cancelling…".to_string()],
+            Some(ExportState::Running) => {
+                vec![format!(
+                    "Saving {}…",
+                    export.map(|e| e.label.as_str()).unwrap_or_default()
+                )]
+            }
+            Some(ExportState::Done(message)) | Some(ExportState::Failed(message)) => {
+                message.lines().map(str::to_string).collect()
+            }
+            None => Vec::new(),
+        };
+        let heading_color = if failed { theme::ERROR } else { theme::TEXT };
+
+        div()
+            .absolute()
+            .right(px(16.))
+            .bottom(px(STATUS_BAR_HEIGHT + 12.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w(px(360.))
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::SURFACE))
+            .shadow_lg()
+            .text_sm()
+            .children(lines.into_iter().enumerate().map(|(ix, line)| {
+                if ix == 0 {
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(heading_color))
+                        .child(line)
+                } else {
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(line)
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .when(running && !cancelling, |el| {
+                        el.child(ui::button("export-cancel", "Cancel").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.cancel_export(cx);
+                            },
+                        )))
+                    })
+                    .when(!running, |el| {
+                        el.child(
+                            ui::button("export-dismiss", "Dismiss").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.dismiss_export(cx);
+                                },
+                            )),
+                        )
+                    }),
+            )
+    }
 }
 
 fn window_options(title: &str, window_size: gpui::Size<Pixels>, cx: &App) -> WindowOptions {
@@ -1092,6 +1324,45 @@ fn window_title(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// The directory the save dialog opens in: the folder holding the archive the
+/// entry comes from, or the entry's own folder for a file on disk.
+fn initial_export_dir(source: &Path) -> PathBuf {
+    let on_disk = files::split_location(source)
+        .map(|(file, _)| file)
+        .unwrap_or(source);
+    on_disk.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// A caveat for the recovery status of `entry`, or `None` when its status is
+/// not in doubt. Reuses the status text shown in the preview, so an exported
+/// partial or unverified entry is not presented as a whole, verified file.
+fn export_caveat(entry: &Entry) -> Option<String> {
+    let (_, status) = entry.details.iter().find(|(label, _)| *label == "Status")?;
+    (!status.starts_with("Complete")).then(|| status.clone())
+}
+
+/// Builds the result shown when an export ends. The success message is
+/// deliberately neutral: it never implies the saved bytes are a verified or
+/// byte-identical original file. Any recovery caveat is appended.
+fn export_outcome(result: io::Result<u64>, caveat: Option<&str>, dest: &Path) -> ExportOutcome {
+    let name = window_title(dest);
+    match result {
+        Ok(bytes) => {
+            let mut message = format!(
+                "Saved {} bytes to {name}.",
+                files::format_bytes_exact(bytes)
+            );
+            if let Some(caveat) = caveat {
+                message.push('\n');
+                message.push_str(caveat);
+            }
+            ExportOutcome::Done(message)
+        }
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => ExportOutcome::Cancelled,
+        Err(err) => ExportOutcome::Failed(format!("Could not save {name}: {err}")),
+    }
+}
+
 /// Opens any regular file, including archive entries and images, as bytes.
 fn open_binary_inspector(path: PathBuf, cx: &mut App) {
     let mut options = window_options(&window_title(&path), size(px(1200.), px(760.)), cx);
@@ -1114,5 +1385,91 @@ fn open_image_viewer(path: PathBuf, cx: &mut App) {
         cx.new(|cx| ImageViewer::new(path, window, cx))
     }) {
         log::error!("failed to open image viewer: {err:#}");
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    fn file_entry(name: &str, details: Vec<(&'static str, String)>) -> Entry {
+        let mut entry = Entry::new(
+            name.to_string(),
+            PathBuf::from(name),
+            EntryKind::File,
+            Some(10),
+            None,
+        );
+        entry.details = details;
+        entry
+    }
+
+    #[test]
+    fn caveat_is_added_only_for_uncertain_status() {
+        let complete = file_entry("0x0000000100.dds", vec![("Status", "Complete: …".into())]);
+        assert!(export_caveat(&complete).is_none());
+
+        let unverified = file_entry(
+            "0x0000000100.bin",
+            vec![("Status", "Unverified: no known file signature".into())],
+        );
+        assert_eq!(
+            export_caveat(&unverified).as_deref(),
+            Some("Unverified: no known file signature")
+        );
+
+        // A native entry has no recovery status, so no caveat.
+        let native = file_entry("Row 00000", vec![("Offset", "0x100".into())]);
+        assert!(export_caveat(&native).is_none());
+    }
+
+    #[test]
+    fn outcome_messages_are_neutral_and_honest() {
+        let dest = Path::new("out").join("texture.dds");
+        match export_outcome(Ok(2048), None, &dest) {
+            ExportOutcome::Done(message) => {
+                assert!(
+                    message.contains("Saved 2,048 bytes to texture.dds."),
+                    "{message}"
+                );
+                assert!(!message.to_lowercase().contains("original"), "{message}");
+            }
+            _ => panic!("expected a completed export"),
+        }
+        match export_outcome(Ok(2048), Some("Unverified: may be partial"), &dest) {
+            ExportOutcome::Done(message) => {
+                assert!(message.contains("Unverified: may be partial"), "{message}");
+            }
+            _ => panic!("expected a completed export"),
+        }
+        let cancelled = io::Error::new(io::ErrorKind::Interrupted, "cancelled");
+        assert!(matches!(
+            export_outcome(Err(cancelled), None, &dest),
+            ExportOutcome::Cancelled
+        ));
+        let failed = io::Error::other("disk full");
+        match export_outcome(Err(failed), None, &dest) {
+            ExportOutcome::Failed(message) => {
+                assert!(message.contains("Could not save texture.dds"), "{message}");
+                assert!(message.contains("disk full"), "{message}");
+            }
+            _ => panic!("expected a failed export"),
+        }
+    }
+
+    #[test]
+    fn initial_dir_is_the_folder_holding_the_source() {
+        // A plain path that does not exist falls back to its own folder.
+        assert_eq!(
+            initial_export_dir(Path::new("plain/dir/file.bin")),
+            PathBuf::from("plain/dir")
+        );
+
+        // An archive entry opens in the archive file's folder.
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("pack.rpf");
+        std::fs::write(&archive, b"9FPR0000").unwrap();
+        let entry = archive.join("Recovered Entries").join("XML").join("x.xml");
+        assert_eq!(initial_export_dir(&entry), temp.path());
     }
 }
