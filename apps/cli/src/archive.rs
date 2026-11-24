@@ -59,8 +59,8 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Show the table of contents as stored and, where it is readable
-    /// without decryption, its entries
+    /// Show the table of contents and its entries. Processed metadata is
+    /// authenticated with a compatible executable before its entries are used
     Metadata {
         file: PathBuf,
         /// List the entries
@@ -82,6 +82,10 @@ pub enum Command {
         /// Only rpf=0:hash64 is built in
         #[arg(long = "extension", value_parser = metadata::parse_extension, requires = "candidates")]
         extensions: Vec<metadata::Extension>,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -109,6 +113,10 @@ pub enum Command {
         /// Replace the output file if it already exists
         #[arg(long)]
         overwrite: bool,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
     },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
@@ -165,6 +173,7 @@ pub fn run(command: Command) -> Result<(), String> {
             archive_path,
             mount_prefix,
             extensions,
+            executable,
             json,
         } => metadata::run(
             &file,
@@ -175,6 +184,7 @@ pub fn run(command: Command) -> Result<(), String> {
                 archive_path,
                 mount_prefix,
                 extensions,
+                executable,
                 json,
             },
         ),
@@ -183,7 +193,8 @@ pub fn run(command: Command) -> Result<(), String> {
             row,
             output,
             overwrite,
-        } => extract::run(&file, row, &output, overwrite),
+            executable,
+        } => extract::run(&file, row, &output, overwrite, executable.as_deref()),
         Command::Probe {
             file,
             executable,

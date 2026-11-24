@@ -28,6 +28,8 @@ lforge --help
 lforge info
 lforge archive info game.rpf
 lforge archive recover game.rpf --list
+lforge archive metadata game.rpf --executable game.exe --entries --json
+lforge archive extract game.rpf --executable game.exe --row 42 --output entry.bin
 ```
 
 ## RPF9 support
@@ -40,11 +42,17 @@ Native RPF9 reading is available when the archive's table of contents is stored
 without encryption. Leonida Forge then reads native entries with stored bytes,
 raw DEFLATE, chunked payloads and companion-file payloads.
 
-The table of contents in retail game archives is encrypted, and this build does
-not decrypt it. For those archives the explorer scans the data for zlib streams
-and lists recovery candidates instead. Recovered entries are named by archive
-offset. Their original names and folder structure are unknown, and the scan
-does not produce a complete archive inventory.
+The CLI can also read encrypted table-of-contents metadata when given a
+compatible local executable with `--executable`. It authenticates the metadata
+signature before listing or extracting native entries. The executable and the
+archive are read only; the executable is not copied or cached. Payload bytes
+are not covered by the metadata signature.
+
+The desktop explorer does not yet offer executable selection. For encrypted
+archives it scans the data for zlib streams and lists recovery candidates
+instead. Recovered entries are named by archive offset. Their original names
+and folder structure are unknown, and the scan does not produce a complete
+archive inventory.
 
 This is not full native GTA VI RPF9 support.
 
@@ -59,8 +67,10 @@ This is not full native GTA VI RPF9 support.
 
 ## Known limitations
 
-- Encrypted RPF9 table-of-contents metadata is not decrypted.
-- Recovered entries have no original names or paths.
+- Encrypted RPF9 table-of-contents metadata needs `--executable` in the CLI;
+  the desktop explorer does not decrypt it.
+- Native entries keep hash names. Recovered entries have no original names or
+  paths.
 - A recovered entry can be partial or unverified. The UI reports its status,
   and an export keeps that caveat in the result message.
 - Payload transforms and compression modes beyond the supported list are

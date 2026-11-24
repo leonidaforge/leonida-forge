@@ -15,7 +15,7 @@ use lforge_rage9::rpf::metadata::{
 use lforge_rage9::rpf::names::{self, Candidate, Class, Matches, MountPrefix, Types};
 use serde_json::{Value, json};
 
-use crate::native::Alternates;
+use crate::native::{self, Alternates, Authentication};
 
 /// Larger metadata areas are not read.
 const MAX_METADATA: u64 = 256 * 1024 * 1024;
@@ -27,6 +27,7 @@ pub struct Options {
     pub archive_path: Option<String>,
     pub mount_prefix: Option<String>,
     pub extensions: Vec<Extension>,
+    pub executable: Option<PathBuf>,
     pub json: bool,
 }
 
@@ -110,10 +111,11 @@ impl Naming {
 
 pub fn run(path: &Path, options: &Options) -> Result<(), String> {
     let naming = Naming::read(options)?;
+    // Open failures are command failures, not per-archive report states.
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
-    let report = report(path, &source, options, naming.as_ref());
+    let report = report(path, options, naming.as_ref());
     let out = io::stdout().lock();
     let mut out = BufWriter::new(out);
     let result = if options.json {
@@ -315,20 +317,27 @@ fn entry_json(
     value
 }
 
-fn report(path: &Path, source: &Source, options: &Options, naming: Option<&Naming>) -> Value {
-    let unreadable = |err: Error| {
+fn report(path: &Path, options: &Options, naming: Option<&Naming>) -> Value {
+    let unreadable = |reason: String| {
         json!({
             "format": "RPF9",
             "state": "unreadable",
-            "entries": { "available": false, "reason": err.to_string() },
+            "authentication": { "status": "unavailable", "reason": reason },
+            "entries": { "available": false, "reason": reason },
         })
     };
-    let mut source = source.clone();
+    let mut source = match Source::open(path) {
+        Ok(source) => source,
+        Err(err) => return unreadable(format!("cannot open {}: {err}", path.display())),
+    };
+    if let Err(err) = rpf::read_header(&mut source) {
+        return unreadable(format!("{}: {err}", path.display()));
+    }
     // The header, and at most the A table, decide whether the whole metadata
     // area is worth reading.
-    let probe = match Stored::probe(&mut source) {
+    let probe = match Stored::probe(&mut source.clone()) {
         Ok(probe) => probe,
-        Err(err) => return unreadable(err),
+        Err(err) => return unreadable(format!("{}: {err}", path.display())),
     };
     let prefix = probe.prefix;
     let mut report = json!({
@@ -338,27 +347,71 @@ fn report(path: &Path, source: &Source, options: &Options, naming: Option<&Namin
         "passes": passes_json(&prefix, probe.processing),
         "transformed": false,
         "verified": false,
+        "authentication": { "status": "not_attempted" },
     });
-    if let Some(reason) = probe.unsupported() {
+    let (metadata, metadata_source, authentication) = if probe.processing.is_none() {
+        match Stored::read(&mut source, MAX_METADATA).and_then(Stored::decode) {
+            Ok(metadata) => (metadata, source, Authentication::NotApplicable),
+            Err(err) => {
+                report["state"] = json!("stored");
+                report["entries"] = json!({ "available": false, "reason": err.to_string() });
+                return report;
+            }
+        }
+    } else if options.executable.is_some() {
+        match native::open_metadata(path, MAX_METADATA, options.executable.as_deref()) {
+            Ok(opened) => (opened.metadata, opened.source, opened.authentication),
+            Err(reason) => {
+                report["state"] = json!("stored");
+                report["authentication"] = json!({ "status": "unavailable", "reason": reason });
+                report["entries"] = json!({ "available": false, "reason": reason });
+                return report;
+            }
+        }
+    } else {
+        let reason = probe
+            .unsupported()
+            .unwrap_or_else(|| "the metadata is processed".to_string());
         report["state"] = json!("stored");
+        report["authentication"] = json!({ "status": "unavailable", "reason": reason });
         report["entries"] = json!({
             "available": false,
             "reason": format!("{}; {reason}", Error::Transformed(probe.processing)),
         });
         return report;
-    }
-    let metadata = match Stored::read(&mut source, MAX_METADATA).and_then(Stored::decode) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            report["state"] = json!("stored");
-            report["entries"] = json!({ "available": false, "reason": err.to_string() });
-            return report;
-        }
     };
     report["state"] = json!("decoded");
+    report["authentication"] = authentication_json(&authentication);
+    if let Some(verification) = authentication.report() {
+        report["transformed"] = json!(true);
+        report["verified"] = json!(true);
+        report["passes"]["signature"] = json!("verified");
+        if let Some(pass) = verification.archive_pass {
+            report["passes"]["archive_pass"] = json!(if pass {
+                "required: B sub-block 1 is present"
+            } else {
+                "not required: B sub-block 1 is absent"
+            });
+        }
+    }
     let alternates = Alternates::resolve(path, &metadata);
-    report["entries"] = entries_json(&metadata, &source, &alternates, options, naming);
+    report["entries"] = entries_json(&metadata, &metadata_source, &alternates, options, naming);
     report
+}
+
+fn authentication_json(authentication: &Authentication) -> Value {
+    match authentication {
+        Authentication::NotApplicable => json!({ "status": authentication.status() }),
+        Authentication::Authenticated(report) => json!({
+            "status": "authenticated",
+            "outcome": report.outcome.to_string(),
+            "stage": report.stage,
+            "signature": report.signature.to_string(),
+            "archive_pass": report.archive_pass,
+            "candidates": report.candidates,
+            "selected_candidate": report.selected_candidate,
+        }),
+    }
 }
 
 /// A summary of the archive's companion files, where it lists any.
@@ -388,7 +441,11 @@ fn entries_json(
     naming: Option<&Naming>,
 ) -> Value {
     let entries: Vec<Entry> = metadata.entries().collect();
-    let mut value = json!({ "available": true, "rows": entries.len() });
+    let mut value = json!({
+        "available": true,
+        "source": "native_toc",
+        "rows": entries.len(),
+    });
     if let Some(companions) = companions_json(alternates) {
         value["companions"] = companions;
     }
@@ -500,9 +557,31 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
         }
         writeln!(out, "archive pass: {}", text(&passes["archive_pass"]))?;
         writeln!(out, "secondary:   {}", text(&passes["secondary_area"]))?;
-        writeln!(out, "transformed: no")?;
-        writeln!(out, "verified:    no (the signature is not checked)")?;
+        writeln!(out, "signature:   {}", text(&passes["signature"]))?;
+        writeln!(
+            out,
+            "transformed: {}",
+            if report["transformed"] == json!(true) {
+                "yes"
+            } else {
+                "no"
+            }
+        )?;
+        writeln!(
+            out,
+            "verified:    {}",
+            if report["verified"] == json!(true) {
+                "yes"
+            } else {
+                "no"
+            }
+        )?;
     }
+    writeln!(
+        out,
+        "authentication: {}",
+        text(&report["authentication"]["status"])
+    )?;
     let entries = &report["entries"];
     if entries["available"] != json!(true) {
         writeln!(

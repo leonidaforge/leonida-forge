@@ -19,8 +19,16 @@ use crate::output;
 /// Larger table-of-contents areas are not read, as in `archive metadata`.
 const MAX_METADATA: u64 = 256 * 1024 * 1024;
 
-pub fn run(file: &Path, row: u32, output: &Path, overwrite: bool) -> Result<(), String> {
-    let (source, metadata) = native::open_metadata(file, MAX_METADATA)?;
+pub fn run(
+    file: &Path,
+    row: u32,
+    output: &Path,
+    overwrite: bool,
+    executable: Option<&Path>,
+) -> Result<(), String> {
+    let opened = native::open_metadata(file, MAX_METADATA, executable)?;
+    let source = opened.source;
+    let metadata = opened.metadata;
     let rows = metadata.rows();
     if row >= rows {
         return Err(match rows {

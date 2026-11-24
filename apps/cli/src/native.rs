@@ -7,16 +7,57 @@
 //! directory with its path-traversal, symlink and header checks.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_binary::pe::ExecutableView;
 use lforge_rage9::rpf;
+use lforge_rage9::rpf::metadata::verify::{
+    OpenReport, VerifyOutcome, VerifyReport, open_authenticated,
+};
 use lforge_rage9::rpf::metadata::{Companion, CompanionStatus, Metadata, Stored};
 
+/// How the native table of contents was obtained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Authentication {
+    /// The archive has no processing pass, so its stored metadata is the
+    /// table the engine reads.
+    NotApplicable,
+    /// The signature verified and steps 4 and 5 decoded the metadata.
+    Authenticated(VerifyReport),
+}
+
+impl Authentication {
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Authenticated(_) => "authenticated",
+        }
+    }
+
+    pub fn report(&self) -> Option<&VerifyReport> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Authenticated(report) => Some(report),
+        }
+    }
+}
+
+/// An opened archive and the native table of contents the engine would read.
+pub struct Opened {
+    pub source: Source,
+    pub metadata: Metadata,
+    pub authentication: Authentication,
+}
+
 /// Opens `path`, reads the RPF9 header and decodes the native table of
-/// contents. Metadata that the engine processes before use (an encrypted or
-/// otherwise transformed area) is rejected with the reason, as are malformed
-/// or oversized areas. `limit` caps the metadata area read into memory.
-pub fn open_metadata(path: &Path, limit: u64) -> Result<(Source, Metadata), String> {
+/// contents.
+///
+/// Unprocessed metadata is decoded directly. Encrypted metadata requires an
+/// `executable` and is used only after the signature verifies. Malformed or
+/// oversized metadata is rejected. `limit` caps the metadata area read into
+/// memory.
+pub fn open_metadata(path: &Path, limit: u64, executable: Option<&Path>) -> Result<Opened, String> {
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -24,16 +65,51 @@ pub fn open_metadata(path: &Path, limit: u64) -> Result<(Source, Metadata), Stri
     // be used before all of them are read.
     let probe =
         Stored::probe(&mut source.clone()).map_err(|err| format!("{}: {err}", path.display()))?;
-    if let Some(reason) = probe.unsupported() {
+    if probe.processing.is_none() {
+        let metadata = Stored::read(&mut source.clone(), limit)
+            .and_then(Stored::decode)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        return Ok(Opened {
+            source,
+            metadata,
+            authentication: Authentication::NotApplicable,
+        });
+    }
+    let Some(executable) = executable else {
+        let reason = probe
+            .unsupported()
+            .unwrap_or_else(|| "the metadata is processed".to_string());
         return Err(format!(
-            "the table of contents of {} is not read: {reason}",
+            "the table of contents of {} is not read: it is processed and requires --executable: {reason}",
             path.display()
         ));
-    }
-    let metadata = Stored::read(&mut source.clone(), limit)
-        .and_then(Stored::decode)
+    };
+    let view = ExecutableView::open(executable)
+        .map_err(|err| format!("cannot open {}: {err}", executable.display()))?;
+    let open: OpenReport = open_authenticated(&mut source.clone(), &view, &AtomicBool::new(false))
         .map_err(|err| format!("{}: {err}", path.display()))?;
-    Ok((source, metadata))
+    let report = open.report;
+    let Some(authenticated) = open.authenticated else {
+        return Err(format!(
+            "the table of contents of {} is not authenticated: {} (stage {})",
+            path.display(),
+            report.outcome,
+            report.stage
+        ));
+    };
+    if report.outcome != VerifyOutcome::MetadataDecodedAuthenticated {
+        return Err(format!(
+            "the table of contents of {} is not authenticated: {} (stage {})",
+            path.display(),
+            report.outcome,
+            report.stage
+        ));
+    }
+    Ok(Opened {
+        source,
+        metadata: authenticated.into_metadata(),
+        authentication: Authentication::Authenticated(report),
+    })
 }
 
 /// The alternate read sources of an archive, resolved from `B` sub-block 3.

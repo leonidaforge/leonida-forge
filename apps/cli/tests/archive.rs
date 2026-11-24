@@ -356,6 +356,7 @@ fn metadata_lists_decoded_entries_with_names() {
     assert_eq!(report["state"], "decoded");
     assert_eq!(report["transformed"], false);
     assert_eq!(report["verified"], false);
+    assert_eq!(report["authentication"]["status"], "not_applicable");
     assert_eq!(report["prefix"]["rows"], 2);
     assert_eq!(report["regions"]["descriptors"]["start"], 0x60);
     assert_eq!(report["passes"]["static_pass"], Value::Null);
@@ -368,6 +369,9 @@ fn metadata_lists_decoded_entries_with_names() {
     assert_eq!(listed[0]["layout"], "A");
     assert_eq!(listed[0]["payload_offset"], 0x100);
     assert_eq!(listed[0]["read_source"], "main");
+    let name_hash = listed[0]["name_hash"].as_str().unwrap();
+    assert!(name_hash.starts_with("0x"));
+    assert_eq!(name_hash.len(), 18);
     assert_eq!(listed[0]["raw"]["available"], true);
     assert_eq!(
         listed[0]["names"],
