@@ -53,6 +53,11 @@ pub enum Error {
     /// processing is not implemented.
     Transformed(Processing),
     Cipher(transform::Error),
+    /// The entry's stored bytes are not its contents.
+    Encoded {
+        row: u32,
+        encoding: &'static str,
+    },
 }
 
 impl fmt::Display for Error {
@@ -68,6 +73,10 @@ impl fmt::Display for Error {
                 "the stored metadata is processed before use ({processing}), which is not supported"
             ),
             Error::Cipher(err) => write!(f, "metadata cipher pass failed: {err}"),
+            Error::Encoded { row, encoding } => write!(
+                f,
+                "entry {row} is stored {encoding}, so its stored bytes are not its contents"
+            ),
         }
     }
 }
@@ -308,7 +317,10 @@ pub struct Stored {
 }
 
 impl Stored {
-    /// Reads `[0, hdr[0x04])` from the start of `source`.
+    /// Reads `[0, hdr[0x04])` from the start of `source`. For an archive
+    /// inside a larger file or another archive, `source` is a
+    /// [`lforge_binary::Source::slice`] of it, which keeps all offsets
+    /// archive-relative.
     pub fn read(source: &mut (impl Read + Seek), limit: u64) -> Result<Self, Error> {
         let archive_len = source.seek(SeekFrom::End(0))?;
         source.seek(SeekFrom::Start(0))?;
@@ -913,6 +925,31 @@ impl Metadata {
 
     pub fn payload_transform(&self, row: u32) -> Result<bool, Error> {
         Ok(self.field(row, keys::PAYLOAD_TRANSFORM)?.is_some())
+    }
+
+    /// The archive-relative range of an entry stored as it is: from its
+    /// payload offset, its logical size, as the engine reads a nested archive.
+    /// Fails with [`Error::Encoded`] for an entry that is compressed, chunked
+    /// or behind the payload transform.
+    pub fn raw_range(&self, row: u32) -> Result<Range<u64>, Error> {
+        let location = self.location(row)?;
+        let encoding = if location.is_compressed() {
+            Some("compressed")
+        } else if self.chunk_table(row)?.is_some() {
+            Some("in chunks")
+        } else if self.payload_transform(row)? {
+            Some("behind the payload transform")
+        } else {
+            None
+        };
+        if let Some(encoding) = encoding {
+            return Err(Error::Encoded { row, encoding });
+        }
+        let start = location.payload_offset;
+        let end = start
+            .checked_add(location.logical_len)
+            .ok_or_else(|| invalid(format!("the range of entry {row} overflows")))?;
+        Ok(start..end)
     }
 
     /// The chunk table. Its entries are addressed relative to the value and

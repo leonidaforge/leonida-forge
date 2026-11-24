@@ -984,3 +984,173 @@ mod chain {
         assert_eq!(error, transform::Error::Unaligned(span.len()));
     }
 }
+
+mod embedded {
+    //! Archives inside files and inside other archives, read through views
+    //! of a file-backed source.
+
+    use std::io::Write;
+
+    use lforge_binary::Source;
+
+    use super::*;
+
+    const PAYLOADS: usize = 0x1000;
+
+    fn source(bytes: &[u8]) -> Source {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        Source::from_file(file).unwrap()
+    }
+
+    fn leaf(value: [u8; 4]) -> Vec<u8> {
+        Build::default().build(&[Column::new(KEY_X, 4, &[&value], &[Some(0)])])
+    }
+
+    enum Storage {
+        Raw,
+        Compressed,
+        Transformed,
+    }
+
+    /// An archive with one row per payload, stored from offset 0x1000 on.
+    fn parent(payloads: &[(&[u8], Storage)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut records = Vec::new();
+        for (payload, stored) in payloads {
+            let offset = PAYLOADS + data.len();
+            let mode = u8::from(matches!(stored, Storage::Compressed));
+            let units = payload.len().div_ceil(16) as u32;
+            records.push(record_a(
+                units,
+                (offset / 16) as u32,
+                payload.len() as u64,
+                0,
+                mode,
+            ));
+            data.extend_from_slice(payload);
+            data.resize(data.len().next_multiple_of(16), 0);
+        }
+        let all: Vec<Option<u32>> = (0..payloads.len() as u32).map(Some).collect();
+        let transformed: Vec<Option<u32>> = payloads
+            .iter()
+            .map(|(_, stored)| matches!(stored, Storage::Transformed).then_some(0))
+            .collect();
+        let records: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let mut bytes = Build::default().build(&[
+            Column::new(keys::LOCATION_A, 16, &records, &all),
+            Column::new(keys::PAYLOAD_TRANSFORM, 1, &[&[0]], &transformed),
+        ]);
+        assert!(bytes.len() <= PAYLOADS);
+        bytes.resize(PAYLOADS, 0);
+        bytes.extend_from_slice(&data);
+        bytes
+    }
+
+    fn decode(source: &mut Source) -> Metadata {
+        Stored::read(source, 1 << 20).unwrap().decode().unwrap()
+    }
+
+    fn view(parent: &Source, metadata: &Metadata, row: u32) -> Source {
+        let range = metadata.raw_range(row).unwrap();
+        parent.slice(range.start, range.end - range.start).unwrap()
+    }
+
+    #[test]
+    fn reads_an_archive_at_offset_zero() {
+        let mut bytes = leaf([1, 2, 3, 4]);
+        bytes.extend_from_slice(&[0xCC; 0x40]);
+        let metadata = decode(&mut source(&bytes));
+        assert_eq!(metadata.field(0, KEY_X).unwrap(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    #[test]
+    fn reads_an_archive_embedded_at_an_offset() {
+        let archive = leaf([1, 2, 3, 4]);
+        let mut bytes = vec![0xEE; 0x30];
+        bytes.extend_from_slice(&archive);
+        bytes.extend_from_slice(&[0xCC; 0x20]);
+        let file = source(&bytes);
+
+        let metadata = decode(&mut file.slice(0x30, archive.len() as u64).unwrap());
+        assert_eq!(metadata.field(0, KEY_X).unwrap(), Some(&[1, 2, 3, 4][..]));
+        // A view may extend past the metadata area.
+        let rest = file.len() - 0x30;
+        decode(&mut file.slice(0x30, rest).unwrap());
+        // Without the view, the file does not start with an archive.
+        invalid_reason(Stored::read(&mut file.clone(), 1 << 20));
+    }
+
+    #[test]
+    fn rejects_truncated_embedded_metadata() {
+        let archive = leaf([1, 2, 3, 4]);
+        let mut bytes = vec![0xEE; 0x30];
+        bytes.extend_from_slice(&archive);
+        let file = source(&bytes);
+        let short = archive.len() as u64 - 1;
+        let reason = invalid_reason(Stored::read(&mut file.slice(0x30, short).unwrap(), 1 << 20));
+        assert!(reason.contains("end of the file"), "{reason}");
+        let header_only = file.slice(0x30, 0x20).unwrap();
+        assert!(matches!(
+            Stored::read(&mut header_only.clone(), 1 << 20),
+            Err(Error::Io(_))
+        ));
+        assert!(file.slice(0x30, archive.len() as u64 + 1).is_err());
+    }
+
+    #[test]
+    fn reads_archives_nested_in_an_embedded_archive() {
+        let first = leaf([1, 2, 3, 4]);
+        let second = leaf([5, 6, 7, 8]);
+        let archive = parent(&[(&first, Storage::Raw), (&second, Storage::Raw)]);
+        let mut bytes = vec![0xEE; 0x50];
+        bytes.extend_from_slice(&archive);
+        let file = source(&bytes);
+
+        let outer = file.slice(0x50, archive.len() as u64).unwrap();
+        let metadata = decode(&mut outer.clone());
+        let mut a = view(&outer, &metadata, 0);
+        let mut b = view(&outer, &metadata, 1);
+        // The views are archive-relative, not file-relative.
+        assert_eq!(metadata.raw_range(0).unwrap().start, PAYLOADS as u64);
+        drop((file, outer));
+        let a = decode(&mut a);
+        let b = decode(&mut b);
+        assert_eq!(a.field(0, KEY_X).unwrap(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(b.field(0, KEY_X).unwrap(), Some(&[5, 6, 7, 8][..]));
+    }
+
+    #[test]
+    fn refuses_encoded_entries_as_raw_bytes() {
+        let child = leaf([1, 2, 3, 4]);
+        let archive = parent(&[
+            (&child, Storage::Raw),
+            (&child, Storage::Compressed),
+            (&child, Storage::Transformed),
+        ]);
+        let metadata = decode(&mut source(&archive));
+        assert!(metadata.raw_range(0).is_ok());
+        for (row, expected) in [(1, "compressed"), (2, "behind the payload transform")] {
+            match metadata.raw_range(row) {
+                Err(Error::Encoded { row: r, encoding }) => {
+                    assert_eq!((r, encoding), (row, expected));
+                }
+                other => panic!("row {row}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_entries_outside_the_archive() {
+        let child = leaf([1, 2, 3, 4]);
+        let mut archive = parent(&[(&child, Storage::Raw)]);
+        archive.truncate(PAYLOADS + child.len() - 1);
+        let outer = source(&archive);
+        let metadata = decode(&mut outer.clone());
+        let range = metadata.raw_range(0).unwrap();
+        let err = outer
+            .slice(range.start, range.end - range.start)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
