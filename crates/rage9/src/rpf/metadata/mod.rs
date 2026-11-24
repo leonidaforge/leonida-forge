@@ -26,6 +26,7 @@ use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 mod companion;
 mod entry;
 mod payload;
+pub mod probe;
 pub mod provider;
 pub mod recognize;
 pub mod transform;
@@ -395,6 +396,37 @@ fn read_range(source: &mut (impl Read + Seek), range: Range<usize>) -> Result<Ve
     Ok(bytes)
 }
 
+/// The step-1 `A` span: `A` starts at `0x40` and covers `align16(count * 8)`
+/// bytes.
+pub(crate) fn step1_a_span(prefix: &Prefix, layout: &Layout) -> Result<Range<usize>, Error> {
+    let overflow = || invalid("static pass spans overflow");
+    let a = layout.a_table.start;
+    let a_len = to_usize(align(u64::from(prefix.a_records) * 8, 16).ok_or_else(overflow)?)?;
+    let a_end = a.checked_add(a_len).ok_or_else(overflow)?;
+    Ok(a..a_end)
+}
+
+/// The engine computes the start of `B` as `0x40 + align16(A * 8)` and the
+/// end of `B` as the start of the descriptors when it places cipher spans,
+/// while the layout aligns by `G`. Where the two disagree, the engine's spans
+/// would cover other bytes than the layout's regions, so such metadata is
+/// rejected.
+pub(crate) fn check_span_formulas(prefix: &Prefix, layout: &Layout) -> Result<(), Error> {
+    let overflow = || invalid("cipher span offsets overflow");
+    let b = align(u64::from(prefix.a_records) * 8, 16)
+        .map(|a| HEADER_LEN as u64 + a)
+        .ok_or_else(overflow)?;
+    let b_end = b + u64::from(prefix.b_len);
+    if layout.b_block.start as u64 != b || layout.descriptors.start as u64 != b_end {
+        return Err(invalid(format!(
+            "the cipher spans place B at {b:#x}..{b_end:#x}, the layout at {:#x}..{:#x} \
+             with descriptors at {:#x}",
+            layout.b_block.start, layout.b_block.end, layout.descriptors.start
+        )));
+    }
+    Ok(())
+}
+
 /// The metadata area as stored in the archive.
 #[derive(Debug, Clone)]
 pub struct Stored {
@@ -519,42 +551,22 @@ impl Stored {
     /// Step 1 spans. They start at the `A` table and `B` block of the layout.
     fn static_spans(&self) -> Result<Vec<Range<usize>>, Error> {
         let overflow = || invalid("static pass spans overflow");
-        let a = self.layout.a_table.start;
-        let a_len =
-            to_usize(align(u64::from(self.prefix.a_records) * 8, 16).ok_or_else(overflow)?)?;
-        let a_end = a.checked_add(a_len).ok_or_else(overflow)?;
+        let a = step1_a_span(&self.prefix, &self.layout)?;
         let b_len = to_usize(u64::from(self.prefix.b_len))?;
         Ok(if self.prefix.selector & 1 != 0 {
             let b = self.layout.b_block.start;
             let b_trailer = to_usize(u64::from(self.prefix.b_trailer_len))?;
             let b_end = b.checked_add(b_len - b_trailer).ok_or_else(overflow)?;
-            vec![a..a_end, b..b_end]
+            vec![a, b..b_end]
         } else {
-            let ab = a..a_end.checked_add(b_len).ok_or_else(overflow)?;
+            let ab = a.start..a.end.checked_add(b_len).ok_or_else(overflow)?;
             vec![ab]
         })
     }
 
-    /// The engine computes the start of `B` as `0x40 + align16(A * 8)` and
-    /// the end of `B` as the start of the descriptors when it places cipher
-    /// spans, while the layout aligns by `G`. Where the two disagree, the
-    /// engine's spans would cover other bytes than the layout's regions, so
-    /// such metadata is rejected.
+    /// See [`check_span_formulas`].
     fn check_span_formulas(&self) -> Result<(), Error> {
-        let overflow = || invalid("cipher span offsets overflow");
-        let b = align(u64::from(self.prefix.a_records) * 8, 16)
-            .map(|a| HEADER_LEN as u64 + a)
-            .ok_or_else(overflow)?;
-        let b_end = b + u64::from(self.prefix.b_len);
-        let layout = &self.layout;
-        if layout.b_block.start as u64 != b || layout.descriptors.start as u64 != b_end {
-            return Err(invalid(format!(
-                "the cipher spans place B at {b:#x}..{b_end:#x}, the layout at {:#x}..{:#x} \
-                 with descriptors at {:#x}",
-                layout.b_block.start, layout.b_block.end, layout.descriptors.start
-            )));
-        }
-        Ok(())
+        check_span_formulas(&self.prefix, &self.layout)
     }
 
     /// The step 4 span, computed as the engine computes it.

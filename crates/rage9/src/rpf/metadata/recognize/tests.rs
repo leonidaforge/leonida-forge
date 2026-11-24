@@ -1,7 +1,7 @@
 //! Tests over synthetic PE32+ images. Every fixture is built here; no
 //! executable-derived bytes, key material or local path appears in this file.
 
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
@@ -10,11 +10,14 @@ use lforge_binary::pe::{Error as PeError, ExecutableView};
 use super::descriptor::{WRITER_PATTERN, recognize_with as recognize_descriptor_with};
 use super::registry::{recognize_with as recognize_registry_with, with_records};
 use super::*;
-use crate::rpf::metadata::provider::{
-    EncodedAesBlock, FixedTablesError, recognize_fixed_tables, recognize_fixed_tables_with,
-    synthetic,
+use crate::rpf::metadata::probe::{
+    AUTHENTICATION, ProbeError, ProbeOutcome, ProbeReport, probe, probe_with_limit,
 };
-use crate::rpf::metadata::transform::BlockDecrypt;
+use crate::rpf::metadata::provider::{
+    EncodedAesBlock, FixedTablesError, RecognizedSource, SourceError, recognize_fixed_tables,
+    recognize_fixed_tables_with, synthetic,
+};
+use crate::rpf::metadata::transform::{BlockDecrypt, CipherSource};
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
 const TEXT_VA: u32 = 0x1000;
@@ -1191,45 +1194,102 @@ fn provider_selection_follows_the_algorithm_family() {
 #[ignore = "set LEONIDA_FORGE_EXECUTABLE to a local executable to run"]
 fn local_executable_smoke_test() {
     let Some(path) = std::env::var_os("LEONIDA_FORGE_EXECUTABLE") else {
-        return;
+        panic!("set LEONIDA_FORGE_EXECUTABLE to a local executable to run this test");
     };
     let image = ExecutableView::open(std::path::Path::new(&path)).unwrap();
-    let registry = recognize_registry(&image, &AtomicBool::new(false)).unwrap();
+    let cancel = AtomicBool::new(false);
+    let registry = recognize_registry(&image, &cancel).unwrap();
+    // The research for the inspected build expects 24 records and 10
+    // algorithm-0x10 states. The counts are printed rather than pinned, so a
+    // different build is not rejected for a structural count alone.
     eprintln!(
         "registry records: {}, algorithm states: {}",
         registry.record_count(),
         registry.algorithm_state_count()
     );
-    let mut recognized = 0;
-    for selector in [9u8, 8, 3, 2] {
-        match recognize_static_descriptor(&image, &registry, selector, &AtomicBool::new(false)) {
-            Ok(descriptor) => {
-                eprintln!(
-                    "selector {selector}: index {}, kind {:#x}",
-                    descriptor.index(),
-                    descriptor.kind()
-                );
-                recognized += 1;
-            }
-            Err(error) => eprintln!("selector {selector}: {error}"),
-        }
-    }
-    assert!(recognized > 0, "no inspected-build selector resolved");
+    assert!(registry.record_count() > 0, "the registry has no records");
+    assert!(
+        registry.algorithm_state_count() > 0,
+        "the registry has no algorithm-0x10 states"
+    );
 
-    match recognize_fixed_tables(&image, &AtomicBool::new(false)) {
-        Ok(tables) => {
-            eprintln!("fixed transformation tables: recognized");
-            if let Ok(recognized) = Recognized::recognize(&image, 9, &AtomicBool::new(false))
-                && let Ok(state) = recognized.state()
-            {
-                eprintln!(
-                    "encoded block initialized: {}",
-                    EncodedAesBlock::new(state, tables).is_ok()
-                );
-            }
-        }
-        Err(error) => eprintln!("fixed transformation tables: {error}"),
+    let four_odd = recognize_static_descriptor(&image, &registry, 9, &cancel).unwrap();
+    let four_even = recognize_static_descriptor(&image, &registry, 8, &cancel).unwrap();
+    assert_eq!(
+        four_odd, four_even,
+        "selectors 9 and 8 must select the same descriptor"
+    );
+    let one_odd = recognize_static_descriptor(&image, &registry, 3, &cancel).unwrap();
+    let one_even = recognize_static_descriptor(&image, &registry, 2, &cancel).unwrap();
+    assert_eq!(
+        one_odd, one_even,
+        "selectors 3 and 2 must select the same descriptor"
+    );
+    assert_ne!(four_odd, one_odd, "the two descriptors must differ");
+    eprintln!(
+        "selector 9/8: index {}, kind {:#x}",
+        four_odd.index(),
+        four_odd.kind()
+    );
+    eprintln!(
+        "selector 3/2: index {}, kind {:#x}",
+        one_odd.index(),
+        one_odd.kind()
+    );
+
+    for selector in [0u8, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15] {
+        assert!(
+            recognize_static_descriptor(&image, &registry, selector, &cancel).is_err(),
+            "selector {selector} unexpectedly resolved"
+        );
     }
+    eprintln!("unavailable selectors fail closed");
+
+    let source = RecognizedSource::recognize(&image, 9, &cancel).unwrap();
+    assert_eq!(source.algorithm_id(), ALGORITHM_CBC);
+    assert_eq!(source.provider(), 2);
+    assert_eq!(source.mode(), STATIC_STEP1_MODE);
+    let index = source.descriptor().index();
+    assert_eq!(source.static_kind(index), Some(source.descriptor().kind()));
+    assert!(source.static_descriptor(index).is_some());
+    assert!(source.cbc_block(source.descriptor().key_id()).is_some());
+    eprintln!(
+        "provider: algorithm {:#x}, provider {}, mode {}, block initialized",
+        source.algorithm_id(),
+        source.provider(),
+        source.mode()
+    );
+}
+
+/// Optional read-only A-table probe against local files. The caller supplies
+/// the executable through `LEONIDA_FORGE_EXECUTABLE` and an archive through
+/// `LEONIDA_FORGE_ARCHIVE`. The result is evidence for these files only; it
+/// does not authenticate the archive.
+#[test]
+#[ignore = "set LEONIDA_FORGE_EXECUTABLE and LEONIDA_FORGE_ARCHIVE to local files to run"]
+fn local_archive_probe_smoke_test() {
+    let Some(executable) = std::env::var_os("LEONIDA_FORGE_EXECUTABLE") else {
+        panic!("set LEONIDA_FORGE_EXECUTABLE to a local executable to run this test");
+    };
+    let Some(archive) = std::env::var_os("LEONIDA_FORGE_ARCHIVE") else {
+        panic!("set LEONIDA_FORGE_ARCHIVE to a local archive to run this test");
+    };
+    let image = ExecutableView::open(std::path::Path::new(&executable)).unwrap();
+    let mut source = Source::open(std::path::Path::new(&archive)).unwrap();
+    let report = probe(&mut source, &image, &AtomicBool::new(false)).unwrap();
+    eprintln!("probe outcome: {}", report.outcome);
+    eprintln!(
+        "registry records: {:?}, algorithm states: {:?}",
+        report.registry_records, report.registry_algorithm_states
+    );
+    eprintln!("descriptor: {:?}", report.descriptor);
+    eprintln!("state identified: {}", report.state_identified);
+    eprintln!("fixed tables: {}", report.fixed_tables);
+    eprintln!("block initialized: {}", report.block_initialized);
+    eprintln!("A table: {:?}", report.a_table);
+    eprintln!("authentication: {}", report.authentication);
+    assert_eq!(report.authentication, AUTHENTICATION);
+    assert_ne!(report.outcome, ProbeOutcome::Cancelled);
 }
 
 // --- fixed transformation tables -----------------------------------------
@@ -1462,4 +1522,346 @@ fn recognizes_registry_fixed_tables_and_block_end_to_end() {
     let mut value = synthetic::FIPS_CIPHERTEXT;
     block.decrypt_block(&mut value);
     assert_eq!(value, synthetic::FIPS_PLAINTEXT);
+}
+
+// --- key provider source and A-table probe -------------------------------
+
+const PROBE_IV: [u8; 16] = [0x33; 16];
+const PROBE_RECORDS_OFFSET: usize = 0x5000;
+const PROBE_A_RECORD_LEN: usize = 8;
+
+fn a_record(id: u16, offset: u32) -> [u8; PROBE_A_RECORD_LEN] {
+    let mut record = [0u8; PROBE_A_RECORD_LEN];
+    put_u16(&mut record, 0, id);
+    put_u32(&mut record, 4, offset);
+    record
+}
+
+fn probe_selectors() -> Vec<u64> {
+    let mut selectors = vec![selector_for(KEY_FOUR, ALGORITHM_CBC, STATIC_STEP1_MODE)];
+    selectors.extend((1..5u64).map(|index| ((0x7000 + index) << 32) | 0x0200_0000u64));
+    selectors
+}
+
+fn probe_rdata(selectors: &[u64], corrupt_fixed: Option<usize>) -> Vec<u8> {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let state_offset = PROBE_RECORDS_OFFSET + selectors.len() * RECORD_LEN;
+    let state_va = IMAGE_BASE + u64::from(RDATA_VA) + state_offset as u64;
+    let mut data = synthetic.fixed_bytes();
+    if let Some(offset) = corrupt_fixed {
+        data[offset] ^= 1;
+    }
+    data.resize(state_offset, 0);
+    for (index, selector) in selectors.iter().enumerate() {
+        let record = PROBE_RECORDS_OFFSET + index * RECORD_LEN;
+        put_u64(&mut data, record, *selector);
+        put_u64(&mut data, record + 8, state_va);
+        put_u64(&mut data, record + 16, STATE_LEN as u64);
+    }
+    data.extend_from_slice(synthetic.raw_state());
+    data
+}
+
+fn probe_image(selectors: &[u64], kind: u16, corrupt_fixed: Option<usize>) -> ExecutableView {
+    let writer_va = IMAGE_BASE + u64::from(TEXT_VA);
+    let func_va = writer_va + 0x100;
+    let four = DescriptorSpec {
+        key: KEY_FOUR,
+        kind,
+        parameter_va: data_va(IV_FOUR_OFFSET),
+        object_va: data_va(OBJECT_FOUR_OFFSET),
+    };
+    let one = DescriptorSpec {
+        key: KEY_ONE,
+        kind: KIND_ONE,
+        parameter_va: data_va(IV_ONE_OFFSET),
+        object_va: data_va(OBJECT_ONE_OFFSET),
+    };
+    let code = builder_code(func_va, writer_va, &four, &one);
+    let mut data = descriptor_data();
+    data[IV_FOUR_OFFSET..IV_FOUR_OFFSET + 16].copy_from_slice(&PROBE_IV);
+    descriptor_image(code, probe_rdata(selectors, corrupt_fixed), data)
+}
+
+fn cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], data: &mut [u8]) {
+    let mut previous = *iv;
+    for block in data.as_chunks_mut::<16>().0 {
+        for (byte, chain) in block.iter_mut().zip(&previous) {
+            *byte ^= chain;
+        }
+        synthetic::reference_encrypt(key, block);
+        previous = *block;
+    }
+}
+
+fn probe_archive(
+    records: &[[u8; PROBE_A_RECORD_LEN]],
+    b_len: u32,
+    selector: u8,
+    flags: u8,
+    key: &[u8; 32],
+) -> Vec<u8> {
+    let a_span = align(records.len() * PROBE_A_RECORD_LEN, 16);
+    let b_start = 0x40 + a_span;
+    let metadata_len = b_start + b_len as usize;
+    let mut bytes = vec![0u8; metadata_len];
+    bytes[..4].copy_from_slice(&crate::rpf::MAGIC);
+    put_u32(&mut bytes, 0x04, metadata_len as u32);
+    put_u32(&mut bytes, 0x08, metadata_len as u32);
+    put_u16(&mut bytes, 0x1A, records.len() as u16);
+    put_u32(&mut bytes, 0x1C, b_len);
+    bytes[0x2C] = 1;
+    bytes[0x2D] = flags;
+    bytes[0x2E] = selector;
+    let mut plaintext = vec![0u8; a_span];
+    for (index, record) in records.iter().enumerate() {
+        let start = index * PROBE_A_RECORD_LEN;
+        plaintext[start..start + PROBE_A_RECORD_LEN].copy_from_slice(record);
+    }
+    cbc_encrypt(key, &PROBE_IV, &mut plaintext);
+    bytes[0x40..0x40 + a_span].copy_from_slice(&plaintext);
+    bytes
+}
+
+fn run_probe(image: &ExecutableView, archive: &[u8]) -> ProbeReport {
+    let mut cursor = Cursor::new(archive.to_vec());
+    probe(&mut cursor, image, &AtomicBool::new(false)).unwrap()
+}
+
+fn plausible_records() -> Vec<[u8; PROBE_A_RECORD_LEN]> {
+    vec![
+        a_record(1, 0x00),
+        a_record(2, 0x20),
+        a_record(9, 0x40),
+        a_record(4, 0x60),
+        a_record(5, 0x80),
+    ]
+}
+
+#[test]
+fn the_recognized_source_resolves_the_step1_provider() {
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let source = RecognizedSource::recognize(&image, 9, &AtomicBool::new(false)).unwrap();
+    assert_eq!(source.descriptor().index(), 4);
+    assert_eq!(source.descriptor().key_id(), KEY_FOUR);
+    assert_eq!(source.algorithm_id(), ALGORITHM_CBC);
+    assert_eq!(source.provider(), 2);
+    assert_eq!(source.mode(), STATIC_STEP1_MODE);
+    assert_eq!(source.static_kind(4), Some(KIND_FOUR));
+    assert_eq!(source.static_kind(1), None);
+    assert_eq!(source.static_descriptor(4), Some((KEY_FOUR, PROBE_IV)));
+    assert_eq!(source.static_descriptor(1), None);
+    assert!(source.cbc_block(KEY_FOUR).is_some());
+    // Cipher type 3 selects the same algorithm 0x10 block.
+    assert!(source.cbc_block_for(KIND_ONE, KEY_FOUR).is_some());
+    assert!(source.cbc_block_for(1, KEY_FOUR).is_none());
+    assert!(source.cbc_block_for(KIND_FOUR, 0xDEAD_BEEF).is_none());
+    assert!(!format!("{source:?}").contains(&format!("{KEY_FOUR:#x}")));
+}
+
+#[test]
+fn the_recognized_source_reports_a_missing_state() {
+    let selectors: Vec<u64> = (1..=5u64)
+        .map(|index| ((0x7000 + index) << 32) | 0x0200_0000u64)
+        .collect();
+    let image = probe_image(&selectors, KIND_FOUR, None);
+    let error = RecognizedSource::recognize(&image, 9, &AtomicBool::new(false)).unwrap_err();
+    assert!(matches!(
+        error,
+        SourceError::Recognition(RecognitionError::Descriptor(
+            DescriptorError::NoCompatibleState
+        ))
+    ));
+}
+
+#[test]
+fn the_probe_accepts_a_plausible_a_table() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let report = run_probe(&image, &archive);
+    assert_eq!(report.outcome, ProbeOutcome::Plausible);
+    let summary = report.a_table.unwrap();
+    assert_eq!(summary.records, 5);
+    assert_eq!(summary.known_ids, 3);
+    assert_eq!(report.registry_records, Some(5));
+    assert!(report.registry_algorithm_states.unwrap() >= 1);
+    assert_eq!(report.descriptor.unwrap().index, 4);
+    assert!(report.state_identified);
+    assert!(report.fixed_tables);
+    assert!(report.block_initialized);
+    assert_eq!(report.authentication, AUTHENTICATION);
+}
+
+#[test]
+fn the_probe_accepts_a_kind_3_descriptor() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    // Cipher type 3 selects algorithm 0x10 as well.
+    let image = probe_image(&probe_selectors(), KIND_ONE, None);
+    let report = run_probe(&image, &archive);
+    assert_eq!(report.outcome, ProbeOutcome::Plausible);
+    let descriptor = report.descriptor.unwrap();
+    assert_eq!(descriptor.kind, KIND_ONE);
+    assert_eq!(descriptor.algorithm_id, ALGORITHM_CBC);
+    assert_eq!(descriptor.provider, 2);
+}
+
+#[test]
+fn the_probe_rejects_malformed_a_tables() {
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let cases = vec![
+        (vec![], "the A table has no records"),
+        (
+            vec![
+                a_record(1, 0x00),
+                a_record(1, 0x10),
+                a_record(2, 0x20),
+                a_record(6, 0x30),
+                a_record(9, 0x40),
+            ],
+            "two A records share an identifier",
+        ),
+        (
+            vec![
+                a_record(0, 0x00),
+                a_record(1, 0x10),
+                a_record(2, 0x20),
+                a_record(6, 0x30),
+                a_record(9, 0x40),
+            ],
+            "an A record has a zero identifier",
+        ),
+        (
+            vec![
+                a_record(1, 0x00),
+                a_record(2, 0x100),
+                a_record(9, 0x20),
+                a_record(6, 0x30),
+                a_record(3, 0x40),
+            ],
+            "an A record points outside the B block",
+        ),
+        (
+            vec![
+                a_record(4, 0x00),
+                a_record(5, 0x10),
+                a_record(7, 0x20),
+                a_record(8, 0x30),
+                a_record(10, 0x40),
+            ],
+            "no A record references a known sub-block",
+        ),
+    ];
+    for (records, reason) in cases {
+        let archive = probe_archive(&records, 0x100, 9, 1, &synthetic::FIPS_KEY);
+        let report = run_probe(&image, &archive);
+        assert_eq!(report.outcome, ProbeOutcome::Implausible(reason));
+    }
+}
+
+#[test]
+fn the_probe_does_not_accept_a_wrong_state() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &[0x42; 32]);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let report = run_probe(&image, &archive);
+    assert!(matches!(report.outcome, ProbeOutcome::Implausible(_)));
+}
+
+#[test]
+fn the_probe_reports_an_unsupported_descriptor() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    // Cipher type 1 selects an untraced algorithm.
+    let image = probe_image(&probe_selectors(), 1, None);
+    let report = run_probe(&image, &archive);
+    assert_eq!(
+        report.outcome,
+        ProbeOutcome::DescriptorUnsupported("the cipher type is not supported")
+    );
+    assert!(report.registry_records.is_some());
+    assert!(report.descriptor.is_none());
+}
+
+#[test]
+fn the_probe_reports_a_missing_state() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let selectors: Vec<u64> = (1..=5u64)
+        .map(|index| ((0x7000 + index) << 32) | 0x0200_0000u64)
+        .collect();
+    let image = probe_image(&selectors, KIND_FOUR, None);
+    let report = run_probe(&image, &archive);
+    assert_eq!(
+        report.outcome,
+        ProbeOutcome::StateUnsupported("no compatible key state")
+    );
+    assert!(report.descriptor.is_some());
+    assert!(!report.state_identified);
+}
+
+#[test]
+fn the_probe_reports_malformed_fixed_tables() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, Some(5));
+    let report = run_probe(&image, &archive);
+    assert!(matches!(
+        report.outcome,
+        ProbeOutcome::FixedTablesUnsupported(_)
+    ));
+    assert!(report.state_identified);
+    assert!(!report.fixed_tables);
+}
+
+#[test]
+fn the_probe_is_not_applicable_without_a_static_pass() {
+    let archive = probe_archive(&[], 0, 0, 1, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let report = run_probe(&image, &archive);
+    assert_eq!(report.outcome, ProbeOutcome::NotApplicable);
+    assert!(report.registry_records.is_none());
+}
+
+#[test]
+fn the_probe_can_be_cancelled() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let mut cursor = Cursor::new(archive);
+    let report = probe(&mut cursor, &image, &AtomicBool::new(true)).unwrap();
+    assert_eq!(report.outcome, ProbeOutcome::Cancelled);
+    assert!(report.registry_records.is_none());
+}
+
+#[test]
+fn the_probe_enforces_the_span_limit() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let mut cursor = Cursor::new(archive);
+    let report = probe_with_limit(&mut cursor, &image, &AtomicBool::new(false), 16).unwrap();
+    assert_eq!(
+        report.outcome,
+        ProbeOutcome::ResourceLimit {
+            what: "step-1 A span bytes",
+            limit: 16
+        }
+    );
+}
+
+#[test]
+fn the_probe_rejects_an_inconsistent_layout() {
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 0, &synthetic::FIPS_KEY);
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let mut cursor = Cursor::new(archive);
+    let error = probe(&mut cursor, &image, &AtomicBool::new(false)).unwrap_err();
+    assert_eq!(
+        error,
+        ProbeError::Archive("the cipher spans disagree with the layout")
+    );
+}
+
+#[test]
+fn the_probe_rejects_an_unreadable_archive() {
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let mut cursor = Cursor::new(Vec::new());
+    let error = probe(&mut cursor, &image, &AtomicBool::new(false)).unwrap_err();
+    assert_eq!(
+        error,
+        ProbeError::Archive("the metadata area cannot be read")
+    );
 }

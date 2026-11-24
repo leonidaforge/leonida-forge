@@ -99,6 +99,24 @@ fn decrypts_the_fips_197_aes_256_vector() {
 }
 
 #[test]
+fn reference_encrypt_passes_the_published_vectors() {
+    let mut block = synthetic::FIPS_PLAINTEXT;
+    synthetic::reference_encrypt(&synthetic::FIPS_KEY, &mut block);
+    assert_eq!(block, synthetic::FIPS_CIPHERTEXT);
+
+    let mut previous = NIST_IV;
+    for (index, plaintext) in NIST_PLAINTEXT.iter().enumerate() {
+        let mut ciphertext = *plaintext;
+        for (byte, chain) in ciphertext.iter_mut().zip(&previous) {
+            *byte ^= chain;
+        }
+        synthetic::reference_encrypt(&NIST_KEY, &mut ciphertext);
+        assert_eq!(ciphertext, NIST_CIPHERTEXT[index]);
+        previous = NIST_CIPHERTEXT[index];
+    }
+}
+
+#[test]
 fn decrypts_the_nist_cbc_vector_through_cbc() {
     let block = block_for(&NIST_KEY);
     let mut data: Vec<u8> = NIST_CIPHERTEXT.concat();

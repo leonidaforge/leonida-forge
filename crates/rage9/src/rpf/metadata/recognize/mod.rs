@@ -40,6 +40,7 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use descriptor::recognize_descriptor;
 pub use descriptor::{DescriptorError, recognize_static_descriptor};
 pub use registry::{Registry, RegistryError, recognize_registry};
 
@@ -296,11 +297,11 @@ impl From<DescriptorError> for RecognitionError {
 /// A recognized registry together with the static descriptor of one archive
 /// selector and a verified compatible state.
 ///
-/// A future phase turns this into a [`CipherSource`] once the encoded-AES
-/// block operation exists. It reports recognition only; no archive metadata was
-/// decrypted or authenticated.
+/// [`RecognizedSource`] pairs this with the fixed tables and builds the
+/// encoded block operation. This type reports recognition only; no archive
+/// metadata was decrypted or authenticated.
 ///
-/// [`CipherSource`]: super::transform::CipherSource
+/// [`RecognizedSource`]: crate::rpf::metadata::provider::RecognizedSource
 pub struct Recognized {
     registry: Registry,
     descriptor: StaticDescriptor,
@@ -319,6 +320,15 @@ impl Recognized {
     ) -> Result<Self, RecognitionError> {
         let registry = recognize_registry(image, cancel)?;
         let descriptor = recognize_static_descriptor(image, &registry, archive_selector, cancel)?;
+        Ok(Self::from_parts(registry, descriptor)?)
+    }
+
+    /// Pairs an already recognized registry with an already extracted
+    /// descriptor. The caller MUST have verified the compatible state.
+    pub(crate) fn from_parts(
+        registry: Registry,
+        descriptor: StaticDescriptor,
+    ) -> Result<Self, DescriptorError> {
         let algorithm = descriptor
             .algorithm()
             .map_err(|_| DescriptorError::UnsupportedCipher)?

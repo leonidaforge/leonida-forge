@@ -146,6 +146,26 @@ fn inv_shift_rows(state: &mut [u8; 16]) {
     }
 }
 
+fn shift_rows(state: &mut [u8; 16]) {
+    let current = *state;
+    for column in 0..4 {
+        for row in 0..4 {
+            state[4 * column + row] = current[4 * ((column + row) % 4) + row];
+        }
+    }
+}
+
+fn mix_columns(state: &mut [u8; 16]) {
+    let current = *state;
+    for column in 0..4 {
+        let bytes = &current[4 * column..4 * column + 4];
+        state[4 * column] = gmul(bytes[0], 2) ^ gmul(bytes[1], 3) ^ bytes[2] ^ bytes[3];
+        state[4 * column + 1] = bytes[0] ^ gmul(bytes[1], 2) ^ gmul(bytes[2], 3) ^ bytes[3];
+        state[4 * column + 2] = bytes[0] ^ bytes[1] ^ gmul(bytes[2], 2) ^ gmul(bytes[3], 3);
+        state[4 * column + 3] = gmul(bytes[0], 3) ^ bytes[1] ^ bytes[2] ^ gmul(bytes[3], 2);
+    }
+}
+
 pub(crate) fn inv_mix_columns(state: &mut [u8; 16]) {
     let current = *state;
     for column in 0..4 {
@@ -184,6 +204,34 @@ pub(crate) fn reference_decrypt(key: &[u8; 32], block: &mut [u8; 16]) {
         *byte = invsbox[*byte as usize];
     }
     for (byte, key_byte) in block.iter_mut().zip(&round_keys[0]) {
+        *byte ^= key_byte;
+    }
+}
+
+/// Standard AES-256 encryption. Tests use it to build archive ciphertext that
+/// the encoded block operation must decrypt. It shares no code with the
+/// encoded instance.
+pub(crate) fn reference_encrypt(key: &[u8; 32], block: &mut [u8; 16]) {
+    let (sbox, _) = boxes();
+    let round_keys = round_keys(key);
+    for (byte, key_byte) in block.iter_mut().zip(&round_keys[0]) {
+        *byte ^= key_byte;
+    }
+    for round_key in round_keys.iter().take(14).skip(1) {
+        for byte in block.iter_mut() {
+            *byte = sbox[*byte as usize];
+        }
+        shift_rows(block);
+        mix_columns(block);
+        for (byte, key_byte) in block.iter_mut().zip(round_key) {
+            *byte ^= key_byte;
+        }
+    }
+    for byte in block.iter_mut() {
+        *byte = sbox[*byte as usize];
+    }
+    shift_rows(block);
+    for (byte, key_byte) in block.iter_mut().zip(&round_keys[14]) {
         *byte ^= key_byte;
     }
 }

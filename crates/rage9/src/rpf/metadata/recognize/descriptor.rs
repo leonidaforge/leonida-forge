@@ -173,6 +173,25 @@ pub(crate) fn recognize_with(
     cancel: &AtomicBool,
     limits: Limits,
 ) -> Result<StaticDescriptor, DescriptorError> {
+    let descriptor = recognize_descriptor(image, archive_selector, cancel, limits)?;
+    let algorithm = descriptor
+        .algorithm()
+        .map_err(|_| DescriptorError::UnsupportedCipher)?
+        .id();
+    registry
+        .state_for_key(descriptor.key_id(), algorithm, STATIC_STEP1_MODE)
+        .map_err(map_registry)?;
+    Ok(descriptor)
+}
+
+/// Extracts the static descriptor `archive_selector` selects without linking it
+/// to a key state. The caller resolves the state separately.
+pub(crate) fn recognize_descriptor(
+    image: &ExecutableView,
+    archive_selector: u8,
+    cancel: &AtomicBool,
+    limits: Limits,
+) -> Result<StaticDescriptor, DescriptorError> {
     let index = archive_selector >> 1;
     let sections = code_sections(image);
     if sections.is_empty() {
@@ -238,17 +257,13 @@ pub(crate) fn recognize_with(
         (Some(_), Some(_)) => return Err(DescriptorError::DescriptorAmbiguous),
     };
 
-    let algorithm = match Algorithm::of(tuple.kind) {
-        Ok(algorithm @ Algorithm::Cbc) => algorithm,
-        _ => return Err(DescriptorError::UnsupportedCipher),
-    };
+    if !matches!(Algorithm::of(tuple.kind), Ok(Algorithm::Cbc)) {
+        return Err(DescriptorError::UnsupportedCipher);
+    }
     let parameter = read_parameter(image, tuple.parameter_va)?;
     if !mapped_range(image, tuple.object_va, DESCRIPTOR_OBJECT_LEN) {
         return Err(DescriptorError::MalformedObject);
     }
-    registry
-        .state_for_key(tuple.key_id, algorithm.id(), STATIC_STEP1_MODE)
-        .map_err(map_registry)?;
 
     Ok(StaticDescriptor::new(
         index,
