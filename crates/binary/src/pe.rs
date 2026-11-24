@@ -38,6 +38,15 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+/// `NumberOfRvaAndSizes` in a PE32+ optional header.
+const NUMBER_OF_RVA_AND_SIZES: usize = 108;
+/// The first data directory entry in a PE32+ optional header.
+const DATA_DIRECTORIES: usize = 112;
+/// Offset of the exception table (`.pdata`) data directory.
+pub const DIRECTORY_EXCEPTION: usize = 3;
+/// The PE32+ optional header has room for at most this many directories.
+const MAX_DATA_DIRECTORIES: usize = 16;
+
 #[derive(Debug)]
 pub enum Error {
     Io(io::Error),
@@ -209,6 +218,8 @@ pub struct ExecutableView {
     image_base: u64,
     size_of_image: u32,
     sections: Vec<Section>,
+    /// `(RVA, size)` of the data directories present in the optional header.
+    data_directories: Vec<(u32, u32)>,
 }
 
 impl ExecutableView {
@@ -285,6 +296,18 @@ impl ExecutableView {
             return Err(malformed("SizeOfImage is zero"));
         }
 
+        // Data directories. The count is advisory: a directory is available
+        // only if the optional header is long enough to contain it.
+        let declared = u32_at(&optional, NUMBER_OF_RVA_AND_SIZES).unwrap_or(0) as usize;
+        let data_directories = (0..declared.min(MAX_DATA_DIRECTORIES))
+            .map_while(|index| {
+                let offset = DATA_DIRECTORIES.checked_add(index.checked_mul(8)?)?;
+                let rva = u32_at(&optional, offset)?;
+                let size = u32_at(&optional, offset.checked_add(4)?)?;
+                Some((rva, size))
+            })
+            .collect();
+
         // Section table.
         if section_count == 0 {
             return Err(malformed("the image has no sections"));
@@ -359,6 +382,7 @@ impl ExecutableView {
             image_base,
             size_of_image,
             sections,
+            data_directories,
         })
     }
 
@@ -376,6 +400,16 @@ impl ExecutableView {
 
     pub fn sections(&self) -> &[Section] {
         &self.sections
+    }
+
+    /// The RVA range of data directory `index`, or `None` if the optional
+    /// header has no such directory or it is empty. The range is not checked
+    /// against the sections; a read validates it. [`DIRECTORY_EXCEPTION`] is
+    /// the exception table that bounds functions in x86-64 images.
+    pub fn data_directory(&self, index: usize) -> Option<Range<u64>> {
+        let (rva, size) = *self.data_directories.get(index)?;
+        let start = u64::from(rva);
+        (size != 0).then(|| start..start + u64::from(size))
     }
 
     /// The length of the executable, fixed when it was opened.

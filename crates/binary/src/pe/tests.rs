@@ -54,6 +54,7 @@ struct Builder {
     size_of_image: u32,
     section_count: Option<u16>,
     sections: Vec<Sec>,
+    directories: Vec<(u32, u32)>,
 }
 
 impl Default for Builder {
@@ -76,6 +77,7 @@ impl Default for Builder {
                 chars: SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ,
                 data,
             }],
+            directories: Vec::new(),
         }
     }
 }
@@ -110,7 +112,15 @@ impl Builder {
         put_u32(&mut buf, OPTIONAL_START + 36, 0x200);
         put_u32(&mut buf, OPTIONAL_START + 56, self.size_of_image);
         put_u16(&mut buf, OPTIONAL_START + 68, 3);
-        put_u32(&mut buf, OPTIONAL_START + 108, 0);
+        put_u32(
+            &mut buf,
+            OPTIONAL_START + 108,
+            self.directories.len() as u32,
+        );
+        for (index, (rva, size)) in self.directories.iter().enumerate() {
+            put_u32(&mut buf, OPTIONAL_START + 112 + 8 * index, *rva);
+            put_u32(&mut buf, OPTIONAL_START + 116 + 8 * index, *size);
+        }
 
         for (index, section) in self.sections.iter().enumerate() {
             let off = TABLE_START + 40 * index;
@@ -426,4 +436,36 @@ fn reports_a_snapshot_identity() {
     let identity = image.identity(&AtomicBool::new(false)).unwrap();
     assert_eq!(identity.len, bytes.len() as u64);
     assert_eq!(identity.sha256, <[u8; 32]>::from(Sha256::digest(&bytes)));
+}
+
+#[test]
+fn exposes_data_directories() {
+    let image = Builder {
+        directories: vec![(0x1000, 0x20), (0, 0), (0x1040, 0x0C)],
+        ..Builder::default()
+    };
+    let image = view(&image).unwrap();
+    assert_eq!(image.data_directory(0), Some(0x1000..0x1020));
+    // A zero size means the directory is absent.
+    assert_eq!(image.data_directory(1), None);
+    assert_eq!(image.data_directory(2), Some(0x1040..0x104C));
+    // The count bounds the directories that are reported.
+    assert_eq!(image.data_directory(3), None);
+    assert_eq!(image.data_directory(usize::MAX), None);
+}
+
+#[test]
+fn ignores_data_directories_the_optional_header_cannot_hold() {
+    // An overstated count must not read past the optional header: only the
+    // entries that fit are reported.
+    let mut bytes = Builder {
+        directories: vec![(0x1000, 0x20)],
+        ..Builder::default()
+    }
+    .build();
+    put_u32(&mut bytes, 0x58 + 108, 64);
+    let image = view_of(&bytes).unwrap();
+    assert_eq!(image.data_directory(0), Some(0x1000..0x1020));
+    assert_eq!(image.data_directory(15), None);
+    assert_eq!(image.data_directory(16), None);
 }
