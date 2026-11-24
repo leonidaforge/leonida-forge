@@ -32,7 +32,9 @@ pub const RECOVERED: &str = "Recovered Entries";
 pub const PAGES: &str = "Resource Pages";
 pub const UNRECOVERED: &str = "Unrecovered Regions";
 /// Indexes kept in memory; older ones are reloaded from the cache file.
-const MAX_IN_MEMORY: usize = 8;
+/// Tests run at the same time and share this cache, so they get room enough
+/// not to push out each other's indexes.
+const MAX_IN_MEMORY: usize = if cfg!(test) { 4096 } else { 8 };
 
 const SOURCE_NOTE: &str = "Recovered from a zlib stream in the archive data. The name is the \
      archive offset; the original name and folder are unknown.";

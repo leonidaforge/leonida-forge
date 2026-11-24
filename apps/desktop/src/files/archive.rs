@@ -39,7 +39,9 @@ pub const MAX_CHAIN: u64 = 2 * 1024 * 1024 * 1024;
 /// Caps the decompressed archives kept for reuse. Archives still in use stay
 /// alive until they are no longer used.
 const MAX_KEPT: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_KEPT_COUNT: usize = 32;
+/// Tests run at the same time and share this cache, so they get room enough
+/// not to push out each other's archives.
+const MAX_KEPT_COUNT: usize = if cfg!(test) { 4096 } else { 32 };
 /// In folders with more files, only files with an archive extension are
 /// checked, so listing them does not open every file. Opening any file still
 /// checks its contents.
