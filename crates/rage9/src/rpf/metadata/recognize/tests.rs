@@ -10,6 +10,11 @@ use lforge_binary::pe::{Error as PeError, ExecutableView};
 use super::descriptor::{WRITER_PATTERN, recognize_with as recognize_descriptor_with};
 use super::registry::{recognize_with as recognize_registry_with, with_records};
 use super::*;
+use crate::rpf::metadata::provider::{
+    EncodedAesBlock, FixedTablesError, recognize_fixed_tables, recognize_fixed_tables_with,
+    synthetic,
+};
+use crate::rpf::metadata::transform::BlockDecrypt;
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
 const TEXT_VA: u32 = 0x1000;
@@ -879,6 +884,8 @@ fn recognizes_through_the_composed_entry_point() {
     let image = standard_descriptor_image();
     let recognized = Recognized::recognize(&image, 9, &AtomicBool::new(false)).unwrap();
     assert_eq!(recognized.mode(), STATIC_STEP1_MODE);
+    assert_eq!(recognized.algorithm_id(), ALGORITHM_CBC);
+    assert_eq!(recognized.provider(), 2);
     assert_eq!(recognized.descriptor().index(), 4);
     let state = recognized.state().unwrap();
     assert_eq!(state.len(), STATE_LEN);
@@ -887,6 +894,14 @@ fn recognizes_through_the_composed_entry_point() {
     let debug = format!("{recognized:?}");
     assert!(!debug.contains(&format!("{KEY_FOUR:08x}")));
     assert!(!debug.contains("17171717"));
+
+    // Cipher type 3 is a different kind in the same algorithm family. The
+    // provider must follow the family, not the raw kind.
+    let recognized = Recognized::recognize(&image, 3, &AtomicBool::new(false)).unwrap();
+    assert_eq!(recognized.descriptor().kind(), KIND_ONE);
+    assert_eq!(recognized.algorithm_id(), ALGORITHM_CBC);
+    assert_eq!(recognized.provider(), 2);
+    assert_eq!(recognized.state().unwrap().len(), STATE_LEN);
 }
 
 #[test]
@@ -1135,6 +1150,39 @@ fn enforces_the_function_length_limit() {
     ));
 }
 
+#[test]
+fn provider_selection_follows_the_algorithm_family() {
+    use crate::rpf::metadata::transform::Algorithm;
+
+    // Static step 1 is fixed at mode 1; the selector does not supply it.
+    assert_eq!(STATIC_STEP1_MODE, 1);
+    // The provider is a function of the algorithm identifier and mode.
+    assert_eq!(provider_for(0x10, 0), 3);
+    assert_eq!(provider_for(0x10, 1), 2);
+    assert_eq!(provider_for(0x11, 1), 2);
+    assert_eq!(provider_for(0x15, 7), 2);
+    assert_eq!(provider_for(0x0f, 1), 0);
+    assert_eq!(provider_for(0x16, 1), 0);
+    // Cipher types 3, 4, 5, 10, 11, 12 and 16 select algorithm 0x10. The
+    // provider must use that algorithm, not the raw cipher type.
+    for kind in [3u16, 4, 5, 10, 11, 12, 16] {
+        let algorithm = Algorithm::of(kind).unwrap();
+        assert_eq!(algorithm, Algorithm::Cbc, "type {kind}");
+        assert_eq!(algorithm.id(), ALGORITHM_CBC, "type {kind}");
+        assert_eq!(provider_for(algorithm.id(), STATIC_STEP1_MODE), 2);
+    }
+    // Passing the raw type would select no provider.
+    assert_eq!(provider_for(3, STATIC_STEP1_MODE), 0);
+    assert_eq!(
+        selector_for(0x1234_5678, ALGORITHM_CBC, 1),
+        0x1234_5678_0200_0000
+    );
+    // Other traced or untraced types do not select the encoded AES block.
+    assert_eq!(Algorithm::of(1), Ok(Algorithm::Untraced(1)));
+    assert_eq!(Algorithm::of(17), Ok(Algorithm::Untraced(0x11)));
+    assert!(Algorithm::of(13).is_err());
+}
+
 /// Optional read-only check against a local executable. The caller supplies
 /// its path through `LEONIDA_FORGE_EXECUTABLE`; nothing here knows a build, a
 /// path or a selector. The observed selectors are those of the inspected
@@ -1167,4 +1215,251 @@ fn local_executable_smoke_test() {
         }
     }
     assert!(recognized > 0, "no inspected-build selector resolved");
+
+    match recognize_fixed_tables(&image, &AtomicBool::new(false)) {
+        Ok(tables) => {
+            eprintln!("fixed transformation tables: recognized");
+            if let Ok(recognized) = Recognized::recognize(&image, 9, &AtomicBool::new(false))
+                && let Ok(state) = recognized.state()
+            {
+                eprintln!(
+                    "encoded block initialized: {}",
+                    EncodedAesBlock::new(state, tables).is_ok()
+                );
+            }
+        }
+        Err(error) => eprintln!("fixed transformation tables: {error}"),
+    }
+}
+
+// --- fixed transformation tables -----------------------------------------
+
+fn fixed_section(data: Vec<u8>) -> Section {
+    Section {
+        name: ".rdata",
+        va: RDATA_VA,
+        characteristics: RDATA_CHARACTERISTICS,
+        data,
+    }
+}
+
+#[test]
+fn recognizes_synthetic_fixed_tables() {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let image = build_view(&[fixed_section(synthetic.fixed_bytes())], &[]);
+    let tables = recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap();
+    let block = EncodedAesBlock::new(synthetic.state_bytes(), tables).unwrap();
+    let mut value = synthetic::FIPS_CIPHERTEXT;
+    block.decrypt_block(&mut value);
+    assert_eq!(value, synthetic::FIPS_PLAINTEXT);
+}
+
+#[test]
+fn ignores_writable_and_executable_fixed_tables() {
+    let bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    let writable = build_view(
+        &[Section {
+            name: ".data",
+            va: RDATA_VA,
+            characteristics: DATA_CHARACTERISTICS,
+            data: bytes.clone(),
+        }],
+        &[],
+    );
+    assert_eq!(
+        recognize_fixed_tables(&writable, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::NotFound
+    );
+
+    let executable = build_view(
+        &[Section {
+            name: ".text",
+            va: RDATA_VA,
+            characteristics: TEXT_CHARACTERISTICS,
+            data: bytes,
+        }],
+        &[],
+    );
+    assert_eq!(
+        recognize_fixed_tables(&executable, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::NotFound
+    );
+}
+
+#[test]
+fn rejects_two_fixed_table_blocks() {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let mut data = synthetic.fixed_bytes();
+    data.extend_from_slice(&synthetic.fixed_bytes());
+    let image = build_view(&[fixed_section(data)], &[]);
+    assert_eq!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Ambiguous
+    );
+}
+
+#[test]
+fn reports_missing_fixed_tables() {
+    let image = build_view(&[fixed_section(vec![0u8; 0x5000])], &[]);
+    assert_eq!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::NotFound
+    );
+}
+
+#[test]
+fn rejects_a_non_affine_stage_table() {
+    let mut bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    // Byte 5 is not one of the affine prefilter probes, so the stage table is
+    // found and then rejected by the full check.
+    bytes[5] ^= 1;
+    let image = build_view(&[fixed_section(bytes)], &[]);
+    assert!(matches!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Malformed(_)
+    ));
+}
+
+#[test]
+fn rejects_duplicate_stage_tables() {
+    let mut bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    let first: Vec<u8> = bytes[..256].to_vec();
+    bytes[256..512].copy_from_slice(&first);
+    let image = build_view(&[fixed_section(bytes)], &[]);
+    assert!(matches!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Malformed(_)
+    ));
+}
+
+#[test]
+fn rejects_a_malformed_round_table() {
+    let mut bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    let round_table = 16 * 256;
+    bytes.copy_within(round_table..round_table + 4, round_table + 4);
+    let image = build_view(&[fixed_section(bytes)], &[]);
+    assert!(matches!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Malformed(_)
+    ));
+}
+
+#[test]
+fn rejects_duplicate_round_tables() {
+    let mut bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    let first_round = 16 * 256;
+    let second_round = first_round + 1024;
+    let first: Vec<u8> = bytes[first_round..first_round + 1024].to_vec();
+    bytes[second_round..second_round + 1024].copy_from_slice(&first);
+    let image = build_view(&[fixed_section(bytes)], &[]);
+    assert!(matches!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Malformed(_)
+    ));
+}
+
+#[test]
+fn rejects_a_truncated_fixed_table_block() {
+    let mut bytes = synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes();
+    bytes.truncate(16 * 256);
+    let image = build_view(&[fixed_section(bytes)], &[]);
+    assert!(matches!(
+        recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap_err(),
+        FixedTablesError::Malformed(_)
+    ));
+}
+
+#[test]
+fn fixed_table_recognition_can_be_cancelled() {
+    let image = build_view(
+        &[fixed_section(
+            synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes(),
+        )],
+        &[],
+    );
+    assert_eq!(
+        recognize_fixed_tables(&image, &AtomicBool::new(true)).unwrap_err(),
+        FixedTablesError::Cancelled
+    );
+}
+
+#[test]
+fn enforces_fixed_table_scan_limits() {
+    let image = build_view(
+        &[fixed_section(
+            synthetic::instance(&synthetic::FIPS_KEY).fixed_bytes(),
+        )],
+        &[],
+    );
+    let budget = recognize_fixed_tables_with(
+        &image,
+        &AtomicBool::new(false),
+        Limits {
+            scan_bytes: 1024,
+            ..limits()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        budget,
+        FixedTablesError::ResourceLimit {
+            what: "fixed-table scan",
+            ..
+        }
+    ));
+
+    let steps = recognize_fixed_tables_with(
+        &image,
+        &AtomicBool::new(false),
+        Limits {
+            scan_offsets: 10,
+            ..limits()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        steps,
+        FixedTablesError::ResourceLimit {
+            what: "fixed-table scan steps",
+            ..
+        }
+    ));
+}
+
+#[test]
+fn recognizes_registry_fixed_tables_and_block_end_to_end() {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let key_id = 0x0041_0004u32;
+    let selector = selector_for(key_id, ALGORITHM_CBC, STATIC_STEP1_MODE);
+
+    let records_offset = 0x5000usize;
+    let state_offset = records_offset + 5 * RECORD_LEN;
+    let state_va = IMAGE_BASE + u64::from(RDATA_VA) + state_offset as u64;
+    let mut data = synthetic.fixed_bytes();
+    data.resize(state_offset, 0);
+    for index in 0..5 {
+        let selector = if index == 0 {
+            selector
+        } else {
+            ((0x7000 + index as u64) << 32) | 0x0200_0000
+        };
+        let record = records_offset + index * RECORD_LEN;
+        put_u64(&mut data, record, selector);
+        put_u64(&mut data, record + 8, state_va);
+        put_u64(&mut data, record + 16, STATE_LEN as u64);
+    }
+    data.extend_from_slice(synthetic.raw_state());
+
+    let image = build_view(&[fixed_section(data)], &[]);
+    let cancel = AtomicBool::new(false);
+    let registry = recognize_registry(&image, &cancel).unwrap();
+    assert_eq!(registry.record_count(), 5);
+    let state = registry
+        .state_for_key(key_id, ALGORITHM_CBC, STATIC_STEP1_MODE)
+        .unwrap();
+    let tables = recognize_fixed_tables(&image, &cancel).unwrap();
+    let block = EncodedAesBlock::new(state, tables).unwrap();
+    let mut value = synthetic::FIPS_CIPHERTEXT;
+    block.decrypt_block(&mut value);
+    assert_eq!(value, synthetic::FIPS_PLAINTEXT);
 }

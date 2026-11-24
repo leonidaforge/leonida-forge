@@ -124,6 +124,17 @@ impl Algorithm {
             13..=15 => return Err(Error::InvalidType(kind)),
         })
     }
+
+    /// The algorithm identifier the engine's key selector carries. This is a
+    /// property of the algorithm family, not of the cipher type that selected
+    /// it: cipher types 3, 4, 5, 10, 11, 12 and 16 all carry `0x10`.
+    pub fn id(self) -> u8 {
+        match self {
+            Algorithm::Identity => 0,
+            Algorithm::Cbc => 0x10,
+            Algorithm::Untraced(id) => id,
+        }
+    }
 }
 
 /// Decryption of one block under a fixed key.

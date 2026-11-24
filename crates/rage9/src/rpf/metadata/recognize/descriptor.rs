@@ -25,7 +25,7 @@ use iced_x86::{
 };
 use lforge_binary::pe::{ExecutableView, Section};
 
-use super::{ALGORITHM_CBC, Limits, Registry, RegistryError, STATIC_STEP1_MODE, StaticDescriptor};
+use super::{Limits, Registry, RegistryError, STATIC_STEP1_MODE, StaticDescriptor};
 use crate::rpf::metadata::transform::Algorithm;
 
 /// The static descriptor writer's body. Every hit is revalidated by decoding;
@@ -238,15 +238,16 @@ pub(crate) fn recognize_with(
         (Some(_), Some(_)) => return Err(DescriptorError::DescriptorAmbiguous),
     };
 
-    if !matches!(Algorithm::of(tuple.kind), Ok(Algorithm::Cbc)) {
-        return Err(DescriptorError::UnsupportedCipher);
-    }
+    let algorithm = match Algorithm::of(tuple.kind) {
+        Ok(algorithm @ Algorithm::Cbc) => algorithm,
+        _ => return Err(DescriptorError::UnsupportedCipher),
+    };
     let parameter = read_parameter(image, tuple.parameter_va)?;
     if !mapped_range(image, tuple.object_va, DESCRIPTOR_OBJECT_LEN) {
         return Err(DescriptorError::MalformedObject);
     }
     registry
-        .state_for_key(tuple.key_id, ALGORITHM_CBC, STATIC_STEP1_MODE)
+        .state_for_key(tuple.key_id, algorithm.id(), STATIC_STEP1_MODE)
         .map_err(map_registry)?;
 
     Ok(StaticDescriptor::new(

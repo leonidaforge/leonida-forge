@@ -72,6 +72,64 @@ pub(crate) fn selector_for(key_id: u32, algorithm_id: u8, mode: u8) -> u64 {
     (u64::from(key_id) << 32) | (provider << 24)
 }
 
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+/// Whether the 60-word schedule has at least one nonzero word.
+pub(crate) fn schedule_nonzero(bytes: &[u8]) -> bool {
+    bytes.get(4..4 + 60 * 4).is_some_and(|schedule| {
+        schedule
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|word| u32::from_le_bytes(*word) != 0)
+    })
+}
+
+/// Whether all sixteen final-round tables are permutations of `0..=255`.
+pub(crate) fn final_tables_ok(bytes: &[u8]) -> bool {
+    (0..16).all(|index| {
+        let start = 0xF4 + 0x100 * index;
+        bytes.get(start..start + 0x100).is_some_and(is_permutation)
+    })
+}
+
+pub(crate) fn is_permutation(table: &[u8]) -> bool {
+    if table.len() != 256 {
+        return false;
+    }
+    let mut seen = [false; 256];
+    for &byte in table {
+        if std::mem::replace(&mut seen[byte as usize], true) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The structure an encoded algorithm-`0x10` key state must have: exact
+/// length, magic, nonzero schedule and sixteen permutation final tables.
+pub(crate) fn validate_encoded_state(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() != STATE_LEN {
+        return Err("unexpected state length");
+    }
+    if read_u32(bytes, 0) != Some(STATE_MAGIC) {
+        return Err("unexpected state magic");
+    }
+    if !schedule_nonzero(bytes) {
+        return Err("the schedule is zero");
+    }
+    if !final_tables_ok(bytes) {
+        return Err("a final-round table is not a permutation");
+    }
+    Ok(())
+}
+
 /// An owned copy of an encoded key state. It is zeroized when dropped.
 ///
 /// The executable reader copies the bytes. Zeroization clears this owned
@@ -246,6 +304,9 @@ impl From<DescriptorError> for RecognitionError {
 pub struct Recognized {
     registry: Registry,
     descriptor: StaticDescriptor,
+    /// The algorithm identifier of the descriptor's cipher type, which is not
+    /// the raw cipher type when several types select one algorithm.
+    algorithm: u8,
 }
 
 impl Recognized {
@@ -258,9 +319,14 @@ impl Recognized {
     ) -> Result<Self, RecognitionError> {
         let registry = recognize_registry(image, cancel)?;
         let descriptor = recognize_static_descriptor(image, &registry, archive_selector, cancel)?;
+        let algorithm = descriptor
+            .algorithm()
+            .map_err(|_| DescriptorError::UnsupportedCipher)?
+            .id();
         Ok(Self {
             registry,
             descriptor,
+            algorithm,
         })
     }
 
@@ -270,6 +336,16 @@ impl Recognized {
 
     pub fn descriptor(&self) -> &StaticDescriptor {
         &self.descriptor
+    }
+
+    /// The algorithm identifier the engine's key selector carries.
+    pub fn algorithm_id(&self) -> u8 {
+        self.algorithm
+    }
+
+    /// The provider the engine selects for this algorithm and mode.
+    pub fn provider(&self) -> u8 {
+        provider_for(self.algorithm, STATIC_STEP1_MODE)
     }
 
     /// The step-1 cipher mode, which the engine fixes at
@@ -282,7 +358,7 @@ impl Recognized {
     /// cached from recognition.
     pub fn state(&self) -> Result<StateBytes, RegistryError> {
         self.registry
-            .state_for_key(self.descriptor.key_id, ALGORITHM_CBC, STATIC_STEP1_MODE)
+            .state_for_key(self.descriptor.key_id, self.algorithm, STATIC_STEP1_MODE)
     }
 
     /// The current SHA-256 identity of the executable. Use it to detect that

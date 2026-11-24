@@ -21,7 +21,10 @@ use lforge_binary::Error as BinaryError;
 use lforge_binary::pe::{ExecutableView, Identity, Section};
 use zeroize::Zeroizing;
 
-use super::{DEFAULT_RECORD_LEN, Limits, STATE_LEN, STATE_MAGIC, StateBytes, selector_for};
+use super::{
+    DEFAULT_RECORD_LEN, Limits, STATE_LEN, STATE_MAGIC, StateBytes, final_tables_ok, read_u32,
+    schedule_nonzero, selector_for, validate_encoded_state,
+};
 
 /// Bytes per registry record.
 const RECORD_LEN: u64 = 0x18;
@@ -123,7 +126,7 @@ impl Registry {
                 .read_va(record.state_va, STATE_LEN)
                 .map_err(|_| RegistryError::StateMalformed("the state cannot be read"))?,
         );
-        validate_state(&bytes)?;
+        validate_encoded_state(&bytes).map_err(RegistryError::StateMalformed)?;
         Ok(StateBytes::new(bytes))
     }
 
@@ -150,62 +153,6 @@ fn unique_record(records: &[Record], selector: u64) -> Result<Record, RegistryEr
         (None, _) => Err(RegistryError::NoCompatibleState),
         (Some(_), Some(_)) => Err(RegistryError::Ambiguous),
     }
-}
-
-fn validate_state(bytes: &[u8]) -> Result<(), RegistryError> {
-    if bytes.len() != STATE_LEN {
-        return Err(RegistryError::StateMalformed("unexpected state length"));
-    }
-    if read_u32(bytes, 0) != Some(STATE_MAGIC) {
-        return Err(RegistryError::StateMalformed("unexpected state magic"));
-    }
-    if !schedule_nonzero(bytes) {
-        return Err(RegistryError::StateMalformed("the schedule is zero"));
-    }
-    if !final_tables_ok(bytes) {
-        return Err(RegistryError::StateMalformed(
-            "a final-round table is not a permutation",
-        ));
-    }
-    Ok(())
-}
-
-fn schedule_nonzero(bytes: &[u8]) -> bool {
-    bytes.get(4..4 + 60 * 4).is_some_and(|schedule| {
-        schedule
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|word| u32::from_le_bytes(*word) != 0)
-    })
-}
-
-fn final_tables_ok(bytes: &[u8]) -> bool {
-    (0..16).all(|index| {
-        let start = 0xF4 + 0x100 * index;
-        bytes.get(start..start + 0x100).is_some_and(is_permutation)
-    })
-}
-
-fn is_permutation(table: &[u8]) -> bool {
-    if table.len() != 256 {
-        return false;
-    }
-    let mut seen = [false; 256];
-    for &byte in table {
-        if std::mem::replace(&mut seen[byte as usize], true) {
-            return false;
-        }
-    }
-    true
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-    bytes
-        .get(offset..offset.checked_add(4)?)?
-        .try_into()
-        .ok()
-        .map(u32::from_le_bytes)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
