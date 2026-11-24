@@ -22,7 +22,7 @@ use super::provider::{EncodedAesError, FixedTablesError, SelectionError, select_
 use super::recognize::{DescriptorError, RecognitionError, RegistryError};
 use super::signature::{self, SignatureError};
 use super::transform::Error as CipherError;
-use super::{Error as MetadataError, Stored, step1_a_span};
+use super::{Error as MetadataError, Metadata, Stored, step1_a_span};
 
 /// Larger metadata areas are not read.
 pub const MAX_METADATA: u64 = 256 * 1024 * 1024;
@@ -193,18 +193,59 @@ fn archive_error(error: MetadataError) -> VerifyError {
     VerifyError::Archive(reason)
 }
 
+/// Metadata that passed the signature check. Its constructor is private, so
+/// trusted native parsing can only be reached through [`open_authenticated`].
+#[derive(Clone)]
+pub struct AuthenticatedMetadata {
+    metadata: Metadata,
+}
+
+impl AuthenticatedMetadata {
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    pub fn into_metadata(self) -> Metadata {
+        self.metadata
+    }
+}
+
+impl fmt::Debug for AuthenticatedMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthenticatedMetadata")
+    }
+}
+
+/// The verification report and, only for authenticated metadata, the parsed
+/// table of contents.
+#[derive(Debug, Clone)]
+pub struct OpenReport {
+    pub report: VerifyReport,
+    pub authenticated: Option<AuthenticatedMetadata>,
+}
+
+impl OpenReport {
+    fn refused(report: VerifyReport) -> Self {
+        Self {
+            report,
+            authenticated: None,
+        }
+    }
+}
+
 /// Runs step 1, signature verification and steps 4 and 5 on an archive.
 ///
 /// The archive is read-only. The report distinguishes structural decoding from
-/// cryptographic authentication.
-pub fn verify_archive(
+/// cryptographic authentication. `authenticated` is `Some` only when the
+/// signature verified and the resulting metadata parsed.
+pub fn open_authenticated(
     archive: &mut (impl Read + Seek),
     executable: &ExecutableView,
     cancel: &AtomicBool,
-) -> Result<VerifyReport, VerifyError> {
+) -> Result<OpenReport, VerifyError> {
     let probe = Stored::probe(archive).map_err(archive_error)?;
     if probe.prefix.selector == 0 {
-        return Ok(VerifyReport::not_applicable());
+        return Ok(OpenReport::refused(VerifyReport::not_applicable()));
     }
     let stored = Stored::read(archive, MAX_METADATA).map_err(archive_error)?;
     let a_span = step1_a_span(&stored.prefix, &stored.layout)
@@ -222,7 +263,7 @@ pub fn verify_archive(
         cancel,
     ) {
         Ok(selection) => selection,
-        Err(error) => return Ok(selection_failure(error)),
+        Err(error) => return Ok(OpenReport::refused(selection_failure(error))),
     };
     let mut report = VerifyReport {
         outcome: VerifyOutcome::ATableImplausible("the A table was not checked"),
@@ -236,12 +277,16 @@ pub fn verify_archive(
 
     let (mut bytes, _) = match stored.decrypt_step1(&selection.source) {
         Ok(decoded) => decoded,
-        Err(error) => return Ok(metadata_failure(error, report, "step1")),
+        Err(error) => {
+            return Ok(OpenReport::refused(metadata_failure(
+                error, report, "step1",
+            )));
+        }
     };
     if cancel.load(Ordering::Relaxed) {
         report.outcome = VerifyOutcome::Cancelled;
         report.stage = "step1";
-        return Ok(report);
+        return Ok(OpenReport::refused(report));
     }
 
     let (signature_state, signature_outcome) = check_signature(&stored, &bytes, executable, cancel);
@@ -249,12 +294,18 @@ pub fn verify_archive(
     if let Some(outcome) = signature_outcome {
         report.outcome = outcome;
         report.stage = "signature";
-        return Ok(report);
+        return Ok(OpenReport::refused(report));
     }
 
     if let Some(skipped) = match stored.decrypt_archive(&mut bytes, &selection.source) {
         Ok(skipped) => skipped,
-        Err(error) => return Ok(metadata_failure(error, report, "archive_pass")),
+        Err(error) => {
+            return Ok(OpenReport::refused(metadata_failure(
+                error,
+                report,
+                "archive_pass",
+            )));
+        }
     } {
         report.archive_pass = Some(true);
         report.stage = if skipped {
@@ -276,7 +327,30 @@ pub fn verify_archive(
             VerifyOutcome::MetadataDecodedUnverified
         };
     }
-    Ok(report)
+    if !report.signature.is_valid() {
+        return Ok(OpenReport::refused(report));
+    }
+    match Metadata::from_decoded(bytes) {
+        Ok(metadata) => Ok(OpenReport {
+            report,
+            authenticated: Some(AuthenticatedMetadata { metadata }),
+        }),
+        Err(_) => {
+            report.outcome =
+                VerifyOutcome::MalformedMetadata("the authenticated metadata is invalid");
+            report.stage = "metadata";
+            Ok(OpenReport::refused(report))
+        }
+    }
+}
+
+/// Runs the verification pipeline and returns only its report.
+pub fn verify_archive(
+    archive: &mut (impl Read + Seek),
+    executable: &ExecutableView,
+    cancel: &AtomicBool,
+) -> Result<VerifyReport, VerifyError> {
+    Ok(open_authenticated(archive, executable, cancel)?.report)
 }
 
 /// Returns the signature state and, on a terminal failure, the report outcome.

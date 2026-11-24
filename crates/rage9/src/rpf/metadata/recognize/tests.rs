@@ -2,10 +2,15 @@
 //! executable-derived bytes, key material or local path appears in this file.
 
 use std::io::{Cursor, Write};
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
 use lforge_binary::pe::{Error as PeError, ExecutableView};
+use rand_core::OsRng;
+use rsa::pkcs8::EncodePublicKey;
+use rsa::{Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+use sha2::{Digest, Sha256};
 
 use super::descriptor::{WRITER_PATTERN, recognize_with as recognize_descriptor_with};
 use super::registry::{recognize_with as recognize_registry_with, with_records};
@@ -18,6 +23,9 @@ use crate::rpf::metadata::provider::{
     recognize_fixed_tables, recognize_fixed_tables_with, synthetic,
 };
 use crate::rpf::metadata::transform::{BlockDecrypt, CipherSource};
+use crate::rpf::metadata::verify::{VerifyOutcome, open_authenticated};
+use crate::rpf::metadata::{keys, signature};
+use crate::rpf::names::hash64;
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
 const TEXT_VA: u32 = 0x1000;
@@ -1948,4 +1956,191 @@ fn the_probe_rejects_an_unreadable_archive() {
         error,
         ProbeError::Archive("the metadata area cannot be read")
     );
+}
+
+// --- authenticated native metadata --------------------------------------
+
+const SIGNATURE_KEY_ID: u16 = 4;
+const AUTH_METADATA_LEN: usize = 0x2A0;
+const AUTH_B_START: usize = 0x70;
+const AUTH_B_LEN: usize = 0x200;
+const AUTH_DESCRIPTORS: usize = 0x270;
+
+fn signature_private() -> &'static RsaPrivateKey {
+    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+    KEY.get_or_init(|| RsaPrivateKey::new(&mut OsRng, 2048).expect("a synthetic RSA key"))
+}
+
+/// The probe image with a public key-table entry for the signature key.
+fn authenticated_image() -> ExecutableView {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let mut rdata = probe_rdata_blocks(
+        &[synthetic.fixed_bytes()],
+        synthetic.raw_state(),
+        &probe_selectors(),
+    );
+    let der = RsaPublicKey::from(signature_private())
+        .to_public_key_der()
+        .expect("a synthetic DER key")
+        .as_bytes()
+        .to_vec();
+    while !rdata.len().is_multiple_of(8) {
+        rdata.push(0);
+    }
+    let record = rdata.len();
+    let der_at = record + RECORD_LEN;
+    let mut entry = vec![0u8; RECORD_LEN];
+    put_u64(
+        &mut entry,
+        0,
+        (u64::from(SIGNATURE_KEY_ID) << 32) | 0x0500_0000,
+    );
+    put_u64(
+        &mut entry,
+        8,
+        IMAGE_BASE + u64::from(RDATA_VA) + der_at as u64,
+    );
+    put_u64(&mut entry, 16, der.len() as u64);
+    rdata.extend_from_slice(&entry);
+    rdata.extend_from_slice(&der);
+    probe_image_with_rdata(rdata, KIND_FOUR)
+}
+
+/// An encrypted archive whose metadata carries one named row. A type 0
+/// sub-block 1 makes the archive pass a no-op. `corrupt_signature` flips one
+/// signature byte after signing; `corrupt_entry` points the column at a value
+/// outside its pool.
+fn authenticated_archive(corrupt_signature: bool, corrupt_entry: bool) -> Vec<u8> {
+    let records = [
+        a_record(1, 0x00),
+        a_record(6, 0x20),
+        a_record(9, 0x130),
+        a_record(5, 0x140),
+        a_record(2, 0x150),
+    ];
+    let mut bytes = vec![0u8; AUTH_METADATA_LEN];
+    bytes[..4].copy_from_slice(&crate::rpf::MAGIC);
+    put_u32(&mut bytes, 0x04, AUTH_METADATA_LEN as u32);
+    put_u32(&mut bytes, 0x08, AUTH_METADATA_LEN as u32);
+    put_u16(&mut bytes, 0x1A, records.len() as u16);
+    put_u32(&mut bytes, 0x1C, AUTH_B_LEN as u32);
+    put_u16(&mut bytes, 0x20, 1);
+    put_u16(&mut bytes, 0x22, 0);
+    put_u32(&mut bytes, 0x24, 1);
+    bytes[0x2C] = 1;
+    bytes[0x2D] = 1;
+    bytes[0x2E] = 9;
+    for (index, record) in records.iter().enumerate() {
+        let start = 0x40 + index * PROBE_A_RECORD_LEN;
+        bytes[start..start + PROBE_A_RECORD_LEN].copy_from_slice(record);
+    }
+    // Sub-block 1: cipher type 0, algorithm 0.
+    let descriptor = AUTH_B_START;
+    put_u32(&mut bytes, descriptor, 0);
+    put_u16(&mut bytes, descriptor + 4, 0);
+    let signature_at = AUTH_B_START + 0x20;
+    bytes[signature_at] = 1;
+    put_u16(&mut bytes, signature_at + 2, SIGNATURE_KEY_ID);
+    let descriptor_at = AUTH_DESCRIPTORS;
+    put_u64(&mut bytes, descriptor_at, keys::NAME_HASH);
+    put_u32(
+        &mut bytes,
+        descriptor_at + 0x0C,
+        if corrupt_entry { 0x1000 } else { 0 },
+    );
+    put_u16(&mut bytes, descriptor_at + 0x10, 8);
+    bytes[AUTH_DESCRIPTORS + 0x18] = 0;
+    let pool = AUTH_METADATA_LEN - 16;
+    put_u64(&mut bytes, pool, hash64(b"synthetic"));
+    let signature_start = signature_at + 4;
+    let signature_end = signature_start + 0x100;
+    let spans = [
+        0..0x10,
+        0x18..signature_start,
+        signature_end..AUTH_METADATA_LEN,
+    ];
+    let message = signature::message(&bytes, &spans);
+    let digest = Sha256::digest(Sha256::digest(&message));
+    let mut signature = signature_private()
+        .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        .expect("a synthetic signature");
+    if corrupt_signature {
+        signature[0] ^= 1;
+    }
+    bytes[signature_start..signature_end].copy_from_slice(&signature);
+    // Step 1 runs one CBC chain over the A span and then the B span.
+    cbc_encrypt(
+        &synthetic::FIPS_KEY,
+        &PROBE_IV,
+        &mut bytes[0x40..AUTH_DESCRIPTORS],
+    );
+    bytes
+}
+
+#[test]
+fn open_authenticated_parses_synthetic_native_metadata() {
+    let image = authenticated_image();
+    let mut cursor = Cursor::new(authenticated_archive(false, false));
+    let opened = open_authenticated(&mut cursor, &image, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        opened.report.outcome,
+        VerifyOutcome::MetadataDecodedAuthenticated
+    );
+    assert_eq!(opened.report.signature.to_string(), "valid");
+    let metadata = opened
+        .authenticated
+        .expect("authenticated metadata")
+        .into_metadata();
+    assert_eq!(metadata.rows(), 1);
+    assert_eq!(metadata.name_hash(0).unwrap(), Some(hash64(b"synthetic")));
+}
+
+#[test]
+fn open_authenticated_refuses_a_bad_signature() {
+    let image = authenticated_image();
+    let mut cursor = Cursor::new(authenticated_archive(true, false));
+    let opened = open_authenticated(&mut cursor, &image, &AtomicBool::new(false)).unwrap();
+    assert_eq!(opened.report.outcome, VerifyOutcome::SignatureInvalid);
+    assert!(opened.authenticated.is_none());
+}
+
+#[test]
+fn open_authenticated_reports_a_missing_key() {
+    let image = probe_image(&probe_selectors(), KIND_FOUR, None);
+    let mut cursor = Cursor::new(authenticated_archive(false, false));
+    let opened = open_authenticated(&mut cursor, &image, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        opened.report.outcome,
+        VerifyOutcome::MetadataDecodedUnverified
+    );
+    assert_eq!(
+        opened.report.signature.to_string(),
+        "unavailable: no verification key"
+    );
+    assert!(opened.authenticated.is_none());
+}
+
+#[test]
+fn open_authenticated_keeps_malformed_entries_unreadable() {
+    let image = authenticated_image();
+    let mut cursor = Cursor::new(authenticated_archive(false, true));
+    let opened = open_authenticated(&mut cursor, &image, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        opened.report.outcome,
+        VerifyOutcome::MetadataDecodedAuthenticated
+    );
+    let metadata = opened
+        .authenticated
+        .expect("authenticated metadata")
+        .into_metadata();
+    assert!(metadata.entry(0).unwrap().name_hash.is_err());
+}
+
+#[test]
+fn open_authenticated_can_be_cancelled() {
+    let image = authenticated_image();
+    let mut cursor = Cursor::new(authenticated_archive(false, false));
+    let opened = open_authenticated(&mut cursor, &image, &AtomicBool::new(true)).unwrap();
+    assert_eq!(opened.report.outcome, VerifyOutcome::Cancelled);
+    assert!(opened.authenticated.is_none());
 }
