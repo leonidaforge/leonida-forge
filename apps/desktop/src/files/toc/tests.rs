@@ -853,24 +853,86 @@ fn archives_in_archives_have_no_companion_directory() {
     assert!(files::describe(&path).unwrap().contains("0 available"));
 }
 
-#[test]
-fn archives_in_companions_are_not_opened() {
-    let temp = tempfile::tempdir().unwrap();
-    let zip = zip_bytes(&[("leaf.txt", b"leaf")]);
-    let full = native_rpf_with(
-        &[Spec {
-            source: Some(0),
-            ..spec(&zip, RPF_TYPE)
-        }],
+/// A main archive whose rows are read from companion `data.dat`: a stored
+/// ZIP holding `leaf.txt` with `leaf`, a native RPF9, and the ZIP again as
+/// raw DEFLATE.
+fn companion_nesting(leaf: &[u8]) -> Vec<u8> {
+    let zip = zip_bytes_with(&[("leaf.txt", leaf)], ::zip::CompressionMethod::Stored);
+    let inner = native_rpf(&[spec(b"deep leaf", 3)]);
+    native_rpf_with(
+        &[
+            Spec {
+                source: Some(0),
+                ..spec(&zip, RPF_TYPE)
+            },
+            Spec {
+                source: Some(0),
+                ..spec(&inner, RPF_TYPE)
+            },
+            Spec {
+                source: Some(0),
+                mode: 1,
+                logical: Some(zip.len() as u64),
+                ..spec(&deflate(&zip), RPF_TYPE)
+            },
+        ],
         &[(b"data.dat", 2)],
-    );
+    )
+}
+
+#[test]
+fn archives_in_companions_open_and_follow_the_companion() {
+    let temp = tempfile::tempdir().unwrap();
+    let full = companion_nesting(b"leaf");
     let path = temp.path().join("main.rpf");
     fs::write(&path, &full).unwrap();
-    fs::write(temp.path().join("data.dat"), companion_of(&full, 2)).unwrap();
-    let row = path.join("Row 00000");
-    // The bytes can be read, but not browsed as an archive.
-    assert_eq!(files::read(&row).unwrap(), zip);
-    let err = archive::prepare(&row, &Progress::default(), &AtomicBool::new(false)).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("companion"), "{err}");
+    let data = temp.path().join("data.dat");
+    fs::write(&data, companion_of(&full, 2)).unwrap();
+    let row = |n: u32| path.join(row_name(n));
+
+    // ZIP and RPF9 in companion rows, recognised by content.
+    let nested = opened(&row(0));
+    assert_eq!(
+        (nested.format, nested.decompressed),
+        (archive::Format::Zip, 0)
+    );
+    assert_eq!(nested.dependencies.len(), 1);
+    assert_eq!(nested.dependencies[0].0, data);
+    assert_eq!(files::read(&row(0).join("leaf.txt")).unwrap(), b"leaf");
+    let nested = opened(&row(1));
+    assert_eq!(nested.format, archive::Format::Rpf9);
+    assert_eq!(
+        files::read(&row(1).join("Row 00000")).unwrap(),
+        b"deep leaf"
+    );
+    let nested = opened(&row(2));
+    assert_eq!(nested.format, archive::Format::Zip);
+    assert!(nested.decompressed > 0);
+    assert_eq!(files::read(&row(2).join("leaf.txt")).unwrap(), b"leaf");
+    assert_eq!(files::list(&path).unwrap()[0].kind, EntryKind::Archive);
+
+    // A replaced companion, with the main archive unchanged.
+    let changed = companion_nesting(b"LEAF");
+    let mut replacement = companion_of(&changed, 2);
+    replacement.push(0);
+    fs::write(&data, &replacement).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), full);
+    for n in [0, 2] {
+        assert!(prepare_required(&files::list(&row(n)).unwrap_err()).is_some());
+        assert_eq!(files::read(&row(n).join("leaf.txt")).unwrap(), b"LEAF");
+    }
+
+    // A removed companion, then one that reappears.
+    fs::remove_file(&data).unwrap();
+    let err = files::read(&row(0).join("leaf.txt")).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{err}");
+    let entries = files::list(&path).unwrap();
+    assert!(detail(&entries[0], "Read source").contains("missing"));
+    assert!(detail(&entries[0], "Contents").starts_with("Not readable"));
+    fs::write(&data, companion_of(&full, 2)).unwrap();
+    assert_eq!(files::read(&row(0).join("leaf.txt")).unwrap(), b"leaf");
+    assert_eq!(
+        files::read(&row(1).join("Row 00000")).unwrap(),
+        b"deep leaf"
+    );
 }

@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
 use lforge_rage9::rpf::metadata::{
@@ -21,7 +22,7 @@ use lforge_rage9::rpf::metadata::{
 };
 use lforge_rage9::rpf::names::{self, Candidate, Matches, MountPrefix, Types};
 
-use super::archive::{Archive, Stamp, check_size};
+use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
 /// Larger tables of contents are not read.
@@ -127,7 +128,7 @@ fn companion_stamps(dir: Option<&Path>, records: &[Companion]) -> Vec<Option<Sta
         .iter()
         .map(|record| {
             dir.and_then(|dir| record.path(dir))
-                .and_then(|path| stamp(&path))
+                .and_then(|path| file_stamp(&path))
         })
         .collect()
 }
@@ -144,13 +145,6 @@ fn names_file(archive: &Archive) -> PathBuf {
     archive.root.with_file_name(name)
 }
 
-fn stamp(path: &Path) -> Option<Stamp> {
-    let metadata = fs::metadata(path).ok()?;
-    metadata
-        .is_file()
-        .then(|| (metadata.len(), metadata.modified().ok()))
-}
-
 /// Rows whose names can be matched: with a location record and well-formed
 /// name fields.
 fn matchable(row: &Row) -> bool {
@@ -159,7 +153,7 @@ fn matchable(row: &Row) -> bool {
 
 impl Names {
     fn read(file: PathBuf, rows: &[Row]) -> Option<Self> {
-        let stamp = stamp(&file)?;
+        let stamp = file_stamp(&file)?;
         let mut names = Self {
             file,
             stamp,
@@ -279,17 +273,35 @@ impl Native {
     /// Whether the candidate file and the companion files are unchanged
     /// since the table was read.
     pub fn is_current(&self, archive: &Archive) -> bool {
-        let names = stamp(&names_file(archive));
+        let names = file_stamp(&names_file(archive));
         let records = &self.companions.records;
         names == self.names.as_ref().map(|names| names.stamp)
             && companion_stamps(companion_dir(archive).as_deref(), records)
                 == self.companions.stamps
     }
 
-    /// Whether the entry at `inner` is read through a companion file.
-    pub fn reads_companion(&self, inner: &Path) -> bool {
-        self.row(inner)
-            .is_some_and(|row| matches!(row.read_source, Ok(Some(_))))
+    /// The companion file the entry at `inner` is read through, with its
+    /// stamp when it was opened.
+    pub fn dependencies(&self, archive: &Archive, inner: &Path) -> Vec<Dependency> {
+        let Some(Ok(Some(index))) = self.row(inner).map(|row| &row.read_source) else {
+            return Vec::new();
+        };
+        let index = *index as usize;
+        let companions = &self.companions;
+        let available = matches!(
+            companions.statuses.get(index),
+            Some(CompanionStatus::Available(_))
+        );
+        let path = companion_dir(archive)
+            .zip(companions.records.get(index))
+            .and_then(|(dir, record)| record.path(&dir));
+        match (available, path) {
+            (true, Some(path)) => {
+                let stamp = companions.stamps.get(index).copied().flatten();
+                vec![(path, stamp)]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn alternates(&self) -> &[Option<Source>] {
@@ -454,23 +466,31 @@ impl Native {
             .map_err(to_io)
     }
 
-    /// Writes the stored bytes of an entry stored as it is. Encoded entries
-    /// and entries read through an alternate source are refused.
+    /// Writes the contents of an entry, decoded where that is supported.
+    /// Entries that cannot be read, also through an unavailable companion,
+    /// are refused. Decoding stops once `cancel` is set.
     pub fn copy(
         &self,
         archive: &Archive,
         inner: &Path,
         out: &mut dyn Write,
         limit: u64,
+        cancel: &AtomicBool,
     ) -> io::Result<()> {
         let row = self.row(inner).ok_or_else(not_found)?;
-        let payload = row
+        let mut payload = row
             .payload(&archive.source, self.alternates())
             .map_err(to_io)?;
         check_size(payload.len(), limit)?;
-        // A payload never yields more than its declared size.
-        io::copy(&mut payload.take(limit), out)?;
-        Ok(())
+        // A payload never yields more than its declared size. `io::copy`
+        // would retry the `Interrupted` that cancellation returns.
+        let mut buf = vec![0; 64 * 1024];
+        loop {
+            match payload.read_cancellable(&mut buf, cancel)? {
+                0 => return Ok(()),
+                n => out.write_all(&buf[..n])?,
+            }
+        }
     }
 
     pub fn raw_source(&self, archive: &Archive, inner: &Path) -> Option<Source> {

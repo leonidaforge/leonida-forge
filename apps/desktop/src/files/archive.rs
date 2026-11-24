@@ -53,6 +53,26 @@ const MAX_ATTEMPTS: usize = 2 * MAX_DEPTH + 2;
 /// Size and modification time of a file on disk.
 pub type Stamp = (u64, Option<SystemTime>);
 
+/// A file other than the one the chain starts at that an archive's bytes
+/// come from, with its stamp when they were read. `None` for a file that did
+/// not exist.
+pub type Dependency = (PathBuf, Option<Stamp>);
+
+/// The stamp of a regular file, or `None` if there is none.
+pub fn file_stamp(path: &Path) -> Option<Stamp> {
+    let metadata = fs::metadata(path).ok()?;
+    metadata
+        .is_file()
+        .then(|| (metadata.len(), metadata.modified().ok()))
+}
+
+/// Whether every file in `dependencies` is unchanged.
+pub fn dependencies_current(dependencies: &[Dependency]) -> bool {
+    dependencies
+        .iter()
+        .all(|(path, stamp)| file_stamp(path) == *stamp)
+}
+
 /// An archive opened for reading.
 #[derive(Debug, Clone)]
 pub struct Archive {
@@ -70,6 +90,9 @@ pub struct Archive {
     /// Why the contents may be incomplete, for archives recovered from
     /// another archive.
     pub caveat: Option<String>,
+    /// Further files this archive's bytes come from, such as RPF9 companion
+    /// files, for archives opened from another archive.
+    pub dependencies: Vec<Dependency>,
 }
 
 impl Archive {
@@ -90,6 +113,7 @@ impl Archive {
                 depth: 1,
                 decompressed: 0,
                 caveat: None,
+                dependencies: Vec::new(),
             }),
             other => Err(other),
         })
@@ -268,9 +292,21 @@ pub fn copy(
     out: &mut dyn Write,
     limit: u64,
 ) -> io::Result<Option<SystemTime>> {
+    copy_cancellable(archive, inner, out, limit, &AtomicBool::new(false))
+}
+
+/// [`copy`] that also stops while decoding once `cancel` is set. Writes to
+/// `out` should check it too.
+fn copy_cancellable(
+    archive: &Archive,
+    inner: &Path,
+    out: &mut dyn Write,
+    limit: u64,
+    cancel: &AtomicBool,
+) -> io::Result<Option<SystemTime>> {
     match archive.format {
         Format::Zip => zip::copy(archive, inner, out, limit),
-        Format::Rpf9 => rpf::copy(archive, inner, out, limit).map(|()| None),
+        Format::Rpf9 => rpf::copy(archive, inner, out, limit, cancel).map(|()| None),
     }
 }
 
@@ -289,7 +325,7 @@ pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
         if kept
             .by_path
             .get(&entry.path)
-            .is_some_and(|nested| nested.stamp == archive.stamp)
+            .is_some_and(|nested| nested.is_current(archive))
         {
             entry.kind = EntryKind::Archive;
         }
@@ -440,11 +476,12 @@ fn decompress_limited(
             file_name(&path)
         )));
     }
+    let mut dependencies = parent.dependencies.clone();
     if parent.format == Format::Rpf9 {
-        rpf::check_nested(parent, inner)?;
+        dependencies.extend(rpf::dependencies(parent, inner)?);
     }
     if let Some(source) = stored_view(parent, inner, read_limit, cancel)? {
-        return keep_identified(parent, inner, path, source, 0);
+        return keep_identified(parent, inner, path, source, 0, dependencies);
     }
     let len = file_len(parent, inner)?;
     check_size(len, read_limit)?;
@@ -464,7 +501,7 @@ fn decompress_limited(
             cancel,
         };
         // The declared size may be wrong, so the copy is capped as well.
-        copy(parent, inner, &mut out, len.min(read_limit))
+        copy_cancellable(parent, inner, &mut out, len.min(read_limit), cancel)
             .and_then(|_| out.flush())
             .map_err(
                 |err| match err.get_ref().is_some_and(|e| e.is::<Cancelled>()) {
@@ -475,11 +512,9 @@ fn decompress_limited(
     }
     let source = Source::from_file(temp)?;
     let decompressed = source.len();
-    keep_identified(parent, inner, path, source, decompressed)
+    keep_identified(parent, inner, path, source, decompressed, dependencies)
 }
 
-/// A file of `parent` stored as it is, as a view of the parent's source.
-/// Other files have to be decoded, which a view must not stand in for.
 /// A file of `parent` stored as it is, as a view of the parent's source,
 /// within `read_limit`. ZIP files are checked against their CRC-32 first;
 /// RPF9 records no checksum. Other files have to be decoded, which a view
@@ -514,6 +549,7 @@ fn keep_identified(
     path: PathBuf,
     mut source: Source,
     decompressed: u64,
+    dependencies: Vec<Dependency>,
 ) -> io::Result<()> {
     let format = match identify::identify(&mut source)? {
         Identified::Archive(format) => format,
@@ -531,6 +567,7 @@ fn keep_identified(
             source,
             decompressed,
             caveat,
+            dependencies,
             last_used: 0,
         },
     );
@@ -546,7 +583,17 @@ struct Kept {
     /// its parent.
     decompressed: u64,
     caveat: Option<String>,
+    /// Of the archive and the archives it is stored in.
+    dependencies: Vec<Dependency>,
     last_used: u64,
+}
+
+impl Kept {
+    /// Whether this was opened from `parent` as it is now: the file on disk
+    /// and every further file the bytes come from are unchanged.
+    fn is_current(&self, parent: &Archive) -> bool {
+        self.stamp == parent.stamp && dependencies_current(&self.dependencies)
+    }
 }
 
 #[derive(Default)]
@@ -584,15 +631,15 @@ fn keep(path: PathBuf, mut archive: Kept) {
     }
 }
 
-/// The kept archive at `inner` in `parent`, if it was decompressed from the
-/// same file on disk.
+/// The kept archive at `inner` in `parent`, if it was opened from the same
+/// file on disk and the files it depends on are unchanged.
 fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
     let path = parent.path.join(inner);
     let mut kept = kept_archives();
     kept.clock += 1;
     let now = kept.clock;
     let entry = kept.by_path.get_mut(&path)?;
-    if entry.stamp != parent.stamp {
+    if !entry.is_current(parent) {
         kept.by_path.remove(&path);
         return None;
     }
@@ -606,6 +653,7 @@ fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
         depth: parent.depth + 1,
         decompressed: parent.decompressed.saturating_add(entry.decompressed),
         caveat: entry.caveat.clone(),
+        dependencies: entry.dependencies.clone(),
     })
 }
 

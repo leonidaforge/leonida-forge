@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use lforge_rage9::resource::{Page, Segment};
 use lforge_rage9::rpf::{self, CacheKey, Index, Kind, Progress, Region, Resource, Status, Stream};
 
-use super::archive::{Archive, Stamp, check_size, needs_prepare};
+use super::archive::{Archive, Dependency, Stamp, check_size, needs_prepare};
 use super::toc;
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
@@ -54,6 +54,8 @@ enum Contents {
 
 struct Cached {
     stamp: Stamp,
+    /// Of the archive, as it was opened.
+    dependencies: Vec<Dependency>,
     contents: Contents,
     last_used: u64,
 }
@@ -88,10 +90,12 @@ fn cache_key(archive: &Archive) -> io::Result<CacheKey> {
         location.push('|');
         location.push_str(&nested.to_string_lossy());
     }
-    Ok(CacheKey {
-        location,
-        version: rpf::file_version(&fs::metadata(&archive.root)?)?,
-    })
+    let mut version = rpf::file_version(&fs::metadata(&archive.root)?)?;
+    // The bytes may also come from companion files.
+    for dependency in &archive.dependencies {
+        version.extend_from_slice(format!("|{dependency:?}").as_bytes());
+    }
+    Ok(CacheKey { location, version })
 }
 
 fn remember(archive: &Archive, contents: Contents) -> Contents {
@@ -102,6 +106,7 @@ fn remember(archive: &Archive, contents: Contents) -> Contents {
         archive.path.clone(),
         Cached {
             stamp: archive.stamp,
+            dependencies: archive.dependencies.clone(),
             contents: contents.clone(),
             last_used,
         },
@@ -124,6 +129,7 @@ fn in_memory(archive: &Archive) -> Option<Contents> {
     let now = indexes.clock;
     let cached = indexes.by_archive.get_mut(&archive.path)?;
     let current = cached.stamp == archive.stamp
+        && cached.dependencies == archive.dependencies
         && match &cached.contents {
             Contents::Native(native) => native.is_current(archive),
             Contents::Recovered(index, _) => index.archive_len == archive.source.len(),
@@ -559,9 +565,15 @@ fn list_recovered(archive: &Archive, index: &Index, inner: &Path) -> io::Result<
 }
 
 /// Writes one entry, page or region to `out`, within `limit`.
-pub fn copy(archive: &Archive, inner: &Path, out: &mut dyn Write, limit: u64) -> io::Result<()> {
+pub fn copy(
+    archive: &Archive,
+    inner: &Path,
+    out: &mut dyn Write,
+    limit: u64,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
     let index = match contents(archive)? {
-        Contents::Native(native) => return native.copy(archive, inner, out, limit),
+        Contents::Native(native) => return native.copy(archive, inner, out, limit, cancel),
         Contents::Recovered(index, _) => index,
     };
     let source = archive.source.clone();
@@ -649,17 +661,13 @@ pub fn caveat(archive: &Archive, inner: &Path) -> Option<String> {
 
 /// The bytes of a file stored as it is, as a view of the archive's source.
 /// `None` for anything else, which [`copy`] decodes or reports.
-/// Refuses to open a file read through a companion file as a nested
-/// archive: what is kept of a nested archive is checked against the file on
-/// disk the chain starts at, which would not notice a changed companion.
-pub fn check_nested(archive: &Archive, inner: &Path) -> io::Result<()> {
-    match contents(archive)? {
-        Contents::Native(native) if native.reads_companion(inner) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "an archive read through a companion file is not opened: changes to the companion              would not be noticed",
-        )),
-        _ => Ok(()),
-    }
+/// The further files the bytes of the file at `inner` come from: its
+/// companion file, if it is read through one.
+pub fn dependencies(archive: &Archive, inner: &Path) -> io::Result<Vec<Dependency>> {
+    Ok(match contents(archive)? {
+        Contents::Native(native) => native.dependencies(archive, inner),
+        Contents::Recovered(..) => Vec::new(),
+    })
 }
 
 pub fn raw_source(archive: &Archive, inner: &Path) -> io::Result<Option<lforge_binary::Source>> {
