@@ -595,16 +595,21 @@ impl Stored {
         let mut key_lookup_skipped = false;
         let mut cipher = |descriptor: &CipherDescriptor| {
             key_lookup_skipped |= Algorithm::of(descriptor.kind)? == Algorithm::Identity;
-            Cipher::new(descriptor, |key_id| source.cbc_block(key_id))
+            Cipher::new(descriptor, |key_id| {
+                source.cbc_block_for(descriptor.kind, key_id)
+            })
         };
         if self.prefix.selector != 0 {
             let index = self.prefix.selector >> 1;
+            let kind = source
+                .static_kind(index)
+                .ok_or(transform::Error::NoStaticDescriptor(index))?;
             let (key_id, parameter) = source
                 .static_descriptor(index)
                 .ok_or(transform::Error::NoStaticDescriptor(index))?;
             let descriptor = CipherDescriptor {
                 key_id,
-                kind: transform::static_kind(index),
+                kind,
                 parameter,
             };
             cipher(&descriptor)?.run(&mut bytes, &self.static_spans()?)?;

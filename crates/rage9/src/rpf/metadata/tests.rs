@@ -983,6 +983,54 @@ mod chain {
         let error = cipher_error(stored.transform(&Source::full()));
         assert_eq!(error, transform::Error::Unaligned(span.len()));
     }
+
+    #[test]
+    fn uses_the_sources_kind_and_block_overrides() {
+        // Selector 1 -> index 0, whose current-build static_kind is 0, a
+        // no-op. A source that overrides static_kind(0) to 16 (CBC) must drive
+        // a real decryption of the static spans, and every pass must resolve
+        // its block through cbc_block_for, not the bare cbc_block.
+        let plain = plain(1, vec![1, 2, 6], archive(16));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, false);
+        encrypt(&mut bytes, STATIC_KEY, STATIC_IV, &[A_SPAN, B_SPAN], false);
+        let stored = Stored::from_bytes(bytes).unwrap();
+
+        struct Recognized;
+        impl transform::CipherSource for Recognized {
+            type Block = Toy;
+
+            fn static_descriptor(&self, index: u8) -> Option<(u32, Block)> {
+                (index == 0).then_some((STATIC_ID, STATIC_IV))
+            }
+
+            fn static_kind(&self, index: u8) -> Option<u16> {
+                (index == 0).then_some(16)
+            }
+
+            // Returning None proves the transform resolves blocks through
+            // cbc_block_for below, never through the bare cbc_block.
+            fn cbc_block(&self, _: u32) -> Option<Toy> {
+                None
+            }
+
+            fn cbc_block_for(&self, kind: u16, key_id: u32) -> Option<Toy> {
+                if !matches!(
+                    transform::Algorithm::of(kind),
+                    Ok(transform::Algorithm::Cbc)
+                ) {
+                    return None;
+                }
+                match key_id {
+                    STATIC_ID => Some(Toy { key: STATIC_KEY }),
+                    ARCHIVE_ID => Some(Toy { key: ARCHIVE_KEY }),
+                    _ => None,
+                }
+            }
+        }
+
+        assert_eq!(stored.transform(&Recognized).unwrap().bytes(), &plain[..]);
+    }
 }
 
 mod embedded {

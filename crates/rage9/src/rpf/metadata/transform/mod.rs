@@ -136,11 +136,27 @@ pub trait CipherSource {
     type Block: BlockDecrypt;
 
     /// The key identifier and parameter of static descriptor `index`. Its
-    /// cipher type is [`static_kind`].
+    /// cipher type is [`CipherSource::static_kind`].
     fn static_descriptor(&self, index: u8) -> Option<(u32, Block)>;
+
+    /// The cipher type of static descriptor `index`. The default returns the
+    /// current build's [`static_kind`] mapping, so existing sources need not
+    /// implement it; a recognized source overrides it with the type read from
+    /// the executable.
+    fn static_kind(&self, index: u8) -> Option<u16> {
+        Some(static_kind(index))
+    }
 
     /// The algorithm 0x10 block operation for `key_id`.
     fn cbc_block(&self, key_id: u32) -> Option<Self::Block>;
+
+    /// The block operation for `key_id` under cipher type `kind`. The default
+    /// ignores `kind` and calls [`CipherSource::cbc_block`]; a recognized
+    /// source overrides it to select the block by the type's algorithm.
+    fn cbc_block_for(&self, kind: u16, key_id: u32) -> Option<Self::Block> {
+        let _ = kind;
+        self.cbc_block(key_id)
+    }
 }
 
 /// CBC decryption in place. The IV carries over between updates until

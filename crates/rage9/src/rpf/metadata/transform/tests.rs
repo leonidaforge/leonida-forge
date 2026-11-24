@@ -97,6 +97,30 @@ fn maps_cipher_types_to_algorithms() {
 }
 
 #[test]
+fn cipher_source_defaults_delegate() {
+    // A source that implements only the required methods gets the additive
+    // behavior from the trait defaults.
+    struct Basic;
+    impl CipherSource for Basic {
+        type Block = Toy;
+        fn static_descriptor(&self, _: u8) -> Option<(u32, Block)> {
+            Some((0x1234, IV))
+        }
+        fn cbc_block(&self, key_id: u32) -> Option<Toy> {
+            (key_id == 0x1234).then(toy)
+        }
+    }
+    let source = Basic;
+    // static_kind defaults to the current-build free function.
+    assert_eq!(source.static_kind(4), Some(static_kind(4)));
+    assert_eq!(source.static_kind(1), Some(3));
+    // cbc_block_for defaults to cbc_block and ignores the kind.
+    assert!(source.cbc_block_for(16, 0x1234).is_some());
+    assert!(source.cbc_block_for(3, 0x1234).is_some());
+    assert!(source.cbc_block_for(16, 0x4321).is_none());
+}
+
+#[test]
 fn per_span_reset_types() {
     for kind in 0..=20 {
         assert_eq!(descriptor(kind).resets_per_span(), matches!(kind, 3..=5));
