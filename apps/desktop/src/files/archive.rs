@@ -6,8 +6,9 @@
 //! archive at a time. Archives are recognised by their contents, not by
 //! their names.
 //!
-//! An archive stored in another archive is decompressed once, by
-//! [`prepare`], into an anonymous temporary file. It is reused while the
+//! An archive stored in another archive is opened once, by [`prepare`]: as a
+//! view of its parent's bytes if it is stored as it is, otherwise
+//! decompressed into an anonymous temporary file. It is reused while the
 //! file on disk that holds the outermost archive is unchanged. Until then,
 //! and until an RPF9 archive is indexed, operations fail with an error that
 //! [`prepare_required`] recognises, so the explorer can show progress and
@@ -415,7 +416,7 @@ pub fn check_size(size: u64, limit: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Decompresses a file of `parent` that is an archive itself and keeps it.
+/// Opens a file of `parent` that is an archive itself and keeps it.
 fn decompress(parent: &Archive, inner: &Path, cancel: &AtomicBool) -> io::Result<()> {
     decompress_limited(parent, inner, cancel, MAX_CHAIN)
 }
@@ -432,6 +433,9 @@ fn decompress_limited(
             "{} is nested too deeply: at most {MAX_DEPTH} archives inside each other can be opened",
             file_name(&path)
         )));
+    }
+    if let Some(source) = stored_source(parent, inner)? {
+        return keep_identified(parent, inner, path, source, 0);
     }
     let len = file_len(parent, inner)?;
     check_size(len, MAX_READ)?;
@@ -460,7 +464,28 @@ fn decompress_limited(
                 },
             )?;
     }
-    let mut source = Source::from_file(temp)?;
+    let source = Source::from_file(temp)?;
+    let decompressed = source.len();
+    keep_identified(parent, inner, path, source, decompressed)
+}
+
+/// A file of `parent` stored as it is, as a view of the parent's source.
+/// Other files have to be decoded, which a view must not stand in for.
+fn stored_source(parent: &Archive, inner: &Path) -> io::Result<Option<Source>> {
+    match parent.format {
+        Format::Zip => zip::stored_source(parent, inner),
+        // Recovered entries are zlib streams.
+        Format::Rpf9 => Ok(None),
+    }
+}
+
+fn keep_identified(
+    parent: &Archive,
+    inner: &Path,
+    path: PathBuf,
+    mut source: Source,
+    decompressed: u64,
+) -> io::Result<()> {
     let format = match identify::identify(&mut source)? {
         Identified::Archive(format) => format,
         other => return Err(not_an_archive(&path, &other)),
@@ -475,6 +500,7 @@ fn decompress_limited(
             stamp: parent.stamp,
             format,
             source,
+            decompressed,
             caveat,
             last_used: 0,
         },
@@ -487,6 +513,9 @@ struct Kept {
     stamp: Stamp,
     format: Format,
     source: Source,
+    /// The size of the temporary file holding the archive, 0 for a view of
+    /// its parent.
+    decompressed: u64,
     caveat: Option<String>,
     last_used: u64,
 }
@@ -509,7 +538,7 @@ fn keep(path: PathBuf, mut archive: Kept) {
     archive.last_used = kept.clock;
     kept.by_path.insert(path.clone(), archive);
     loop {
-        let total: u64 = kept.by_path.values().map(|kept| kept.source.len()).sum();
+        let total: u64 = kept.by_path.values().map(|kept| kept.decompressed).sum();
         if total <= MAX_KEPT && kept.by_path.len() <= MAX_KEPT_COUNT {
             break;
         }
@@ -546,7 +575,7 @@ fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
         root: parent.root.clone(),
         stamp: parent.stamp,
         depth: parent.depth + 1,
-        decompressed: parent.decompressed.saturating_add(entry.source.len()),
+        decompressed: parent.decompressed.saturating_add(entry.decompressed),
         caveat: entry.caveat.clone(),
     })
 }
@@ -573,7 +602,8 @@ pub(crate) mod tests {
     use super::*;
     use crate::files;
     use crate::files::rpf::tests::{rpf_bytes, zlib};
-    use crate::files::zip::tests::zip_bytes;
+    use crate::files::zip::tests::{zip_bytes, zip_bytes_with};
+    use ::zip::CompressionMethod;
 
     fn names(entries: &[Entry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
@@ -745,6 +775,102 @@ pub(crate) mod tests {
         ] {
             check_chain(chain);
         }
+    }
+
+    fn nested(path: &Path) -> Archive {
+        list_opened(path);
+        match locate(path).unwrap() {
+            Location::Archive(archive) => archive,
+            other => panic!("expected an opened archive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stored_archives_are_views_and_compressed_ones_are_decoded() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner_zip = zip_bytes(&[("leaf.txt", b"leaf")]);
+        let inner_rpf = rpf_bytes(&[zlib(b"<?xml version=\"1.0\"?><a/>")]);
+        let files: [(&str, &[u8]); 2] = [("inner.zip", &inner_zip), ("inner.rpf", &inner_rpf)];
+        let stored = temp.path().join("stored.zip");
+        fs::write(&stored, zip_bytes_with(&files, CompressionMethod::Stored)).unwrap();
+        let deflated = temp.path().join("deflated.zip");
+        fs::write(&deflated, zip_bytes(&files)).unwrap();
+
+        for (outer, viewed) in [(&stored, true), (&deflated, false)] {
+            for (name, bytes) in files {
+                let path = outer.join(name);
+                let archive = nested(&path);
+                let expected = if viewed { 0 } else { bytes.len() as u64 };
+                assert_eq!(archive.decompressed, expected, "{}", path.display());
+                assert_eq!(archive.source.len(), bytes.len() as u64);
+                assert_eq!(files::read(&path).unwrap(), bytes);
+                let mut inspected = files::open_binary(&path).unwrap();
+                assert_eq!(
+                    lforge_binary::read_at(&mut inspected.source, 0, bytes.len()).unwrap(),
+                    bytes
+                );
+            }
+            assert_eq!(
+                files::read(&outer.join("inner.zip").join("leaf.txt")).unwrap(),
+                b"leaf"
+            );
+            assert_eq!(
+                names(&list_opened(&outer.join("inner.rpf"))),
+                [rpf::RECOVERED]
+            );
+        }
+
+        // A view is dropped like a decompressed archive when the file changes.
+        fs::write(
+            &stored,
+            zip_bytes_with(
+                &[("inner.zip", &inner_zip), ("new.txt", b"n")],
+                CompressionMethod::Stored,
+            ),
+        )
+        .unwrap();
+        let path = stored.join("inner.zip");
+        assert_eq!(
+            prepare_required(&files::list(&path).unwrap_err()),
+            Some(path.as_path())
+        );
+        assert_eq!(names(&list_opened(&path)), ["leaf.txt"]);
+    }
+
+    #[test]
+    fn stored_archives_nest_as_views_of_views() {
+        let temp = tempfile::tempdir().unwrap();
+        let leaf = b"<?xml version=\"1.0\"?><leaf/>";
+        let rpf = rpf_bytes(&[zlib(leaf)]);
+        let middle = zip_bytes_with(
+            &[("pad.txt", b"padding"), ("inner.rpf", &rpf)],
+            CompressionMethod::Stored,
+        );
+        let outer = temp.path().join("outer.zip");
+        fs::write(
+            &outer,
+            zip_bytes_with(
+                &[("first.txt", b"x"), ("middle.zip", &middle)],
+                CompressionMethod::Stored,
+            ),
+        )
+        .unwrap();
+
+        let middle_path = outer.join("middle.zip");
+        let rpf_path = middle_path.join("inner.rpf");
+        let middle_archive = nested(&middle_path);
+        let rpf_archive = nested(&rpf_path);
+        assert_eq!((middle_archive.depth, middle_archive.decompressed), (2, 0));
+        assert_eq!((rpf_archive.depth, rpf_archive.decompressed), (3, 0));
+        let mut head = rpf_archive.source.clone();
+        assert_eq!(
+            lforge_binary::read_at(&mut head, 0, rpf.len()).unwrap(),
+            rpf
+        );
+        assert_eq!(
+            files::read(&recovered(&rpf_path, "XML", "xml")).unwrap(),
+            leaf
+        );
     }
 
     #[test]

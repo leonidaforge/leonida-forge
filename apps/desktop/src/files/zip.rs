@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use chrono::{Local, NaiveDate, TimeZone};
 use lforge_binary::Source;
-use zip::ZipArchive;
+use zip::{CompressionMethod, ZipArchive};
 
 use super::archive::{Archive, check_size};
 use super::{Entry, EntryKind};
@@ -110,6 +110,26 @@ pub fn copy(
     Ok(modified)
 }
 
+/// The bytes of a file stored without compression or encryption, as a view
+/// of the archive's source. `None` for any other file, which has to be
+/// decoded first.
+pub fn stored_source(archive: &Archive, inner: &Path) -> io::Result<Option<Source>> {
+    let mut zip = open(archive)?;
+    let index = find(&mut zip, inner)?;
+    let file = zip.by_index_raw(index).map_err(io::Error::other)?;
+    if file.compression() != CompressionMethod::Stored
+        || file.encrypted()
+        || file.compressed_size() != file.size()
+    {
+        return Ok(None);
+    }
+    // Set by `by_index_raw`, relative to the archive's source.
+    let Some(start) = file.data_start() else {
+        return Ok(None);
+    };
+    archive.source.slice(start, file.size()).map(Some)
+}
+
 fn find(zip: &mut Zip, inner: &Path) -> io::Result<usize> {
     (0..zip.len())
         .find(|&index| {
@@ -151,10 +171,13 @@ pub(crate) mod tests {
     use zip::write::SimpleFileOptions;
 
     pub(crate) fn zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        zip_bytes_with(files, CompressionMethod::Deflated)
+    }
+
+    pub(crate) fn zip_bytes_with(files: &[(&str, &[u8])], method: CompressionMethod) -> Vec<u8> {
         let mut out = io::Cursor::new(Vec::new());
         let mut zip = zip::ZipWriter::new(&mut out);
-        let options =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = SimpleFileOptions::default().compression_method(method);
         for (name, data) in files {
             if name.ends_with('/') {
                 zip.add_directory(*name, options).unwrap();
@@ -180,6 +203,41 @@ pub(crate) mod tests {
             archive::Location::Archive(archive) => archive,
             other => panic!("not an archive: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stored_files_are_views_and_compressed_files_are_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let stored = temp.path().join("stored.zip");
+        fs::write(
+            &stored,
+            zip_bytes_with(
+                &[("a.bin", &data), ("b.bin", b"tail")],
+                CompressionMethod::Stored,
+            ),
+        )
+        .unwrap();
+        let archive = opened(&stored);
+        let mut view = stored_source(&archive, Path::new("a.bin"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(view.len(), data.len() as u64);
+        assert_eq!(lforge_binary::read_at(&mut view, 0, 10_000).unwrap(), data);
+        let mut tail = stored_source(&archive, Path::new("b.bin"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(lforge_binary::read_at(&mut tail, 0, 100).unwrap(), b"tail");
+        assert!(stored_source(&archive, Path::new("missing.bin")).is_err());
+
+        let deflated = temp.path().join("deflated.zip");
+        write_zip(&deflated, &[("a.bin", &data)]);
+        let archive = opened(&deflated);
+        assert!(
+            stored_source(&archive, Path::new("a.bin"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
