@@ -32,6 +32,7 @@ pub mod keys {
     pub const PAYLOAD_TRANSFORM: u64 = 0x2860_30A3_58A7_89FB;
     /// The 32-bit key of rows whose type uses the 32-bit class.
     pub const NAME_KEY: u64 = 0xB707_6B62_45D3_5FB5;
+    pub const READ_SOURCE: u64 = 0xCBB6_8FF7_B707_8DB7;
 }
 
 pub const DESCRIPTOR_LEN: usize = 24;
@@ -58,6 +59,11 @@ pub enum Error {
         row: u32,
         encoding: &'static str,
     },
+    /// The entry is read through an alternate source that was not supplied.
+    ReadSource {
+        row: u32,
+        index: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -76,6 +82,10 @@ impl fmt::Display for Error {
             Error::Encoded { row, encoding } => write!(
                 f,
                 "entry {row} is stored {encoding}, so its stored bytes are not its contents"
+            ),
+            Error::ReadSource { row, index } => write!(
+                f,
+                "entry {row} is read through alternate source {index}, which is not available"
             ),
         }
     }
@@ -927,10 +937,24 @@ impl Metadata {
         Ok(self.field(row, keys::PAYLOAD_TRANSFORM)?.is_some())
     }
 
+    /// The alternate source the entry's stored bytes are read through. `None`
+    /// for the main source: the column is absent, the cell is null or the
+    /// value is `0xFFFFFFFF`.
+    pub fn read_source(&self, row: u32) -> Result<Option<u32>, Error> {
+        let index = self
+            .field(row, keys::READ_SOURCE)?
+            .map(|value| {
+                u32_at(value, 0).ok_or_else(|| invalid("read source shorter than 4 bytes"))
+            })
+            .transpose()?;
+        Ok(index.filter(|&index| index != u32::MAX))
+    }
+
     /// The archive-relative range of an entry stored as it is: from its
     /// payload offset, its logical size, as the engine reads a nested archive.
     /// Fails with [`Error::Encoded`] for an entry that is compressed, chunked
-    /// or behind the payload transform.
+    /// or behind the payload transform. The range is not checked against a
+    /// source; [`Metadata::raw_source`] does that.
     pub fn raw_range(&self, row: u32) -> Result<Range<u64>, Error> {
         let location = self.location(row)?;
         let encoding = if location.is_compressed() {
@@ -945,11 +969,45 @@ impl Metadata {
         if let Some(encoding) = encoding {
             return Err(Error::Encoded { row, encoding });
         }
+        if location.logical_len > location.stored_len {
+            return Err(invalid(format!(
+                "entry {row} is stored as it is, but its logical size {:#x} exceeds its stored size {:#x}",
+                location.logical_len, location.stored_len
+            )));
+        }
         let start = location.payload_offset;
         let end = start
             .checked_add(location.logical_len)
             .ok_or_else(|| invalid(format!("the range of entry {row} overflows")))?;
         Ok(start..end)
+    }
+
+    /// The bytes of an entry stored as it is, as a view of the source it is
+    /// read through: `main`, or `alternates[i]` for read source `i`. The
+    /// range is the same in every source. An alternate that is not supplied
+    /// fails with [`Error::ReadSource`] rather than falling back to `main`.
+    pub fn raw_source(
+        &self,
+        row: u32,
+        main: &lforge_binary::Source,
+        alternates: &[lforge_binary::Source],
+    ) -> Result<lforge_binary::Source, Error> {
+        let range = self.raw_range(row)?;
+        let source = match self.read_source(row)? {
+            None => main,
+            Some(index) => usize::try_from(index)
+                .ok()
+                .and_then(|i| alternates.get(i))
+                .ok_or(Error::ReadSource { row, index })?,
+        };
+        if range.end > source.len() {
+            return Err(invalid(format!(
+                "entry {row} ends at {:#x}, after the end of the archive ({:#x})",
+                range.end,
+                source.len()
+            )));
+        }
+        Ok(source.slice(range.start, range.end - range.start)?)
     }
 
     /// The chunk table. Its entries are addressed relative to the value and

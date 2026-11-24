@@ -1011,6 +1011,10 @@ mod embedded {
         Raw,
         Compressed,
         Transformed,
+        /// Raw, read through the given read source.
+        Source(u32),
+        /// Raw, with a logical size one byte above the stored size.
+        Oversized,
     }
 
     /// An archive with one row per payload, stored from offset 0x1000 on.
@@ -1021,13 +1025,11 @@ mod embedded {
             let offset = PAYLOADS + data.len();
             let mode = u8::from(matches!(stored, Storage::Compressed));
             let units = payload.len().div_ceil(16) as u32;
-            records.push(record_a(
-                units,
-                (offset / 16) as u32,
-                payload.len() as u64,
-                0,
-                mode,
-            ));
+            let logical = match stored {
+                Storage::Oversized => u64::from(units) * 16 + 1,
+                _ => payload.len() as u64,
+            };
+            records.push(record_a(units, (offset / 16) as u32, logical, 0, mode));
             data.extend_from_slice(payload);
             data.resize(data.len().next_multiple_of(16), 0);
         }
@@ -1036,10 +1038,24 @@ mod embedded {
             .iter()
             .map(|(_, stored)| matches!(stored, Storage::Transformed).then_some(0))
             .collect();
+        let sources: Vec<[u8; 4]> = payloads
+            .iter()
+            .map(|(_, stored)| match stored {
+                Storage::Source(index) => index.to_le_bytes(),
+                _ => [0; 4],
+            })
+            .collect();
+        let with_source: Vec<Option<u32>> = payloads
+            .iter()
+            .enumerate()
+            .map(|(n, (_, stored))| matches!(stored, Storage::Source(_)).then_some(n as u32))
+            .collect();
         let records: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+        let sources: Vec<&[u8]> = sources.iter().map(|s| &s[..]).collect();
         let mut bytes = Build::default().build(&[
             Column::new(keys::LOCATION_A, 16, &records, &all),
             Column::new(keys::PAYLOAD_TRANSFORM, 1, &[&[0]], &transformed),
+            Column::new(keys::READ_SOURCE, 4, &sources, &with_source),
         ]);
         assert!(bytes.len() <= PAYLOADS);
         bytes.resize(PAYLOADS, 0);
@@ -1052,8 +1068,7 @@ mod embedded {
     }
 
     fn view(parent: &Source, metadata: &Metadata, row: u32) -> Source {
-        let range = metadata.raw_range(row).unwrap();
-        parent.slice(range.start, range.end - range.start).unwrap()
+        metadata.raw_source(row, parent, &[]).unwrap()
     }
 
     #[test]
@@ -1147,10 +1162,74 @@ mod embedded {
         archive.truncate(PAYLOADS + child.len() - 1);
         let outer = source(&archive);
         let metadata = decode(&mut outer.clone());
-        let range = metadata.raw_range(0).unwrap();
-        let err = outer
-            .slice(range.start, range.end - range.start)
-            .unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let reason = invalid_reason(metadata.raw_source(0, &outer, &[]));
+        assert!(reason.contains("after the end of the archive"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_raw_entries_larger_than_their_stored_bytes() {
+        let child = leaf([1, 2, 3, 4]);
+        let archive = parent(&[(&child, Storage::Oversized)]);
+        let metadata = decode(&mut source(&archive));
+        let reason = invalid_reason(metadata.raw_range(0));
+        assert!(reason.contains("exceeds its stored size"), "{reason}");
+    }
+
+    #[test]
+    fn reads_the_read_source_column() {
+        let child = leaf([1, 2, 3, 4]);
+        let archive = parent(&[
+            (&child, Storage::Raw),
+            (&child, Storage::Source(u32::MAX)),
+            (&child, Storage::Source(0)),
+            (&child, Storage::Source(3)),
+        ]);
+        let metadata = decode(&mut source(&archive));
+        let sources: Vec<_> = (0..4)
+            .map(|row| metadata.read_source(row).unwrap())
+            .collect();
+        assert_eq!(sources, [None, None, Some(0), Some(3)]);
+        // Without the column every row uses the main source.
+        let plain = decode(&mut source(&parent(&[(&child, Storage::Raw)])));
+        assert_eq!(plain.read_source(0).unwrap(), None);
+    }
+
+    #[test]
+    fn alternate_sources_must_be_supplied() {
+        let first = leaf([1, 2, 3, 4]);
+        let second = leaf([5, 6, 7, 8]);
+        let archive = parent(&[(&first, Storage::Raw), (&second, Storage::Source(1))]);
+        let main = source(&archive);
+        let metadata = decode(&mut main.clone());
+        for alternates in [&[][..], std::slice::from_ref(&main)] {
+            match metadata.raw_source(1, &main, alternates) {
+                Err(Error::ReadSource { row: 1, index: 1 }) => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        // A supplied alternate is read at the same address as the main source.
+        let mut altered = archive.clone();
+        let range = metadata.raw_range(1).unwrap();
+        altered[range.start as usize + 0x40..range.end as usize].fill(0);
+        let alternates = [source(&altered), source(&archive)];
+        let mut from_alternate = metadata.raw_source(1, &main, &alternates).unwrap();
+        assert_eq!(
+            decode(&mut from_alternate).field(0, KEY_X).unwrap(),
+            Some(&[5, 6, 7, 8][..])
+        );
+        assert!(matches!(
+            metadata.raw_source(1, &main, &alternates[..1]),
+            Err(Error::ReadSource { .. })
+        ));
+        // The bytes come from the alternate, not from the main source.
+        let both_altered = [alternates[0].clone(), alternates[0].clone()];
+        let mut altered_view = metadata.raw_source(1, &main, &both_altered).unwrap();
+        assert_eq!(decode(&mut altered_view).field(0, KEY_X).unwrap(), None);
+        // Main-source rows ignore the alternates.
+        let mut first_view = metadata.raw_source(0, &main, &alternates).unwrap();
+        assert_eq!(
+            decode(&mut first_view).field(0, KEY_X).unwrap(),
+            Some(&[1, 2, 3, 4][..])
+        );
     }
 }
