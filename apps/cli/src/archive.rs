@@ -86,6 +86,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Probe the static cipher and A table with a local executable. The
+    /// archive is read only, and no signature is verified
+    Probe {
+        file: PathBuf,
+        /// The executable to recognize the key provider in
+        #[arg(long)]
+        executable: PathBuf,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Export one native table-of-contents entry, decoded where supported
     Extract {
         file: PathBuf,
@@ -173,6 +184,11 @@ pub fn run(command: Command) -> Result<(), String> {
             output,
             overwrite,
         } => extract::run(&file, row, &output, overwrite),
+        Command::Probe {
+            file,
+            executable,
+            json,
+        } => crate::probe::run(&file, &executable, json),
         Command::Recover {
             file,
             list,

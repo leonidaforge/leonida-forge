@@ -4,6 +4,7 @@ mod extract;
 mod metadata;
 mod native;
 mod output;
+mod probe;
 mod recover;
 
 use std::process::ExitCode;
