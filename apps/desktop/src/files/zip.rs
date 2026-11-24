@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use chrono::{Local, NaiveDate, TimeZone};
@@ -110,10 +111,50 @@ pub fn copy(
     Ok(modified)
 }
 
-/// The bytes of a file stored without compression or encryption, as a view
-/// of the archive's source. `None` for any other file, which has to be
-/// decoded first.
-pub fn stored_source(archive: &Archive, inner: &Path) -> io::Result<Option<Source>> {
+/// A file stored without compression or encryption, as a view of the
+/// archive's source. Its bytes have not been checked against its CRC-32.
+pub struct Unverified {
+    pub source: Source,
+    crc32: u32,
+}
+
+/// Bytes read per step when checking a CRC-32.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
+impl Unverified {
+    /// Reads the bytes once, in bounded pieces, and returns the view if they
+    /// match the recorded CRC-32.
+    pub fn verify(self, cancel: &AtomicBool) -> io::Result<Source> {
+        let mut reader = self.source.clone();
+        let mut crc = flate2::Crc::new();
+        let mut buf = vec![0; VERIFY_CHUNK];
+        let mut read = 0u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            crc.update(&buf[..n]);
+            read += n as u64;
+        }
+        if read != self.source.len() || crc.sum() != self.crc32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the stored file does not match its CRC-32",
+            ));
+        }
+        Ok(self.source)
+    }
+}
+
+/// A file stored without compression or encryption. `None` for any other
+/// file, which has to be decoded instead.
+pub fn stored_file(archive: &Archive, inner: &Path) -> io::Result<Option<Unverified>> {
     let mut zip = open(archive)?;
     let index = find(&mut zip, inner)?;
     let file = zip.by_index_raw(index).map_err(io::Error::other)?;
@@ -127,7 +168,10 @@ pub fn stored_source(archive: &Archive, inner: &Path) -> io::Result<Option<Sourc
     let Some(start) = file.data_start() else {
         return Ok(None);
     };
-    archive.source.slice(start, file.size()).map(Some)
+    Ok(Some(Unverified {
+        source: archive.source.slice(start, file.size())?,
+        crc32: file.crc32(),
+    }))
 }
 
 fn find(zip: &mut Zip, inner: &Path) -> io::Result<usize> {
@@ -205,39 +249,56 @@ pub(crate) mod tests {
         }
     }
 
+    fn verified(archive: &Archive, name: &str) -> io::Result<Source> {
+        stored_file(archive, Path::new(name))?
+            .expect("a stored file")
+            .verify(&AtomicBool::new(false))
+    }
+
     #[test]
-    fn stored_files_are_views_and_compressed_files_are_not() {
+    fn stored_files_are_verified_views() {
         let temp = tempfile::tempdir().unwrap();
-        let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        // Larger than one verification step.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let files: [(&str, &[u8]); 3] = [("a.bin", &data), ("b.bin", b"tail"), ("empty.bin", b"")];
+        let bytes = zip_bytes_with(&files, CompressionMethod::Stored);
         let stored = temp.path().join("stored.zip");
-        fs::write(
-            &stored,
-            zip_bytes_with(
-                &[("a.bin", &data), ("b.bin", b"tail")],
-                CompressionMethod::Stored,
-            ),
-        )
-        .unwrap();
+        fs::write(&stored, &bytes).unwrap();
         let archive = opened(&stored);
-        let mut view = stored_source(&archive, Path::new("a.bin"))
-            .unwrap()
-            .unwrap();
+
+        let mut view = verified(&archive, "a.bin").unwrap();
         assert_eq!(view.len(), data.len() as u64);
-        assert_eq!(lforge_binary::read_at(&mut view, 0, 10_000).unwrap(), data);
-        let mut tail = stored_source(&archive, Path::new("b.bin"))
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            lforge_binary::read_at(&mut view, 0, data.len()).unwrap(),
+            data
+        );
+        let mut tail = verified(&archive, "b.bin").unwrap();
         assert_eq!(lforge_binary::read_at(&mut tail, 0, 100).unwrap(), b"tail");
-        assert!(stored_source(&archive, Path::new("missing.bin")).is_err());
+        assert!(verified(&archive, "empty.bin").unwrap().is_empty());
+        assert!(stored_file(&archive, Path::new("missing.bin")).is_err());
+
+        let unverified = stored_file(&archive, Path::new("a.bin")).unwrap().unwrap();
+        let err = unverified.verify(&AtomicBool::new(true)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+
+        // One changed byte in the middle of the stored data.
+        let at = bytes
+            .windows(4)
+            .position(|w| w == &data[1000..1004])
+            .unwrap();
+        let mut corrupt = bytes.clone();
+        corrupt[at] ^= 0xFF;
+        let damaged = temp.path().join("damaged.zip");
+        fs::write(&damaged, corrupt).unwrap();
+        let err = verified(&opened(&damaged), "a.bin").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC-32"), "{err}");
+        assert!(verified(&opened(&damaged), "b.bin").is_ok());
 
         let deflated = temp.path().join("deflated.zip");
         write_zip(&deflated, &[("a.bin", &data)]);
         let archive = opened(&deflated);
-        assert!(
-            stored_source(&archive, Path::new("a.bin"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(stored_file(&archive, Path::new("a.bin")).unwrap().is_none());
     }
 
     #[test]

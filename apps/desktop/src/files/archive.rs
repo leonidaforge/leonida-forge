@@ -418,13 +418,17 @@ pub fn check_size(size: u64, limit: u64) -> io::Result<()> {
 
 /// Opens a file of `parent` that is an archive itself and keeps it.
 fn decompress(parent: &Archive, inner: &Path, cancel: &AtomicBool) -> io::Result<()> {
-    decompress_limited(parent, inner, cancel, MAX_CHAIN)
+    decompress_limited(parent, inner, cancel, MAX_READ, MAX_CHAIN)
 }
 
+/// `read_limit` caps the size of the nested archive, also when it is a view,
+/// because opening it scans its contents like those of a copy. `chain_limit`
+/// caps the bytes decompressed along the chain, which a view adds nothing to.
 fn decompress_limited(
     parent: &Archive,
     inner: &Path,
     cancel: &AtomicBool,
+    read_limit: u64,
     chain_limit: u64,
 ) -> io::Result<()> {
     let path = parent.path.join(inner);
@@ -434,11 +438,13 @@ fn decompress_limited(
             file_name(&path)
         )));
     }
-    if let Some(source) = stored_source(parent, inner)? {
+    if let Some(stored) = stored_file(parent, inner)? {
+        check_size(stored.source.len(), read_limit)?;
+        let source = stored.verify(cancel)?;
         return keep_identified(parent, inner, path, source, 0);
     }
     let len = file_len(parent, inner)?;
-    check_size(len, MAX_READ)?;
+    check_size(len, read_limit)?;
     let room = chain_limit.saturating_sub(parent.decompressed);
     if len > room {
         return Err(io::Error::other(format!(
@@ -455,7 +461,7 @@ fn decompress_limited(
             cancel,
         };
         // The declared size may be wrong, so the copy is capped as well.
-        copy(parent, inner, &mut out, len.min(MAX_READ))
+        copy(parent, inner, &mut out, len.min(read_limit))
             .and_then(|_| out.flush())
             .map_err(
                 |err| match err.get_ref().is_some_and(|e| e.is::<Cancelled>()) {
@@ -471,9 +477,9 @@ fn decompress_limited(
 
 /// A file of `parent` stored as it is, as a view of the parent's source.
 /// Other files have to be decoded, which a view must not stand in for.
-fn stored_source(parent: &Archive, inner: &Path) -> io::Result<Option<Source>> {
+fn stored_file(parent: &Archive, inner: &Path) -> io::Result<Option<zip::Unverified>> {
     match parent.format {
-        Format::Zip => zip::stored_source(parent, inner),
+        Format::Zip => zip::stored_file(parent, inner),
         // Recovered entries are zlib streams.
         Format::Rpf9 => Ok(None),
     }
@@ -837,6 +843,102 @@ pub(crate) mod tests {
         assert_eq!(names(&list_opened(&path)), ["leaf.txt"]);
     }
 
+    /// An outer archive that stores `inner.zip` uncompressed, last.
+    fn stored_outer(dir: &Path, edit: impl FnOnce(&mut Vec<u8>, &[u8])) -> PathBuf {
+        let inner = zip_bytes(&[("leaf.txt", b"leaf contents")]);
+        let mut bytes = zip_bytes_with(
+            &[("first.txt", b"x"), ("inner.zip", &inner)],
+            CompressionMethod::Stored,
+        );
+        edit(&mut bytes, &inner);
+        let outer = dir.join("outer.zip");
+        fs::write(&outer, bytes).unwrap();
+        outer
+    }
+
+    /// Adds `delta` to both sizes in the central header of `name`.
+    fn grow_declared_size(bytes: &mut [u8], name: &str, delta: u32) {
+        let at = (0..bytes.len() - 46)
+            .find(|&i| {
+                let name_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+                bytes[i..].starts_with(b"PK")
+                    && bytes.get(i + 46..i + 46 + name_len) == Some(name.as_bytes())
+            })
+            .unwrap();
+        for field in [at + 20, at + 24] {
+            let size = u32::from_le_bytes(bytes[field..field + 4].try_into().unwrap());
+            bytes[field..field + 4].copy_from_slice(&(size + delta).to_le_bytes());
+        }
+    }
+
+    fn assert_not_opened(path: &Path, cancel: bool) -> io::Error {
+        let err = prepare(path, &Progress::default(), &AtomicBool::new(cancel)).unwrap_err();
+        assert!(prepare_required(&files::list(path).unwrap_err()).is_some());
+        err
+    }
+
+    #[test]
+    fn stored_archives_must_match_their_crc() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = stored_outer(temp.path(), |bytes, inner| {
+            // A byte in the middle of the stored inner archive.
+            let at = bytes.windows(inner.len()).position(|w| w == inner).unwrap();
+            bytes[at + inner.len() / 2] ^= 0x55;
+        });
+        let err = assert_not_opened(&outer.join("inner.zip"), false);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("CRC-32"), "{err}");
+        // The file can still be inspected as bytes.
+        assert!(files::open_binary(&outer.join("first.txt")).is_ok());
+    }
+
+    #[test]
+    fn stored_archives_with_wrong_sizes_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        // The declared size runs into the central directory.
+        let dir = temp.path().join("into_directory");
+        fs::create_dir(&dir).unwrap();
+        let outer = stored_outer(&dir, |bytes, _| grow_declared_size(bytes, "inner.zip", 16));
+        let err = assert_not_opened(&outer.join("inner.zip"), false);
+        assert!(err.to_string().contains("CRC-32"), "{err}");
+        // The declared size runs past the end of the file.
+        let dir = temp.path().join("past_end");
+        fs::create_dir(&dir).unwrap();
+        let outer = stored_outer(&dir, |bytes, _| {
+            grow_declared_size(bytes, "inner.zip", 0x100_0000);
+        });
+        assert_not_opened(&outer.join("inner.zip"), false);
+    }
+
+    #[test]
+    fn verifying_a_stored_archive_can_be_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = stored_outer(temp.path(), |_, _| {});
+        let err = assert_not_opened(&outer.join("inner.zip"), true);
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert!(!list_opened(&outer.join("inner.zip")).is_empty());
+    }
+
+    #[test]
+    fn views_are_capped_in_size_but_decompress_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = stored_outer(temp.path(), |_, _| {});
+        let Location::Inside(parent, name) = locate(&outer.join("inner.zip")).unwrap() else {
+            panic!("expected a file inside the archive");
+        };
+        let cancel = AtomicBool::new(false);
+        let len = file_len(&parent, &name).unwrap();
+        let err = decompress_limited(&parent, &name, &cancel, len - 1, MAX_CHAIN).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        assert!(prepare_required(&files::list(&outer.join("inner.zip")).unwrap_err()).is_some());
+        // No decompression budget is needed for a view.
+        decompress_limited(&parent, &name, &cancel, len, 0).unwrap();
+        let Location::Archive(nested) = locate(&outer.join("inner.zip")).unwrap() else {
+            panic!("expected the kept archive");
+        };
+        assert_eq!((nested.decompressed, nested.source.len()), (0, len));
+    }
+
     #[test]
     fn stored_archives_nest_as_views_of_views() {
         let temp = tempfile::tempdir().unwrap();
@@ -947,9 +1049,9 @@ pub(crate) mod tests {
         };
         let cancel = AtomicBool::new(false);
         let len = inner.len() as u64;
-        let err = decompress_limited(&parent, &name, &cancel, len - 1).unwrap_err();
+        let err = decompress_limited(&parent, &name, &cancel, MAX_READ, len - 1).unwrap_err();
         assert!(err.to_string().contains("decompress to more than"), "{err}");
-        decompress_limited(&parent, &name, &cancel, len).unwrap();
+        decompress_limited(&parent, &name, &cancel, MAX_READ, len).unwrap();
         let Location::Archive(nested) = locate(&outer.join("inner.zip")).unwrap() else {
             panic!("expected the kept archive");
         };
