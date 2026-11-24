@@ -11,6 +11,4 @@ publish.workspace = true
 flate2.workspace = true
 lforge-binary.workspace = true
 sha2.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

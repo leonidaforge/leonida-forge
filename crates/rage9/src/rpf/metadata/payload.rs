@@ -5,13 +5,16 @@
 //! is an error. The engine instead traps on decoder failures and does not
 //! compare sizes.
 //!
-//! A zlib chunk is verified completely, up to its checksum, before any of
-//! its bytes are returned. A raw DEFLATE entry has no checksum, and its end
-//! is checked only when it is read to the end: a partial read returns the
-//! bytes decoded so far without knowing whether the rest of the stream is
-//! intact.
+//! A zlib chunk is decoded and verified completely, up to its checksum,
+//! before any of its bytes are returned, and the bytes returned are the ones
+//! that were verified: they are kept in memory or, for large chunks, in an
+//! anonymous temporary file, not decoded again. A raw DEFLATE entry has no
+//! checksum, and its end is checked only when it is read to the end: a
+//! partial read returns the bytes decoded so far without knowing whether the
+//! rest of the stream is intact.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use lforge_binary::Source;
@@ -24,10 +27,15 @@ const INPUT_LEN: usize = 64 * 1024;
 const SKIP_LEN: usize = 64 * 1024;
 /// The chunk method that holds a zlib stream. The others are copied.
 const ZLIB_METHOD: u8 = 3;
-/// Zlib chunks up to this size are decoded once and kept while they are
-/// read. Larger ones are verified in one pass and decoded again as they are
-/// read.
+/// Zlib chunks up to this size are kept in memory while they are read.
+/// Larger ones are kept in a temporary file.
 const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
+/// For reads that cannot be cancelled.
+static NEVER: AtomicBool = AtomicBool::new(false);
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
+}
 
 fn bad(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -65,7 +73,10 @@ impl Inflater {
 
     /// Runs the decoder once into `out`. Returns the bytes produced and
     /// whether the stream ended.
-    fn step(&mut self, out: &mut [u8]) -> io::Result<(usize, bool)> {
+    fn step(&mut self, out: &mut [u8], cancel: &AtomicBool) -> io::Result<(usize, bool)> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         if self.start == self.end {
             self.start = 0;
             self.end = self.stored.read(&mut self.input)?;
@@ -95,10 +106,10 @@ impl Inflater {
     }
 
     /// Requires the end of the stream, with no further output.
-    fn finish(&mut self) -> io::Result<()> {
+    fn finish(&mut self, cancel: &AtomicBool) -> io::Result<()> {
         let mut scratch = [0; 1];
         loop {
-            let (produced, ended) = self.step(&mut scratch)?;
+            let (produced, ended) = self.step(&mut scratch, cancel)?;
             if produced > 0 {
                 return Err(bad(format!(
                     "the stream holds more than the declared {} bytes",
@@ -120,20 +131,20 @@ impl Inflater {
         Ok(())
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8], cancel: &AtomicBool) -> io::Result<usize> {
         let remaining = self.len - self.out;
         if self.finished || buf.is_empty() {
             return Ok(0);
         }
         if remaining == 0 {
-            self.finish()?;
+            self.finish(cancel)?;
             return Ok(0);
         }
         let max = buf
             .len()
             .min(usize::try_from(remaining).unwrap_or(usize::MAX));
         loop {
-            let (produced, ended) = self.step(&mut buf[..max])?;
+            let (produced, ended) = self.step(&mut buf[..max], cancel)?;
             self.out += produced as u64;
             if ended && self.out != self.len {
                 return Err(bad(format!(
@@ -142,7 +153,7 @@ impl Inflater {
                 )));
             }
             if self.out == self.len {
-                self.finish()?;
+                self.finish(cancel)?;
             }
             if produced > 0 {
                 return Ok(produced);
@@ -150,23 +161,29 @@ impl Inflater {
         }
     }
 
-    /// Decodes the whole stream and checks its end, discarding the output.
-    fn verify(&mut self) -> io::Result<()> {
-        self.skip_to(self.len)?;
+    /// Decodes the whole stream into `out` and checks its end.
+    fn decode_into(&mut self, out: &mut impl Write, cancel: &AtomicBool) -> io::Result<()> {
+        let mut buf = vec![0; SKIP_LEN];
+        while self.out < self.len {
+            match self.read(&mut buf, cancel)? {
+                0 => return Err(bad("the stream ends early")),
+                n => out.write_all(&buf[..n])?,
+            }
+        }
         // Checks the end of the stream, also of an empty one.
-        self.read(&mut [0; 1])?;
+        self.read(&mut [0; 1], cancel)?;
         Ok(())
     }
 
     /// Decodes and discards bytes up to `target`.
-    fn skip_to(&mut self, target: u64) -> io::Result<()> {
+    fn skip_to(&mut self, target: u64, cancel: &AtomicBool) -> io::Result<()> {
         if self.out >= target {
             return Ok(());
         }
         let mut scratch = vec![0; SKIP_LEN];
         while self.out < target {
             let want = usize::try_from(target - self.out).map_or(SKIP_LEN, |n| n.min(SKIP_LEN));
-            if self.read(&mut scratch[..want])? == 0 {
+            if self.read(&mut scratch[..want], cancel)? == 0 {
                 return Err(bad("the stream ends before the position"));
             }
         }
@@ -198,18 +215,17 @@ enum Kind {
     Chunked {
         stored: Source,
         spans: Vec<Span>,
-        /// Zlib chunks whose stream was decoded and checked completely.
-        verified: Vec<bool>,
         /// The zlib chunk read last, by chunk number.
         current: Option<(usize, Decoded)>,
     },
 }
 
-/// A verified zlib chunk.
+/// The contents of a zlib chunk whose stream was decoded and checked
+/// completely.
 enum Decoded {
     Buffered(Vec<u8>),
-    /// A chunk larger than [`CHUNK_BUFFER_LEN`], decoded as it is read.
-    Streamed(Inflater),
+    /// A chunk larger than [`CHUNK_BUFFER_LEN`], in a temporary file.
+    Spooled(Source),
 }
 
 /// The contents of an entry, readable and seekable. Each value keeps its
@@ -292,7 +308,6 @@ impl Payload {
             pos: 0,
             kind: Kind::Chunked {
                 stored,
-                verified: vec![false; spans.len()],
                 spans,
                 current: None,
             },
@@ -305,6 +320,69 @@ impl Payload {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// [`Read::read`] that stops with [`io::ErrorKind::Interrupted`] once
+    /// `cancel` is set, also while it decodes a large chunk.
+    pub fn read_cancellable(&mut self, buf: &mut [u8], cancel: &AtomicBool) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let room = usize::try_from(self.len - self.pos).unwrap_or(usize::MAX);
+        let buf_len = buf.len().min(room);
+        let buf = &mut buf[..buf_len];
+        let pos = self.pos;
+        let n = match &mut self.kind {
+            Kind::Stored(source) => read_at(source, pos, buf)?,
+            Kind::Deflate { stored, inflater } => {
+                let reusable = inflater.as_ref().is_some_and(|i| i.out <= pos);
+                if !reusable {
+                    *inflater = Some(Inflater::new(stored.clone(), false, false, self.len));
+                }
+                let inflater = inflater.as_mut().expect("set above");
+                inflater.skip_to(pos, cancel)?;
+                inflater.read(buf, cancel)?
+            }
+            Kind::Chunked {
+                stored,
+                spans,
+                current,
+            } => {
+                let index = spans.partition_point(|span| span.logical_end() <= pos);
+                let span = &spans[index];
+                let offset = pos - span.logical;
+                let room = usize::try_from(span.logical_end() - pos).unwrap_or(usize::MAX);
+                let buf_len = buf.len().min(room);
+                let buf = &mut buf[..buf_len];
+                if span.chunk.method != ZLIB_METHOD {
+                    read_at(stored, span.stored + offset, buf)?
+                } else {
+                    if !matches!(current, Some((n, _)) if *n == index) {
+                        // Drops the previous chunk first, so that at most
+                        // one is kept.
+                        *current = None;
+                        *current = Some((index, decode_chunk(stored, span, cancel)?));
+                    }
+                    let n = match current.as_ref().map(|(_, decoded)| decoded) {
+                        Some(Decoded::Buffered(bytes)) => {
+                            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                            let chunk = bytes.get(start..).unwrap_or_default();
+                            let n = buf.len().min(chunk.len());
+                            buf[..n].copy_from_slice(&chunk[..n]);
+                            n
+                        }
+                        Some(Decoded::Spooled(file)) => read_at(file, offset, buf)?,
+                        None => 0,
+                    };
+                    if n == 0 {
+                        return Err(bad(format!("chunk {index} ends early")));
+                    }
+                    n
+                }
+            }
+        };
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -324,33 +402,25 @@ impl std::fmt::Debug for Payload {
 }
 
 /// A zlib chunk, decoded and checked completely before any of it is used.
-fn decode_chunk(stored: &Source, span: &Span, verified: &mut bool) -> io::Result<Decoded> {
+fn decode_chunk(stored: &Source, span: &Span, cancel: &AtomicBool) -> io::Result<Decoded> {
     let len = u64::from(span.chunk.logical_len);
-    let inflater = || {
-        stored
-            .slice(span.stored, span.chunk.compressed_len.into())
-            .map(|compressed| Inflater::new(compressed, true, true, len))
-            .map_err(|err| bad(err.to_string()))
-    };
+    let compressed = stored
+        .slice(span.stored, span.chunk.compressed_len.into())
+        .map_err(|err| bad(err.to_string()))?;
+    let mut inflater = Inflater::new(compressed, true, true, len);
     if len <= CHUNK_BUFFER_LEN {
-        let mut inflater = inflater()?;
-        let mut bytes = vec![0; len as usize];
-        let mut filled = 0;
-        while filled < bytes.len() {
-            match inflater.read(&mut bytes[filled..])? {
-                0 => return Err(bad("the chunk ends early")),
-                n => filled += n,
-            }
-        }
-        inflater.verify()?;
-        *verified = true;
+        let mut bytes = Vec::with_capacity(len as usize);
+        inflater.decode_into(&mut bytes, cancel)?;
         return Ok(Decoded::Buffered(bytes));
     }
-    if !*verified {
-        inflater()?.verify()?;
-        *verified = true;
+    let mut file = io::BufWriter::new(tempfile::tempfile()?);
+    inflater.decode_into(&mut file, cancel)?;
+    let file = file.into_inner().map_err(|err| err.into_error())?;
+    let spooled = Source::from_file(file)?;
+    if spooled.len() != len {
+        return Err(bad("the temporary copy of the chunk has the wrong size"));
     }
-    Ok(Decoded::Streamed(inflater()?))
+    Ok(Decoded::Spooled(spooled))
 }
 
 fn read_at(source: &Source, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -365,72 +435,7 @@ fn read_at(source: &Source, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 
 impl Read for Payload {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len || buf.is_empty() {
-            return Ok(0);
-        }
-        let room = usize::try_from(self.len - self.pos).unwrap_or(usize::MAX);
-        let buf_len = buf.len().min(room);
-        let buf = &mut buf[..buf_len];
-        let pos = self.pos;
-        let n = match &mut self.kind {
-            Kind::Stored(source) => read_at(source, pos, buf)?,
-            Kind::Deflate { stored, inflater } => {
-                let reusable = inflater.as_ref().is_some_and(|i| i.out <= pos);
-                if !reusable {
-                    *inflater = Some(Inflater::new(stored.clone(), false, false, self.len));
-                }
-                let inflater = inflater.as_mut().expect("set above");
-                inflater.skip_to(pos)?;
-                inflater.read(buf)?
-            }
-            Kind::Chunked {
-                stored,
-                spans,
-                verified,
-                current,
-            } => {
-                let index = spans.partition_point(|span| span.logical_end() <= pos);
-                let span = &spans[index];
-                let offset = pos - span.logical;
-                let room = usize::try_from(span.logical_end() - pos).unwrap_or(usize::MAX);
-                let buf_len = buf.len().min(room);
-                let buf = &mut buf[..buf_len];
-                if span.chunk.method != ZLIB_METHOD {
-                    read_at(stored, span.stored + offset, buf)?
-                } else {
-                    let reusable = match current {
-                        Some((n, Decoded::Buffered(_))) => *n == index,
-                        Some((n, Decoded::Streamed(inflater))) => {
-                            *n == index && inflater.out <= offset
-                        }
-                        None => false,
-                    };
-                    if !reusable {
-                        *current = Some((index, decode_chunk(stored, span, &mut verified[index])?));
-                    }
-                    let n = match current.as_mut().map(|(_, decoded)| decoded) {
-                        Some(Decoded::Buffered(bytes)) => {
-                            let start = usize::try_from(offset).unwrap_or(usize::MAX);
-                            let chunk = bytes.get(start..).unwrap_or_default();
-                            let n = buf.len().min(chunk.len());
-                            buf[..n].copy_from_slice(&chunk[..n]);
-                            n
-                        }
-                        Some(Decoded::Streamed(inflater)) => {
-                            inflater.skip_to(offset)?;
-                            inflater.read(buf)?
-                        }
-                        None => 0,
-                    };
-                    if n == 0 {
-                        return Err(bad(format!("chunk {index} ends early")));
-                    }
-                    n
-                }
-            }
-        };
-        self.pos += n as u64;
-        Ok(n)
+        self.read_cancellable(buf, &NEVER)
     }
 }
 

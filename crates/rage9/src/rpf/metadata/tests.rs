@@ -2302,6 +2302,61 @@ mod decoding {
             assert_eq!(buf, expected[pos as usize..pos as usize + 16], "{pos:#x}");
         }
     }
+
+    #[test]
+    fn returned_bytes_are_the_verified_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        for len in [0x8000, 0x18_0000] {
+            let original = data(len, 28);
+            let (stored, table, expected) = chunked(4, &[(3, original)]);
+            let bytes = archive(&[chunked_spec(stored, table, expected.len())]);
+            let path = temp.path().join(format!("{len}.rpf"));
+            std::fs::write(&path, &bytes).unwrap();
+            let source = Source::open(&path).unwrap();
+            let metadata = Stored::read(&mut source.clone(), 1 << 20)
+                .unwrap()
+                .decode()
+                .unwrap();
+            let entry = metadata.entry(0).unwrap();
+            let mut payload = entry.payload(&source, &[]).unwrap();
+            let mut head = [0; 16];
+            payload.read_exact(&mut head).unwrap();
+            assert_eq!(head, expected[..16]);
+
+            // The stored chunk changes on disk after it was verified.
+            let range = entry.location.clone().unwrap().unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(range.payload_offset + 8))
+                .unwrap();
+            file.write_all(&[0xFF; 64]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+
+            // The rest of the chunk is what was verified, not re-decoded.
+            let mut rest = Vec::new();
+            payload.read_to_end(&mut rest).unwrap();
+            assert_eq!(rest, expected[16..], "{len:#x}");
+            // A new reader sees the damage.
+            let mut fresh = entry.payload(&source, &[]).unwrap();
+            assert!(fresh.read(&mut [0; 16]).is_err(), "{len:#x}");
+        }
+    }
+
+    #[test]
+    fn decoding_a_chunk_can_be_cancelled() {
+        let original = data(0x20_0000, 29);
+        let (stored, table, expected) = chunked(4, &[(3, original)]);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        let mut payload = entries[0].payload(&source, &[]).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let err = payload.read_cancellable(&mut [0; 16], &cancel).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        // Nothing half-decoded is kept.
+        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut head = [0; 16];
+        assert_eq!(payload.read_cancellable(&mut head, &cancel).unwrap(), 16);
+        assert_eq!(head, expected[..16]);
+    }
 }
 
 mod companions {
