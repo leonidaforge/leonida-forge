@@ -1247,26 +1247,27 @@ mod pipeline {
         self, Candidate, Class, MountPrefix, RPF_TYPE, Types, Unresolved, hash64, joaat,
     };
 
-    const PAYLOADS: usize = 0x1000;
+    pub(super) const PAYLOADS: usize = 0x1000;
     const TEXTURE: u8 = 7;
 
-    struct Spec {
-        layout: RecordLayout,
-        payload: Vec<u8>,
-        type_id: u8,
-        mode: u8,
-        hash: Option<u64>,
-        key: Option<u32>,
-        source: Option<u32>,
-        chunks: bool,
-        transform: bool,
+    pub(super) struct Spec {
+        pub(super) layout: RecordLayout,
+        pub(super) payload: Vec<u8>,
+        pub(super) type_id: u8,
+        pub(super) mode: u8,
+        pub(super) hash: Option<u64>,
+        pub(super) key: Option<u32>,
+        pub(super) source: Option<u32>,
+        /// The chunk table value.
+        pub(super) chunks: Option<Vec<u8>>,
+        pub(super) transform: bool,
         /// Overrides the logical size.
-        logical: Option<u64>,
+        pub(super) logical: Option<u64>,
         /// Moves the payload offset this many 16-byte units further.
-        shift: u32,
+        pub(super) shift: u32,
     }
 
-    fn spec(layout: RecordLayout, payload: Vec<u8>, type_id: u8) -> Spec {
+    pub(super) fn spec(layout: RecordLayout, payload: Vec<u8>, type_id: u8) -> Spec {
         Spec {
             layout,
             payload,
@@ -1275,7 +1276,7 @@ mod pipeline {
             hash: None,
             key: None,
             source: None,
-            chunks: false,
+            chunks: None,
             transform: false,
             logical: None,
             shift: 0,
@@ -1297,7 +1298,7 @@ mod pipeline {
         Column::new(key, width, &elements, &cells)
     }
 
-    fn archive(specs: &[Spec]) -> Vec<u8> {
+    pub(super) fn archive(specs: &[Spec]) -> Vec<u8> {
         let mut data = Vec::new();
         let mut records: Vec<(RecordLayout, Vec<u8>)> = Vec::new();
         for spec in specs {
@@ -1325,7 +1326,11 @@ mod pipeline {
         };
         let each =
             |value: &dyn Fn(&Spec) -> Option<Vec<u8>>| specs.iter().map(value).collect::<Vec<_>>();
-        let chunk = chunk_value(8, 1, 3, &[0x0100 | (0x2345 << 16)]);
+        let chunk_width = specs
+            .iter()
+            .filter_map(|s| s.chunks.as_ref().map(Vec::len))
+            .max()
+            .unwrap_or(8);
         let mut bytes = Build::default().build(&[
             column(keys::LOCATION_R, 20, location(RecordLayout::R)),
             column(keys::LOCATION_F, 24, location(RecordLayout::F)),
@@ -1352,8 +1357,13 @@ mod pipeline {
             ),
             column(
                 keys::CHUNK_TABLE,
-                chunk.len() as u16,
-                each(&|s| s.chunks.then(|| chunk.clone())),
+                chunk_width as u16,
+                each(&|s| {
+                    s.chunks.clone().map(|mut value| {
+                        value.resize(chunk_width, 0);
+                        value
+                    })
+                }),
             ),
         ]);
         assert!(bytes.len() <= PAYLOADS);
@@ -1362,7 +1372,7 @@ mod pipeline {
         bytes
     }
 
-    fn file(bytes: &[u8]) -> Source {
+    pub(super) fn file(bytes: &[u8]) -> Source {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();
         Source::from_file(file).unwrap()
@@ -1394,7 +1404,7 @@ mod pipeline {
             },
             // 3: chunked.
             Spec {
-                chunks: true,
+                chunks: Some(chunk_value(8, 1, 3, &[0x0100 | (0x2345 << 16)])),
                 ..raw(RecordLayout::A, &[1; 16], RPF_TYPE)
             },
             // 4: behind the payload transform.
@@ -1831,5 +1841,421 @@ mod probing {
         set_u16(&mut regions, 0x20, 40);
         let reason = invalid_reason(Stored::probe(&mut counting(regions)));
         assert!(reason.contains("primary regions"), "{reason}");
+    }
+}
+
+mod decoding {
+    //! Entry contents: stored, raw DEFLATE and chunked.
+
+    use std::io::{self, Read, Seek, SeekFrom, Write};
+
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, ZlibEncoder};
+    use lforge_binary::Source;
+
+    use super::pipeline::{Spec, archive, file, spec};
+    use super::*;
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Compressible, but not trivially.
+    fn data(len: usize, seed: u32) -> Vec<u8> {
+        (0..len as u32)
+            .map(|i| ((i / 7 + seed) % 251) as u8 ^ (i % 3) as u8)
+            .collect()
+    }
+
+    /// One chunk table entry in `encoding`.
+    fn chunk_entry(
+        encoding: u8,
+        logical: usize,
+        compressed: usize,
+        stored: usize,
+        method: u8,
+    ) -> u64 {
+        let padding = (stored - compressed) as u64;
+        let method = u64::from(method);
+        match encoding {
+            2 => {
+                assert_eq!(logical % 16, 0);
+                (logical / 16) as u64 | ((stored / 16) as u64) << 32 | padding << 58 | method << 62
+            }
+            3 => {
+                let field = (0x10000 - compressed) as u64;
+                assert_eq!(field & 0xF, padding);
+                ((0x10000 - logical) as u64 & 0xFFFF) | (field & 0xFFFF) << 16 | method << 60
+            }
+            4 => logical as u64 | ((stored / 16) as u64) << 28 | padding << 52 | method << 56,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Stored chunks, the chunk table value and the contents. Method 3
+    /// chunks hold a zlib stream, the others a copy. Padding is nonzero.
+    fn chunked(encoding: u8, chunks: &[(u8, Vec<u8>)]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut stored = Vec::new();
+        let mut entries = Vec::new();
+        let mut contents = Vec::new();
+        for (method, data) in chunks {
+            let compressed = if *method == 3 {
+                zlib(data)
+            } else {
+                data.clone()
+            };
+            let stored_len = compressed.len().next_multiple_of(16);
+            stored.extend_from_slice(&compressed);
+            stored.resize(stored.len() + stored_len - compressed.len(), 0xA5);
+            entries.push(chunk_entry(
+                encoding,
+                data.len(),
+                compressed.len(),
+                stored_len,
+                *method,
+            ));
+            contents.extend_from_slice(data);
+        }
+        let table = chunk_value(8, entries.len() as u16, encoding, &entries);
+        (stored, table, contents)
+    }
+
+    fn chunked_spec(stored: Vec<u8>, table: Vec<u8>, logical: usize) -> Spec {
+        Spec {
+            chunks: Some(table),
+            logical: Some(logical as u64),
+            ..spec(RecordLayout::A, stored, 0)
+        }
+    }
+
+    fn open(specs: &[Spec]) -> (Source, Vec<Entry>) {
+        let source = file(&archive(specs));
+        let metadata = Stored::read(&mut source.clone(), 1 << 20)
+            .unwrap()
+            .decode()
+            .unwrap();
+        (source, metadata.entries().collect())
+    }
+
+    fn contents(entry: &Entry, source: &Source) -> io::Result<Vec<u8>> {
+        let mut payload = entry.payload(source, &[]).map_err(io::Error::other)?;
+        let mut bytes = Vec::new();
+        payload.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn invalid_data(result: io::Result<Vec<u8>>) -> String {
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        err.to_string()
+    }
+
+    #[test]
+    fn decodes_stored_and_raw_deflate_entries() {
+        let plain = data(5000, 1);
+        let big = data(200_000, 2);
+        let (source, entries) = open(&[
+            spec(RecordLayout::A, plain.clone(), 0),
+            Spec {
+                mode: 1,
+                logical: Some(big.len() as u64),
+                ..spec(RecordLayout::F, deflate(&big), 0)
+            },
+        ]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), plain);
+        assert_eq!(contents(&entries[1], &source).unwrap(), big);
+        let mut payload = entries[1].payload(&source, &[]).unwrap();
+        assert_eq!(payload.len(), big.len() as u64);
+        // Forward and backward seeks restart or continue the stream.
+        for pos in [150_000u64, 10, 199_990, 0] {
+            payload.seek(SeekFrom::Start(pos)).unwrap();
+            let mut buf = [0; 10];
+            payload.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, big[pos as usize..pos as usize + 10], "{pos}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_raw_deflate_entries() {
+        let big = data(100_000, 3);
+        let stream = deflate(&big);
+        let with = |payload: Vec<u8>, logical: usize| Spec {
+            mode: 1,
+            logical: Some(logical as u64),
+            ..spec(RecordLayout::A, payload, 0)
+        };
+        let (source, entries) = open(&[
+            // A zlib header and trailer are not raw DEFLATE.
+            with(zlib(&big), big.len()),
+            with(stream.clone(), big.len() - 1),
+            with(stream.clone(), big.len() + 1),
+            with(stream[..stream.len() / 2].to_vec(), big.len()),
+            // Ten megabytes of zeros declared as 1000 bytes.
+            with(deflate(&vec![0; 10_000_000]), 1000),
+        ]);
+        invalid_data(contents(&entries[0], &source));
+        assert!(invalid_data(contents(&entries[1], &source)).contains("more than the declared"));
+        assert!(invalid_data(contents(&entries[2], &source)).contains("ends after"));
+        assert!(invalid_data(contents(&entries[3], &source)).contains("ends before"));
+        assert!(invalid_data(contents(&entries[4], &source)).contains("more than the declared"));
+    }
+
+    #[test]
+    fn refuses_unsupported_modes() {
+        let (source, entries) = open(&[
+            Spec {
+                mode: 2,
+                ..spec(RecordLayout::A, vec![1; 16], 0)
+            },
+            Spec {
+                mode: 5,
+                ..spec(RecordLayout::A, vec![1; 16], 0)
+            },
+            Spec {
+                mode: 1,
+                transform: true,
+                ..spec(RecordLayout::A, deflate(b"x"), 0)
+            },
+        ]);
+        for (row, expected) in [(0, "mode 2 fails"), (1, "mode 5 has no known codec")] {
+            match entries[row].payload(&source, &[]) {
+                Err(Error::Undecodable { reason, .. }) => {
+                    assert!(reason.contains(expected), "{reason}")
+                }
+                other => panic!("row {row}: {:?}", other.map(|p| p.len())),
+            }
+        }
+        assert!(matches!(
+            entries[2].payload(&source, &[]),
+            Err(Error::Encoded {
+                encoding: "behind the payload transform",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decodes_chunk_encodings_and_methods() {
+        let cases = [
+            (
+                2,
+                vec![
+                    (3, data(0x10000, 4)),
+                    (0, data(32, 5)),
+                    (1, data(48, 6)),
+                    (2, data(16, 7)),
+                    (3, data(0x2000, 8)),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (3, data(0x10000, 9)),
+                    (3, data(0x8000, 10)),
+                    (0, data(0x100, 11)),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    (3, data(1000, 12)),
+                    (0, data(100, 13)),
+                    (3, data(70_000, 14)),
+                ],
+            ),
+        ];
+        for (encoding, chunks) in cases {
+            let (stored, table, expected) = chunked(encoding, &chunks);
+            // With a chunk table the entry's mode does not pick the decoder.
+            let row = Spec {
+                mode: 5,
+                ..chunked_spec(stored, table, expected.len())
+            };
+            let (source, entries) = open(&[row]);
+            assert_eq!(
+                contents(&entries[0], &source).unwrap(),
+                expected,
+                "encoding {encoding}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_chunked_entries_at_any_position() {
+        let chunks = [
+            (3, data(0x1000, 15)),
+            (0, data(0x30, 16)),
+            (3, data(0x3000, 17)),
+            (2, data(0x20, 18)),
+            (3, data(0x800, 19)),
+        ];
+        let (stored, table, expected) = chunked(2, &chunks);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        let mut payload = entries[0].payload(&source, &[]).unwrap();
+        // Forward and backward, across chunk boundaries.
+        for (pos, len) in [
+            (0x0FF0, 0x60),
+            (0x4000, 0x80),
+            (0x10, 0x20),
+            (0x1028, 0x10),
+            (0x4020, 0x830),
+            (0x0, 0x1000),
+            (expected.len() as u64 - 5, 5),
+        ] {
+            payload.seek(SeekFrom::Start(pos)).unwrap();
+            let mut buf = vec![0; len];
+            payload.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, expected[pos as usize..pos as usize + len], "{pos:#x}");
+        }
+        assert_eq!(
+            payload.seek(SeekFrom::End(0)).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(payload.read(&mut [0; 4]).unwrap(), 0);
+        assert!(
+            payload
+                .seek(SeekFrom::Current(-(expected.len() as i64) - 1))
+                .is_err()
+        );
+        // Independent payloads keep their own positions.
+        let mut other = entries[0].payload(&source, &[]).unwrap();
+        let mut first = [0; 4];
+        other.read_exact(&mut first).unwrap();
+        assert_eq!(first, expected[..4]);
+    }
+
+    #[test]
+    fn later_chunks_do_not_decode_earlier_ones() {
+        let chunks = [(3, data(0x1000, 20)), (3, data(0x1000, 21))];
+        let (mut stored, table, expected) = chunked(4, &chunks);
+        // Damage the first zlib stream.
+        stored[2..10].fill(0xFF);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        let mut payload = entries[0].payload(&source, &[]).unwrap();
+        payload.seek(SeekFrom::Start(0x1000)).unwrap();
+        let mut second = vec![0; 0x1000];
+        payload.read_exact(&mut second).unwrap();
+        assert_eq!(second, expected[0x1000..]);
+        payload.seek(SeekFrom::Start(0)).unwrap();
+        assert!(payload.read_exact(&mut [0; 16]).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_zlib_chunks() {
+        let original = data(0x2000, 22);
+        let stream = zlib(&original);
+        // The Adler-32 trailer.
+        let mut checksum = stream.clone();
+        *checksum.last_mut().unwrap() ^= 1;
+        // A stream followed by bytes it does not use.
+        let mut trailing = stream.clone();
+        trailing.extend_from_slice(&[0; 7]);
+        let cases: [(Vec<u8>, usize, &str); 4] = [
+            (checksum, original.len(), "invalid"),
+            (trailing, original.len(), "of its"),
+            (stream.clone(), original.len() - 1, "more than the declared"),
+            (stream, original.len() + 1, "ends after"),
+        ];
+        for (compressed, logical, expected) in cases {
+            let stored_len = compressed.len().next_multiple_of(16);
+            let mut stored = compressed.clone();
+            stored.resize(stored_len, 0xA5);
+            let entry = chunk_entry(4, logical, compressed.len(), stored_len, 3);
+            let table = chunk_value(8, 1, 4, &[entry]);
+            let (source, entries) = open(&[chunked_spec(stored, table, logical)]);
+            let message = invalid_data(contents(&entries[0], &source));
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn rejects_inconsistent_chunk_tables() {
+        let copy = data(0x40, 23);
+        let (stored, table, expected) = chunked(4, &[(0, copy)]);
+        let reason = |spec: Spec| {
+            let (source, entries) = open(&[spec]);
+            match entries[0].payload(&source, &[]) {
+                Err(Error::Invalid(reason)) => reason,
+                other => panic!("{:?}", other.map(|p| p.len())),
+            }
+        };
+        // A copy chunk whose stored bytes differ from its logical size.
+        let wrong_copy = chunk_value(8, 1, 4, &[chunk_entry(4, 0x30, 0x40, 0x40, 1)]);
+        let message = reason(chunked_spec(stored.clone(), wrong_copy, 0x30));
+        assert!(message.contains("is copied"), "{message}");
+        // More padding than stored bytes.
+        let padded = chunk_value(8, 1, 2, &[0x4 | (0xFu64 << 58) | (3u64 << 62)]);
+        let message = reason(chunked_spec(stored.clone(), padded, 0x40));
+        assert!(message.contains("more padding"), "{message}");
+        // Sums against the entry's sizes.
+        let message = reason(chunked_spec(
+            stored.clone(),
+            table.clone(),
+            expected.len() + 1,
+        ));
+        assert!(message.contains("logical size"), "{message}");
+        let big = chunk_value(8, 1, 4, &[chunk_entry(4, 0x40, 0x40, 0x40, 0)]);
+        let message = reason(chunked_spec(vec![0; 0x20], big, 0x40));
+        assert!(message.contains("more than its"), "{message}");
+        // A table whose entries lie outside the pool, or with an encoding
+        // that is not 2, 3 or 4.
+        for table in [chunk_value(8, 100, 4, &[0]), chunk_value(8, 1, 9, &[0])] {
+            let message = reason(chunked_spec(stored.clone(), table, 0x40));
+            assert!(message.contains("malformed chunk table"), "{message}");
+        }
+    }
+
+    #[test]
+    fn uses_the_read_source_and_archive_bounds() {
+        let big = data(50_000, 24);
+        let (stored, table, expected) = chunked(4, &[(3, big.clone())]);
+        let (source, entries) = open(&[
+            Spec {
+                source: Some(1),
+                ..chunked_spec(stored.clone(), table.clone(), expected.len())
+            },
+            Spec {
+                shift: 0x10_0000,
+                ..chunked_spec(stored, table, expected.len())
+            },
+        ]);
+        assert!(matches!(
+            entries[0].payload(&source, &[]),
+            Err(Error::ReadSource { row: 0, index: 1 })
+        ));
+        let alternates = [source.clone(), source.clone()];
+        let mut payload = entries[0].payload(&source, &alternates).unwrap();
+        let mut bytes = Vec::new();
+        payload.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, big);
+        let reason = invalid_reason(entries[1].payload(&source, &[]));
+        assert!(reason.contains("after the end"), "{reason}");
+    }
+
+    #[test]
+    fn decoded_entries_hold_nested_archives() {
+        let inner = Build::default().build(&[Column::new(KEY_X, 4, &[&[4, 3, 2, 1]], &[Some(0)])]);
+        let (stored, table, expected) = chunked(3, &[(3, inner.clone())]);
+        let (source, entries) = open(&[
+            Spec {
+                mode: 1,
+                logical: Some(inner.len() as u64),
+                ..spec(RecordLayout::A, deflate(&inner), 0)
+            },
+            chunked_spec(stored, table, expected.len()),
+        ]);
+        for entry in &entries {
+            let bytes = contents(entry, &source).unwrap();
+            let nested = Stored::from_bytes(bytes).unwrap().decode().unwrap();
+            assert_eq!(nested.field(0, KEY_X).unwrap(), Some(&[4, 3, 2, 1][..]));
+        }
     }
 }

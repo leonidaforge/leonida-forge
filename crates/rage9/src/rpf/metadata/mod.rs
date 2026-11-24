@@ -19,9 +19,11 @@ use std::ops::Range;
 
 use super::{HEADER_LEN, MAGIC};
 pub use entry::{Entry, Field};
+pub use payload::Payload;
 use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 
 mod entry;
+mod payload;
 pub mod transform;
 
 /// Field keys whose meaning is established.
@@ -66,6 +68,11 @@ pub enum Error {
         row: u32,
         index: u32,
     },
+    /// The entry's contents are stored in a way that is not supported.
+    Undecodable {
+        row: u32,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -89,6 +96,9 @@ impl fmt::Display for Error {
                 f,
                 "entry {row} is read through alternate source {index}, which is not available"
             ),
+            Error::Undecodable { row, reason } => {
+                write!(f, "entry {row} cannot be decoded: {reason}")
+            }
         }
     }
 }
