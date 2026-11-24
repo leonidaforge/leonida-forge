@@ -50,7 +50,7 @@ fn check(cancel: &AtomicBool) -> Result<(), Error> {
     }
 }
 
-/// A file opened for positional reads.
+/// A file, or a range of one, opened for positional reads.
 ///
 /// Each clone keeps its own position but shares the handle, so clones can
 /// read from different threads at the same time. The length is fixed when
@@ -58,6 +58,8 @@ fn check(cancel: &AtomicBool) -> Result<(), Error> {
 #[derive(Debug, Clone)]
 pub struct Source {
     file: Arc<File>,
+    /// Where the source starts in the file.
+    base: u64,
     len: u64,
     pos: u64,
 }
@@ -71,6 +73,29 @@ impl Source {
         let len = file.metadata()?.len();
         Ok(Self {
             file: Arc::new(file),
+            base: 0,
+            len,
+            pos: 0,
+        })
+    }
+
+    /// `len` bytes from `offset` of this source, as a source of their own
+    /// that starts at position 0. It keeps the file open. The range must lie
+    /// inside this source.
+    pub fn slice(&self, offset: u64, len: u64) -> io::Result<Self> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{len:#x} bytes at {offset:#x} exceed the source ({:#x} bytes)",
+                    self.len
+                ),
+            ));
+        }
+        Ok(Self {
+            file: Arc::clone(&self.file),
+            // Cannot overflow: this source lies inside the file.
+            base: self.base + offset,
             len,
             pos: 0,
         })
@@ -92,11 +117,11 @@ impl Read for Source {
         }
         let max = usize::try_from(self.len - self.pos).unwrap_or(usize::MAX);
         let buf_len = buf.len().min(max);
+        let at = self.base + self.pos;
         #[cfg(windows)]
-        let n =
-            std::os::windows::fs::FileExt::seek_read(&*self.file, &mut buf[..buf_len], self.pos)?;
+        let n = std::os::windows::fs::FileExt::seek_read(&*self.file, &mut buf[..buf_len], at)?;
         #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(&*self.file, &mut buf[..buf_len], self.pos)?;
+        let n = std::os::unix::fs::FileExt::read_at(&*self.file, &mut buf[..buf_len], at)?;
         self.pos += n as u64;
         Ok(n)
     }
@@ -284,6 +309,72 @@ mod tests {
         a.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, b"56789");
         assert!(a.seek(SeekFrom::Current(-100)).is_err());
+    }
+
+    fn digits() -> Source {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"0123456789").unwrap();
+        Source::from_file(file).unwrap()
+    }
+
+    #[test]
+    fn slices_read_relative_to_their_start() {
+        let source = digits();
+        let mut slice = source.slice(2, 5).unwrap();
+        assert_eq!(slice.len(), 5);
+        assert_eq!(read_at(&mut slice, 0, 100).unwrap(), b"23456");
+        assert_eq!(read_at(&mut slice, 4, 100).unwrap(), b"6");
+        assert!(read_at(&mut slice, 5, 1).unwrap().is_empty());
+        assert!(read_at(&mut slice, 6, 1).is_err());
+        assert_eq!(slice.seek(SeekFrom::End(-1)).unwrap(), 4);
+        let mut rest = Vec::new();
+        slice.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"6");
+        // A position past the end reads nothing rather than the parent.
+        slice.seek(SeekFrom::Start(100)).unwrap();
+        assert_eq!(slice.read(&mut [0; 4]).unwrap(), 0);
+    }
+
+    #[test]
+    fn slices_nest_and_read_independently() {
+        let source = digits();
+        let outer = source.slice(1, 8).unwrap();
+        let mut inner = outer.slice(2, 4).unwrap();
+        let mut other = outer.slice(0, 3).unwrap();
+        assert_eq!(read_at(&mut inner, 0, 10).unwrap(), b"3456");
+        assert_eq!(read_at(&mut other, 1, 10).unwrap(), b"23");
+        let mut a = inner.clone();
+        a.seek(SeekFrom::Start(3)).unwrap();
+        assert_eq!(read_at(&mut inner, 0, 1).unwrap(), b"3");
+        assert_eq!(read_at(&mut a, 3, 1).unwrap(), b"6");
+        assert!(outer.slice(8, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn slices_must_lie_inside_their_source() {
+        let source = digits();
+        let outer = source.slice(4, 4).unwrap();
+        for (offset, len) in [
+            (0, 5),
+            (5, 0),
+            (4, 1),
+            (1, u64::MAX),
+            (u64::MAX, 1),
+            (u64::MAX, u64::MAX),
+        ] {
+            let err = outer.slice(offset, len).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{offset} {len}");
+        }
+        assert!(source.slice(10, 0).is_ok());
+        assert!(source.slice(11, 0).is_err());
+    }
+
+    #[test]
+    fn slices_keep_the_file_open() {
+        let source = digits();
+        let mut slice = source.slice(7, 3).unwrap();
+        drop(source);
+        assert_eq!(read_at(&mut slice, 0, 3).unwrap(), b"789");
     }
 
     #[test]
