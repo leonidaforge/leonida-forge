@@ -23,6 +23,7 @@ pub(crate) mod synthetic;
 mod tests;
 
 pub use block::{EncodedAesBlock, EncodedAesError};
+pub(crate) use fixed::recognize_candidates as recognize_fixed_table_candidates;
 #[cfg(test)]
 pub(crate) use fixed::recognize_with as recognize_fixed_tables_with;
 pub use fixed::{

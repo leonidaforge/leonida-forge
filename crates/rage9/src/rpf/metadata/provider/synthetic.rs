@@ -89,10 +89,6 @@ fn inverse_byte(value: u8) -> u8 {
     0
 }
 
-fn encoding(word: usize, lane: usize) -> u8 {
-    ENCODING[4 * word + lane]
-}
-
 fn from_aes(block: &[u8; 16]) -> [u8; 16] {
     let mut out = [0u8; 16];
     for word in 0..4 {
@@ -270,16 +266,23 @@ impl Synthetic {
     }
 }
 
-/// Builds the encoded fixed tables and key state for `key` with the chosen
+/// Builds the encoded fixed tables and key state for `key` with the default
 /// byte encoding.
 pub(crate) fn instance(key: &[u8; 32]) -> Synthetic {
+    instance_with_encoding(key, ENCODING)
+}
+
+/// Builds the encoded fixed tables and key state for `key` with an explicit
+/// per-position byte encoding.
+pub(crate) fn instance_with_encoding(key: &[u8; 32], encodings: [u8; 16]) -> Synthetic {
     let (_, invsbox) = boxes();
+    let encode = |word: usize, lane: usize| encodings[4 * word + lane];
 
     let mut stage = [[0u8; STAGE_TABLE_LEN]; STAGE_TABLE_COUNT];
     for word in 0..4 {
         for lane in 0..4 {
             let index = 4 * word + (3 - lane);
-            let encoding = encoding(word, lane);
+            let encoding = encode(word, lane);
             for (x, slot) in stage[index].iter_mut().enumerate() {
                 *slot = gmul(encoding, x as u8);
             }
@@ -292,13 +295,13 @@ pub(crate) fn instance(key: &[u8; 32]) -> Synthetic {
         let delta = index % 4;
         let output_word = (word + delta) % 4;
         let source_lane = (3 - delta) % 4;
-        let decoding = inverse_byte(encoding(word, source_lane));
+        let decoding = inverse_byte(encode(word, source_lane));
         for (x, slot) in table.iter_mut().enumerate() {
             let logical = invsbox[gmul(decoding, x as u8) as usize];
             let mut value = 0u32;
             for lane in 0..4 {
                 let coefficient = INVMIX[3 - lane][delta];
-                let encoded = gmul(encoding(output_word, lane), gmul(coefficient, logical));
+                let encoded = gmul(encode(output_word, lane), gmul(coefficient, logical));
                 value |= u32::from(encoded) << (8 * lane);
             }
             *slot = value;
@@ -311,7 +314,7 @@ pub(crate) fn instance(key: &[u8; 32]) -> Synthetic {
     let whitening = from_aes(&round_keys[14]);
     for word in 0..4 {
         for lane in 0..4 {
-            let byte = gmul(encoding(word, lane), whitening[4 * word + lane]);
+            let byte = gmul(encode(word, lane), whitening[4 * word + lane]);
             schedule[word] |= u32::from(byte) << (8 * lane);
         }
     }
@@ -322,7 +325,7 @@ pub(crate) fn instance(key: &[u8; 32]) -> Synthetic {
         let mixed = from_aes(&mixed);
         for word in 0..4 {
             for lane in 0..4 {
-                let byte = gmul(encoding(word, lane), mixed[4 * word + lane]);
+                let byte = gmul(encode(word, lane), mixed[4 * word + lane]);
                 schedule[4 + 4 * round_index + word] |= u32::from(byte) << (8 * lane);
             }
         }
@@ -332,7 +335,7 @@ pub(crate) fn instance(key: &[u8; 32]) -> Synthetic {
     for (source, &target) in FINAL_PERMUTATION.iter().enumerate() {
         let word = source / 4;
         let lane = source % 4;
-        let decoding = inverse_byte(encoding(word, lane));
+        let decoding = inverse_byte(encode(word, lane));
         for (x, slot) in final_tables[target].iter_mut().enumerate() {
             *slot = invsbox[gmul(decoding, x as u8) as usize] ^ round_keys[0][target];
         }

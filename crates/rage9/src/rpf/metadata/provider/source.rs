@@ -60,6 +60,9 @@ impl From<EncodedAesError> for SourceError {
 }
 
 /// A recognized key provider that can build block operations for its keys.
+/// Construction requires a unique structurally valid fixed-table block; an
+/// image with several is rejected as ambiguous. The archive probe selects
+/// among them by the decrypted A table.
 pub struct RecognizedSource {
     recognized: Recognized,
     tables: FixedTables,

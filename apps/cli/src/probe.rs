@@ -142,7 +142,7 @@ fn report_json(report: &ProbeReport) -> Value {
                 "registry": registry_stage(report),
                 "descriptor": descriptor_stage(report),
                 "state": simple_stage(report, Stage::State, report.state_identified),
-                "fixed_tables": simple_stage(report, Stage::FixedTables, report.fixed_tables),
+                "fixed_tables": fixed_tables_stage(report),
                 "block": simple_stage(report, Stage::Block, report.block_initialized),
                 "a_table": a_table_stage(report),
             },
@@ -209,6 +209,19 @@ fn simple_stage(report: &ProbeReport, stage: Stage, complete: bool) -> Value {
     stopped_or_skipped(report, stage)
 }
 
+fn fixed_tables_stage(report: &ProbeReport) -> Value {
+    if report.fixed_tables {
+        return json!({
+            "status": "ok",
+            "candidates": report.fixed_tables_candidates,
+        });
+    }
+    if Stage::FixedTables.failed_by(&report.outcome) {
+        return json!({"status": "failed", "reason": outcome_reason(&report.outcome)});
+    }
+    stopped_or_skipped(report, Stage::FixedTables)
+}
+
 fn stopped_or_skipped(report: &ProbeReport, stage: Stage) -> Value {
     if matches!(
         report.outcome,
@@ -267,6 +280,7 @@ fn a_table_stage(report: &ProbeReport) -> Value {
             "status": "ok",
             "records": summary.records,
             "known_ids": summary.known_ids,
+            "candidate": report.selected_fixed_table,
         }),
         None => {
             if Stage::ATable.failed_by(&report.outcome) {
@@ -303,14 +317,21 @@ fn print_text(report: &ProbeReport) {
         println!("state:        identified");
     }
     if report.fixed_tables {
-        println!("fixed tables: recognized");
+        println!(
+            "fixed tables: {} structurally valid candidate(s)",
+            report.fixed_tables_candidates
+        );
     }
     if report.block_initialized {
         println!("block:        initialized");
     }
     if let Some(summary) = report.a_table {
+        let candidate = report
+            .selected_fixed_table
+            .map(|index| format!(", candidate {index}"))
+            .unwrap_or_default();
         println!(
-            "A table:      plausible ({} records, {} known sub-blocks)",
+            "A table:      plausible ({} records, {} known sub-blocks{candidate})",
             summary.records, summary.known_ids
         );
     }

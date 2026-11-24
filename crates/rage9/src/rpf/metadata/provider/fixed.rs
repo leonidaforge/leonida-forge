@@ -11,7 +11,10 @@
 //! and that every round table is injective, has four byte-lane permutations
 //! and an affine 8-dimensional image. Recognition scans initialized, readable,
 //! non-writable, non-executable sections for that contiguous block. It does
-//! not use a fixed address, section name or executable build.
+//! not use a fixed address, section name or executable build. A real image can
+//! contain several structurally valid blocks; the single-block API reports
+//! that as [`FixedTablesError::Ambiguous`], and the archive probe tries the
+//! candidates and selects the one that decrypts a plausible A table.
 //!
 //! The table bytes are game-derived. They are read from the caller's
 //! executable at run time and are never copied into the repository. A build
@@ -148,6 +151,43 @@ pub(crate) fn recognize_with(
     cancel: &AtomicBool,
     limits: Limits,
 ) -> Result<FixedTables, FixedTablesError> {
+    let candidates = scan_candidates(image, cancel, limits)?;
+    match candidates.valid.len() {
+        1 => Ok(candidates.valid.into_iter().next().expect("one element")),
+        0 => Err(candidates
+            .malformed
+            .map_or(FixedTablesError::NotFound, FixedTablesError::Malformed)),
+        _ => Err(FixedTablesError::Ambiguous),
+    }
+}
+
+/// Returns every structurally valid fixed table block. Real images can
+/// contain several; the archive probe disambiguates them by the decrypted
+/// A table.
+pub(crate) fn recognize_candidates(
+    image: &ExecutableView,
+    cancel: &AtomicBool,
+    limits: Limits,
+) -> Result<Vec<FixedTables>, FixedTablesError> {
+    let candidates = scan_candidates(image, cancel, limits)?;
+    if candidates.valid.is_empty() {
+        return Err(candidates
+            .malformed
+            .map_or(FixedTablesError::NotFound, FixedTablesError::Malformed));
+    }
+    Ok(candidates.valid)
+}
+
+struct Candidates {
+    valid: Vec<FixedTables>,
+    malformed: Option<&'static str>,
+}
+
+fn scan_candidates(
+    image: &ExecutableView,
+    cancel: &AtomicBool,
+    limits: Limits,
+) -> Result<Candidates, FixedTablesError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(FixedTablesError::Cancelled);
     }
@@ -182,12 +222,7 @@ pub(crate) fn recognize_with(
             &mut malformed,
         )?;
     }
-
-    match valid.len() {
-        1 => Ok(valid.pop().expect("one element")),
-        0 => Err(malformed.map_or(FixedTablesError::NotFound, FixedTablesError::Malformed)),
-        _ => Err(FixedTablesError::Ambiguous),
-    }
+    Ok(Candidates { valid, malformed })
 }
 
 #[allow(clippy::too_many_arguments)]

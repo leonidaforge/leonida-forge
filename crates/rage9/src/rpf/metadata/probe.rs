@@ -11,6 +11,11 @@
 //! authenticate the archive or prove the key is the shipping key. A failing
 //! probe is likewise not proof of a wrong key: a different build, a different
 //! registry layout or an unsupported construct fails the same way.
+//!
+//! When the executable has several structurally valid fixed-table blocks, the
+//! probe tries each with the recognized state and requires exactly one to
+//! produce a plausible A table. The candidate count and selected index are
+//! reported; no address is used.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -20,13 +25,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lforge_binary::pe::ExecutableView;
 
 use super::provider::{
-    EncodedAesError, FixedTablesError, RecognizedSource, SourceError, recognize_fixed_tables,
+    EncodedAesBlock, EncodedAesError, FixedTablesError, SourceError,
+    recognize_fixed_table_candidates,
 };
 use super::recognize::{
-    DescriptorError, Limits, RecognitionError, Recognized, RegistryError, STATIC_STEP1_MODE,
-    provider_for, recognize_descriptor, recognize_registry,
+    DescriptorError, Limits, RecognitionError, RegistryError, STATIC_STEP1_MODE, provider_for,
+    recognize_descriptor, recognize_registry,
 };
-use super::transform::{Cipher, CipherDescriptor, CipherSource};
+use super::transform::{Cipher, CipherDescriptor};
 use super::{Error as MetadataError, Stored, check_span_formulas, read_range, step1_a_span};
 
 /// The probe reads at most this many bytes of the metadata area.
@@ -138,6 +144,10 @@ pub struct ProbeReport {
     pub descriptor: Option<DescriptorInfo>,
     pub state_identified: bool,
     pub fixed_tables: bool,
+    /// Structurally valid fixed-table blocks. More than one is possible.
+    pub fixed_tables_candidates: usize,
+    /// The candidate index selected by the decrypted A table.
+    pub selected_fixed_table: Option<usize>,
     pub block_initialized: bool,
     pub a_table: Option<ATableSummary>,
     pub authentication: &'static str,
@@ -156,6 +166,8 @@ impl ProbeReport {
             descriptor: None,
             state_identified: false,
             fixed_tables: false,
+            fixed_tables_candidates: 0,
+            selected_fixed_table: None,
             block_initialized: false,
             a_table: None,
             authentication: AUTHENTICATION,
@@ -294,84 +306,95 @@ pub(crate) fn probe_with_limit(
         return Ok(report);
     }
 
-    let tables = match recognize_fixed_tables(executable, cancel) {
-        Ok(tables) => tables,
+    let candidates = match recognize_fixed_table_candidates(executable, cancel, Limits::default()) {
+        Ok(candidates) => candidates,
         Err(error) => {
             report.outcome = fixed_tables_outcome(error);
             return Ok(report);
         }
     };
     report.fixed_tables = true;
+    report.fixed_tables_candidates = candidates.len();
     if cancelled(cancel) {
         report.outcome = ProbeOutcome::Cancelled;
         return Ok(report);
     }
 
-    let recognized = match Recognized::from_parts(registry, descriptor) {
-        Ok(recognized) => recognized,
-        Err(_) => {
-            report.outcome =
-                ProbeOutcome::DescriptorUnsupported("the static descriptor is invalid");
-            return Ok(report);
-        }
-    };
-    let source = match RecognizedSource::from_parts(recognized, tables) {
-        Ok(source) => source,
-        Err(error) => {
-            report.outcome = source_outcome(error);
-            if matches!(report.outcome, ProbeOutcome::StateUnsupported(_)) {
-                report.state_identified = false;
-            }
-            return Ok(report);
-        }
-    };
-    report.block_initialized = true;
-
-    let mut bytes = read_range(archive, span)
+    let bytes = read_range(archive, span)
         .map_err(|_| ProbeError::Read("the step-1 A span could not be read"))?;
-    let index = stored.prefix.selector >> 1;
-    let Some(descriptor) = step1_descriptor(&source, index) else {
-        report.outcome = ProbeOutcome::BlockUnsupported("the static descriptor is not available");
-        return Ok(report);
+    let cipher_descriptor = CipherDescriptor {
+        key_id: descriptor.key_id(),
+        kind: descriptor.kind(),
+        parameter: *descriptor.parameter(),
     };
-    let mut cipher = match Cipher::new(&descriptor, |key_id| {
-        source.cbc_block_for(descriptor.kind, key_id)
-    }) {
-        Ok(cipher) => cipher,
-        Err(_) => {
-            report.outcome = ProbeOutcome::BlockUnsupported("the key state did not build a block");
+    let a_span = 0..bytes.len();
+    let mut plausible = Vec::new();
+    let mut first_invalid = None;
+    let mut block_initialized = false;
+    for (candidate_index, tables) in candidates.into_iter().enumerate() {
+        let state =
+            match registry.state_for_key(descriptor.key_id(), algorithm.id(), STATIC_STEP1_MODE) {
+                Ok(state) => state,
+                Err(error) => {
+                    report.outcome = state_outcome(error);
+                    return Ok(report);
+                }
+            };
+        let block = match EncodedAesBlock::new(state, tables) {
+            Ok(block) => block,
+            Err(error) => {
+                report.outcome = source_outcome(SourceError::Block(error));
+                return Ok(report);
+            }
+        };
+        block_initialized = true;
+        let mut decrypted = bytes.clone();
+        let mut cipher = match Cipher::new(&cipher_descriptor, |_| Some(block)) {
+            Ok(cipher) => cipher,
+            Err(_) => {
+                report.outcome =
+                    ProbeOutcome::BlockUnsupported("the key state did not build a cipher");
+                return Ok(report);
+            }
+        };
+        if let Err(error) = cipher.run(&mut decrypted, std::slice::from_ref(&a_span)) {
+            report.outcome = block_run_outcome(error);
             return Ok(report);
         }
-    };
-    let span_len = bytes.len();
-    let a_span = 0..span_len;
-    if let Err(error) = cipher.run(&mut bytes, std::slice::from_ref(&a_span)) {
-        report.outcome = block_run_outcome(error);
-        return Ok(report);
+        match validate_a_table(
+            &decrypted,
+            usize::from(stored.prefix.a_records),
+            stored.prefix.b_len,
+        ) {
+            Ok(summary) => plausible.push((candidate_index, summary)),
+            Err(reason) => {
+                if first_invalid.is_none() {
+                    first_invalid = Some(reason);
+                }
+            }
+        }
     }
-
-    match validate_a_table(
-        &bytes,
-        usize::from(stored.prefix.a_records),
-        stored.prefix.b_len,
-    ) {
-        Ok(summary) => {
-            report.a_table = Some(summary);
+    report.block_initialized = block_initialized;
+    match plausible.as_slice() {
+        [(candidate_index, summary)] => {
+            report.selected_fixed_table = Some(*candidate_index);
+            report.a_table = Some(*summary);
             report.outcome = ProbeOutcome::Plausible;
         }
-        Err(reason) => report.outcome = ProbeOutcome::Implausible(reason),
+        [] => {
+            report.outcome = if report.fixed_tables_candidates == 1 {
+                ProbeOutcome::Implausible(first_invalid.unwrap_or("the A table is not plausible"))
+            } else {
+                ProbeOutcome::Implausible("no fixed table candidate produced a plausible A table")
+            }
+        }
+        _ => {
+            report.outcome = ProbeOutcome::Implausible(
+                "more than one fixed table candidate produced a plausible A table",
+            )
+        }
     }
     Ok(report)
-}
-
-fn step1_descriptor<S: CipherSource>(source: &S, index: u8) -> Option<CipherDescriptor> {
-    let kind = source.static_kind(index)?;
-    let (key_id, parameter) = source.static_descriptor(index)?;
-    Some(CipherDescriptor {
-        key_id,
-        kind,
-        parameter,
-    })
 }
 
 fn block_run_outcome(error: super::transform::Error) -> ProbeOutcome {

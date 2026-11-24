@@ -1245,20 +1245,43 @@ fn local_executable_smoke_test() {
     }
     eprintln!("unavailable selectors fail closed");
 
-    let source = RecognizedSource::recognize(&image, 9, &cancel).unwrap();
-    assert_eq!(source.algorithm_id(), ALGORITHM_CBC);
-    assert_eq!(source.provider(), 2);
-    assert_eq!(source.mode(), STATIC_STEP1_MODE);
-    let index = source.descriptor().index();
-    assert_eq!(source.static_kind(index), Some(source.descriptor().kind()));
-    assert!(source.static_descriptor(index).is_some());
-    assert!(source.cbc_block(source.descriptor().key_id()).is_some());
+    let recognized = Recognized::recognize(&image, 9, &cancel).unwrap();
+    assert_eq!(recognized.algorithm_id(), ALGORITHM_CBC);
+    assert_eq!(recognized.provider(), 2);
+    assert_eq!(recognized.mode(), STATIC_STEP1_MODE);
     eprintln!(
-        "provider: algorithm {:#x}, provider {}, mode {}, block initialized",
-        source.algorithm_id(),
-        source.provider(),
-        source.mode()
+        "provider: algorithm {:#x}, provider {}, mode {}",
+        recognized.algorithm_id(),
+        recognized.provider(),
+        recognized.mode()
     );
+
+    let candidates = crate::rpf::metadata::provider::recognize_fixed_table_candidates(
+        &image,
+        &cancel,
+        Limits::default(),
+    )
+    .unwrap();
+    eprintln!(
+        "structurally valid fixed-table blocks: {}",
+        candidates.len()
+    );
+    assert!(!candidates.is_empty());
+    let key_id = recognized.descriptor().key_id();
+    let mut initialized = 0;
+    for tables in candidates {
+        let state = registry
+            .state_for_key(key_id, ALGORITHM_CBC, STATIC_STEP1_MODE)
+            .unwrap();
+        if EncodedAesBlock::new(state, tables).is_ok() {
+            initialized += 1;
+        }
+    }
+    assert!(
+        initialized > 0,
+        "no fixed-table candidate initialized the block"
+    );
+    eprintln!("fixed-table blocks initialized with the recognized state: {initialized}");
 }
 
 /// Optional read-only A-table probe against local files. The caller supplies
@@ -1285,6 +1308,10 @@ fn local_archive_probe_smoke_test() {
     eprintln!("descriptor: {:?}", report.descriptor);
     eprintln!("state identified: {}", report.state_identified);
     eprintln!("fixed tables: {}", report.fixed_tables);
+    eprintln!(
+        "fixed-table candidates: {}, selected: {:?}",
+        report.fixed_tables_candidates, report.selected_fixed_table
+    );
     eprintln!("block initialized: {}", report.block_initialized);
     eprintln!("A table: {:?}", report.a_table);
     eprintln!("authentication: {}", report.authentication);
@@ -1547,8 +1574,10 @@ fn recognizes_registry_fixed_tables_and_block_end_to_end() {
 // --- key provider source and A-table probe -------------------------------
 
 const PROBE_IV: [u8; 16] = [0x33; 16];
-const PROBE_RECORDS_OFFSET: usize = 0x5000;
 const PROBE_A_RECORD_LEN: usize = 8;
+const OTHER_ENCODING: [u8; 16] = [
+    0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x71, 0x82, 0x93, 0xa4, 0xb5, 0xc6, 0xd7, 0xe8, 0xf9, 0x1a, 0x1b,
+];
 
 fn a_record(id: u16, offset: u32) -> [u8; PROBE_A_RECORD_LEN] {
     let mut record = [0u8; PROBE_A_RECORD_LEN];
@@ -1563,26 +1592,35 @@ fn probe_selectors() -> Vec<u64> {
     selectors
 }
 
-fn probe_rdata(selectors: &[u64], corrupt_fixed: Option<usize>) -> Vec<u8> {
-    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
-    let state_offset = PROBE_RECORDS_OFFSET + selectors.len() * RECORD_LEN;
+fn probe_rdata_blocks(blocks: &[Vec<u8>], state: &[u8], selectors: &[u64]) -> Vec<u8> {
+    let records_offset = blocks.iter().map(Vec::len).sum::<usize>();
+    let state_offset = records_offset + selectors.len() * RECORD_LEN;
     let state_va = IMAGE_BASE + u64::from(RDATA_VA) + state_offset as u64;
-    let mut data = synthetic.fixed_bytes();
-    if let Some(offset) = corrupt_fixed {
-        data[offset] ^= 1;
+    let mut data = Vec::new();
+    for block in blocks {
+        data.extend_from_slice(block);
     }
     data.resize(state_offset, 0);
     for (index, selector) in selectors.iter().enumerate() {
-        let record = PROBE_RECORDS_OFFSET + index * RECORD_LEN;
+        let record = records_offset + index * RECORD_LEN;
         put_u64(&mut data, record, *selector);
         put_u64(&mut data, record + 8, state_va);
         put_u64(&mut data, record + 16, STATE_LEN as u64);
     }
-    data.extend_from_slice(synthetic.raw_state());
+    data.extend_from_slice(state);
     data
 }
 
-fn probe_image(selectors: &[u64], kind: u16, corrupt_fixed: Option<usize>) -> ExecutableView {
+fn probe_rdata(selectors: &[u64], corrupt_fixed: Option<usize>) -> Vec<u8> {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let mut block = synthetic.fixed_bytes();
+    if let Some(offset) = corrupt_fixed {
+        block[offset] ^= 1;
+    }
+    probe_rdata_blocks(&[block], synthetic.raw_state(), selectors)
+}
+
+fn probe_image_with_rdata(rdata: Vec<u8>, kind: u16) -> ExecutableView {
     let writer_va = IMAGE_BASE + u64::from(TEXT_VA);
     let func_va = writer_va + 0x100;
     let four = DescriptorSpec {
@@ -1600,7 +1638,11 @@ fn probe_image(selectors: &[u64], kind: u16, corrupt_fixed: Option<usize>) -> Ex
     let code = builder_code(func_va, writer_va, &four, &one);
     let mut data = descriptor_data();
     data[IV_FOUR_OFFSET..IV_FOUR_OFFSET + 16].copy_from_slice(&PROBE_IV);
-    descriptor_image(code, probe_rdata(selectors, corrupt_fixed), data)
+    descriptor_image(code, rdata, data)
+}
+
+fn probe_image(selectors: &[u64], kind: u16, corrupt_fixed: Option<usize>) -> ExecutableView {
+    probe_image_with_rdata(probe_rdata(selectors, corrupt_fixed), kind)
 }
 
 fn cbc_encrypt(key: &[u8; 32], iv: &[u8; 16], data: &mut [u8]) {
@@ -1708,8 +1750,30 @@ fn the_probe_accepts_a_plausible_a_table() {
     assert_eq!(report.descriptor.unwrap().index, 4);
     assert!(report.state_identified);
     assert!(report.fixed_tables);
+    assert_eq!(report.fixed_tables_candidates, 1);
+    assert_eq!(report.selected_fixed_table, Some(0));
     assert!(report.block_initialized);
     assert_eq!(report.authentication, AUTHENTICATION);
+}
+
+#[test]
+fn the_probe_selects_the_fixed_table_candidate() {
+    let good = synthetic::instance(&synthetic::FIPS_KEY);
+    let other = synthetic::instance_with_encoding(&[0x5a; 32], OTHER_ENCODING);
+    let archive = probe_archive(&plausible_records(), 0x100, 9, 1, &synthetic::FIPS_KEY);
+    let rdata = probe_rdata_blocks(
+        &[good.fixed_bytes(), other.fixed_bytes()],
+        good.raw_state(),
+        &probe_selectors(),
+    );
+    let image = probe_image_with_rdata(rdata, KIND_FOUR);
+    let report = run_probe(&image, &archive);
+    assert_eq!(report.outcome, ProbeOutcome::Plausible);
+    assert_eq!(report.fixed_tables_candidates, 2);
+    assert_eq!(report.selected_fixed_table, Some(0));
+    let summary = report.a_table.unwrap();
+    assert_eq!(summary.records, 5);
+    assert_eq!(summary.known_ids, 3);
 }
 
 #[test]
