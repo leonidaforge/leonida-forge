@@ -162,6 +162,7 @@ function Get-ThirdPartyNotices {
 $desktopPe = Get-PeImage $desktop
 $cliPe = Get-PeImage $cli
 
+$privatePaths = @($env:USERPROFILE, $root) | Where-Object { $_ }
 foreach ($image in @($desktopPe, $cliPe)) {
     if ($image.Machine -ne 0x8664) {
         throw "$($image.Path) is not an x64 executable"
@@ -171,6 +172,12 @@ foreach ($image in @($desktopPe, $cliPe)) {
     }
     if ($crtImports) {
         throw "$($image.Path) still imports the dynamic CRT: $($crtImports -join ', ')"
+    }
+    $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($image.Path))
+    foreach ($prefix in $privatePaths) {
+        if ($text.IndexOf($prefix, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw "$($image.Path) embeds the local path $prefix"
+        }
     }
 }
 if ($desktopPe.Subsystem -ne 2) {

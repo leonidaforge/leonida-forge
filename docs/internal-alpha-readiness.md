@@ -102,6 +102,8 @@ Automated, run for this package:
   tests.
 - `cargo build --workspace --locked`: pass.
 - Release build for `x86_64-pc-windows-msvc`: pass.
+- Packaged binary scan for the build user's profile path and the repository
+  root: no matches.
 
 The export slot is covered by focused unit tests: overlapping dialog requests,
 a cancelled dialog whose result arrives late, and a delayed dialog completing
@@ -173,15 +175,16 @@ repositories. A public release still needs a full license-text audit.
 
 ## Runtime linkage
 
-Both binaries use the static MSVC CRT. The release build sets:
+Both binaries use the static MSVC CRT. `scripts/build-windows-x64.ps1` passes
+`-C target-feature=+crt-static` through `CARGO_ENCODED_RUSTFLAGS`. This is the
+Rust-supported `crt-static` target feature. The repository does not set it
+globally, so development, clippy and test builds keep the default dynamic CRT
+and match CI.
 
-```powershell
-$env:RUSTFLAGS = "-C target-feature=+crt-static"
-```
-
-This is the Rust-supported `crt-static` target feature. The repository does not
-set it globally, so development, clippy and test builds keep the default
-dynamic CRT and match CI.
+The same script remaps the repository root, `CARGO_HOME` and `RUSTUP_HOME` to
+`/leonida-forge`, `/cargo` and `/rustup`. Release binaries carry panic-location
+strings, and without the remap they would embed the build machine's user name
+and paths. The remap also makes the path strings stable across machines.
 
 `dumpbin /dependents` on the release binaries shows no `VCRUNTIME140.dll`, no
 `MSVCP140.dll` and no `api-ms-win-crt-*` imports. The remaining imports are
@@ -200,24 +203,24 @@ pinned by `rust-toolchain.toml` and dependencies by `Cargo.lock`.
 
 ```powershell
 rustup toolchain install
-$env:RUSTFLAGS = "-C target-feature=+crt-static"
-cargo build --release --locked --target x86_64-pc-windows-msvc -p lforge-desktop -p lforge-cli
+pwsh -NoProfile -File scripts/build-windows-x64.ps1
 pwsh -NoProfile -File scripts/package-windows-x64.ps1
 ```
 
 The first build fetches GPUI from the pinned Zed revision, so a clean machine
-needs network access. The package script verifies both executables, their PE
-machine and subsystem, the absence of dynamic CRT imports, and that the CLI
-answers `--help` and reports the expected version. It then stages only the
-listed files, writes the ZIP and prints the SHA-256.
+needs network access. The build script sets the static CRT and the path remap.
+The package script verifies both executables, their PE machine and subsystem,
+the absence of dynamic CRT imports, and that the CLI answers `--help` and
+reports the expected version. It then stages only the listed files, writes the
+ZIP and prints the SHA-256.
 
 ## GitHub Actions workflow
 
 `.github/workflows/windows-alpha.yml` is manual (`workflow_dispatch`) and uses
 `windows-2025`. It checks out the selected commit, installs the pinned
 toolchain, then runs the CI gates: fmt, clippy, tests and the locked workspace
-build. It then builds the two release binaries with static CRT linking, runs
-the packaging script, and uploads only `dist/*.zip` and `dist/*.sha256` with
+build. It then runs the release build script, runs the packaging script, and
+uploads only `dist/*.zip` and `dist/*.sha256` with
 `actions/upload-artifact`. Workflow permissions are limited to
 `contents: read`. There are no deployment secrets, no external services and no
 GitHub Release step. Tag triggers and release publication remain disabled until

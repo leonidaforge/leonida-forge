@@ -33,9 +33,7 @@ jobs:
       - run: cargo build --workspace --locked
 
       - name: Build release binaries
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p lforge-desktop -p lforge-cli
+        run: pwsh -NoProfile -File scripts/build-windows-x64.ps1
 
       - name: Verify and package
         run: pwsh -NoProfile -File scripts/package-windows-x64.ps1
