@@ -1,7 +1,9 @@
 //! Read-only access to GTA VI RPF9 archives.
 //!
-//! The table of contents of RPF9 archives is encrypted and is not read. What
-//! can be listed is recovered from the data area instead: file data is stored
+//! The engine processes most of the table of contents in place before reading
+//! it, with algorithms that are not known; [`metadata`] parses the table once
+//! it is available in that processed form. What can be listed without it is
+//! recovered from the data area instead: file data is stored
 //! as zlib streams at 16-byte aligned offsets, and files larger than 64 KiB
 //! are split into one stream per 64 KiB chunk. [`scan`] finds these streams,
 //! checks each one by inflating it completely, reconstructs resources from
@@ -13,6 +15,7 @@
 //! streams that are not zero padding are reported as [`Region`] values.
 
 mod cache;
+pub mod metadata;
 mod reconstruct;
 mod scan;
 
