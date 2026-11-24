@@ -10,10 +10,12 @@ use lforge_binary::Source;
 use lforge_rage9::rpf;
 use lforge_rage9::rpf::metadata::transform::{self, Algorithm};
 use lforge_rage9::rpf::metadata::{
-    Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
+    CompanionStatus, Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
 };
 use lforge_rage9::rpf::names::{self, Candidate, Class, Matches, MountPrefix, Types};
 use serde_json::{Value, json};
+
+use crate::native::Alternates;
 
 /// Larger metadata areas are not read.
 const MAX_METADATA: u64 = 256 * 1024 * 1024;
@@ -111,7 +113,7 @@ pub fn run(path: &Path, options: &Options) -> Result<(), String> {
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
-    let report = report(&source, options, naming.as_ref());
+    let report = report(path, &source, options, naming.as_ref());
     let out = io::stdout().lock();
     let mut out = BufWriter::new(out);
     let result = if options.json {
@@ -206,8 +208,8 @@ fn hex<T: std::fmt::UpperHex>(value: T, digits: usize) -> String {
 }
 
 /// Whether the entry's stored bytes can be read as they are, and why not.
-fn raw_json(entry: &Entry, source: &Source) -> Value {
-    match entry.raw_source(source, &[]) {
+fn raw_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
+    match entry.raw_source(source, alternates) {
         Ok(view) => json!({ "available": true, "size": view.len() }),
         Err(Error::Encoded { encoding, .. }) => {
             json!({ "available": false, "reason": format!("stored {encoding}") })
@@ -220,7 +222,62 @@ fn raw_json(entry: &Entry, source: &Source) -> Value {
     }
 }
 
-fn entry_json(entry: &Entry, source: &Source, names: Option<(&Matches, &Naming)>) -> Value {
+/// How the entry's contents can be obtained: one of the readability states.
+/// This reports actual payload readability, not only raw-byte availability.
+///
+/// - `stored`: readable as the stored bytes are.
+/// - `decoded`: readable after supported decoding (raw DEFLATE or chunks).
+/// - `unsupported_transform`: behind the unsupported payload transform.
+/// - `unsupported_compression`: an unsupported compression mode.
+/// - `alternate_source`: read through a companion that is not available.
+/// - `malformed`: the payload metadata did not parse or is inconsistent.
+fn contents_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
+    let state = |readable: bool, state: &str, reason: Option<String>| {
+        let mut value = json!({ "readable": readable, "state": state });
+        if let Some(reason) = reason {
+            value["reason"] = json!(reason);
+        }
+        value
+    };
+    // A field that did not parse takes precedence: nothing downstream is trustworthy.
+    let malformed = [
+        entry.location.as_ref().err(),
+        entry.chunks.as_ref().err(),
+        entry.payload_transform.as_ref().err(),
+        entry.read_source.as_ref().err(),
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    if let Some(reason) = malformed {
+        return state(false, "malformed", Some(reason.clone()));
+    }
+    match entry.payload(source, alternates) {
+        Ok(_) if entry.raw_source(source, alternates).is_ok() => state(true, "stored", None),
+        Ok(_) => state(true, "decoded", None),
+        Err(Error::Encoded { encoding, .. }) => state(
+            false,
+            "unsupported_transform",
+            Some(format!("stored {encoding}")),
+        ),
+        Err(Error::Undecodable { reason, .. }) => {
+            state(false, "unsupported_compression", Some(reason))
+        }
+        Err(Error::ReadSource { index, .. }) => state(
+            false,
+            "alternate_source",
+            Some(format!("alternate read source {index} is not available")),
+        ),
+        Err(err) => state(false, "malformed", Some(err.to_string())),
+    }
+}
+
+fn entry_json(
+    entry: &Entry,
+    source: &Source,
+    alternates: &[Option<Source>],
+    names: Option<(&Matches, &Naming)>,
+) -> Value {
     let location = &entry.location;
     let mut value = json!({
         "row": entry.row,
@@ -242,7 +299,8 @@ fn entry_json(entry: &Entry, source: &Source, names: Option<(&Matches, &Naming)>
             Ok(Some(index)) => json!(index),
             Err(reason) => json!({ "malformed": reason }),
         },
-        "raw": raw_json(entry, source),
+        "raw": raw_json(entry, source, alternates),
+        "contents": contents_json(entry, source, alternates),
     });
     if let Some((matches, naming)) = names
         && let Some(row) = matches.row(entry.row)
@@ -257,7 +315,7 @@ fn entry_json(entry: &Entry, source: &Source, names: Option<(&Matches, &Naming)>
     value
 }
 
-fn report(source: &Source, options: &Options, naming: Option<&Naming>) -> Value {
+fn report(path: &Path, source: &Source, options: &Options, naming: Option<&Naming>) -> Value {
     let unreadable = |err: Error| {
         json!({
             "format": "RPF9",
@@ -298,18 +356,42 @@ fn report(source: &Source, options: &Options, naming: Option<&Naming>) -> Value 
         }
     };
     report["state"] = json!("decoded");
-    report["entries"] = entries_json(&metadata, &source, options, naming);
+    let alternates = Alternates::resolve(path, &metadata);
+    report["entries"] = entries_json(&metadata, &source, &alternates, options, naming);
     report
+}
+
+/// A summary of the archive's companion files, where it lists any.
+fn companions_json(alternates: &Alternates) -> Option<Value> {
+    if let Some(problem) = &alternates.problem {
+        return Some(json!({ "available": false, "reason": problem }));
+    }
+    if alternates.records.is_empty() {
+        return None;
+    }
+    let count =
+        |kind: fn(&CompanionStatus) -> bool| alternates.statuses.iter().filter(|s| kind(s)).count();
+    Some(json!({
+        "records": alternates.records.len(),
+        "available": count(|s| matches!(s, CompanionStatus::Available(_))),
+        "missing": count(|s| matches!(s, CompanionStatus::Missing(_))),
+        "invalid": count(|s| matches!(s, CompanionStatus::Invalid(_))),
+        "unsupported": count(|s| matches!(s, CompanionStatus::Unsupported(_))),
+    }))
 }
 
 fn entries_json(
     metadata: &Metadata,
     source: &Source,
+    alternates: &Alternates,
     options: &Options,
     naming: Option<&Naming>,
 ) -> Value {
     let entries: Vec<Entry> = metadata.entries().collect();
     let mut value = json!({ "available": true, "rows": entries.len() });
+    if let Some(companions) = companions_json(alternates) {
+        value["companions"] = companions;
+    }
     let matches = naming.map(|naming| {
         let candidates: Vec<Candidate> = naming
             .candidates
@@ -345,7 +427,7 @@ fn entries_json(
         value["listed"] = entries
             .iter()
             .take(options.limit)
-            .map(|entry| entry_json(entry, source, names))
+            .map(|entry| entry_json(entry, source, alternates.sources(), names))
             .collect();
     }
     value
@@ -444,14 +526,37 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
             )?,
         }
     }
+    if let Some(companions) = entries["companions"].as_object() {
+        match companions.get("reason") {
+            Some(reason) => writeln!(out, "companions:  not read: {}", text(reason))?,
+            None => writeln!(
+                out,
+                "companions:  {} ({} available, {} missing, {} invalid, {} unsupported)",
+                companions["records"],
+                companions["available"],
+                companions["missing"],
+                companions["invalid"],
+                companions["unsupported"]
+            )?,
+        }
+    }
     let Some(listed) = entries["listed"].as_array() else {
         return Ok(());
     };
     writeln!(out)?;
     writeln!(
         out,
-        "{:>6} {:<6} {:>4} {:>14} {:>12} {:>12} {:>4} {:>6} {:<18} raw",
-        "row", "layout", "type", "offset", "stored", "logical", "mode", "source", "name"
+        "{:>6} {:<6} {:>4} {:>14} {:>12} {:>12} {:>4} {:>6} {:<18} {:<11} raw",
+        "row",
+        "layout",
+        "type",
+        "offset",
+        "stored",
+        "logical",
+        "mode",
+        "source",
+        "name",
+        "contents"
     )?;
     for entry in listed {
         let name = match (&entry["name_hash"], &entry["name_key"]) {
@@ -463,6 +568,13 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
             Some(true) => "yes".to_string(),
             _ => text(&entry["raw"]["reason"]),
         };
+        let contents = match entry["contents"]["state"].as_str() {
+            Some("unsupported_transform") => "transform",
+            Some("unsupported_compression") => "compression",
+            Some("alternate_source") => "source",
+            Some(state) => state,
+            None => "-",
+        };
         let number = |key: &str| match &entry[key] {
             Value::Number(n) => n
                 .as_u64()
@@ -471,7 +583,7 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
         };
         write!(
             out,
-            "{:>6} {:<6} {:>4} {:>14} {:>12} {:>12} {:>4} {:>6} {:<18} {raw}",
+            "{:>6} {:<6} {:>4} {:>14} {:>12} {:>12} {:>4} {:>6} {:<18} {contents:<11} {raw}",
             entry["row"],
             text(&entry["layout"]),
             text(&entry["type_id"]),

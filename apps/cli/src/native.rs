@@ -10,7 +10,7 @@ use std::path::Path;
 
 use lforge_binary::Source;
 use lforge_rage9::rpf;
-use lforge_rage9::rpf::metadata::{Metadata, Stored};
+use lforge_rage9::rpf::metadata::{Companion, CompanionStatus, Metadata, Stored};
 
 /// Opens `path`, reads the RPF9 header and decodes the native table of
 /// contents. Metadata that the engine processes before use (an encrypted or
@@ -41,22 +41,39 @@ pub fn open_metadata(path: &Path, limit: u64) -> Result<(Source, Metadata), Stri
 /// is not available, so an entry read through it is refused rather than read
 /// from the main archive.
 pub struct Alternates {
+    pub records: Vec<Companion>,
+    pub statuses: Vec<CompanionStatus>,
     sources: Vec<Option<Source>>,
+    /// Why sub-block 3 could not be read, if it is malformed.
+    pub problem: Option<String>,
 }
 
 impl Alternates {
     /// Resolves the companions of `archive`, a file on disk, against its own
     /// directory. The archive is never opened as a companion source.
     pub fn resolve(archive: &Path, metadata: &Metadata) -> Self {
-        let sources = match metadata.companions() {
-            Ok(list) => list
-                .open(archive)
-                .iter()
-                .map(|status| status.source().cloned())
-                .collect(),
-            Err(_) => Vec::new(),
+        let list = match metadata.companions() {
+            Ok(list) => list,
+            Err(err) => {
+                return Self {
+                    records: Vec::new(),
+                    statuses: Vec::new(),
+                    sources: Vec::new(),
+                    problem: Some(err.to_string()),
+                };
+            }
         };
-        Self { sources }
+        let statuses = list.open(archive);
+        let sources = statuses
+            .iter()
+            .map(|status| status.source().cloned())
+            .collect();
+        Self {
+            records: list.records,
+            statuses,
+            sources,
+            problem: None,
+        }
     }
 
     pub fn sources(&self) -> &[Option<Source>] {

@@ -90,10 +90,13 @@ lforge archive resource data.rpf 0x2010 --json # pages and checks of one resourc
 Where the table of contents is stored without encryption, it can be read directly instead of scanned.
 
 ```sh
+lforge archive metadata data.rpf --entries         # the native entries and how each one reads
 lforge archive extract data.rpf --row 42 --output file.bin
 ```
 
-Entries are identified by their row number in the table, as listed by `archive metadata --entries`. `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
+Entries are identified by their row number in the table. `archive metadata --entries` lists them and reports, for each one, whether its contents are readable as stored, readable after supported decoding, or unavailable. When an entry is unavailable it gives the reason: an unsupported payload transform, an unsupported compression mode, a companion file that is missing or invalid, or malformed metadata.
+
+`archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
 
 ## AI Contributions
 
