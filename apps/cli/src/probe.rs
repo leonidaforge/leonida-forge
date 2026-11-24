@@ -7,6 +7,9 @@ use lforge_binary::pe::ExecutableView;
 use lforge_rage9::rpf::metadata::probe::{
     AUTHENTICATION, DescriptorInfo, ProbeError, ProbeOutcome, ProbeReport, probe,
 };
+use lforge_rage9::rpf::metadata::verify::{
+    SignatureOutcome, VerifyOutcome, VerifyReport, verify_archive,
+};
 use serde_json::{Value, json};
 
 pub fn run(archive: &Path, executable: &Path, json_output: bool) -> Result<(), String> {
@@ -39,14 +42,15 @@ pub fn run(archive: &Path, executable: &Path, json_output: bool) -> Result<(), S
         }
     };
 
-    let value = report_json(&report);
+    let verification = verify_archive(&mut source, &view, &cancel).ok();
+    let value = report_json(&report, verification.as_ref());
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&value).expect("JSON value")
         );
     } else {
-        print_text(&report);
+        print_text(&report, verification.as_ref());
     }
     if report.outcome.is_plausible() || report.outcome.is_not_applicable() {
         Ok(())
@@ -85,7 +89,10 @@ fn failed_json(outcome: &str, reason: &str, executable_ok: bool) -> Value {
                 "fixed_tables": {"status": "not_attempted"},
                 "block": {"status": "not_attempted"},
                 "a_table": {"status": "not_attempted"},
+                "signature": {"status": "not_attempted"},
+                "archive": {"status": "not_attempted"},
             },
+            "trust": {"status": "not_attempted"},
         },
     })
 }
@@ -124,7 +131,7 @@ fn outcome_reason(outcome: &ProbeOutcome) -> String {
     }
 }
 
-fn report_json(report: &ProbeReport) -> Value {
+fn report_json(report: &ProbeReport, verification: Option<&VerifyReport>) -> Value {
     json!({
         "format": "RPF9",
         "probe": {
@@ -145,7 +152,10 @@ fn report_json(report: &ProbeReport) -> Value {
                 "fixed_tables": fixed_tables_stage(report),
                 "block": simple_stage(report, Stage::Block, report.block_initialized),
                 "a_table": a_table_stage(report),
+                "signature": signature_stage(verification),
+                "archive": archive_stage(verification),
             },
+            "trust": trust_stage(verification),
         },
     })
 }
@@ -292,7 +302,62 @@ fn a_table_stage(report: &ProbeReport) -> Value {
     }
 }
 
-fn print_text(report: &ProbeReport) {
+fn signature_stage(report: Option<&VerifyReport>) -> Value {
+    let Some(report) = report else {
+        return json!({"status": "not_attempted"});
+    };
+    match &report.signature {
+        SignatureOutcome::Valid => json!({"status": "ok", "result": "valid"}),
+        SignatureOutcome::Invalid => json!({
+            "status": "failed",
+            "result": "invalid",
+            "reason": "the signature does not match the metadata",
+        }),
+        SignatureOutcome::Unavailable(reason) => json!({
+            "status": "unavailable",
+            "result": "unavailable",
+            "reason": reason,
+        }),
+        SignatureOutcome::Unsupported(reason) => json!({
+            "status": "unsupported",
+            "result": "unsupported",
+            "reason": reason,
+        }),
+        SignatureOutcome::NotPerformed => json!({"status": "not_attempted"}),
+    }
+}
+
+fn archive_stage(report: Option<&VerifyReport>) -> Value {
+    let Some(report) = report else {
+        return json!({"status": "not_attempted"});
+    };
+    match report.archive_pass {
+        Some(true) => json!({"status": "ok", "pass": true}),
+        Some(false) => json!({"status": "skipped", "pass": false}),
+        None => json!({"status": "not_attempted"}),
+    }
+}
+
+fn trust_stage(report: Option<&VerifyReport>) -> Value {
+    let Some(report) = report else {
+        return json!({"status": "unavailable"});
+    };
+    let status = match report.outcome {
+        VerifyOutcome::MetadataDecodedAuthenticated => "authenticated",
+        VerifyOutcome::MetadataDecodedUnverified => "unverified",
+        VerifyOutcome::SignatureInvalid => "invalid",
+        VerifyOutcome::NotApplicable => "not_applicable",
+        VerifyOutcome::Cancelled | VerifyOutcome::ResourceLimit { .. } => "stopped",
+        _ => "failed",
+    };
+    json!({
+        "status": status,
+        "outcome": report.outcome.to_string(),
+        "stage": report.stage,
+    })
+}
+
+fn print_text(report: &ProbeReport, verification: Option<&VerifyReport>) {
     println!("format:       RPF9");
     println!("selector:     {:#04x}", report.selector);
     println!(
@@ -333,6 +398,13 @@ fn print_text(report: &ProbeReport) {
         println!(
             "A table:      plausible ({} records, {} known sub-blocks{candidate})",
             summary.records, summary.known_ids
+        );
+    }
+    if let Some(verification) = verification {
+        println!("signature:    {}", verification.signature);
+        println!(
+            "trust:        {} (stage {})",
+            verification.outcome, verification.stage
         );
     }
     println!("authentication: {AUTHENTICATION}");

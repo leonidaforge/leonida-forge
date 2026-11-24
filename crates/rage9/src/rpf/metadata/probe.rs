@@ -511,7 +511,7 @@ fn source_outcome(error: SourceError) -> ProbeOutcome {
 /// the `B` block. At least one record MUST use a known sub-block identifier.
 /// The engine does not require padding bytes to be zero, and neither does
 /// this check.
-fn validate_a_table(
+pub(crate) fn validate_a_table(
     bytes: &[u8],
     records: usize,
     b_len: u32,

@@ -11,16 +11,19 @@
 //! drive it.
 
 use std::fmt;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_binary::pe::ExecutableView;
 
 use super::block::{EncodedAesBlock, EncodedAesError};
-use super::fixed::{FixedTables, FixedTablesError, recognize_fixed_tables};
+use super::fixed::{FixedTables, FixedTablesError, recognize_candidates, recognize_fixed_tables};
+use crate::rpf::metadata::probe::{ATableSummary, validate_a_table};
 use crate::rpf::metadata::recognize::{
-    RecognitionError, Recognized, STATIC_STEP1_MODE, StaticDescriptor,
+    Limits, RecognitionError, Recognized, STATIC_STEP1_MODE, StaticDescriptor,
 };
-use crate::rpf::metadata::transform::{Algorithm, Block, CipherSource};
+use crate::rpf::metadata::transform::{
+    Algorithm, Block, Cipher, CipherDescriptor, CipherSource, Error as CipherError,
+};
 
 #[derive(Debug)]
 pub enum SourceError {
@@ -153,5 +156,87 @@ impl fmt::Debug for RecognizedSource {
             .field("mode", &self.recognized.mode())
             .field("tables", &self.tables)
             .finish_non_exhaustive()
+    }
+}
+
+/// A recognized source selected by the step-1 A table.
+pub(crate) struct Selection {
+    pub source: RecognizedSource,
+    pub a_table: ATableSummary,
+    pub candidates: usize,
+    pub selected: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum SelectionError {
+    Recognition(RecognitionError),
+    FixedTables(FixedTablesError),
+    Block(EncodedAesError),
+    Cipher(CipherError),
+    NoPlausible,
+    Ambiguous,
+    Cancelled,
+}
+
+/// Tries every structurally valid fixed-table block with the recognized state
+/// and selects the unique one that turns `a_span` into a plausible A table.
+/// The A span MUST be the exact step-1 A ciphertext span.
+pub(crate) fn select_source(
+    a_span: &[u8],
+    a_records: u16,
+    b_len: u32,
+    image: &ExecutableView,
+    archive_selector: u8,
+    cancel: &AtomicBool,
+) -> Result<Selection, SelectionError> {
+    let recognized = Recognized::recognize(image, archive_selector, cancel)
+        .map_err(SelectionError::Recognition)?;
+    let candidates = recognize_candidates(image, cancel, Limits::default())
+        .map_err(SelectionError::FixedTables)?;
+    let descriptor = *recognized.descriptor();
+    let kind = descriptor.kind();
+    let cipher_descriptor = CipherDescriptor {
+        key_id: descriptor.key_id(),
+        kind,
+        parameter: *descriptor.parameter(),
+    };
+    let mut plausible = Vec::new();
+    for (index, tables) in candidates.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(SelectionError::Cancelled);
+        }
+        let source =
+            RecognizedSource::from_parts(recognized.clone(), tables.clone()).map_err(|error| {
+                match error {
+                    SourceError::Recognition(error) => SelectionError::Recognition(error),
+                    SourceError::FixedTables(error) => SelectionError::FixedTables(error),
+                    SourceError::Block(error) => SelectionError::Block(error),
+                }
+            })?;
+        let mut plain = a_span.to_vec();
+        let mut cipher = Cipher::new(&cipher_descriptor, |key_id| {
+            source.cbc_block_for(kind, key_id)
+        })
+        .map_err(SelectionError::Cipher)?;
+        let span = 0..plain.len();
+        cipher
+            .run(&mut plain, std::slice::from_ref(&span))
+            .map_err(SelectionError::Cipher)?;
+        if let Ok(summary) = validate_a_table(&plain, usize::from(a_records), b_len) {
+            plausible.push((index, source, summary));
+        }
+    }
+    match plausible.len() {
+        0 => Err(SelectionError::NoPlausible),
+        1 => {
+            let (selected, source, a_table) = plausible.pop().expect("one selection");
+            Ok(Selection {
+                source,
+                a_table,
+                candidates: candidates.len(),
+                selected,
+            })
+        }
+        _ => Err(SelectionError::Ambiguous),
     }
 }

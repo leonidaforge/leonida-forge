@@ -302,6 +302,7 @@ impl From<DescriptorError> for RecognitionError {
 /// metadata was decrypted or authenticated.
 ///
 /// [`RecognizedSource`]: crate::rpf::metadata::provider::RecognizedSource
+#[derive(Clone)]
 pub struct Recognized {
     registry: Registry,
     descriptor: StaticDescriptor,

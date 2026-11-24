@@ -116,6 +116,15 @@ fn probe_json_is_stable_without_a_static_pass() {
         value["probe"]["stages"]["a_table"]["status"],
         "not_attempted"
     );
+    assert_eq!(
+        value["probe"]["stages"]["signature"]["status"],
+        "not_attempted"
+    );
+    assert_eq!(
+        value["probe"]["stages"]["archive"]["status"],
+        "not_attempted"
+    );
+    assert_eq!(value["probe"]["trust"]["status"], "not_applicable");
 }
 
 #[test]
@@ -145,4 +154,5 @@ fn probe_reports_an_unsupported_executable() {
         value["probe"]["stages"]["registry"]["status"],
         "not_attempted"
     );
+    assert_eq!(value["probe"]["trust"]["status"], "not_attempted");
 }

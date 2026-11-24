@@ -29,7 +29,9 @@ mod payload;
 pub mod probe;
 pub mod provider;
 pub mod recognize;
+pub mod signature;
 pub mod transform;
+pub mod verify;
 
 /// Field keys whose meaning is established.
 pub mod keys {
@@ -602,46 +604,73 @@ impl Stored {
     /// bytes, in one buffer or two; `Stored` holds them in one. Other states
     /// are not modelled.
     pub fn transform(&self, source: &impl CipherSource) -> Result<Transformed, Error> {
-        if !self.processing().is_none() {
-            self.check_span_formulas()?;
-        }
-        let mut bytes = self.bytes.clone();
-        let mut key_lookup_skipped = false;
-        let mut cipher = |descriptor: &CipherDescriptor| {
-            key_lookup_skipped |= Algorithm::of(descriptor.kind)? == Algorithm::Identity;
-            Cipher::new(descriptor, |key_id| {
-                source.cbc_block_for(descriptor.kind, key_id)
-            })
-        };
-        if self.prefix.selector != 0 {
-            let index = self.prefix.selector >> 1;
-            let kind = source
-                .static_kind(index)
-                .ok_or(transform::Error::NoStaticDescriptor(index))?;
-            let (key_id, parameter) = source
-                .static_descriptor(index)
-                .ok_or(transform::Error::NoStaticDescriptor(index))?;
-            let descriptor = CipherDescriptor {
-                key_id,
-                kind,
-                parameter,
-            };
-            cipher(&descriptor)?.run(&mut bytes, &self.static_spans()?)?;
-        }
-        if let Some(descriptor) = self.archive_descriptor(&bytes)? {
-            cipher(&descriptor)?.run(&mut bytes, &[self.primary_span()?])?;
-            let secondary = to_usize(u64::from(self.prefix.primary_len))?
-                ..to_usize(u64::from(self.prefix.metadata_len))?;
-            if !secondary.is_empty() {
-                cipher(&descriptor)?.run(&mut bytes, &[secondary])?;
-            }
-        }
+        let (mut bytes, mut key_lookup_skipped) = self.decrypt_step1(source)?;
+        key_lookup_skipped |= self.decrypt_archive(&mut bytes, source)?.unwrap_or(false);
         Ok(Transformed {
             bytes,
             prefix: self.prefix,
             layout: self.layout.clone(),
             key_lookup_skipped,
         })
+    }
+
+    /// Runs step 1 on a copy of the stored bytes. The signature and steps 4
+    /// and 5 are not processed.
+    pub(crate) fn decrypt_step1(
+        &self,
+        source: &impl CipherSource,
+    ) -> Result<(Vec<u8>, bool), Error> {
+        if !self.processing().is_none() {
+            self.check_span_formulas()?;
+        }
+        let mut bytes = self.bytes.clone();
+        if self.prefix.selector == 0 {
+            return Ok((bytes, false));
+        }
+        let index = self.prefix.selector >> 1;
+        let kind = source
+            .static_kind(index)
+            .ok_or(transform::Error::NoStaticDescriptor(index))?;
+        let (key_id, parameter) = source
+            .static_descriptor(index)
+            .ok_or(transform::Error::NoStaticDescriptor(index))?;
+        let descriptor = CipherDescriptor {
+            key_id,
+            kind,
+            parameter,
+        };
+        let skipped = Algorithm::of(kind)? == Algorithm::Identity;
+        Cipher::new(&descriptor, |key_id| {
+            source.cbc_block_for(descriptor.kind, key_id)
+        })?
+        .run(&mut bytes, &self.static_spans()?)?;
+        Ok((bytes, skipped))
+    }
+
+    /// Runs steps 4 and 5 over post-step-1 bytes with the `B` sub-block 1
+    /// descriptor. Returns whether algorithm 0 was used.
+    pub(crate) fn decrypt_archive(
+        &self,
+        bytes: &mut [u8],
+        source: &impl CipherSource,
+    ) -> Result<Option<bool>, Error> {
+        let Some(descriptor) = self.archive_descriptor(bytes)? else {
+            return Ok(None);
+        };
+        let skipped = Algorithm::of(descriptor.kind)? == Algorithm::Identity;
+        Cipher::new(&descriptor, |key_id| {
+            source.cbc_block_for(descriptor.kind, key_id)
+        })?
+        .run(bytes, &[self.primary_span()?])?;
+        let secondary = to_usize(u64::from(self.prefix.primary_len))?
+            ..to_usize(u64::from(self.prefix.metadata_len))?;
+        if !secondary.is_empty() {
+            Cipher::new(&descriptor, |key_id| {
+                source.cbc_block_for(descriptor.kind, key_id)
+            })?
+            .run(bytes, &[secondary])?;
+        }
+        Ok(Some(skipped))
     }
 
     /// The parsed table, if the engine runs no processing pass over these

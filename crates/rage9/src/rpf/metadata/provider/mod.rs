@@ -30,3 +30,4 @@ pub use fixed::{
     FixedTables, FixedTablesError, ROUND_TABLE_LEN, STAGE_TABLE_LEN, recognize_fixed_tables,
 };
 pub use source::{RecognizedSource, SourceError};
+pub(crate) use source::{SelectionError, select_source};
