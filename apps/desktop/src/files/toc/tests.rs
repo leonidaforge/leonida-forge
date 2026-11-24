@@ -37,6 +37,7 @@ pub(crate) struct Spec {
     pub logical: Option<u64>,
     /// The chunk table value.
     pub chunks: Option<Vec<u8>>,
+    pub source: Option<u32>,
 }
 
 pub(crate) fn spec(payload: &[u8], type_id: u8) -> Spec {
@@ -50,12 +51,19 @@ pub(crate) fn spec(payload: &[u8], type_id: u8) -> Spec {
         bad_hash: false,
         logical: None,
         chunks: None,
+        source: None,
     }
 }
 
-/// An archive whose table of contents is stored unencrypted: columns name
-/// hash, name key, A location record and chunk table, then the payloads.
+/// An archive whose table of contents is stored unencrypted.
 pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
+    native_rpf_with(rows, &[])
+}
+
+/// [`native_rpf`] with `B` sub-block 3 listing `companions`, names and
+/// identifiers. Columns: name hash, name key, A location record, chunk table
+/// and read source, then the payloads.
+pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec<u8> {
     let n = rows.len();
     assert!(n < 0xFE);
     let chunk_width = rows
@@ -68,11 +76,16 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
         (keys::NAME_KEY, 8 * n, 4),
         (keys::LOCATION_A, 12 * n, 16),
         (keys::CHUNK_TABLE, 28 * n, chunk_width),
+        (keys::READ_SOURCE, (28 + chunk_width) * n, 4),
     ];
-    let cells = 0x60 + columns.len() * 24;
+    // One A record, for sub-block 2 or, with companions, sub-block 3.
+    let b = 0x50;
+    let b_len = (8 + companions.len() * 0x108).next_multiple_of(16);
+    let descriptors = b + b_len;
+    let cells = descriptors + columns.len() * 24;
     let pool = (cells + columns.len() * n).next_multiple_of(8);
     // The empty secondary area starts 8-aligned after the primary one.
-    let end = (pool + (28 + chunk_width) * n).next_multiple_of(8);
+    let end = (pool + (32 + chunk_width) * n).next_multiple_of(8);
     let payloads = end.next_multiple_of(16);
     let mut bytes = vec![0u8; payloads];
     let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
@@ -82,14 +95,23 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
     put(&mut bytes, 0x04, &(end as u32).to_le_bytes());
     put(&mut bytes, 0x08, &(end as u32).to_le_bytes());
     put(&mut bytes, 0x1A, &1u16.to_le_bytes());
-    put(&mut bytes, 0x1C, &0x10u32.to_le_bytes());
+    put(&mut bytes, 0x1C, &(b_len as u32).to_le_bytes());
     put(&mut bytes, 0x20, &(columns.len() as u16).to_le_bytes());
     put(&mut bytes, 0x24, &(n as u32).to_le_bytes());
     bytes[0x2C] = 1;
     bytes[0x2D] = 1;
-    put(&mut bytes, 0x40, &2u16.to_le_bytes());
+    let sub_block: u16 = if companions.is_empty() { 2 } else { 3 };
+    put(&mut bytes, 0x40, &sub_block.to_le_bytes());
+    if !companions.is_empty() {
+        put(&mut bytes, b, &(companions.len() as u32).to_le_bytes());
+        for (i, (name, identifier)) in companions.iter().enumerate() {
+            let record = b + 8 + i * 0x108;
+            put(&mut bytes, record, name);
+            put(&mut bytes, record + 0x100, &identifier.to_le_bytes());
+        }
+    }
     for (column, (key, offset, width)) in columns.into_iter().enumerate() {
-        let at = 0x60 + column * 24;
+        let at = descriptors + column * 24;
         put(&mut bytes, at, &key.to_le_bytes());
         put(&mut bytes, at + 0x0C, &(offset as u32).to_le_bytes());
         put(&mut bytes, at + 0x10, &(width as u16).to_le_bytes());
@@ -110,6 +132,7 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
                 cell(row.key.is_some()),
                 cell(row.location),
                 cell(row.chunks.is_some()),
+                cell(row.source.is_some()),
             ],
         );
         put(
@@ -140,6 +163,11 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
         if let Some(table) = &row.chunks {
             put(&mut bytes, pool + 28 * n + chunk_width * r, table);
         }
+        put(
+            &mut bytes,
+            pool + (28 + chunk_width) * n + 4 * r,
+            &row.source.unwrap_or(u32::MAX).to_le_bytes(),
+        );
         data.extend_from_slice(&row.payload);
         data.resize(data.len().next_multiple_of(16), 0);
     }
@@ -661,4 +689,188 @@ fn decoded_entries_read_and_hold_archives() {
     )
     .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+}
+
+const COMPANION_MAGIC: [u8; 8] = [0, 0, 0, 0x39, 0x56, 0x46, 0x50, 0x52];
+
+/// `archive` with a companion header: the payloads at the same offsets.
+fn companion_of(archive: &[u8], identifier: u64) -> Vec<u8> {
+    let mut bytes = archive.to_vec();
+    bytes[..8].copy_from_slice(&COMPANION_MAGIC);
+    bytes[8..16].copy_from_slice(&identifier.to_le_bytes());
+    bytes
+}
+
+/// Rows read through companions, with sub-block 3 listing `missing.dat`,
+/// `data.dat` and `bad.dat`. Returns the archive with zeros where the
+/// companion rows' payloads are, the archive with them, and the text.
+fn companion_archive() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let text: Vec<u8> = (0..30_000u32).map(|i| b'a' + (i / 5 % 26) as u8).collect();
+    let rows = [
+        Spec {
+            source: Some(1),
+            ..spec(&text, 0)
+        },
+        Spec {
+            source: Some(1),
+            mode: 1,
+            logical: Some(text.len() as u64),
+            ..spec(&deflate(&text), 0)
+        },
+        Spec {
+            source: Some(0),
+            ..spec(&text, 0)
+        },
+        Spec {
+            source: Some(2),
+            ..spec(&text, 0)
+        },
+        Spec {
+            source: Some(5),
+            ..spec(&text, 0)
+        },
+        spec(b"in the main file", 0),
+    ];
+    let companions: [(&[u8], u64); 3] = [(b"missing.dat", 1), (b"data.dat", 2), (b"bad.dat", 3)];
+    let full = native_rpf_with(&rows, &companions);
+    let mut main = full.clone();
+    // The main row's payload is last; everything before it is zeroed.
+    let last = full
+        .windows(16)
+        .rposition(|w| w == b"in the main file")
+        .unwrap();
+    let first = u32::from_le_bytes(full[4..8].try_into().unwrap()) as usize;
+    main[first.next_multiple_of(16)..last].fill(0);
+    (main, full, text)
+}
+
+#[test]
+fn companions_are_found_next_to_the_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, full, text) = companion_archive();
+    let path = temp.path().join("main.rpf");
+    fs::write(&path, &main).unwrap();
+    fs::write(temp.path().join("data.dat"), companion_of(&full, 2)).unwrap();
+    fs::write(temp.path().join("bad.dat"), companion_of(&full, 9)).unwrap();
+
+    let entries = files::list(&path).unwrap();
+    assert_eq!(
+        detail(&entries[0], "Read source"),
+        "Companion 1 (data.dat), available"
+    );
+    assert!(detail(&entries[2], "Read source").starts_with("Companion 0 (missing.dat), missing"));
+    assert!(detail(&entries[3], "Read source").starts_with("Companion 2 (bad.dat), invalid"));
+    assert!(detail(&entries[3], "Read source").contains("identifier"));
+    assert_eq!(
+        detail(&entries[4], "Read source"),
+        "Companion 5, not listed by the archive"
+    );
+    assert_eq!(detail(&entries[5], "Read source"), "Main");
+    assert_eq!(detail(&entries[0], "Contents"), "Readable as stored");
+    assert_eq!(
+        detail(&entries[1], "Contents"),
+        "Readable, decoded when read"
+    );
+    assert!(detail(&entries[2], "Contents").starts_with("Not readable"));
+    let note = files::describe(&path).unwrap();
+    assert!(
+        note.contains("3 companion files: 1 available, 1 missing, 1 invalid, 0 not supported"),
+        "{note}"
+    );
+
+    // Stored and raw DEFLATE rows come from the companion, at the same
+    // offsets as in the main file.
+    for n in [0, 1] {
+        assert_eq!(files::read(&entries[n].path).unwrap(), text, "row {n}");
+    }
+    let mut inspected = files::open_binary(&entries[0].path).unwrap();
+    assert_eq!(
+        lforge_binary::read_at(&mut inspected.source, 100, 10).unwrap(),
+        text[100..110]
+    );
+    assert_eq!(files::read(&entries[5].path).unwrap(), b"in the main file");
+    // Unavailable companions do not fall back to the main file.
+    for n in [2, 3, 4] {
+        let err = files::read(&entries[n].path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "row {n}");
+        assert!(err.to_string().contains("alternate source"), "{err}");
+    }
+}
+
+#[test]
+fn changed_companions_are_checked_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, full, text) = companion_archive();
+    let path = temp.path().join("main.rpf");
+    fs::write(&path, &main).unwrap();
+    let data = temp.path().join("data.dat");
+    fs::write(&data, companion_of(&full, 2)).unwrap();
+    let row = |n: u32| path.join(row_name(n));
+    assert_eq!(files::read(&row(0)).unwrap(), text);
+
+    // A wrong identifier makes the cached companion unusable.
+    let mut wrong = companion_of(&full, 7);
+    wrong.push(0);
+    fs::write(&data, &wrong).unwrap();
+    assert!(files::read(&row(0)).is_err());
+    let entries = files::list(&path).unwrap();
+    assert!(detail(&entries[0], "Read source").contains("invalid"));
+    // A companion that appears later is used.
+    fs::write(&data, companion_of(&full, 2)).unwrap();
+    fs::write(temp.path().join("missing.dat"), companion_of(&full, 1)).unwrap();
+    assert_eq!(files::read(&row(0)).unwrap(), text);
+    assert_eq!(files::read(&row(2)).unwrap(), text);
+    // A removed companion is noticed.
+    fs::remove_file(&data).unwrap();
+    assert!(files::read(&row(0)).is_err());
+}
+
+#[test]
+fn archives_in_archives_have_no_companion_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let (main, full, _) = companion_archive();
+    let outer = temp.path().join("outer.zip");
+    let data = companion_of(&full, 2);
+    fs::write(
+        &outer,
+        zip_bytes_with(
+            &[("main.rpf", &main), ("data.dat", &data)],
+            ::zip::CompressionMethod::Stored,
+        ),
+    )
+    .unwrap();
+    // A data.dat next to the outer file is not used either.
+    fs::write(temp.path().join("data.dat"), &data).unwrap();
+    let path = outer.join("main.rpf");
+    opened(&path);
+    let entries = files::list(&path).unwrap();
+    let source = detail(&entries[0], "Read source");
+    assert!(source.contains("not supported"), "{source}");
+    assert!(source.contains("stored in another archive"), "{source}");
+    let err = files::read(&entries[0].path).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(files::read(&entries[5].path).unwrap(), b"in the main file");
+    assert!(files::describe(&path).unwrap().contains("0 available"));
+}
+
+#[test]
+fn archives_in_companions_are_not_opened() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip = zip_bytes(&[("leaf.txt", b"leaf")]);
+    let full = native_rpf_with(
+        &[Spec {
+            source: Some(0),
+            ..spec(&zip, RPF_TYPE)
+        }],
+        &[(b"data.dat", 2)],
+    );
+    let path = temp.path().join("main.rpf");
+    fs::write(&path, &full).unwrap();
+    fs::write(temp.path().join("data.dat"), companion_of(&full, 2)).unwrap();
+    let row = path.join("Row 00000");
+    // The bytes can be read, but not browsed as an archive.
+    assert_eq!(files::read(&row).unwrap(), zip);
+    let err = archive::prepare(&row, &Progress::default(), &AtomicBool::new(false)).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("companion"), "{err}");
 }

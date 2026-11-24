@@ -438,6 +438,9 @@ fn decompress_limited(
             file_name(&path)
         )));
     }
+    if parent.format == Format::Rpf9 {
+        rpf::check_nested(parent, inner)?;
+    }
     if let Some(source) = stored_view(parent, inner, read_limit, cancel)? {
         return keep_identified(parent, inner, path, source, 0);
     }

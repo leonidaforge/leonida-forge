@@ -16,7 +16,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use lforge_binary::Source;
-use lforge_rage9::rpf::metadata::{ChunkTable, Entry as Row, Error, Stored};
+use lforge_rage9::rpf::metadata::{
+    ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
+};
 use lforge_rage9::rpf::names::{self, Candidate, Matches, MountPrefix, Types};
 
 use super::archive::{Archive, Stamp, check_size};
@@ -41,9 +43,99 @@ struct Names {
     problem: Option<String>,
 }
 
+/// The companion files of `B` sub-block 3, opened for an archive that is a
+/// file on disk.
+struct Companions {
+    records: Vec<Companion>,
+    statuses: Vec<CompanionStatus>,
+    /// The source of each record, `None` where it is not available.
+    alternates: Vec<Option<Source>>,
+    /// Of each companion file, to notice changes.
+    stamps: Vec<Option<Stamp>>,
+    /// Why sub-block 3 could not be read.
+    problem: Option<String>,
+}
+
+impl Companions {
+    fn read(archive: &Archive, metadata: &Metadata) -> Self {
+        let mut companions = Self {
+            records: Vec::new(),
+            statuses: Vec::new(),
+            alternates: Vec::new(),
+            stamps: Vec::new(),
+            problem: None,
+        };
+        let list = match metadata.companions() {
+            Ok(list) => list,
+            Err(err) => {
+                companions.problem = Some(err.to_string());
+                return companions;
+            }
+        };
+        let dir = companion_dir(archive);
+        companions.statuses = match &dir {
+            Some(_) => list.open(&archive.path),
+            None => {
+                let reason = "the archive is stored in another archive, so there is no                      directory to find companion files in";
+                vec![CompanionStatus::Unsupported(reason.into()); list.records.len()]
+            }
+        };
+        companions.records = list.records;
+        companions.alternates = companions
+            .statuses
+            .iter()
+            .map(|status| status.source().cloned())
+            .collect();
+        companions.stamps = companion_stamps(dir.as_deref(), &companions.records);
+        companions
+    }
+
+    fn text(&self, index: u32) -> String {
+        let Some(record) = self.records.get(index as usize) else {
+            return match &self.problem {
+                Some(problem) => format!("Companion {index}, not readable: {problem}"),
+                None => format!("Companion {index}, not listed by the archive"),
+            };
+        };
+        let name = String::from_utf8_lossy(&record.name);
+        match self.statuses.get(index as usize) {
+            Some(CompanionStatus::Available(_)) => format!("Companion {index} ({name}), available"),
+            Some(CompanionStatus::Missing(reason)) => {
+                format!("Companion {index} ({name}), missing: {reason}")
+            }
+            Some(CompanionStatus::Invalid(reason)) => {
+                format!("Companion {index} ({name}), invalid: {reason}")
+            }
+            Some(CompanionStatus::Unsupported(reason)) => {
+                format!("Companion {index} ({name}), not supported: {reason}")
+            }
+            None => format!("Companion {index} ({name}), not opened"),
+        }
+    }
+}
+
+/// The directory companion files are resolved in: that of the archive file
+/// on disk. An archive stored in another archive has none.
+fn companion_dir(archive: &Archive) -> Option<PathBuf> {
+    (archive.depth == 1)
+        .then(|| archive.path.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn companion_stamps(dir: Option<&Path>, records: &[Companion]) -> Vec<Option<Stamp>> {
+    records
+        .iter()
+        .map(|record| {
+            dir.and_then(|dir| record.path(dir))
+                .and_then(|path| stamp(&path))
+        })
+        .collect()
+}
+
 pub struct Native {
     rows: Vec<Row>,
     names: Option<Names>,
+    companions: Companions,
 }
 
 fn names_file(archive: &Archive) -> PathBuf {
@@ -176,13 +268,32 @@ impl Native {
         let metadata = stored.decode().map_err(unreadable)?;
         let rows: Vec<Row> = metadata.entries().collect();
         let names = Names::read(names_file(archive), &rows);
-        Ok(Self { rows, names })
+        let companions = Companions::read(archive, &metadata);
+        Ok(Self {
+            rows,
+            names,
+            companions,
+        })
     }
 
-    /// Whether the candidate file is unchanged since the table was read.
+    /// Whether the candidate file and the companion files are unchanged
+    /// since the table was read.
     pub fn is_current(&self, archive: &Archive) -> bool {
-        let now = stamp(&names_file(archive));
-        now == self.names.as_ref().map(|names| names.stamp)
+        let names = stamp(&names_file(archive));
+        let records = &self.companions.records;
+        names == self.names.as_ref().map(|names| names.stamp)
+            && companion_stamps(companion_dir(archive).as_deref(), records)
+                == self.companions.stamps
+    }
+
+    /// Whether the entry at `inner` is read through a companion file.
+    pub fn reads_companion(&self, inner: &Path) -> bool {
+        self.row(inner)
+            .is_some_and(|row| matches!(row.read_source, Ok(Some(_))))
+    }
+
+    fn alternates(&self) -> &[Option<Source>] {
+        &self.companions.alternates
     }
 
     fn row(&self, inner: &Path) -> Option<&Row> {
@@ -303,14 +414,14 @@ impl Native {
             "Read source",
             match &row.read_source {
                 Ok(None) => "Main".to_string(),
-                Ok(Some(index)) => format!("Alternate {index}, not available"),
+                Ok(Some(index)) => self.companions.text(*index),
                 Err(reason) => malformed(reason),
             },
         ));
         details.push((
             "Contents",
-            match row.payload(&archive.source, &[]) {
-                Ok(_) if row.raw_source(&archive.source, &[]).is_ok() => {
+            match row.payload(&archive.source, self.alternates()) {
+                Ok(_) if row.raw_source(&archive.source, self.alternates()).is_ok() => {
                     "Readable as stored".to_string()
                 }
                 Ok(_) => "Readable, decoded when read".to_string(),
@@ -339,7 +450,8 @@ impl Native {
 
     fn raw(&self, archive: &Archive, inner: &Path) -> io::Result<Source> {
         let row = self.row(inner).ok_or_else(not_found)?;
-        row.raw_source(&archive.source, &[]).map_err(to_io)
+        row.raw_source(&archive.source, self.alternates())
+            .map_err(to_io)
     }
 
     /// Writes the stored bytes of an entry stored as it is. Encoded entries
@@ -352,7 +464,9 @@ impl Native {
         limit: u64,
     ) -> io::Result<()> {
         let row = self.row(inner).ok_or_else(not_found)?;
-        let payload = row.payload(&archive.source, &[]).map_err(to_io)?;
+        let payload = row
+            .payload(&archive.source, self.alternates())
+            .map_err(to_io)?;
         check_size(payload.len(), limit)?;
         // A payload never yields more than its declared size.
         io::copy(&mut payload.take(limit), out)?;
@@ -431,6 +545,25 @@ impl Native {
                     names.candidates.len()
                 ));
             }
+        }
+        let companions = &self.companions;
+        if let Some(problem) = &companions.problem {
+            note.push_str(&format!(
+                " Its list of companion files could not be read: {problem}."
+            ));
+        } else if !companions.records.is_empty() {
+            let count = |kind: fn(&CompanionStatus) -> bool| {
+                companions.statuses.iter().filter(|s| kind(s)).count()
+            };
+            note.push_str(&format!(
+                " It lists {} companion files: {} available, {} missing, {} invalid, {} not \
+                 supported.",
+                companions.records.len(),
+                count(|s| matches!(s, CompanionStatus::Available(_))),
+                count(|s| matches!(s, CompanionStatus::Missing(_))),
+                count(|s| matches!(s, CompanionStatus::Invalid(_))),
+                count(|s| matches!(s, CompanionStatus::Unsupported(_))),
+            ));
         }
         Some(note)
     }

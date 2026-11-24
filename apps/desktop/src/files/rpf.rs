@@ -647,6 +647,19 @@ pub fn caveat(archive: &Archive, inner: &Path) -> Option<String> {
 
 /// The bytes of a file stored as it is, as a view of the archive's source.
 /// `None` for anything else, which [`copy`] decodes or reports.
+/// Refuses to open a file read through a companion file as a nested
+/// archive: what is kept of a nested archive is checked against the file on
+/// disk the chain starts at, which would not notice a changed companion.
+pub fn check_nested(archive: &Archive, inner: &Path) -> io::Result<()> {
+    match contents(archive)? {
+        Contents::Native(native) if native.reads_companion(inner) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "an archive read through a companion file is not opened: changes to the companion              would not be noticed",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn raw_source(archive: &Archive, inner: &Path) -> io::Result<Option<lforge_binary::Source>> {
     match contents(archive)? {
         Contents::Native(native) => Ok(native.raw_source(archive, inner)),
