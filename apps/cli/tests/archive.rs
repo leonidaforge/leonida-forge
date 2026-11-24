@@ -439,7 +439,8 @@ fn metadata_explains_why_entries_are_unavailable() {
     );
     let reason = report["entries"]["reason"].as_str().unwrap();
     assert!(reason.contains("processed before use"), "{reason}");
-    assert!(reason.contains("decryption is not implemented"), "{reason}");
+    assert!(reason.contains("it is encrypted"), "{reason}");
+    assert!(reason.contains("key is not available"), "{reason}");
     assert!(report["entries"].get("listed").is_none());
 
     // A header whose table layout is invalid is still reported.

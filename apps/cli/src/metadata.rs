@@ -258,39 +258,47 @@ fn entry_json(entry: &Entry, source: &Source, names: Option<(&Matches, &Naming)>
 }
 
 fn report(source: &Source, options: &Options, naming: Option<&Naming>) -> Value {
-    let stored = match Stored::read(&mut source.clone(), MAX_METADATA) {
-        Ok(stored) => stored,
-        Err(err) => {
-            return json!({
-                "format": "RPF9",
-                "state": "unreadable",
-                "entries": { "available": false, "reason": err.to_string() },
-            });
-        }
+    let unreadable = |err: Error| {
+        json!({
+            "format": "RPF9",
+            "state": "unreadable",
+            "entries": { "available": false, "reason": err.to_string() },
+        })
     };
-    let prefix = *stored.prefix();
-    let processing = stored.processing();
+    let mut source = source.clone();
+    // The header, and at most the A table, decide whether the whole metadata
+    // area is worth reading.
+    let probe = match Stored::probe(&mut source) {
+        Ok(probe) => probe,
+        Err(err) => return unreadable(err),
+    };
+    let prefix = probe.prefix;
     let mut report = json!({
         "format": "RPF9",
         "prefix": prefix_json(&prefix),
-        "regions": layout_json(stored.layout()),
-        "passes": passes_json(&prefix, processing),
+        "regions": layout_json(&probe.layout),
+        "passes": passes_json(&prefix, probe.processing),
         "transformed": false,
         "verified": false,
     });
-    let metadata = match stored.decode() {
+    if let Some(reason) = probe.unsupported() {
+        report["state"] = json!("stored");
+        report["entries"] = json!({
+            "available": false,
+            "reason": format!("{}; {reason}", Error::Transformed(probe.processing)),
+        });
+        return report;
+    }
+    let metadata = match Stored::read(&mut source, MAX_METADATA).and_then(Stored::decode) {
         Ok(metadata) => metadata,
         Err(err) => {
             report["state"] = json!("stored");
-            report["entries"] = json!({
-                "available": false,
-                "reason": format!("{err}; decryption is not implemented"),
-            });
+            report["entries"] = json!({ "available": false, "reason": err.to_string() });
             return report;
         }
     };
     report["state"] = json!("decoded");
-    report["entries"] = entries_json(&metadata, source, options, naming);
+    report["entries"] = entries_json(&metadata, &source, options, naming);
     report
 }
 
