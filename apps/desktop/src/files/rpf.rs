@@ -594,7 +594,7 @@ pub fn copy(
     match resolve(&index, inner).ok_or_else(not_found)? {
         Node::Entry(entry) => {
             check_size(entry.len, limit)?;
-            rpf::read_entry(source, &index, entry, limit, out)?;
+            rpf::read_entry(source, &index, entry, limit, out, cancel)?;
         }
         Node::Page(resource, position) => {
             let (page, streams) = index
@@ -602,11 +602,11 @@ pub fn copy(
                 .nth(position)
                 .ok_or_else(not_found)?;
             check_size(page.len, limit)?;
-            rpf::read_streams(source, &index, streams, limit, out)?;
+            rpf::read_streams(source, &index, streams, limit, out, cancel)?;
         }
         Node::Region(region) => {
             check_size(region.len, limit)?;
-            rpf::read_region(source, region, limit, out)?;
+            rpf::read_region(source, region, limit, out, cancel)?;
         }
         _ => return Err(io::Error::other("not a file")),
     }

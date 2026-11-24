@@ -72,7 +72,15 @@ fn scan_bytes(bytes: Vec<u8>) -> Index {
 
 fn read(bytes: &[u8], index: &Index, entry: &Entry) -> Vec<u8> {
     let mut out = Vec::new();
-    read_entry(Cursor::new(bytes), index, entry, u64::MAX, &mut out).unwrap();
+    read_entry(
+        Cursor::new(bytes),
+        index,
+        entry,
+        u64::MAX,
+        &mut out,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     out
 }
 
@@ -306,7 +314,15 @@ fn reconstructs_system_and_graphics_pages() {
     assert_eq!((page.segment, page.len), (Segment::Graphics, 0x7000));
     assert_eq!(page_label(&owner.layout, position), (Segment::Graphics, 2));
     let mut out = Vec::new();
-    read_streams(Cursor::new(&bytes), &index, streams, u64::MAX, &mut out).unwrap();
+    read_streams(
+        Cursor::new(&bytes),
+        &index,
+        streams,
+        u64::MAX,
+        &mut out,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(out, pages[2]);
     assert!(index.page_at(after[0]).is_none());
     assert!(index.page_at(offsets[0] + 16).is_none());
@@ -631,14 +647,23 @@ fn reads_check_limits_and_changes() {
     bytes.extend_from_slice(&[0x33; 48]);
     let index = scan_bytes(bytes.clone());
     let entry = &index.entries[0];
+    let ok = AtomicBool::new(false);
     let mut out = Vec::new();
-    let err = read_entry(Cursor::new(&bytes), &index, entry, 69_999, &mut out).unwrap_err();
+    let err = read_entry(Cursor::new(&bytes), &index, entry, 69_999, &mut out, &ok).unwrap_err();
     assert!(matches!(err, Error::TooLarge { len: 70_000, .. }));
 
     let mut changed = bytes.clone();
     let second = index.entry_streams(entry)[1].offset as usize;
     changed[second + 4] ^= 0xFF;
-    let err = read_entry(Cursor::new(&changed), &index, entry, u64::MAX, &mut out).unwrap_err();
+    let err = read_entry(
+        Cursor::new(&changed),
+        &index,
+        entry,
+        u64::MAX,
+        &mut out,
+        &ok,
+    )
+    .unwrap_err();
     assert!(matches!(err, Error::Changed(_)));
     let err = read_entry(
         Cursor::new(&bytes[..second]),
@@ -646,15 +671,35 @@ fn reads_check_limits_and_changes() {
         entry,
         u64::MAX,
         &mut Vec::new(),
+        &ok,
     )
     .unwrap_err();
     assert!(matches!(err, Error::Changed(_)));
 
+    // A set cancel flag stops a read before it writes a complete payload.
+    let cancelled = AtomicBool::new(true);
+    let mut out = Vec::new();
+    let err = read_entry(
+        Cursor::new(&bytes),
+        &index,
+        entry,
+        u64::MAX,
+        &mut out,
+        &cancelled,
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Cancelled));
+    assert!(out.len() < 70_000);
+
     let region = index.regions[0];
     let mut raw = Vec::new();
-    read_region(Cursor::new(&bytes), &region, u64::MAX, &mut raw).unwrap();
+    read_region(Cursor::new(&bytes), &region, u64::MAX, &mut raw, &ok).unwrap();
     assert_eq!(raw, &bytes[region.offset as usize..][..region.len as usize]);
-    assert!(read_region(Cursor::new(&bytes), &region, 1, &mut raw).is_err());
+    assert!(read_region(Cursor::new(&bytes), &region, 1, &mut raw, &ok).is_err());
+    let mut raw = Vec::new();
+    let err =
+        read_region(Cursor::new(&bytes), &region, u64::MAX, &mut raw, &cancelled).unwrap_err();
+    assert!(matches!(err, Error::Cancelled));
 }
 
 /// Zeros of any length with a few bytes set, for offsets past 4 GiB
@@ -729,7 +774,15 @@ fn handles_offsets_past_4_gib() {
     assert_eq!(entry.stream_count(), 2);
     assert_eq!(entry.status, Status::Complete);
     let mut out = Vec::new();
-    read_entry(source, &index, entry, u64::MAX, &mut out).unwrap();
+    read_entry(
+        source,
+        &index,
+        entry,
+        u64::MAX,
+        &mut out,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert!(out.ends_with(b"end of the file"));
 }
 
@@ -761,7 +814,15 @@ fn reconstructs_resources_past_4_gib() {
     let (owner, position, _, streams) = index.page_at(page_at).unwrap();
     assert_eq!((owner.offset, position), (base, 1));
     let mut out = Vec::new();
-    read_streams(source, &index, streams, u64::MAX, &mut out).unwrap();
+    read_streams(
+        source,
+        &index,
+        streams,
+        u64::MAX,
+        &mut out,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(out, graphics(0x3000, 11));
 }
 

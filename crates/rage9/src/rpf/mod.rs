@@ -22,7 +22,7 @@ mod scan;
 
 use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use crate::Status;
 use crate::resource::{Layout, Page, Segment};
@@ -499,13 +499,15 @@ impl Progress {
 }
 
 /// Inflates `streams`, for example those of one resource page, into `out`,
-/// checking each against the index.
+/// checking each against the index. Returns [`Error::Cancelled`] if `cancel`
+/// is set, checked between streams and as each produces output.
 pub fn read_streams<S: Read + Seek>(
     mut source: S,
     index: &Index,
     streams: &[Stream],
     limit: u64,
     out: &mut dyn Write,
+    cancel: &AtomicBool,
 ) -> Result<u64, Error> {
     let len: u64 = streams.iter().map(|s| u64::from(s.len)).sum();
     if len > limit {
@@ -515,12 +517,20 @@ pub fn read_streams<S: Read + Seek>(
     let mut window = scan::Window::new(source, index.archive_len);
     let mut scratch = vec![0; scan::SCRATCH_LEN];
     for stream in streams {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
         let inflated = scan::inflate(
             &mut window,
             stream.offset,
             stream.len.into(),
             &mut scratch,
-            &mut |bytes| out.write_all(bytes).map_err(Error::Io),
+            &mut |bytes| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                out.write_all(bytes).map_err(Error::Io)
+            },
         )?;
         if inflated != Some((stream.stored_len.into(), stream.len.into())) {
             return Err(Error::Changed(format!(
@@ -541,8 +551,16 @@ pub fn read_entry<S: Read + Seek>(
     entry: &Entry,
     limit: u64,
     out: &mut dyn Write,
+    cancel: &AtomicBool,
 ) -> Result<u64, Error> {
-    read_streams(source, index, index.entry_streams(entry), limit, out)
+    read_streams(
+        source,
+        index,
+        index.entry_streams(entry),
+        limit,
+        out,
+        cancel,
+    )
 }
 
 fn check_len(source: &mut impl Seek, index: &Index) -> Result<(), Error> {
@@ -556,12 +574,14 @@ fn check_len(source: &mut impl Seek, index: &Index) -> Result<(), Error> {
     Ok(())
 }
 
-/// Copies the raw bytes of a region into `out`.
+/// Copies the raw bytes of a region into `out`. Returns [`Error::Cancelled`]
+/// if `cancel` is set, checked as the bytes are copied.
 pub fn read_region<S: Read + Seek>(
     mut source: S,
     region: &Region,
     limit: u64,
     out: &mut dyn Write,
+    cancel: &AtomicBool,
 ) -> Result<u64, Error> {
     if region.len > limit {
         return Err(Error::TooLarge {
@@ -580,7 +600,20 @@ pub fn read_region<S: Read + Seek>(
         ));
     }
     source.seek(SeekFrom::Start(region.offset))?;
-    let copied = io::copy(&mut source.take(region.len), out)?;
+    let mut reader = source.take(region.len);
+    let mut buf = vec![0u8; scan::SCRATCH_LEN];
+    let mut copied = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buf[..read])?;
+        copied += read as u64;
+    }
     if copied != region.len {
         return Err(Error::Changed(
             "the archive is shorter than its index".into(),
