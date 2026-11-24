@@ -16,6 +16,7 @@
 
 mod cache;
 pub mod metadata;
+pub mod names;
 mod reconstruct;
 mod scan;
 

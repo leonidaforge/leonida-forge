@@ -7,7 +7,7 @@ use super::*;
 const KEY_X: u64 = 0x1111_2222_3333_4444;
 const KEY_Y: u64 = 0x5555_6666_7777_8888;
 
-struct Column {
+pub(crate) struct Column {
     key: u64,
     width: u16,
     pool: Vec<u8>,
@@ -15,7 +15,7 @@ struct Column {
 }
 
 impl Column {
-    fn new(key: u64, width: u16, elements: &[&[u8]], cells: &[Option<u32>]) -> Self {
+    pub(crate) fn new(key: u64, width: u16, elements: &[&[u8]], cells: &[Option<u32>]) -> Self {
         let mut pool = Vec::new();
         for element in elements {
             assert_eq!(element.len(), usize::from(width));
@@ -30,13 +30,13 @@ impl Column {
     }
 }
 
-struct Build {
-    a_ids: Vec<u16>,
-    b_len: u32,
-    flags: u8,
-    selector: u8,
-    cell_width: u8,
-    secondary: u16,
+pub(crate) struct Build {
+    pub(crate) a_ids: Vec<u16>,
+    pub(crate) b_len: u32,
+    pub(crate) flags: u8,
+    pub(crate) selector: u8,
+    pub(crate) cell_width: u8,
+    pub(crate) secondary: u16,
 }
 
 impl Default for Build {
@@ -124,12 +124,18 @@ impl Build {
         bytes
     }
 
-    fn metadata(&self, columns: &[Column]) -> Metadata {
+    pub(crate) fn metadata(&self, columns: &[Column]) -> Metadata {
         Metadata::from_decoded(self.build(columns)).unwrap()
     }
 }
 
-fn record_a(stored16: u32, offset16: u32, logical: u64, type_id: u8, mode: u8) -> Vec<u8> {
+pub(crate) fn record_a(
+    stored16: u32,
+    offset16: u32,
+    logical: u64,
+    type_id: u8,
+    mode: u8,
+) -> Vec<u8> {
     let mut value = Vec::new();
     value.extend_from_slice(&stored16.to_le_bytes());
     value.extend_from_slice(&offset16.to_le_bytes());
