@@ -33,6 +33,10 @@ pub(crate) struct Spec {
     pub location: bool,
     /// Points the name hash cell past its pool.
     pub bad_hash: bool,
+    /// Overrides the logical size, which is the payload's length otherwise.
+    pub logical: Option<u64>,
+    /// The chunk table value.
+    pub chunks: Option<Vec<u8>>,
 }
 
 pub(crate) fn spec(payload: &[u8], type_id: u8) -> Spec {
@@ -44,18 +48,31 @@ pub(crate) fn spec(payload: &[u8], type_id: u8) -> Spec {
         key: None,
         location: true,
         bad_hash: false,
+        logical: None,
+        chunks: None,
     }
 }
 
 /// An archive whose table of contents is stored unencrypted: columns name
-/// hash, name key and A location record, then the payloads.
+/// hash, name key, A location record and chunk table, then the payloads.
 pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
     let n = rows.len();
     assert!(n < 0xFE);
-    let cells = 0xA8;
-    let pool = (cells + 3 * n).next_multiple_of(8);
+    let chunk_width = rows
+        .iter()
+        .filter_map(|row| row.chunks.as_ref().map(Vec::len))
+        .max()
+        .unwrap_or(8);
+    let columns = [
+        (keys::NAME_HASH, 0, 8),
+        (keys::NAME_KEY, 8 * n, 4),
+        (keys::LOCATION_A, 12 * n, 16),
+        (keys::CHUNK_TABLE, 28 * n, chunk_width),
+    ];
+    let cells = 0x60 + columns.len() * 24;
+    let pool = (cells + columns.len() * n).next_multiple_of(8);
     // The empty secondary area starts 8-aligned after the primary one.
-    let end = (pool + 28 * n).next_multiple_of(8);
+    let end = (pool + (28 + chunk_width) * n).next_multiple_of(8);
     let payloads = end.next_multiple_of(16);
     let mut bytes = vec![0u8; payloads];
     let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
@@ -66,21 +83,16 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
     put(&mut bytes, 0x08, &(end as u32).to_le_bytes());
     put(&mut bytes, 0x1A, &1u16.to_le_bytes());
     put(&mut bytes, 0x1C, &0x10u32.to_le_bytes());
-    put(&mut bytes, 0x20, &3u16.to_le_bytes());
+    put(&mut bytes, 0x20, &(columns.len() as u16).to_le_bytes());
     put(&mut bytes, 0x24, &(n as u32).to_le_bytes());
     bytes[0x2C] = 1;
     bytes[0x2D] = 1;
     put(&mut bytes, 0x40, &2u16.to_le_bytes());
-    let columns = [
-        (keys::NAME_HASH, 0, 8u16),
-        (keys::NAME_KEY, 8 * n, 4),
-        (keys::LOCATION_A, 12 * n, 16),
-    ];
     for (column, (key, offset, width)) in columns.into_iter().enumerate() {
         let at = 0x60 + column * 24;
         put(&mut bytes, at, &key.to_le_bytes());
         put(&mut bytes, at + 0x0C, &(offset as u32).to_le_bytes());
-        put(&mut bytes, at + 0x10, &width.to_le_bytes());
+        put(&mut bytes, at + 0x10, &(width as u16).to_le_bytes());
     }
     let mut data = Vec::new();
     for (r, row) in rows.iter().enumerate() {
@@ -92,8 +104,13 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
         };
         put(
             &mut bytes,
-            cells + r * 3,
-            &[hash_cell, cell(row.key.is_some()), cell(row.location)],
+            cells + r * columns.len(),
+            &[
+                hash_cell,
+                cell(row.key.is_some()),
+                cell(row.location),
+                cell(row.chunks.is_some()),
+            ],
         );
         put(
             &mut bytes,
@@ -106,8 +123,8 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
             &row.key.unwrap_or(0).to_le_bytes(),
         );
         let offset = payloads + data.len();
-        let packed =
-            row.payload.len() as u64 | (u64::from(row.type_id) << 48) | (u64::from(row.mode) << 56);
+        let logical = row.logical.unwrap_or(row.payload.len() as u64);
+        let packed = logical | (u64::from(row.type_id) << 48) | (u64::from(row.mode) << 56);
         let record = pool + 12 * n + 16 * r;
         put(
             &mut bytes,
@@ -120,11 +137,35 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
             &((offset / 16) as u32).to_le_bytes(),
         );
         put(&mut bytes, record + 8, &packed.to_le_bytes());
+        if let Some(table) = &row.chunks {
+            put(&mut bytes, pool + 28 * n + chunk_width * r, table);
+        }
         data.extend_from_slice(&row.payload);
         data.resize(data.len().next_multiple_of(16), 0);
     }
     bytes.extend_from_slice(&data);
     bytes
+}
+
+/// A chunk table value in encoding 4 and its stored chunks: one zlib stream
+/// per element of `chunks`, padded with nonzero bytes.
+pub(crate) fn zlib_chunks(chunks: &[&[u8]]) -> (Vec<u8>, Vec<u8>, u64) {
+    let mut stored = Vec::new();
+    let mut table = vec![8, 0, 0, 0];
+    table.extend_from_slice(&(chunks.len() as u16).to_le_bytes());
+    table.extend_from_slice(&[0, 4]);
+    let mut logical = 0;
+    for data in chunks {
+        let compressed = zlib(data);
+        let stored_len = compressed.len().next_multiple_of(16);
+        let padding = (stored_len - compressed.len()) as u64;
+        stored.extend_from_slice(&compressed);
+        stored.resize(stored.len() + padding as usize, 0xA5);
+        let entry = data.len() as u64 | ((stored_len / 16) as u64) << 28 | padding << 52 | 3 << 56;
+        table.extend_from_slice(&entry.to_le_bytes());
+        logical += data.len() as u64;
+    }
+    (stored, table, logical)
 }
 
 fn names_of(entries: &[Entry]) -> Vec<&str> {
@@ -176,9 +217,9 @@ fn lists_entries_from_the_table_of_contents() {
                 ..spec(&raw, 5)
             },
             Spec {
-                mode: 1,
+                mode: 2,
                 hash: Some(hash64(b"packed")),
-                ..spec(&zlib(b"compressed"), RPF_TYPE)
+                ..spec(b"stored with mode 2", RPF_TYPE)
             },
             Spec {
                 location: false,
@@ -217,9 +258,9 @@ fn lists_entries_from_the_table_of_contents() {
     );
     assert_eq!(detail(&entries[1], "Compression"), "None");
     assert_eq!(detail(&entries[1], "Read source"), "Main");
-    assert_eq!(detail(&entries[1], "Raw bytes"), "Available");
-    assert_eq!(detail(&entries[2], "Compression"), "Mode 1, not supported");
-    assert!(detail(&entries[2], "Raw bytes").starts_with("Not available"));
+    assert_eq!(detail(&entries[1], "Contents"), "Readable as stored");
+    assert_eq!(detail(&entries[2], "Compression"), "Mode 2, not supported");
+    assert!(detail(&entries[2], "Contents").starts_with("Not readable"));
     assert_eq!(detail(&entries[3], "Location record"), "Missing");
     assert_eq!(entries[3].type_name, "RPF9 entry, unreadable");
     assert!(detail(&entries[4], "Name hash").starts_with("Malformed"));
@@ -227,7 +268,7 @@ fn lists_entries_from_the_table_of_contents() {
         detail(&entries[4], "Names"),
         "Unknown: the row is malformed"
     );
-    assert_eq!(detail(&entries[4], "Raw bytes"), "Available");
+    assert_eq!(detail(&entries[4], "Contents"), "Readable as stored");
 
     let note = files::describe(&path).unwrap();
     assert!(note.contains("table of contents"), "{note}");
@@ -243,10 +284,10 @@ fn lists_entries_from_the_table_of_contents() {
         raw
     );
     assert_eq!(files::read(&entries[4].path).unwrap(), [4; 16]);
-    // Encoded and unreadable entries are refused with the reason.
+    // Unsupported and unreadable entries are refused with the reason.
     let err = files::read(&entries[2].path).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("compressed"), "{err}");
+    assert!(err.to_string().contains("mode 2"), "{err}");
     assert!(files::open_binary(&entries[2].path).is_err());
     let err = files::read(&entries[3].path).unwrap_err();
     assert!(err.to_string().contains("no location record"), "{err}");
@@ -371,7 +412,7 @@ fn raw_entries_open_as_nested_archives() {
             spec(&inner_native, RPF_TYPE),
             spec(&encrypted, RPF_TYPE),
             Spec {
-                mode: 1,
+                mode: 2,
                 ..spec(&zip, RPF_TYPE)
             },
         ]),
@@ -401,10 +442,10 @@ fn raw_entries_open_as_nested_archives() {
     let listed = files::list(&path).unwrap();
     assert_eq!(listed[0].kind, EntryKind::Archive);
     assert_eq!(listed[1].kind, EntryKind::Archive);
-    // A compressed entry is not opened as raw bytes.
+    // An entry with an unsupported mode is not opened.
     let err = archive::prepare(&row(3), &Progress::default(), &AtomicBool::new(false)).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("compressed"), "{err}");
+    assert!(err.to_string().contains("mode 2"), "{err}");
     assert!(prepare_required(&files::list(&row(3)).unwrap_err()).is_some());
 }
 
@@ -501,4 +542,123 @@ fn passes_other_than_decryption_are_named_as_such() {
         assert!(!note.contains("encrypted"), "{note}");
     }
     assert_eq!(full_reads(), before);
+}
+
+fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    io::Write::write_all(&mut encoder, data).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn decoded_entries_read_and_hold_archives() {
+    let temp = tempfile::tempdir().unwrap();
+    let text: Vec<u8> = (0..100_000u32).map(|i| b'a' + (i / 9 % 26) as u8).collect();
+    let zip = zip_bytes(&[("leaf.txt", b"leaf")]);
+    let inner_native = native_rpf(&[spec(b"deep leaf", 3)]);
+    let (zip_chunks, zip_table, zip_len) = zlib_chunks(&[&zip[..20], &zip[20..]]);
+    let (rpf_chunks, rpf_table, rpf_len) = zlib_chunks(&[&inner_native]);
+    let (text_chunks, text_table, text_len) = zlib_chunks(&[&text[..60_000], &text[60_000..]]);
+    let mut bad_chunks = text_chunks.clone();
+    // The Adler-32 trailer of the second zlib stream.
+    let second_end = zlib(&text[..60_000]).len().next_multiple_of(16) + zlib(&text[60_000..]).len();
+    bad_chunks[second_end - 1] ^= 1;
+    let path = temp.path().join("decoded.rpf");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                mode: 1,
+                logical: Some(text.len() as u64),
+                ..spec(&deflate(&text), 0)
+            },
+            Spec {
+                chunks: Some(text_table.clone()),
+                logical: Some(text_len),
+                ..spec(&text_chunks, 0)
+            },
+            Spec {
+                chunks: Some(zip_table),
+                logical: Some(zip_len),
+                ..spec(&zip_chunks, RPF_TYPE)
+            },
+            Spec {
+                mode: 1,
+                logical: Some(inner_native.len() as u64),
+                ..spec(&deflate(&inner_native), RPF_TYPE)
+            },
+            Spec {
+                chunks: Some(rpf_table),
+                logical: Some(rpf_len),
+                ..spec(&rpf_chunks, RPF_TYPE)
+            },
+            Spec {
+                chunks: Some(text_table),
+                logical: Some(text_len),
+                ..spec(&bad_chunks, 0)
+            },
+        ]),
+    )
+    .unwrap();
+
+    let entries = files::list(&path).unwrap();
+    assert_eq!(detail(&entries[0], "Compression"), "Raw DEFLATE");
+    assert_eq!(
+        detail(&entries[0], "Contents"),
+        "Readable, decoded when read"
+    );
+    assert!(detail(&entries[1], "Compression").starts_with("In chunks"));
+    assert_eq!(
+        detail(&entries[1], "Chunks"),
+        "2 in encoding 4: 2 zlib, 0 copied"
+    );
+    // Read in full, and in the Binary Inspector.
+    for n in [0, 1] {
+        assert_eq!(entries[n].size, Some(text.len() as u64));
+        assert_eq!(files::read(&entries[n].path).unwrap(), text);
+        let mut inspected = files::open_binary(&entries[n].path).unwrap();
+        assert_eq!(
+            lforge_binary::read_at(&mut inspected.source, 59_990, 20).unwrap(),
+            text[59_990..60_010]
+        );
+    }
+    // Archives in decoded entries are recognised by content and decompressed
+    // within the chain's budget.
+    let row = |n: u32| path.join(row_name(n));
+    let nested = opened(&row(2));
+    assert_eq!(nested.format, archive::Format::Zip);
+    assert_eq!(nested.decompressed, zip.len() as u64);
+    assert_eq!(files::read(&row(2).join("leaf.txt")).unwrap(), b"leaf");
+    for n in [3, 4] {
+        let nested = opened(&row(n));
+        assert_eq!(nested.format, archive::Format::Rpf9);
+        assert_eq!(nested.decompressed, inner_native.len() as u64);
+        assert_eq!(
+            files::read(&row(n).join("Row 00000")).unwrap(),
+            b"deep leaf"
+        );
+    }
+    // A damaged chunk is reported, not returned.
+    let err = files::read(&entries[5].path).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(files::open_binary(&entries[5].path).is_err());
+    // Decompressing a nested archive can be cancelled.
+    let cancelled = temp.path().join("cancelled.rpf");
+    fs::write(
+        &cancelled,
+        native_rpf(&[Spec {
+            mode: 1,
+            logical: Some(inner_native.len() as u64),
+            ..spec(&deflate(&inner_native), RPF_TYPE)
+        }]),
+    )
+    .unwrap();
+    let err = archive::prepare(
+        &cancelled.join("Row 00000"),
+        &Progress::default(),
+        &AtomicBool::new(true),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Interrupted);
 }

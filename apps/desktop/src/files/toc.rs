@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use lforge_binary::Source;
-use lforge_rage9::rpf::metadata::{Entry as Row, Error, Stored};
+use lforge_rage9::rpf::metadata::{ChunkTable, Entry as Row, Error, Stored};
 use lforge_rage9::rpf::names::{self, Candidate, Matches, MountPrefix, Types};
 
 use super::archive::{Archive, Stamp, check_size};
@@ -111,11 +111,22 @@ impl Names {
 fn to_io(err: Error) -> io::Error {
     match err {
         Error::Io(err) => err,
-        err @ (Error::Encoded { .. } | Error::ReadSource { .. }) => {
+        err @ (Error::Encoded { .. } | Error::ReadSource { .. } | Error::Undecodable { .. }) => {
             io::Error::new(io::ErrorKind::Unsupported, err.to_string())
         }
         err => io::Error::new(io::ErrorKind::InvalidData, err.to_string()),
     }
+}
+
+/// How many chunks, and how they are stored.
+fn chunk_text(table: &ChunkTable) -> String {
+    let zlib = table.chunks.iter().filter(|c| c.is_compressed()).count();
+    let copied = table.chunks.len() - zlib;
+    format!(
+        "{} in encoding {}: {zlib} zlib, {copied} copied",
+        table.chunks.len(),
+        table.encoding
+    )
 }
 
 /// `Row 00042`. Tables have at most 65535 rows.
@@ -265,9 +276,13 @@ impl Native {
                 ("Stored size", size_text(l.stored_len)),
                 (
                     "Compression",
-                    match l.mode {
-                        0 => "None".to_string(),
-                        mode => format!("Mode {mode}, not supported"),
+                    match (&row.chunks, l.mode) {
+                        (Ok(Some(_)), mode) => {
+                            format!("In chunks (mode {mode} is not used with a chunk table)")
+                        }
+                        (_, 0) => "None".to_string(),
+                        (_, 1) => "Raw DEFLATE".to_string(),
+                        (_, mode) => format!("Mode {mode}, not supported"),
                     },
                 ),
             ]),
@@ -275,14 +290,7 @@ impl Native {
             Err(reason) => details.push(("Location record", malformed(reason))),
         }
         match &row.chunks {
-            Ok(Some(chunks)) => details.push((
-                "Chunks",
-                format!(
-                    "{} in encoding {}, not supported",
-                    chunks.chunks.len(),
-                    chunks.encoding
-                ),
-            )),
+            Ok(Some(chunks)) => details.push(("Chunks", chunk_text(chunks))),
             Ok(None) => {}
             Err(reason) => details.push(("Chunks", malformed(reason))),
         }
@@ -300,10 +308,13 @@ impl Native {
             },
         ));
         details.push((
-            "Raw bytes",
-            match row.raw_source(&archive.source, &[]) {
-                Ok(_) => "Available".to_string(),
-                Err(err) => format!("Not available: {err}"),
+            "Contents",
+            match row.payload(&archive.source, &[]) {
+                Ok(_) if row.raw_source(&archive.source, &[]).is_ok() => {
+                    "Readable as stored".to_string()
+                }
+                Ok(_) => "Readable, decoded when read".to_string(),
+                Err(err) => format!("Not readable: {err}"),
             },
         ));
         details.push(("Source", ROW_NOTE.to_string()));
@@ -340,9 +351,11 @@ impl Native {
         out: &mut dyn Write,
         limit: u64,
     ) -> io::Result<()> {
-        let source = self.raw(archive, inner)?;
-        check_size(source.len(), limit)?;
-        io::copy(&mut source.take(limit), out)?;
+        let row = self.row(inner).ok_or_else(not_found)?;
+        let payload = row.payload(&archive.source, &[]).map_err(to_io)?;
+        check_size(payload.len(), limit)?;
+        // A payload never yields more than its declared size.
+        io::copy(&mut payload.take(limit), out)?;
         Ok(())
     }
 
