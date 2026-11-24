@@ -279,3 +279,225 @@ fn reports_reconstructed_resources() {
             .contains("no resource")
     );
 }
+
+/// Decoded metadata with two rows, then their payloads: row 0 raw, named
+/// `item`, row 1 compressed, named `packed`. `selector` is `hdr[0x2E]`.
+fn decoded_rpf(path: &Path, selector: u8) {
+    use lforge_rage9::rpf::metadata::keys;
+    use lforge_rage9::rpf::names::hash64;
+
+    let mut bytes = vec![0u8; 0xC8];
+    let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
+        bytes[at..at + value.len()].copy_from_slice(value);
+    };
+    put(&mut bytes, 0, b"9FPR");
+    put(&mut bytes, 0x04, &0xC8u32.to_le_bytes());
+    put(&mut bytes, 0x08, &0xC8u32.to_le_bytes());
+    put(&mut bytes, 0x1A, &1u16.to_le_bytes());
+    put(&mut bytes, 0x1C, &0x10u32.to_le_bytes());
+    put(&mut bytes, 0x20, &2u16.to_le_bytes());
+    put(&mut bytes, 0x24, &2u32.to_le_bytes());
+    bytes[0x2C] = 1;
+    bytes[0x2D] = 1;
+    bytes[0x2E] = selector;
+    // One A record for sub-block 2, then the descriptors at 0x60.
+    put(&mut bytes, 0x40, &2u16.to_le_bytes());
+    for (column, (key, pool_offset, width)) in
+        [(keys::NAME_HASH, 0u32, 8u16), (keys::LOCATION_A, 16, 16)]
+            .into_iter()
+            .enumerate()
+    {
+        let at = 0x60 + column * 24;
+        put(&mut bytes, at, &key.to_le_bytes());
+        put(&mut bytes, at + 0x0C, &pool_offset.to_le_bytes());
+        put(&mut bytes, at + 0x10, &width.to_le_bytes());
+    }
+    // Cells at 0x90, row-major; each row uses its own value.
+    put(&mut bytes, 0x90, &[0, 0, 1, 1]);
+    put(&mut bytes, 0x98, &hash64(b"item").to_le_bytes());
+    put(&mut bytes, 0xA0, &hash64(b"packed").to_le_bytes());
+    for (row, (offset16, mode)) in [(0x10u32, 0u64), (0x11, 1)].into_iter().enumerate() {
+        let at = 0xA8 + row * 16;
+        put(&mut bytes, at, &1u32.to_le_bytes());
+        put(&mut bytes, at + 4, &offset16.to_le_bytes());
+        put(&mut bytes, at + 8, &(16 | (mode << 56)).to_le_bytes());
+    }
+    bytes.resize(0x100, 0);
+    bytes.extend_from_slice(&[0x11; 16]);
+    bytes.extend_from_slice(&[0x22; 16]);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn metadata_lists_decoded_entries_with_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("decoded.rpf");
+    decoded_rpf(&archive, 0);
+    let candidates = temp.path().join("names.txt");
+    std::fs::write(
+        &candidates,
+        "dev:/x/item.rpf\r\ndev:/x/ITEM.rpf\n\ndev:/x/missing.rpf\ndev:/x/model.ydr\n",
+    )
+    .unwrap();
+    let archive = archive.to_str().unwrap();
+    let candidates = candidates.to_str().unwrap();
+    let args = [
+        "archive",
+        "metadata",
+        archive,
+        "--entries",
+        "--candidates",
+        candidates,
+        "--archive-path",
+        "dev:/x/sample.rpf",
+    ];
+
+    let report = json(&lforge(&[&args[..], &["--json"]].concat(), temp.path()));
+    assert_eq!(report["state"], "decoded");
+    assert_eq!(report["transformed"], false);
+    assert_eq!(report["verified"], false);
+    assert_eq!(report["prefix"]["rows"], 2);
+    assert_eq!(report["regions"]["descriptors"]["start"], 0x60);
+    assert_eq!(report["passes"]["static_pass"], Value::Null);
+    let entries = &report["entries"];
+    assert_eq!(entries["rows"], 2);
+    assert_eq!(entries["names"]["candidates"], 4);
+    assert_eq!(entries["names"]["unresolved_candidates"], 1);
+    assert_eq!(entries["names"]["named_rows"], 1);
+    let listed = entries["listed"].as_array().unwrap();
+    assert_eq!(listed[0]["layout"], "A");
+    assert_eq!(listed[0]["payload_offset"], 0x100);
+    assert_eq!(listed[0]["read_source"], "main");
+    assert_eq!(listed[0]["raw"]["available"], true);
+    assert_eq!(
+        listed[0]["names"],
+        serde_json::json!(["dev:/x/item.rpf", "dev:/x/ITEM.rpf"])
+    );
+    assert_eq!(listed[0]["ambiguous"], false);
+    assert_eq!(listed[1]["mode"], 1);
+    assert_eq!(listed[1]["raw"]["reason"], "stored compressed");
+    assert_eq!(listed[1]["names"], serde_json::json!([]));
+    assert_eq!(listed[1]["name_key"], Value::Null);
+
+    let text = lforge(&args, temp.path());
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(stdout.contains("state:       decoded"), "{stdout}");
+    assert!(
+        stdout.contains("dev:/x/item.rpf, dev:/x/ITEM.rpf"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("stored compressed"), "{stdout}");
+
+    let limited = json(&lforge(
+        &[
+            "archive",
+            "metadata",
+            archive,
+            "--entries",
+            "--limit",
+            "1",
+            "--json",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(limited["entries"]["listed"].as_array().unwrap().len(), 1);
+    assert_eq!(limited["entries"]["names"], Value::Null);
+    let text = lforge(
+        &["archive", "metadata", archive, "--entries", "--limit", "1"],
+        temp.path(),
+    );
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("1 more rows")
+    );
+}
+
+#[test]
+fn metadata_explains_why_entries_are_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let processed = temp.path().join("processed.rpf");
+    decoded_rpf(&processed, 9);
+    let report = json(&lforge(
+        &[
+            "archive",
+            "metadata",
+            processed.to_str().unwrap(),
+            "--entries",
+            "--json",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(report["state"], "stored");
+    assert_eq!(report["passes"]["static_pass"]["cipher_type"], 16);
+    assert_eq!(report["passes"]["static_pass"]["algorithm"], "0x10 (CBC)");
+    assert!(
+        report["passes"]["archive_pass"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown")
+    );
+    let reason = report["entries"]["reason"].as_str().unwrap();
+    assert!(reason.contains("processed before use"), "{reason}");
+    assert!(reason.contains("decryption is not implemented"), "{reason}");
+    assert!(report["entries"].get("listed").is_none());
+
+    // A header whose table layout is invalid is still reported.
+    let path = sample(temp.path());
+    let report = json(&lforge(
+        &["archive", "metadata", path.to_str().unwrap(), "--json"],
+        temp.path(),
+    ));
+    assert_eq!(report["state"], "unreadable");
+    assert!(
+        report["entries"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("primary area")
+    );
+}
+
+#[test]
+fn metadata_rejects_invalid_arguments() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("decoded.rpf");
+    decoded_rpf(&archive, 0);
+    let candidates = temp.path().join("names.txt");
+    std::fs::write(&candidates, "x\n").unwrap();
+    let archive = archive.to_str().unwrap();
+    let candidates = candidates.to_str().unwrap();
+    for (args, message) in [
+        (
+            vec![
+                "--candidates",
+                candidates,
+                "--mount-prefix",
+                "no/separator/end",
+            ],
+            "not a mount prefix",
+        ),
+        (vec!["--candidates", "missing.txt"], "cannot read"),
+    ] {
+        let output = lforge(
+            &[&["archive", "metadata", archive][..], &args].concat(),
+            temp.path(),
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(message), "{stderr}");
+    }
+    for args in [
+        vec!["--mount-prefix", "a/"],
+        vec!["--candidates", candidates, "--extension", "ydr"],
+        vec!["--candidates", candidates, "--extension", "ydr=300"],
+        vec!["--candidates", candidates, "--extension", "ydr=7:other"],
+    ] {
+        let output = lforge(
+            &[&["archive", "metadata", archive][..], &args].concat(),
+            temp.path(),
+        );
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    let output = lforge(&["archive", "metadata", "missing.rpf"], temp.path());
+    assert_eq!(output.status.code(), Some(1));
+}

@@ -12,6 +12,8 @@ use lforge_rage9::resource::Segment;
 use lforge_rage9::rpf::{self, Index, Origin, Progress, Resource};
 use serde_json::{Value, json};
 
+use crate::metadata;
+
 /// How the contents of an RPF9 archive are obtained, for users who expect a
 /// file listing.
 const RECOVERY_NOTE: &str = "The table of contents is encrypted and is not read. Entries are zlib \
@@ -57,6 +59,33 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show the table of contents as stored and, where it is readable
+    /// without decryption, its entries
+    Metadata {
+        file: PathBuf,
+        /// List the entries
+        #[arg(long)]
+        entries: bool,
+        /// List at most this many entries
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// A file with one candidate path per line, matched by name hash
+        #[arg(long)]
+        candidates: Option<PathBuf>,
+        /// The archive's own path, whose directory is the mount prefix
+        #[arg(long, conflicts_with = "mount_prefix", requires = "candidates")]
+        archive_path: Option<String>,
+        /// The prefix the archive is mounted at, ending in a slash or backslash
+        #[arg(long, requires = "candidates")]
+        mount_prefix: Option<String>,
+        /// Map an extension to a type ID and class: EXT=TYPE[:hash64|key32].
+        /// Only rpf=0:hash64 is built in
+        #[arg(long = "extension", value_parser = metadata::parse_extension, requires = "candidates")]
+        extensions: Vec<metadata::Extension>,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(command: Command) -> Result<(), String> {
@@ -77,6 +106,27 @@ pub fn run(command: Command) -> Result<(), String> {
             no_cache,
             json,
         } => resource(&file, id, no_cache, json),
+        Command::Metadata {
+            file,
+            entries,
+            limit,
+            candidates,
+            archive_path,
+            mount_prefix,
+            extensions,
+            json,
+        } => metadata::run(
+            &file,
+            &metadata::Options {
+                entries,
+                limit,
+                candidates,
+                archive_path,
+                mount_prefix,
+                extensions,
+                json,
+            },
+        ),
     }
 }
 
