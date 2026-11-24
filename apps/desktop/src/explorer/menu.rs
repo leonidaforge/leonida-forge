@@ -122,6 +122,7 @@ impl Explorer {
                     .selected_entry()
                     .filter(|entry| entry.is_inspectable())
                     .map(|entry| entry.path.clone());
+                let exporting = self.exporting();
                 let exportable = self
                     .selected_entry()
                     .filter(|entry| entry.kind == EntryKind::File)
@@ -173,17 +174,18 @@ impl Explorer {
                             "save-selection-as",
                             "Save Selection As…",
                             false,
-                            exportable.is_some(),
+                            exportable.is_some() && !exporting,
                             None,
                         )
-                        .when_some(exportable, |el, entry| {
-                            el.on_click(
-                                self.menu_action(
+                        .when_some(
+                            exportable.filter(|_| !exporting),
+                            |el, entry| {
+                                el.on_click(self.menu_action(
                                     move |this, _, cx| this.start_export(&entry, cx),
                                     cx,
-                                ),
-                            )
-                        }),
+                                ))
+                            },
+                        ),
                     )
                     .child(ui::menu_separator())
                     .child(
@@ -289,6 +291,7 @@ impl Explorer {
             Menu::Entry { entry, .. } => {
                 let open = entry.clone();
                 let path = entry.path.clone();
+                let exporting = self.exporting();
                 let exportable = (entry.kind == EntryKind::File).then(|| entry.clone());
                 panel
                     .child(
@@ -311,12 +314,13 @@ impl Explorer {
                     )
                     .when_some(exportable, |panel, entry| {
                         panel.child(
-                            ui::menu_item("save-entry-as", "Save As…", false, true, None).on_click(
-                                self.menu_action(
-                                    move |this, _, cx| this.start_export(&entry, cx),
-                                    cx,
-                                ),
-                            ),
+                            ui::menu_item("save-entry-as", "Save As…", false, !exporting, None)
+                                .when(!exporting, |el| {
+                                    el.on_click(self.menu_action(
+                                        move |this, _, cx| this.start_export(&entry, cx),
+                                        cx,
+                                    ))
+                                }),
                         )
                     })
             }

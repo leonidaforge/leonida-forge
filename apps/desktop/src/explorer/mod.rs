@@ -808,10 +808,18 @@ impl Explorer {
         }
     }
 
+    /// Whether an export is running. Only one runs at a time, so the Save As
+    /// actions are disabled while one is in progress (see [`can_start_export`]).
+    fn exporting(&self) -> bool {
+        !can_start_export(self.export.as_ref().map(|export| &export.state))
+    }
+
     /// Asks where to save `entry`, then exports it in the background. Only
     /// regular files are exportable; directories and archives open as folders.
+    /// Refuses to start while another export is running, so a second Save As
+    /// never takes over or cancels an export already in progress.
     fn start_export(&mut self, entry: &Entry, cx: &mut Context<Self>) {
-        if entry.kind != EntryKind::File {
+        if entry.kind != EntryKind::File || self.exporting() {
             return;
         }
         let source = entry.path.clone();
@@ -1341,6 +1349,14 @@ fn export_caveat(entry: &Entry) -> Option<String> {
     (!status.starts_with("Complete")).then(|| status.clone())
 }
 
+/// Whether a new export may begin. Only one export runs at a time: a new one
+/// is refused while another is still writing, so a second Save As cannot take
+/// over or cancel an export already in progress. A finished result waiting to
+/// be dismissed does not block a new export.
+fn can_start_export(current: Option<&ExportState>) -> bool {
+    !matches!(current, Some(ExportState::Running))
+}
+
 /// Builds the result shown when an export ends. The success message is
 /// deliberately neutral: it never implies the saved bytes are a verified or
 /// byte-identical original file. Any recovery caveat is appended.
@@ -1455,6 +1471,16 @@ mod export_tests {
             }
             _ => panic!("expected a failed export"),
         }
+    }
+
+    #[test]
+    fn a_new_export_waits_for_the_running_one() {
+        // No export, or a finished one awaiting dismissal, never blocks.
+        assert!(can_start_export(None));
+        assert!(can_start_export(Some(&ExportState::Done("saved".into()))));
+        assert!(can_start_export(Some(&ExportState::Failed("error".into()))));
+        // A running export owns the single slot until it finishes.
+        assert!(!can_start_export(Some(&ExportState::Running)));
     }
 
     #[test]
