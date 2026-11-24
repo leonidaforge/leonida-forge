@@ -8,6 +8,7 @@ pub mod archive;
 pub mod images;
 pub mod rpf;
 pub mod shell;
+mod toc;
 mod zip;
 
 use std::cmp::Ordering;

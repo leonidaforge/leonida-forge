@@ -1,11 +1,13 @@
-//! RPF9 archives, browsed through the entries recovered from their data.
+//! RPF9 archives, browsed through their own table of contents where it is
+//! stored unencrypted (see [`super::toc`]), and otherwise through the entries
+//! recovered from their data.
 //!
-//! Listing needs an index, which takes a scan of the whole archive. Until
+//! Recovery needs an index, which takes a scan of the whole archive. Until
 //! [`build_index`] has run, listings fail with an error that
 //! [`super::archive::prepare_required`] recognises, so the explorer can show progress and offer
 //! cancellation instead of blocking.
 //!
-//! The archive's own names and folders are unknown. Inside an archive,
+//! Recovered entries have no names or folders. Inside an archive,
 //! `Recovered Entries` holds one virtual folder per kind of entry,
 //! `Resource Pages` holds the page streams of reconstructed resources one by
 //! one, and `Unrecovered Regions` holds byte ranges that could not be
@@ -23,6 +25,7 @@ use lforge_rage9::resource::{Page, Segment};
 use lforge_rage9::rpf::{self, CacheKey, Index, Kind, Progress, Region, Resource, Status, Stream};
 
 use super::archive::{Archive, Stamp, check_size, needs_prepare};
+use super::toc;
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
 pub const RECOVERED: &str = "Recovered Entries";
@@ -38,9 +41,18 @@ const RESOURCE_SOURCE_NOTE: &str = "Reconstructed from consecutive zlib streams 
      data: the system pages, then the graphics pages, as pointers in the resource address them. \
      The name is the archive offset; the original name and folder are unknown.";
 
+/// What an archive is listed from.
+#[derive(Clone)]
+enum Contents {
+    Native(Arc<toc::Native>),
+    /// Entries recovered from the data, and why the table of contents was
+    /// not used.
+    Recovered(Arc<Index>, Arc<str>),
+}
+
 struct Cached {
     stamp: Stamp,
-    index: Arc<Index>,
+    contents: Contents,
     last_used: u64,
 }
 
@@ -80,8 +92,7 @@ fn cache_key(archive: &Archive) -> io::Result<CacheKey> {
     })
 }
 
-fn remember(archive: &Archive, index: Index) -> Arc<Index> {
-    let index = Arc::new(index);
+fn remember(archive: &Archive, contents: Contents) -> Contents {
     let mut indexes = indexes();
     indexes.clock += 1;
     let last_used = indexes.clock;
@@ -89,7 +100,7 @@ fn remember(archive: &Archive, index: Index) -> Arc<Index> {
         archive.path.clone(),
         Cached {
             stamp: archive.stamp,
-            index: index.clone(),
+            contents: contents.clone(),
             last_used,
         },
     );
@@ -102,39 +113,66 @@ fn remember(archive: &Archive, index: Index) -> Arc<Index> {
     {
         indexes.by_archive.remove(&oldest);
     }
-    index
+    contents
 }
 
-/// The index of `archive` from memory or the cache file, if it still matches
-/// the archive. Never scans.
-fn index(archive: &Archive) -> io::Result<Arc<Index>> {
-    let len = archive.source.len();
-    {
-        let mut indexes = indexes();
-        indexes.clock += 1;
-        let now = indexes.clock;
-        if let Some(cached) = indexes.by_archive.get_mut(&archive.path)
-            && cached.stamp == archive.stamp
-            && cached.index.archive_len == len
-        {
-            cached.last_used = now;
-            return Ok(cached.index.clone());
-        }
+fn in_memory(archive: &Archive) -> Option<Contents> {
+    let mut indexes = indexes();
+    indexes.clock += 1;
+    let now = indexes.clock;
+    let cached = indexes.by_archive.get_mut(&archive.path)?;
+    let current = cached.stamp == archive.stamp
+        && match &cached.contents {
+            Contents::Native(native) => native.is_current(archive),
+            Contents::Recovered(index, _) => index.archive_len == archive.source.len(),
+        };
+    if !current {
+        return None;
     }
+    cached.last_used = now;
+    Some(cached.contents.clone())
+}
+
+/// The table of contents, or why it cannot be used.
+fn probe(archive: &Archive) -> Result<Contents, Arc<str>> {
+    toc::Native::read(archive).map(|native| Contents::Native(Arc::new(native)))
+}
+
+/// The contents of `archive` from memory, its table of contents or the
+/// cache file. Never scans.
+fn contents(archive: &Archive) -> io::Result<Contents> {
+    if let Some(contents) = in_memory(archive) {
+        return Ok(contents);
+    }
+    let reason = match probe(archive) {
+        Ok(native) => return Ok(remember(archive, native)),
+        Err(reason) => reason,
+    };
     if let Some(dir) = cache_dir()
-        && let Some(index) = rpf::load(&dir, &cache_key(archive)?, len)
+        && let Some(index) = rpf::load(&dir, &cache_key(archive)?, archive.source.len())
     {
-        return Ok(remember(archive, index));
+        return Ok(remember(
+            archive,
+            Contents::Recovered(Arc::new(index), reason),
+        ));
     }
     Err(needs_prepare(archive.path.clone()))
 }
 
-/// Scans `archive`, unless its index is in memory or in the cache, and keeps
-/// the index in memory.
+/// Reads the table of contents or, where it cannot be used, scans `archive`,
+/// unless its contents are in memory or in the cache. Keeps the result in
+/// memory.
 pub fn build_index(archive: &Archive, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
-    if index(archive).is_ok() {
+    if contents(archive).is_ok() {
         return Ok(());
     }
+    let reason = match probe(archive) {
+        Ok(native) => {
+            remember(archive, native);
+            return Ok(());
+        }
+        Err(reason) => reason,
+    };
     let key = cache_key(archive)?;
     let index = rpf::scan(archive.source.clone(), progress, cancel)?;
     if let Some(dir) = cache_dir()
@@ -142,7 +180,7 @@ pub fn build_index(archive: &Archive, progress: &Progress, cancel: &AtomicBool) 
     {
         let _ = rpf::store(&dir, &key, &index);
     }
-    remember(archive, index);
+    remember(archive, Contents::Recovered(Arc::new(index), reason));
     Ok(())
 }
 
@@ -459,9 +497,15 @@ fn region_file(dir: &Path, region: &Region) -> Entry {
 }
 
 pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
-    let index = index(archive)?;
+    match contents(archive)? {
+        Contents::Native(native) => native.list(archive, inner),
+        Contents::Recovered(index, _) => list_recovered(archive, &index, inner),
+    }
+}
+
+fn list_recovered(archive: &Archive, index: &Index, inner: &Path) -> io::Result<Vec<Entry>> {
     let dir = archive.path.join(inner);
-    let entries = match resolve(&index, inner).ok_or_else(not_found)? {
+    let entries = match resolve(index, inner).ok_or_else(not_found)? {
         Node::Root => {
             let mut folders = Vec::new();
             if !index.entries.is_empty() {
@@ -489,7 +533,7 @@ pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
             .entries
             .iter()
             .filter(|entry| entry.kind == kind)
-            .map(|entry| entry_file(&dir, &index, entry))
+            .map(|entry| entry_file(&dir, index, entry))
             .collect(),
         Node::Pages => index
             .resources
@@ -516,9 +560,12 @@ pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Writes one recovered entry, page or region to `out`, within `limit`.
+/// Writes one entry, page or region to `out`, within `limit`.
 pub fn copy(archive: &Archive, inner: &Path, out: &mut dyn Write, limit: u64) -> io::Result<()> {
-    let index = index(archive)?;
+    let index = match contents(archive)? {
+        Contents::Native(native) => return native.copy(archive, inner, out, limit),
+        Contents::Recovered(index, _) => index,
+    };
     let source = archive.source.clone();
     match resolve(&index, inner).ok_or_else(not_found)? {
         Node::Entry(entry) => {
@@ -556,7 +603,10 @@ fn file_node_len(node: &Node, index: &Index) -> Option<u64> {
 
 /// The shortest leading part of `inner` that names a file in the archive.
 pub fn file_prefix(archive: &Archive, inner: &Path) -> io::Result<Option<PathBuf>> {
-    let index = index(archive)?;
+    let index = match contents(archive)? {
+        Contents::Native(native) => return Ok(native.file_prefix(inner)),
+        Contents::Recovered(index, _) => index,
+    };
     let mut prefix = PathBuf::new();
     for component in inner.components() {
         prefix.push(component);
@@ -571,14 +621,19 @@ pub fn file_prefix(archive: &Archive, inner: &Path) -> io::Result<Option<PathBuf
 }
 
 pub fn file_len(archive: &Archive, inner: &Path) -> io::Result<u64> {
-    let index = index(archive)?;
+    let index = match contents(archive)? {
+        Contents::Native(native) => return native.file_len(inner),
+        Contents::Recovered(index, _) => index,
+    };
     let node = resolve(&index, inner).ok_or_else(not_found)?;
     file_node_len(&node, &index).ok_or_else(|| io::Error::other("not a file"))
 }
 
 /// Why an archive recovered from the entry at `inner` may be incomplete.
 pub fn caveat(archive: &Archive, inner: &Path) -> Option<String> {
-    let index = index(archive).ok()?;
+    let Contents::Recovered(index, _) = contents(archive).ok()? else {
+        return None;
+    };
     let Node::Entry(entry) = resolve(&index, inner)? else {
         return None;
     };
@@ -594,24 +649,36 @@ pub fn caveat(archive: &Archive, inner: &Path) -> Option<String> {
     ))
 }
 
+/// The bytes of a file stored as it is, as a view of the archive's source.
+/// `None` for anything else, which [`copy`] decodes or reports.
+pub fn raw_source(archive: &Archive, inner: &Path) -> io::Result<Option<lforge_binary::Source>> {
+    match contents(archive)? {
+        Contents::Native(native) => Ok(native.raw_source(archive, inner)),
+        // Recovered entries are zlib streams.
+        Contents::Recovered(..) => Ok(None),
+    }
+}
+
 /// Explains where the contents of an archive folder come from. Returns
 /// `None` until the archive is indexed.
 pub fn describe(archive: &Archive, inner: &Path) -> Option<String> {
-    let index = index(archive).ok()?;
+    let (index, reason) = match contents(archive).ok()? {
+        Contents::Native(native) => return native.describe(archive, inner),
+        Contents::Recovered(index, reason) => (index, reason),
+    };
     let percent = |part: u64| match index.data_len() {
         0 => 0.0,
         total => part as f64 * 100.0 / total as f64,
     };
     let note = match resolve(&index, inner)? {
-        Node::Root if index.entries.is_empty() => {
-            "No entries could be recovered: the table of contents is encrypted, and no zlib \
-             streams were found in the archive data. The archive is not necessarily empty."
-                .to_string()
-        }
+        Node::Root if index.entries.is_empty() => format!(
+            "{reason} No entries could be recovered: no zlib streams were found in the archive \
+             data. The archive is not necessarily empty."
+        ),
         Node::Root | Node::Recovered | Node::Kind(_) => format!(
-            "The table of contents is encrypted and is not read. {} were recovered from zlib \
-             streams covering {:.1}% of the archive data. Folders and names are not original: \
-             entries are grouped by kind and named after their archive offset.",
+            "{reason} {} were recovered from zlib streams covering {:.1}% of the archive data. \
+             Folders and names are not original: entries are grouped by kind and named after \
+             their archive offset.",
             count(index.entries.len(), "entry", "entries"),
             percent(index.recovered_len()),
         ),
@@ -651,12 +718,17 @@ pub(crate) mod tests {
         encoder.finish().unwrap()
     }
 
-    /// A header, a table of contents of 0x60 bytes, then `parts` at aligned
-    /// offsets starting at 0x100.
+    /// A header, a table of contents of 0x60 bytes that the static pass
+    /// processes, as in real archives, then `parts` at aligned offsets
+    /// starting at 0x100.
     pub(crate) fn rpf_bytes(parts: &[Vec<u8>]) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x40];
         bytes[..4].copy_from_slice(b"9FPR");
         bytes[4..8].copy_from_slice(&0xA0u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0xA0u32.to_le_bytes());
+        bytes[0x2C] = 1;
+        bytes[0x2D] = 1;
+        bytes[0x2E] = 9;
         bytes.resize(0xA0, 0x5A);
         bytes.resize(0x100, 0);
         for part in parts {

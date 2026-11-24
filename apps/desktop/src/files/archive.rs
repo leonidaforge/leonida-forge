@@ -438,9 +438,7 @@ fn decompress_limited(
             file_name(&path)
         )));
     }
-    if let Some(stored) = stored_file(parent, inner)? {
-        check_size(stored.source.len(), read_limit)?;
-        let source = stored.verify(cancel)?;
+    if let Some(source) = stored_view(parent, inner, read_limit, cancel)? {
         return keep_identified(parent, inner, path, source, 0);
     }
     let len = file_len(parent, inner)?;
@@ -477,11 +475,31 @@ fn decompress_limited(
 
 /// A file of `parent` stored as it is, as a view of the parent's source.
 /// Other files have to be decoded, which a view must not stand in for.
-fn stored_file(parent: &Archive, inner: &Path) -> io::Result<Option<zip::Unverified>> {
+/// A file of `parent` stored as it is, as a view of the parent's source,
+/// within `read_limit`. ZIP files are checked against their CRC-32 first;
+/// RPF9 records no checksum. Other files have to be decoded, which a view
+/// must not stand in for.
+fn stored_view(
+    parent: &Archive,
+    inner: &Path,
+    read_limit: u64,
+    cancel: &AtomicBool,
+) -> io::Result<Option<Source>> {
     match parent.format {
-        Format::Zip => zip::stored_file(parent, inner),
-        // Recovered entries are zlib streams.
-        Format::Rpf9 => Ok(None),
+        Format::Zip => {
+            let Some(stored) = zip::stored_file(parent, inner)? else {
+                return Ok(None);
+            };
+            check_size(stored.source.len(), read_limit)?;
+            stored.verify(cancel).map(Some)
+        }
+        Format::Rpf9 => {
+            let Some(source) = rpf::raw_source(parent, inner)? else {
+                return Ok(None);
+            };
+            check_size(source.len(), read_limit)?;
+            Ok(Some(source))
+        }
     }
 }
 
