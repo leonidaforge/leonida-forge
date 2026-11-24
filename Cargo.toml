@@ -26,6 +26,7 @@ glam = { version = "0.34", features = ["bytemuck"] }
 # GPUI is not published in a current form; pin the Zed revision it is taken from.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "f00a94318c059f03892e04f82343e899fbfaa844", default-features = false }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f00a94318c059f03892e04f82343e899fbfaa844", default-features = false }
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder", "instr_info"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jpeg-decoder = { version = "0.3", default-features = false }
 log = "0.4"
@@ -37,6 +38,7 @@ sha2 = "0.10"
 tempfile = "3.27"
 wgpu = "30.0"
 windows = "0.62"
+zeroize = "1.9"
 zip = { version = "9.4", default-features = false, features = ["deflate"] }
 
 # Zed patches async-task for a waker identity fix that GPUI's executor relies on.

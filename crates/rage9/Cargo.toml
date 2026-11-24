@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 flate2.workspace = true
+iced-x86.workspace = true
 lforge-binary.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+zeroize.workspace = true

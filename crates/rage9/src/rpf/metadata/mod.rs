@@ -26,6 +26,7 @@ use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 mod companion;
 mod entry;
 mod payload;
+pub mod recognize;
 pub mod transform;
 
 /// Field keys whose meaning is established.
