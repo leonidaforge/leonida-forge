@@ -1201,7 +1201,7 @@ mod embedded {
         let archive = parent(&[(&first, Storage::Raw), (&second, Storage::Source(1))]);
         let main = source(&archive);
         let metadata = decode(&mut main.clone());
-        for alternates in [&[][..], std::slice::from_ref(&main)] {
+        for alternates in [&[][..], &[Some(main.clone())]] {
             match metadata.raw_source(1, &main, alternates) {
                 Err(Error::ReadSource { row: 1, index: 1 }) => {}
                 other => panic!("{other:?}"),
@@ -1211,7 +1211,7 @@ mod embedded {
         let mut altered = archive.clone();
         let range = metadata.raw_range(1).unwrap();
         altered[range.start as usize + 0x40..range.end as usize].fill(0);
-        let alternates = [source(&altered), source(&archive)];
+        let alternates = [Some(source(&altered)), Some(source(&archive))];
         let mut from_alternate = metadata.raw_source(1, &main, &alternates).unwrap();
         assert_eq!(
             decode(&mut from_alternate).field(0, KEY_X).unwrap(),
@@ -1299,6 +1299,11 @@ mod pipeline {
     }
 
     pub(super) fn archive(specs: &[Spec]) -> Vec<u8> {
+        archive_with(specs, Build::default())
+    }
+
+    /// Like [`archive`], with the given `A` table and `B` block.
+    pub(super) fn archive_with(specs: &[Spec], build: Build) -> Vec<u8> {
         let mut data = Vec::new();
         let mut records: Vec<(RecordLayout, Vec<u8>)> = Vec::new();
         for spec in specs {
@@ -1331,7 +1336,7 @@ mod pipeline {
             .filter_map(|s| s.chunks.as_ref().map(Vec::len))
             .max()
             .unwrap_or(8);
-        let mut bytes = Build::default().build(&[
+        let mut bytes = build.build(&[
             column(keys::LOCATION_R, 20, location(RecordLayout::R)),
             column(keys::LOCATION_F, 24, location(RecordLayout::F)),
             column(keys::LOCATION_A, 16, location(RecordLayout::A)),
@@ -1522,13 +1527,13 @@ mod pipeline {
                 other => panic!("row {row}: {other:?}"),
             }
         }
-        for alternates in [&[][..], &[view.clone(), view.clone()]] {
+        for alternates in [&[][..], &[Some(view.clone()), None, None]] {
             assert!(matches!(
                 entries[5].raw_source(&view, alternates),
                 Err(Error::ReadSource { row: 5, index: 2 })
             ));
         }
-        let alternates = [view.clone(), view.clone(), view.clone()];
+        let alternates = [None, None, Some(view.clone())];
         let mut third = entries[5].raw_source(&view, &alternates).unwrap();
         assert_eq!(lforge_binary::read_at(&mut third, 0, 64).unwrap(), [3; 16]);
         assert!(invalid_reason(entries[8].raw_range()).contains("exceeds its stored size"));
@@ -2231,7 +2236,7 @@ mod decoding {
             entries[0].payload(&source, &[]),
             Err(Error::ReadSource { row: 0, index: 1 })
         ));
-        let alternates = [source.clone(), source.clone()];
+        let alternates = [None, Some(source.clone())];
         let mut payload = entries[0].payload(&source, &alternates).unwrap();
         let mut bytes = Vec::new();
         payload.read_to_end(&mut bytes).unwrap();
@@ -2296,5 +2301,402 @@ mod decoding {
             payload.read_exact(&mut buf).unwrap();
             assert_eq!(buf, expected[pos as usize..pos as usize + 16], "{pos:#x}");
         }
+    }
+}
+
+mod companions {
+    //! `B` sub-block 3 and companion files, on synthetic archives.
+
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::path::Path;
+
+    use flate2::Compression;
+    use flate2::write::DeflateEncoder;
+
+    use super::pipeline::{Spec, archive_with, spec};
+    use super::*;
+    use crate::rpf::metadata::companion::MAGIC;
+
+    const B_LEN: u32 = 0x600;
+
+    /// The `B` block offset of sub-block 3 with the default `A` table,
+    /// whose second record is ID 3.
+    const SUB_BLOCK: usize = 0x20;
+
+    fn record(name: &[u8], identifier: u64) -> Vec<u8> {
+        let mut record = vec![0; 0x108];
+        record[..name.len()].copy_from_slice(name);
+        record[0x100..].copy_from_slice(&identifier.to_le_bytes());
+        record
+    }
+
+    /// An archive with `records` in sub-block 3.
+    fn archive(specs: &[Spec], records: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = archive_with(
+            specs,
+            Build {
+                b_len: B_LEN,
+                ..Build::default()
+            },
+        );
+        let b = Stored::read(&mut Cursor::new(&bytes), 1 << 20)
+            .unwrap()
+            .layout()
+            .b_block
+            .start;
+        let at = b + SUB_BLOCK;
+        set_u32(&mut bytes, at, records.len() as u32);
+        bytes[at + 4..at + 8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        for (n, record) in records.iter().enumerate() {
+            let start = at + 8 + n * 0x108;
+            bytes[start..start + 0x108].copy_from_slice(record);
+        }
+        bytes
+    }
+
+    fn metadata(bytes: &[u8]) -> Metadata {
+        Stored::read(&mut Cursor::new(bytes), 1 << 20)
+            .unwrap()
+            .decode()
+            .unwrap()
+    }
+
+    fn companion(identifier: u64, rest: &[u8]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&identifier.to_le_bytes());
+        bytes.extend_from_slice(rest);
+        bytes
+    }
+
+    fn status(statuses: &[CompanionStatus]) -> Vec<&'static str> {
+        statuses
+            .iter()
+            .map(|status| match status {
+                CompanionStatus::Available(_) => "available",
+                CompanionStatus::Missing(_) => "missing",
+                CompanionStatus::Invalid(_) => "invalid",
+                CompanionStatus::Unsupported(_) => "unsupported",
+            })
+            .collect()
+    }
+
+    fn reason(status: &CompanionStatus) -> &str {
+        match status {
+            CompanionStatus::Available(_) => "available",
+            CompanionStatus::Missing(reason)
+            | CompanionStatus::Invalid(reason)
+            | CompanionStatus::Unsupported(reason) => reason,
+        }
+    }
+
+    #[test]
+    fn parses_sub_block_3() {
+        let mut unterminated = record(&[b'x'; 0x100], 3);
+        unterminated[0x100..].copy_from_slice(&3u64.to_le_bytes());
+        let bytes = archive(
+            &[spec(RecordLayout::A, vec![1; 16], 0)],
+            &[
+                record(b"first.dat", 0x1122_3344_5566_7788),
+                record(b"sub/second.dat", 2),
+                unterminated,
+            ],
+        );
+        let companions = metadata(&bytes).companions().unwrap();
+        assert_eq!(companions.unknown_04, [0xDE, 0xAD, 0xBE, 0xEF]);
+        let records = &companions.records;
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            (
+                records[0].index,
+                records[0].name.as_slice(),
+                records[0].identifier
+            ),
+            (0, &b"first.dat"[..], 0x1122_3344_5566_7788)
+        );
+        assert_eq!((records[1].index, records[1].terminated), (1, true));
+        assert_eq!(
+            (records[2].name.len(), records[2].terminated),
+            (0x100, false)
+        );
+
+        // Without sub-block 3 there are no companions.
+        let without = archive_with(
+            &[spec(RecordLayout::A, vec![1; 16], 0)],
+            Build {
+                a_ids: vec![2, 4, 6],
+                ..Build::default()
+            },
+        );
+        assert_eq!(
+            metadata(&without).companions().unwrap(),
+            Companions::default()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_sub_blocks() {
+        let row = [spec(RecordLayout::A, vec![1; 16], 0)];
+        let mut too_many = archive(&row, &[record(b"a.dat", 1)]);
+        let b = metadata(&too_many).layout().b_block.clone();
+        set_u32(&mut too_many, b.start + SUB_BLOCK, u32::MAX);
+        let message = invalid_reason(metadata(&too_many).companions());
+        assert!(message.contains("more than fit"), "{message}");
+        // One record more than the B block holds.
+        let fit = (B_LEN as usize - SUB_BLOCK - 8) / 0x108;
+        let mut truncated = archive(&row, &[]);
+        set_u32(&mut truncated, b.start + SUB_BLOCK, fit as u32 + 1);
+        invalid_reason(metadata(&truncated).companions());
+        set_u32(&mut truncated, b.start + SUB_BLOCK, fit as u32);
+        assert_eq!(
+            metadata(&truncated).companions().unwrap().records.len(),
+            fit
+        );
+        // The sub-block's own offset outside the B block. The A record for
+        // ID 3 is the second one.
+        let mut outside = archive(&row, &[]);
+        set_u32(&mut outside, 0x40 + 8 + 4, B_LEN - 4);
+        invalid_reason(metadata(&outside).companions());
+    }
+
+    #[test]
+    fn checks_names_and_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pack");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(temp.path().join("outside.dat"), companion(9, b"")).unwrap();
+        fs::write(dir.join("good.dat"), companion(2, b"payload")).unwrap();
+        fs::write(dir.join("wrong_id.dat"), companion(4, b"")).unwrap();
+        let mut bad_magic = companion(5, b"");
+        bad_magic[3] = 0x38;
+        fs::write(dir.join("bad_magic.dat"), bad_magic).unwrap();
+        fs::write(dir.join("short.dat"), &companion(6, b"")[..15]).unwrap();
+        fs::write(dir.join("sub").join("nested.dat"), companion(7, b"")).unwrap();
+        let names: [(&[u8], u64); 12] = [
+            (b"missing.dat", 1),
+            (b"good.dat", 2),
+            (b"wrong_id.dat", 3),
+            (b"bad_magic.dat", 5),
+            (b"short.dat", 6),
+            (b"sub\\nested.dat", 7),
+            (b"sub/../good.dat", 2),
+            (b"../outside.dat", 9),
+            (b"/good.dat", 2),
+            (b"c:good.dat", 2),
+            (b"g\xFFod.dat", 2),
+            (b"sub", 2),
+        ];
+        // The B block of these archives holds five records, so the names are
+        // spread over several archives in the same directory.
+        let mut statuses = Vec::new();
+        for (n, group) in names.chunks(5).enumerate() {
+            let records: Vec<Vec<u8>> = group.iter().map(|(n, id)| record(n, *id)).collect();
+            let bytes = archive(&[spec(RecordLayout::A, vec![1; 16], 0)], &records);
+            let archive_path = dir.join(format!("main{n}.rpf"));
+            fs::write(&archive_path, &bytes).unwrap();
+            statuses.extend(metadata(&bytes).companions().unwrap().open(&archive_path));
+        }
+        assert_eq!(
+            status(&statuses),
+            [
+                "missing",
+                "available",
+                "invalid",
+                "invalid",
+                "invalid",
+                "available",
+                "available",
+                "invalid",
+                "invalid",
+                "unsupported",
+                "unsupported",
+                "invalid",
+            ]
+        );
+        assert!(
+            reason(&statuses[2]).contains("identifier"),
+            "{}",
+            reason(&statuses[2])
+        );
+        assert!(reason(&statuses[3]).contains("signature"));
+        assert!(reason(&statuses[4]).contains("shorter"));
+        assert!(reason(&statuses[7]).contains("leaves"));
+        assert!(reason(&statuses[8]).contains("absolute"));
+        assert!(reason(&statuses[11]).contains("not a file"));
+        // The companion is read from its start; the header is not skipped.
+        let mut good = statuses[1].source().unwrap().clone();
+        let mut bytes = Vec::new();
+        good.read_to_end(&mut bytes).unwrap();
+        assert_eq!(&bytes[16..], b"payload");
+    }
+
+    #[test]
+    fn refuses_links_out_of_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pack");
+        fs::create_dir(&dir).unwrap();
+        let outside = temp.path().join("outside.dat");
+        fs::write(&outside, companion(1, b"")).unwrap();
+        let link = dir.join("link.dat");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link);
+        if linked.is_err() {
+            // Creating links needs a privilege this environment may lack.
+            return;
+        }
+        let bytes = archive(
+            &[spec(RecordLayout::A, vec![1; 16], 0)],
+            &[record(b"link.dat", 1)],
+        );
+        let statuses = metadata(&bytes)
+            .companions()
+            .unwrap()
+            .open(&dir.join("main.rpf"));
+        assert!(
+            reason(&statuses[0]).contains("outside"),
+            "{}",
+            reason(&statuses[0])
+        );
+    }
+
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// Directory junctions need no privilege on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn refuses_junctions_out_of_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("pack");
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join("data.dat"), companion(1, b"")).unwrap();
+        let junction = dir.join("redirect");
+        let made = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&elsewhere)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert!(junction.join("data.dat").exists());
+        let bytes = archive(
+            &[spec(RecordLayout::A, vec![1; 16], 0)],
+            &[record(b"redirect/data.dat", 1)],
+        );
+        let statuses = metadata(&bytes)
+            .companions()
+            .unwrap()
+            .open(&dir.join("main.rpf"));
+        assert_eq!(status(&statuses), ["invalid"]);
+        assert!(
+            reason(&statuses[0]).contains("outside"),
+            "{}",
+            reason(&statuses[0])
+        );
+    }
+
+    fn read_all(payload: &mut Payload) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        payload.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn file(path: &Path) -> lforge_binary::Source {
+        lforge_binary::Source::open(path).unwrap()
+    }
+
+    #[test]
+    fn payloads_are_read_from_their_companion() {
+        let temp = tempfile::tempdir().unwrap();
+        let text: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let chunk_stream = {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&text).unwrap();
+            encoder.finish().unwrap()
+        };
+        let stored_len = chunk_stream.len().next_multiple_of(16);
+        let padding = (stored_len - chunk_stream.len()) as u64;
+        let entry = text.len() as u64 | ((stored_len / 16) as u64) << 28 | padding << 52 | 3 << 56;
+        let mut chunked = chunk_stream.clone();
+        chunked.resize(stored_len, 0xA5);
+        let rows = [
+            Spec {
+                source: Some(1),
+                ..spec(RecordLayout::A, text.clone(), 0)
+            },
+            Spec {
+                source: Some(1),
+                mode: 1,
+                logical: Some(text.len() as u64),
+                ..spec(RecordLayout::F, deflate(&text), 0)
+            },
+            Spec {
+                source: Some(1),
+                chunks: Some(chunk_value(8, 1, 4, &[entry])),
+                logical: Some(text.len() as u64),
+                ..spec(RecordLayout::A, chunked, 0)
+            },
+            Spec {
+                source: Some(0),
+                ..spec(RecordLayout::A, text.clone(), 0)
+            },
+            Spec {
+                source: Some(7),
+                ..spec(RecordLayout::A, text.clone(), 0)
+            },
+            spec(RecordLayout::A, text.clone(), 0),
+        ];
+        let full = archive(
+            &rows,
+            &[record(b"missing.dat", 10), record(b"data.dat", 11)],
+        );
+        // The companion holds the payloads at the same offsets; the main
+        // file holds zeros there, apart from the main-source row.
+        let metadata_len = metadata(&full).prefix().metadata_len as usize;
+        let mut companion = full.clone();
+        companion[..16].copy_from_slice(&[&MAGIC[..], &11u64.to_le_bytes()].concat());
+        let mut main = full.clone();
+        let last = metadata(&full).raw_range(5).unwrap();
+        main[metadata_len..last.start as usize].fill(0);
+        let dir = temp.path();
+        let main_path = dir.join("main.rpf");
+        fs::write(&main_path, &main).unwrap();
+        fs::write(dir.join("data.dat"), &companion).unwrap();
+
+        let metadata = metadata(&main);
+        let statuses = metadata.companions().unwrap().open(&main_path);
+        assert_eq!(status(&statuses), ["missing", "available"]);
+        let alternates: Vec<_> = statuses.iter().map(|s| s.source().cloned()).collect();
+        let source = file(&main_path);
+        for row in 0..3 {
+            let entry = metadata.entry(row).unwrap();
+            let mut payload = entry.payload(&source, &alternates).unwrap();
+            assert_eq!(read_all(&mut payload), text, "row {row}");
+        }
+        // Companion 0 is missing and there is no companion 7. Neither falls
+        // back to the main file.
+        for (row, index) in [(3, 0), (4, 7)] {
+            let entry = metadata.entry(row).unwrap();
+            match entry.payload(&source, &alternates) {
+                Err(Error::ReadSource { index: i, .. }) => assert_eq!(i, index),
+                other => panic!("row {row}: {other:?}"),
+            }
+        }
+        // The main source still serves its own rows, unchanged by the
+        // companions.
+        let entry = metadata.entry(5).unwrap();
+        assert_eq!(
+            read_all(&mut entry.payload(&source, &alternates).unwrap()),
+            text
+        );
     }
 }

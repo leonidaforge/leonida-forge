@@ -101,18 +101,19 @@ impl Entry {
     }
 
     /// The source the entry's stored bytes are read through: `main`, or
-    /// `alternates[i]` for read source `i`. An alternate that is not supplied
-    /// fails with [`Error::ReadSource`] rather than falling back to `main`.
+    /// `alternates[i]` for read source `i`. An alternate that is missing or
+    /// `None` fails with [`Error::ReadSource`] rather than falling back to
+    /// `main`.
     fn read_through<'s>(
         &self,
         main: &'s Source,
-        alternates: &'s [Source],
+        alternates: &'s [Option<Source>],
     ) -> Result<&'s Source, Error> {
         match &self.read_source {
             Ok(None) => Ok(main),
             Ok(Some(index)) => usize::try_from(*index)
                 .ok()
-                .and_then(|i| alternates.get(i))
+                .and_then(|i| alternates.get(i)?.as_ref())
                 .ok_or(Error::ReadSource {
                     row: self.row,
                     index: *index,
@@ -124,7 +125,11 @@ impl Entry {
     /// The bytes of an entry stored as it is, as a view of the source it is
     /// read through: `main`, or `alternates[i]` for read source `i`. The range is the same in
     /// every source.
-    pub fn raw_source(&self, main: &Source, alternates: &[Source]) -> Result<Source, Error> {
+    pub fn raw_source(
+        &self,
+        main: &Source,
+        alternates: &[Option<Source>],
+    ) -> Result<Source, Error> {
         let row = self.row;
         let range = self.raw_range()?;
         let source = self.read_through(main, alternates)?;
@@ -146,7 +151,7 @@ impl Entry {
     /// stored bytes ([`Entry::raw_source`]) and mode 1 one raw DEFLATE
     /// stream. Other modes fail with [`Error::Undecodable`]. Stored bytes are
     /// read through `main` or `alternates[i]` as for [`Entry::raw_source`].
-    pub fn payload(&self, main: &Source, alternates: &[Source]) -> Result<Payload, Error> {
+    pub fn payload(&self, main: &Source, alternates: &[Option<Source>]) -> Result<Payload, Error> {
         let row = self.row;
         let location = match &self.location {
             Ok(Some(location)) => *location,

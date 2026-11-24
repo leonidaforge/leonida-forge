@@ -18,10 +18,12 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use super::{HEADER_LEN, MAGIC};
+pub use companion::{Companion, Companions, Status as CompanionStatus};
 pub use entry::{Entry, Field};
 pub use payload::Payload;
 use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 
+mod companion;
 mod entry;
 mod payload;
 pub mod transform;
@@ -1087,7 +1089,7 @@ impl Metadata {
         &self,
         row: u32,
         main: &lforge_binary::Source,
-        alternates: &[lforge_binary::Source],
+        alternates: &[Option<lforge_binary::Source>],
     ) -> Result<lforge_binary::Source, Error> {
         self.entry(row)?.raw_source(main, alternates)
     }
