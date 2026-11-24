@@ -2258,4 +2258,43 @@ mod decoding {
             assert_eq!(nested.field(0, KEY_X).unwrap(), Some(&[4, 3, 2, 1][..]));
         }
     }
+
+    #[test]
+    fn partial_reads_verify_the_whole_zlib_chunk() {
+        // Buffered and streamed chunk sizes.
+        for len in [0x3000, 0x20_0000] {
+            let original = data(len, 25);
+            let next = data(0x100, 26);
+            let (mut stored, table, expected) = chunked(4, &[(3, original.clone()), (3, next)]);
+            // The Adler-32 trailer of the first chunk.
+            let trailer = zlib(&original).len() - 1;
+            stored[trailer] ^= 1;
+            let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+            let mut payload = entries[0].payload(&source, &[]).unwrap();
+            // The first bytes of the damaged chunk are not returned.
+            let err = payload.read(&mut [0; 16]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{len:#x}");
+            payload.seek(SeekFrom::Start(len as u64 / 2)).unwrap();
+            assert!(payload.read(&mut [0; 16]).is_err(), "{len:#x}");
+            // The intact chunk after it still reads.
+            payload.seek(SeekFrom::Start(len as u64)).unwrap();
+            let mut tail = vec![0; 0x100];
+            payload.read_exact(&mut tail).unwrap();
+            assert_eq!(tail, expected[len..]);
+        }
+    }
+
+    #[test]
+    fn large_zlib_chunks_read_at_any_position() {
+        let original = data(0x30_0000, 27);
+        let (stored, table, expected) = chunked(4, &[(3, original)]);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        let mut payload = entries[0].payload(&source, &[]).unwrap();
+        for pos in [0x28_0000u64, 0x10, 0x2F_FFF0, 0x10_0000] {
+            payload.seek(SeekFrom::Start(pos)).unwrap();
+            let mut buf = [0; 16];
+            payload.read_exact(&mut buf).unwrap();
+            assert_eq!(buf, expected[pos as usize..pos as usize + 16], "{pos:#x}");
+        }
+    }
 }

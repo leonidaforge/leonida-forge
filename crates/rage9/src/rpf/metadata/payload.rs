@@ -4,6 +4,12 @@
 //! Every size is checked against the table of contents, and every failure
 //! is an error. The engine instead traps on decoder failures and does not
 //! compare sizes.
+//!
+//! A zlib chunk is verified completely, up to its checksum, before any of
+//! its bytes are returned. A raw DEFLATE entry has no checksum, and its end
+//! is checked only when it is read to the end: a partial read returns the
+//! bytes decoded so far without knowing whether the rest of the stream is
+//! intact.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -18,6 +24,10 @@ const INPUT_LEN: usize = 64 * 1024;
 const SKIP_LEN: usize = 64 * 1024;
 /// The chunk method that holds a zlib stream. The others are copied.
 const ZLIB_METHOD: u8 = 3;
+/// Zlib chunks up to this size are decoded once and kept while they are
+/// read. Larger ones are verified in one pass and decoded again as they are
+/// read.
+const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
 
 fn bad(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -140,6 +150,14 @@ impl Inflater {
         }
     }
 
+    /// Decodes the whole stream and checks its end, discarding the output.
+    fn verify(&mut self) -> io::Result<()> {
+        self.skip_to(self.len)?;
+        // Checks the end of the stream, also of an empty one.
+        self.read(&mut [0; 1])?;
+        Ok(())
+    }
+
     /// Decodes and discards bytes up to `target`.
     fn skip_to(&mut self, target: u64) -> io::Result<()> {
         if self.out >= target {
@@ -180,9 +198,18 @@ enum Kind {
     Chunked {
         stored: Source,
         spans: Vec<Span>,
-        /// The decoder of the zlib chunk read last, by chunk number.
-        current: Option<(usize, Inflater)>,
+        /// Zlib chunks whose stream was decoded and checked completely.
+        verified: Vec<bool>,
+        /// The zlib chunk read last, by chunk number.
+        current: Option<(usize, Decoded)>,
     },
+}
+
+/// A verified zlib chunk.
+enum Decoded {
+    Buffered(Vec<u8>),
+    /// A chunk larger than [`CHUNK_BUFFER_LEN`], decoded as it is read.
+    Streamed(Inflater),
 }
 
 /// The contents of an entry, readable and seekable. Each value keeps its
@@ -265,6 +292,7 @@ impl Payload {
             pos: 0,
             kind: Kind::Chunked {
                 stored,
+                verified: vec![false; spans.len()],
                 spans,
                 current: None,
             },
@@ -293,6 +321,36 @@ impl std::fmt::Debug for Payload {
             .field("pos", &self.pos)
             .finish()
     }
+}
+
+/// A zlib chunk, decoded and checked completely before any of it is used.
+fn decode_chunk(stored: &Source, span: &Span, verified: &mut bool) -> io::Result<Decoded> {
+    let len = u64::from(span.chunk.logical_len);
+    let inflater = || {
+        stored
+            .slice(span.stored, span.chunk.compressed_len.into())
+            .map(|compressed| Inflater::new(compressed, true, true, len))
+            .map_err(|err| bad(err.to_string()))
+    };
+    if len <= CHUNK_BUFFER_LEN {
+        let mut inflater = inflater()?;
+        let mut bytes = vec![0; len as usize];
+        let mut filled = 0;
+        while filled < bytes.len() {
+            match inflater.read(&mut bytes[filled..])? {
+                0 => return Err(bad("the chunk ends early")),
+                n => filled += n,
+            }
+        }
+        inflater.verify()?;
+        *verified = true;
+        return Ok(Decoded::Buffered(bytes));
+    }
+    if !*verified {
+        inflater()?.verify()?;
+        *verified = true;
+    }
+    Ok(Decoded::Streamed(inflater()?))
 }
 
 fn read_at(source: &Source, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -328,6 +386,7 @@ impl Read for Payload {
             Kind::Chunked {
                 stored,
                 spans,
+                verified,
                 current,
             } => {
                 let index = spans.partition_point(|span| span.logical_end() <= pos);
@@ -339,18 +398,30 @@ impl Read for Payload {
                 if span.chunk.method != ZLIB_METHOD {
                     read_at(stored, span.stored + offset, buf)?
                 } else {
-                    let reusable =
-                        matches!(current, Some((n, i)) if *n == index && i.out <= offset);
+                    let reusable = match current {
+                        Some((n, Decoded::Buffered(_))) => *n == index,
+                        Some((n, Decoded::Streamed(inflater))) => {
+                            *n == index && inflater.out <= offset
+                        }
+                        None => false,
+                    };
                     if !reusable {
-                        let compressed = stored
-                            .slice(span.stored, span.chunk.compressed_len.into())
-                            .map_err(|err| bad(err.to_string()))?;
-                        let len = span.chunk.logical_len.into();
-                        *current = Some((index, Inflater::new(compressed, true, true, len)));
+                        *current = Some((index, decode_chunk(stored, span, &mut verified[index])?));
                     }
-                    let (_, inflater) = current.as_mut().expect("set above");
-                    inflater.skip_to(offset)?;
-                    let n = inflater.read(buf)?;
+                    let n = match current.as_mut().map(|(_, decoded)| decoded) {
+                        Some(Decoded::Buffered(bytes)) => {
+                            let start = usize::try_from(offset).unwrap_or(usize::MAX);
+                            let chunk = bytes.get(start..).unwrap_or_default();
+                            let n = buf.len().min(chunk.len());
+                            buf[..n].copy_from_slice(&chunk[..n]);
+                            n
+                        }
+                        Some(Decoded::Streamed(inflater)) => {
+                            inflater.skip_to(offset)?;
+                            inflater.read(buf)?
+                        }
+                        None => 0,
+                    };
                     if n == 0 {
                         return Err(bad(format!("chunk {index} ends early")));
                     }
