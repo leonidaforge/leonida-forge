@@ -2,10 +2,13 @@
 //! metadata area `[0, hdr[0x04])`.
 //!
 //! The engine processes parts of the stored metadata in place before it reads
-//! the table, with algorithms that are not known. [`Stored`] holds the bytes as
-//! they are in the archive and reports which of those passes apply. Only
-//! metadata that no pass touches, or that was decoded elsewhere, becomes
-//! [`Metadata`], the parsed table.
+//! the table. [`Stored`] holds the bytes as they are in the archive and reports
+//! which of those passes apply. Only metadata that no pass touches, or that was
+//! decoded elsewhere, becomes [`Metadata`], the parsed table.
+//!
+//! [`Stored::transform`] runs the cipher passes with ciphers that the caller
+//! supplies (see [`transform`]). The block operation and keys for real archives
+//! are not available, so this does not decrypt them.
 //!
 //! Layouts follow the research documentation for executable build e95020b2.
 //! Unlike the engine, every count, offset and index is checked.
@@ -15,6 +18,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 
 use super::{HEADER_LEN, MAGIC};
+use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
+
+pub mod transform;
 
 /// Field keys whose meaning is established.
 pub mod keys {
@@ -44,6 +50,7 @@ pub enum Error {
     /// The engine processes the stored metadata before use, and that
     /// processing is not implemented.
     Transformed(Processing),
+    Cipher(transform::Error),
 }
 
 impl fmt::Display for Error {
@@ -58,6 +65,7 @@ impl fmt::Display for Error {
                 f,
                 "the stored metadata is processed before use ({processing}), which is not supported"
             ),
+            Error::Cipher(err) => write!(f, "metadata cipher pass failed: {err}"),
         }
     }
 }
@@ -67,6 +75,12 @@ impl std::error::Error for Error {}
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<transform::Error> for Error {
+    fn from(err: transform::Error) -> Self {
+        Error::Cipher(err)
     }
 }
 
@@ -349,16 +363,133 @@ impl Stored {
         }
     }
 
-    /// Whether the `A` table names sub-block `id`. Like the engine, this does
-    /// not require the offset to lie in the `B` block.
     fn has_sub_block(&self, id: u16) -> bool {
-        self.bytes
+        self.sub_block(&self.bytes, id).is_some()
+    }
+
+    /// The `B` offset of the first `A` record for sub-block `id` in `bytes`.
+    /// Like the engine, this does not require the offset to lie in the `B`
+    /// block.
+    fn sub_block(&self, bytes: &[u8], id: u16) -> Option<u32> {
+        bytes
             .get(self.layout.a_table.clone())
             .unwrap_or_default()
             .as_chunks::<A_RECORD_LEN>()
             .0
             .iter()
-            .any(|record| u16_at(record, 0) == Some(id))
+            .find(|record| u16_at(*record, 0) == Some(id))
+            .and_then(|record| u32_at(record, 4))
+    }
+
+    /// Step 1 spans. They start at the `A` table and `B` block of the layout.
+    fn static_spans(&self) -> Result<Vec<Range<usize>>, Error> {
+        let overflow = || invalid("static pass spans overflow");
+        let a = self.layout.a_table.start;
+        let a_len =
+            to_usize(align(u64::from(self.prefix.a_records) * 8, 16).ok_or_else(overflow)?)?;
+        let a_end = a.checked_add(a_len).ok_or_else(overflow)?;
+        let b_len = to_usize(u64::from(self.prefix.b_len))?;
+        Ok(if self.prefix.selector & 1 != 0 {
+            let b = self.layout.b_block.start;
+            let b_trailer = to_usize(u64::from(self.prefix.b_trailer_len))?;
+            let b_end = b.checked_add(b_len - b_trailer).ok_or_else(overflow)?;
+            vec![a..a_end, b..b_end]
+        } else {
+            let ab = a..a_end.checked_add(b_len).ok_or_else(overflow)?;
+            vec![ab]
+        })
+    }
+
+    /// The engine computes the start of `B` as `0x40 + align16(A * 8)` and
+    /// the end of `B` as the start of the descriptors when it places cipher
+    /// spans, while the layout aligns by `G`. Where the two disagree, the
+    /// engine's spans would cover other bytes than the layout's regions, so
+    /// such metadata is rejected.
+    fn check_span_formulas(&self) -> Result<(), Error> {
+        let overflow = || invalid("cipher span offsets overflow");
+        let b = align(u64::from(self.prefix.a_records) * 8, 16)
+            .map(|a| HEADER_LEN as u64 + a)
+            .ok_or_else(overflow)?;
+        let b_end = b + u64::from(self.prefix.b_len);
+        let layout = &self.layout;
+        if layout.b_block.start as u64 != b || layout.descriptors.start as u64 != b_end {
+            return Err(invalid(format!(
+                "the cipher spans place B at {b:#x}..{b_end:#x}, the layout at {:#x}..{:#x} \
+                 with descriptors at {:#x}",
+                layout.b_block.start, layout.b_block.end, layout.descriptors.start
+            )));
+        }
+        Ok(())
+    }
+
+    /// The step 4 span, computed as the engine computes it.
+    fn primary_span(&self) -> Result<Range<usize>, Error> {
+        let start = align(u64::from(self.prefix.a_records) * 8, 16)
+            .map(|a| HEADER_LEN as u64 + a + u64::from(self.prefix.b_len))
+            .ok_or_else(|| invalid("primary pass span overflows"))?
+            - u64::from(self.prefix.b_trailer_len);
+        Ok(to_usize(start)?..to_usize(u64::from(self.prefix.primary_len))?)
+    }
+
+    /// `B` sub-block 1, read from `bytes` after step 1.
+    fn archive_descriptor(&self, bytes: &[u8]) -> Result<Option<CipherDescriptor>, Error> {
+        let Some(offset) = self.sub_block(bytes, DESCRIPTOR_SUB_BLOCK) else {
+            return Ok(None);
+        };
+        self.layout
+            .b_block
+            .start
+            .checked_add(offset as usize)
+            .and_then(|start| CipherDescriptor::parse(bytes.get(start..)?))
+            .map(Some)
+            .ok_or_else(|| invalid("B sub-block 1 ends after the metadata area"))
+    }
+
+    /// Runs the cipher passes of the validation chain, steps 1, 4 and 5, on a
+    /// copy of the stored bytes. Each step initializes its own cipher. The
+    /// signature check of step 2 is not performed. On failure nothing of the
+    /// partly processed copy is returned.
+    ///
+    /// The engine runs step 5 in read modes 0 and 1 (view state below 2) when
+    /// the secondary area is non-empty. Both modes hold the same secondary
+    /// bytes, in one buffer or two; `Stored` holds them in one. Other states
+    /// are not modelled.
+    pub fn transform(&self, source: &impl CipherSource) -> Result<Transformed, Error> {
+        if !self.processing().is_none() {
+            self.check_span_formulas()?;
+        }
+        let mut bytes = self.bytes.clone();
+        let mut key_lookup_skipped = false;
+        let mut cipher = |descriptor: &CipherDescriptor| {
+            key_lookup_skipped |= Algorithm::of(descriptor.kind)? == Algorithm::Identity;
+            Cipher::new(descriptor, |key_id| source.cbc_block(key_id))
+        };
+        if self.prefix.selector != 0 {
+            let index = self.prefix.selector >> 1;
+            let (key_id, parameter) = source
+                .static_descriptor(index)
+                .ok_or(transform::Error::NoStaticDescriptor(index))?;
+            let descriptor = CipherDescriptor {
+                key_id,
+                kind: transform::static_kind(index),
+                parameter,
+            };
+            cipher(&descriptor)?.run(&mut bytes, &self.static_spans()?)?;
+        }
+        if let Some(descriptor) = self.archive_descriptor(&bytes)? {
+            cipher(&descriptor)?.run(&mut bytes, &[self.primary_span()?])?;
+            let secondary = to_usize(u64::from(self.prefix.primary_len))?
+                ..to_usize(u64::from(self.prefix.metadata_len))?;
+            if !secondary.is_empty() {
+                cipher(&descriptor)?.run(&mut bytes, &[secondary])?;
+            }
+        }
+        Ok(Transformed {
+            bytes,
+            prefix: self.prefix,
+            layout: self.layout.clone(),
+            key_lookup_skipped,
+        })
     }
 
     /// The parsed table, if the engine runs no processing pass over these
@@ -374,6 +505,41 @@ impl Stored {
             prefix: self.prefix,
             layout: self.layout,
         })
+    }
+}
+
+/// The metadata area after the cipher passes of the validation chain, with
+/// ciphers from a [`CipherSource`]. The signature is not checked, so the bytes
+/// are unauthenticated, and success does not mean the engine accepts the
+/// archive.
+#[derive(Debug, Clone)]
+pub struct Transformed {
+    bytes: Vec<u8>,
+    prefix: Prefix,
+    layout: Layout,
+    key_lookup_skipped: bool,
+}
+
+impl Transformed {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Whether a pass used algorithm 0. The engine looks up a key for it
+    /// and rejects the archive if that fails; this implementation does not,
+    /// so such a pass may succeed here and fail in the engine.
+    pub fn key_lookup_skipped(&self) -> bool {
+        self.key_lookup_skipped
+    }
+
+    /// The parsed table. No signature is checked: the result is
+    /// unauthenticated, like that of [`Stored::decode`].
+    pub fn decode(self) -> Metadata {
+        Metadata {
+            bytes: self.bytes,
+            prefix: self.prefix,
+            layout: self.layout,
+        }
     }
 }
 

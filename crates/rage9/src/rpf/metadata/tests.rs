@@ -671,3 +671,310 @@ fn reads_stored_metadata_from_an_archive() {
         Err(Error::Io(_))
     ));
 }
+
+mod chain {
+    //! The cipher passes with synthetic block operations and keys.
+
+    use super::*;
+    use crate::rpf::metadata::transform::tests::Toy;
+    use crate::rpf::metadata::transform::{self, BLOCK_LEN, Block};
+
+    const STATIC_ID: u32 = 0x51;
+    const ARCHIVE_ID: u32 = 0xA7;
+    const STATIC_KEY: Block = *b"static key 00004";
+    const ARCHIVE_KEY: Block = *b"archive key 0001";
+    const STATIC_IV: Block = [0x3C; BLOCK_LEN];
+    const ARCHIVE_IV: Block = [0x96; BLOCK_LEN];
+
+    // Spans of the synthetic layout below.
+    const A_SPAN: Range<usize> = 0x40..0x60;
+    const B_SPAN: Range<usize> = 0x60..0x1A0;
+    const AB_SPAN: Range<usize> = 0x40..0x1B0;
+    const PRIMARY_SPAN: Range<usize> = 0x1A0..0x1F0;
+    const SECONDARY_SPAN: Range<usize> = 0x1F0..0x200;
+
+    #[derive(Default)]
+    struct Source {
+        statics: Vec<(u8, Block)>,
+        keys: Vec<(u32, Block)>,
+    }
+
+    impl Source {
+        fn full() -> Self {
+            Self {
+                statics: (0..8).map(|index| (index, STATIC_IV)).collect(),
+                keys: vec![(STATIC_ID, STATIC_KEY), (ARCHIVE_ID, ARCHIVE_KEY)],
+            }
+        }
+    }
+
+    impl transform::CipherSource for Source {
+        type Block = Toy;
+
+        fn static_descriptor(&self, index: u8) -> Option<(u32, Block)> {
+            let (_, iv) = self.statics.iter().find(|(i, _)| *i == index)?;
+            Some((STATIC_ID, *iv))
+        }
+
+        fn cbc_block(&self, key_id: u32) -> Option<Toy> {
+            let (_, key) = self.keys.iter().find(|(id, _)| *id == key_id)?;
+            Some(Toy { key: *key })
+        }
+    }
+
+    fn archive(kind: u16) -> transform::CipherDescriptor {
+        transform::CipherDescriptor {
+            key_id: ARCHIVE_ID,
+            kind,
+            parameter: ARCHIVE_IV,
+        }
+    }
+
+    /// Metadata with `B` sub-block 1 at the start of `B` when `a_ids` lists
+    /// ID 1 first.
+    fn plain(selector: u8, a_ids: Vec<u16>, descriptor: transform::CipherDescriptor) -> Vec<u8> {
+        let columns = [
+            Column::new(KEY_X, 8, &[&[0x5A; 8]], &[Some(0)]),
+            Column::new(KEY_Y, 8, &[&[0xC3; 8]], &[Some(0)]),
+        ];
+        let mut bytes = Build {
+            selector,
+            a_ids,
+            secondary: 1,
+            ..Build::default()
+        }
+        .build(&columns);
+        let b = B_SPAN.start;
+        set_u32(&mut bytes, b, descriptor.key_id);
+        set_u16(&mut bytes, b + 4, descriptor.kind);
+        bytes[b + 6..b + 22].copy_from_slice(&descriptor.parameter);
+        let layout = Stored::from_bytes(bytes.clone()).unwrap().layout().clone();
+        assert_eq!(layout.b_block.start, B_SPAN.start);
+        assert_eq!(layout.primary_pool.end, PRIMARY_SPAN.end);
+        assert_eq!(layout.secondary_pool.end, SECONDARY_SPAN.end);
+        bytes
+    }
+
+    /// The inverse of one span runner call.
+    fn encrypt(bytes: &mut [u8], key: Block, iv: Block, spans: &[Range<usize>], per_span: bool) {
+        let mut next = iv;
+        for span in spans {
+            Toy { key }.encrypt(next, &mut bytes[span.clone()]);
+            next = if per_span {
+                iv
+            } else {
+                bytes[span.end - BLOCK_LEN..span.end].try_into().unwrap()
+            };
+        }
+    }
+
+    fn encrypt_archive_passes(bytes: &mut [u8], per_span: bool) {
+        encrypt(bytes, ARCHIVE_KEY, ARCHIVE_IV, &[SECONDARY_SPAN], per_span);
+        encrypt(bytes, ARCHIVE_KEY, ARCHIVE_IV, &[PRIMARY_SPAN], per_span);
+    }
+
+    fn assert_fields(transformed: Transformed) {
+        let metadata = transformed.decode();
+        assert_eq!(metadata.field(0, KEY_X).unwrap(), Some(&[0x5A; 8][..]));
+        assert_eq!(metadata.field(0, KEY_Y).unwrap(), Some(&[0xC3; 8][..]));
+    }
+
+    fn cipher_error(result: Result<Transformed, Error>) -> transform::Error {
+        match result {
+            Err(Error::Cipher(err)) => err,
+            other => panic!("expected Error::Cipher, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runs_static_and_archive_passes() {
+        let plain = plain(9, vec![1, 2, 6], archive(16));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, false);
+        encrypt(&mut bytes, STATIC_KEY, STATIC_IV, &[A_SPAN, B_SPAN], false);
+        for span in [A_SPAN, B_SPAN, PRIMARY_SPAN, SECONDARY_SPAN] {
+            assert_ne!(bytes[span.clone()], plain[span]);
+        }
+        let stored = Stored::from_bytes(bytes.clone()).unwrap();
+
+        let transformed = stored.transform(&Source::full()).unwrap();
+        assert_eq!(transformed.bytes(), &plain[..]);
+        assert!(!transformed.key_lookup_skipped());
+        assert_eq!(stored.bytes(), &bytes[..]);
+        assert_fields(transformed);
+        // Decoding the stored bytes still refuses the processed metadata.
+        assert!(matches!(stored.decode(), Err(Error::Transformed(_))));
+    }
+
+    #[test]
+    fn per_span_types_restart_each_span() {
+        // Static index 1 has cipher type 3.
+        let plain = plain(3, vec![1, 2, 6], archive(4));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, true);
+        encrypt(&mut bytes, STATIC_KEY, STATIC_IV, &[A_SPAN, B_SPAN], true);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        assert_eq!(
+            stored.transform(&Source::full()).unwrap().bytes(),
+            &plain[..]
+        );
+    }
+
+    #[test]
+    fn single_static_span_overlaps_the_primary_pass() {
+        // Bit 0 clear: one span over A and all of B, including the trailer
+        // that step 4 processes again.
+        let plain = plain(8, vec![1, 2, 6], archive(16));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, false);
+        encrypt(&mut bytes, STATIC_KEY, STATIC_IV, &[AB_SPAN], false);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        assert_eq!(
+            stored.transform(&Source::full()).unwrap().bytes(),
+            &plain[..]
+        );
+    }
+
+    #[test]
+    fn default_static_descriptor_is_a_no_op() {
+        let plain = plain(1, vec![1, 2, 6], archive(16));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, false);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        let source = Source {
+            keys: vec![(ARCHIVE_ID, ARCHIVE_KEY)],
+            ..Source::full()
+        };
+        let transformed = stored.transform(&source).unwrap();
+        assert!(transformed.key_lookup_skipped());
+        assert_fields(transformed);
+    }
+
+    #[test]
+    fn rejects_spans_that_disagree_with_the_layout() {
+        let columns = [Column::new(KEY_X, 8, &[&[0x5A; 8]], &[Some(0)])];
+        // G bit 0 clear with odd A: the layout puts B at 0x58, the engine at
+        // 0x60. G bit 0 set with B not a multiple of 16: the descriptors start
+        // at 0x1C0, the engine's B ends at 0x1B8.
+        for (flags, selector, a_ids, b_len) in [
+            (0, 9, vec![1, 2, 6], 0x150),
+            (0, 0, vec![1, 2, 6], 0x150),
+            (1, 9, vec![2, 3, 6, 4], 0x158),
+        ] {
+            let bytes = Build {
+                flags,
+                selector,
+                a_ids,
+                b_len,
+                ..Build::default()
+            }
+            .build(&columns);
+            let stored = Stored::from_bytes(bytes).unwrap();
+            let reason = invalid_reason(stored.transform(&Source::full()));
+            assert!(reason.contains("cipher spans"), "{reason}");
+        }
+        // G bit 0 clear, even A and B a multiple of 8 agree.
+        let bytes = Build {
+            flags: 0,
+            a_ids: vec![1, 2, 6, 3],
+            b_len: 0x148,
+            ..Build::default()
+        }
+        .build(&columns);
+        Stored::from_bytes(bytes)
+            .unwrap()
+            .check_span_formulas()
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_pass_only() {
+        let plain = plain(0, vec![1, 2, 6], archive(11));
+        let mut bytes = plain.clone();
+        encrypt_archive_passes(&mut bytes, false);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        let source = Source {
+            keys: vec![(ARCHIVE_ID, ARCHIVE_KEY)],
+            ..Source::default()
+        };
+        assert_eq!(stored.transform(&source).unwrap().bytes(), &plain[..]);
+    }
+
+    #[test]
+    fn no_passes_keep_the_bytes() {
+        let plain = plain(0, vec![2, 3, 6], archive(16));
+        let stored = Stored::from_bytes(plain.clone()).unwrap();
+        let transformed = stored.transform(&Source::default()).unwrap();
+        assert_eq!(transformed.bytes(), &plain[..]);
+        assert_eq!(
+            transformed.decode().field(0, KEY_X).unwrap(),
+            stored.decode().unwrap().field(0, KEY_X).unwrap()
+        );
+    }
+
+    #[test]
+    fn reports_missing_ciphers() {
+        let stored = Stored::from_bytes(plain(9, vec![1, 2, 6], archive(16))).unwrap();
+        let error = cipher_error(stored.transform(&Source::default()));
+        assert_eq!(error, transform::Error::NoStaticDescriptor(4));
+
+        let stored = Stored::from_bytes(plain(0, vec![1, 2, 6], archive(16))).unwrap();
+        let source = Source {
+            keys: vec![(STATIC_ID, STATIC_KEY)],
+            ..Source::full()
+        };
+        let error = cipher_error(stored.transform(&source));
+        assert_eq!(error, transform::Error::NoKey(ARCHIVE_ID));
+    }
+
+    #[test]
+    fn refuses_unsupported_archive_ciphers() {
+        for (kind, expected) in [
+            (13, transform::Error::InvalidType(13)),
+            (
+                2,
+                transform::Error::Unsupported {
+                    kind: 2,
+                    algorithm: 2,
+                },
+            ),
+            (
+                7,
+                transform::Error::Unsupported {
+                    kind: 7,
+                    algorithm: 0x12,
+                },
+            ),
+        ] {
+            let stored = Stored::from_bytes(plain(0, vec![1, 2, 6], archive(kind))).unwrap();
+            assert_eq!(cipher_error(stored.transform(&Source::full())), expected);
+            assert!(matches!(stored.decode(), Err(Error::Transformed(_))));
+        }
+    }
+
+    #[test]
+    fn rejects_a_descriptor_outside_the_metadata() {
+        let mut bytes = plain(0, vec![1, 2, 6], archive(16));
+        set_u32(&mut bytes, A_SPAN.start + 4, 0xFFFF_0000);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        let reason = invalid_reason(stored.transform(&Source::full()));
+        assert!(reason.contains("sub-block 1"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_unaligned_primary_span() {
+        let columns = [Column::new(KEY_X, 4, &[&[1, 2, 3, 4]], &[Some(0)])];
+        let mut bytes = Build {
+            a_ids: vec![1, 2, 6],
+            ..Build::default()
+        }
+        .build(&columns);
+        set_u32(&mut bytes, B_SPAN.start, ARCHIVE_ID);
+        set_u16(&mut bytes, B_SPAN.start + 4, 16);
+        let stored = Stored::from_bytes(bytes).unwrap();
+        let span = stored.primary_span().unwrap();
+        assert!(!span.len().is_multiple_of(BLOCK_LEN));
+        let error = cipher_error(stored.transform(&Source::full()));
+        assert_eq!(error, transform::Error::Unaligned(span.len()));
+    }
+}
