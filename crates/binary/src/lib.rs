@@ -2,6 +2,7 @@
 //! search and hashing. Nothing here holds a whole file in memory.
 
 mod interpret;
+pub mod pe;
 mod search;
 
 use std::fmt;
