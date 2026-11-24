@@ -115,8 +115,11 @@ file writer has tests for success, overwrite, cancellation, a missing companion
 and a failed finalisation.
 
 Manual, for this package: the packaged desktop launched on this Windows 11
-machine, showed a responsive `Leonida Forge` window, and was stopped by the
-test harness. No GUI interaction was performed.
+machine and opened a top-level window titled `Leonida Forge`, with no
+missing-runtime dialog. The process stayed alive until the test harness stopped
+it. No window interaction was performed, so responsiveness to input is not
+verified. This machine has the Visual C++ Redistributable, so it is not a
+clean-machine test.
 
 ## Known limitations
 
