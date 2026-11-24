@@ -139,38 +139,34 @@ fn probe(archive: &Archive) -> Result<Contents, Arc<str>> {
 }
 
 /// The contents of `archive` from memory, its table of contents or the
-/// cache file. Never scans.
-fn contents(archive: &Archive) -> io::Result<Contents> {
+/// cache file, or why the table of contents cannot be used. Never scans.
+fn lookup(archive: &Archive) -> io::Result<Result<Contents, Arc<str>>> {
     if let Some(contents) = in_memory(archive) {
-        return Ok(contents);
+        return Ok(Ok(contents));
     }
     let reason = match probe(archive) {
-        Ok(native) => return Ok(remember(archive, native)),
+        Ok(native) => return Ok(Ok(remember(archive, native))),
         Err(reason) => reason,
     };
     if let Some(dir) = cache_dir()
         && let Some(index) = rpf::load(&dir, &cache_key(archive)?, archive.source.len())
     {
-        return Ok(remember(
-            archive,
-            Contents::Recovered(Arc::new(index), reason),
-        ));
+        let recovered = Contents::Recovered(Arc::new(index), reason);
+        return Ok(Ok(remember(archive, recovered)));
     }
-    Err(needs_prepare(archive.path.clone()))
+    Ok(Err(reason))
+}
+
+fn contents(archive: &Archive) -> io::Result<Contents> {
+    lookup(archive)?.map_err(|_| needs_prepare(archive.path.clone()))
 }
 
 /// Reads the table of contents or, where it cannot be used, scans `archive`,
 /// unless its contents are in memory or in the cache. Keeps the result in
 /// memory.
 pub fn build_index(archive: &Archive, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
-    if contents(archive).is_ok() {
-        return Ok(());
-    }
-    let reason = match probe(archive) {
-        Ok(native) => {
-            remember(archive, native);
-            return Ok(());
-        }
+    let reason = match lookup(archive)? {
+        Ok(_) => return Ok(()),
         Err(reason) => reason,
     };
     let key = cache_key(archive)?;

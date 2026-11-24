@@ -150,16 +150,19 @@ impl Native {
     pub fn read(archive: &Archive) -> Result<Self, Arc<str>> {
         let unreadable =
             |err: Error| Arc::from(format!("The table of contents could not be read: {err}."));
-        let stored = Stored::read(&mut archive.source.clone(), MAX_METADATA).map_err(unreadable)?;
-        let metadata = match stored.decode() {
-            Ok(metadata) => metadata,
-            Err(Error::Transformed(_)) => {
-                return Err(Arc::from(
-                    "The table of contents is encrypted and is not read.",
-                ));
-            }
-            Err(err) => return Err(unreadable(err)),
-        };
+        let mut source = archive.source.clone();
+        // Decides from the header, and at most the A table, whether the
+        // stored bytes can be used, before reading all of them.
+        let probe = Stored::probe(&mut source).map_err(unreadable)?;
+        if let Some(reason) = probe.unsupported() {
+            return Err(Arc::from(format!(
+                "The table of contents is not read: {reason}."
+            )));
+        }
+        #[cfg(test)]
+        tests::FULL_READS.with(|reads| reads.set(reads.get() + 1));
+        let stored = Stored::read(&mut source, MAX_METADATA).map_err(unreadable)?;
+        let metadata = stored.decode().map_err(unreadable)?;
         let rows: Vec<Row> = metadata.entries().collect();
         let names = Names::read(names_file(archive), &rows);
         Ok(Self { rows, names })

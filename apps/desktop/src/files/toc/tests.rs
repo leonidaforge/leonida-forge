@@ -1,6 +1,7 @@
 //! Explorer tests on synthetic archives with an unencrypted table of
 //! contents.
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 
 use lforge_rage9::rpf::Progress;
@@ -12,6 +13,15 @@ use crate::files;
 use crate::files::archive::{self, Location, locate, prepare_required};
 use crate::files::rpf::tests::{rpf_bytes, zlib};
 use crate::files::zip::tests::{zip_bytes, zip_bytes_with};
+
+thread_local! {
+    /// Full reads of a metadata area on this thread.
+    pub(crate) static FULL_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn full_reads() -> usize {
+    FULL_READS.with(Cell::get)
+}
 
 pub(crate) struct Spec {
     pub payload: Vec<u8>,
@@ -329,7 +339,8 @@ fn unusable_tables_fall_back_to_recovery() {
     for (path, reason) in [
         (
             &encrypted,
-            "The table of contents is encrypted and is not read.",
+            "The table of contents is not read: it is encrypted: the static pass decrypts it \
+             with cipher type 16",
         ),
         (&malformed, "The table of contents could not be read:"),
     ] {
@@ -417,4 +428,77 @@ fn native_archives_open_inside_zip_archives() {
         assert_eq!(names_of(&files::list(&path).unwrap()), ["Row 00000"]);
         assert_eq!(files::read(&path.join("Row 00000")).unwrap(), b"inside");
     }
+}
+
+#[test]
+fn encrypted_tables_are_never_read_in_full() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("encrypted.rpf");
+    fs::write(&path, rpf_bytes(&[zlib(b"<?xml version=\"1.0\"?><a/>")])).unwrap();
+    let before = full_reads();
+    // Listing before the scan, preparing, listing and describing.
+    assert!(prepare_required(&files::list(&path).unwrap_err()).is_some());
+    assert!(prepare_required(&files::list(&path).unwrap_err()).is_some());
+    assert_eq!(names_of(&list_opened(&path)), [files::rpf::RECOVERED]);
+    assert!(files::describe(&path).unwrap().contains("encrypted"));
+    // A changed archive is probed again, still without a full read.
+    fs::write(
+        &path,
+        rpf_bytes(&[zlib(b"<?xml version=\"1.0\"?><b/>"), zlib(b"x")]),
+    )
+    .unwrap();
+    assert!(prepare_required(&files::list(&path).unwrap_err()).is_some());
+    assert_eq!(full_reads(), before);
+}
+
+#[test]
+fn usable_tables_are_read_once_until_something_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("native.rpf");
+    fs::write(&path, native_rpf(&[spec(b"one", 1)])).unwrap();
+    let before = full_reads();
+    for _ in 0..3 {
+        assert_eq!(names_of(&files::list(&path).unwrap()), ["Row 00000"]);
+        files::describe(&path).unwrap();
+    }
+    assert_eq!(full_reads(), before + 1);
+    // A new candidate file, then a changed archive.
+    fs::write(temp.path().join("native.rpf.names.txt"), "x\n").unwrap();
+    files::list(&path).unwrap();
+    assert_eq!(full_reads(), before + 2);
+    fs::write(&path, native_rpf(&[spec(b"one", 1), spec(b"two", 1)])).unwrap();
+    assert_eq!(files::list(&path).unwrap().len(), 2);
+    assert_eq!(full_reads(), before + 3);
+}
+
+#[test]
+fn passes_other_than_decryption_are_named_as_such() {
+    let temp = tempfile::tempdir().unwrap();
+    // Static descriptor 0, a no-op cipher.
+    let mut no_op = rpf_bytes(&[zlib(b"<?xml version=\"1.0\"?><a/>")]);
+    no_op[0x2E] = 1;
+    // Selector 0 with B sub-block 1, whose cipher type is stored as 0.
+    let mut archive_pass = native_rpf(&[spec(b"one", 1)]);
+    archive_pass[0x40..0x42].copy_from_slice(&1u16.to_le_bytes());
+    let before = full_reads();
+    for (name, bytes, expected) in [
+        (
+            "no_op.rpf",
+            no_op,
+            "the static pass processes it with cipher type 0, a no-op cipher",
+        ),
+        (
+            "archive_pass.rpf",
+            archive_pass,
+            "the archive pass processes it with cipher type 0, a no-op cipher",
+        ),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        list_opened(&path);
+        let note = files::describe(&path).unwrap();
+        assert!(note.contains(expected), "{note}");
+        assert!(!note.contains("encrypted"), "{note}");
+    }
+    assert_eq!(full_reads(), before);
 }
