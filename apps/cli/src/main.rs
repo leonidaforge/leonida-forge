@@ -1,6 +1,8 @@
 mod archive;
 mod binary;
+mod extract;
 mod metadata;
+mod native;
 
 use std::process::ExitCode;
 

@@ -12,7 +12,7 @@ use lforge_rage9::resource::Segment;
 use lforge_rage9::rpf::{self, Index, Origin, Progress, Resource};
 use serde_json::{Value, json};
 
-use crate::metadata;
+use crate::{extract, metadata};
 
 /// How the contents of an RPF9 archive are obtained, for users who expect a
 /// file listing.
@@ -86,6 +86,19 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export one native table-of-contents entry, decoded where supported
+    Extract {
+        file: PathBuf,
+        /// The row index of the entry, as `archive metadata --entries` lists it
+        #[arg(long)]
+        row: u32,
+        /// Where to write the entry's contents
+        #[arg(long)]
+        output: PathBuf,
+        /// Replace the output file if it already exists
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 pub fn run(command: Command) -> Result<(), String> {
@@ -127,6 +140,12 @@ pub fn run(command: Command) -> Result<(), String> {
                 json,
             },
         ),
+        Command::Extract {
+            file,
+            row,
+            output,
+            overwrite,
+        } => extract::run(&file, row, &output, overwrite),
     }
 }
 

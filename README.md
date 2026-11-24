@@ -87,6 +87,14 @@ lforge archive resource data.rpf 0x2010 --json # pages and checks of one resourc
 
 `--no-cache` neither reads nor writes the index cache.
 
+Where the table of contents is stored without encryption, it can be read directly instead of scanned.
+
+```sh
+lforge archive extract data.rpf --row 42 --output file.bin
+```
+
+Entries are identified by their row number in the table, as listed by `archive metadata --entries`. `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
+
 ## AI Contributions
 
 **AI-enabled, not AI-driven.**
