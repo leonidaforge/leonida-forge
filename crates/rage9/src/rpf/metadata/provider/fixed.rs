@@ -43,8 +43,10 @@ const BLOCK_BYTES: usize = STAGE_BYTES + ROUND_BYTES;
 const SCAN_STEP: usize = 8;
 /// Raw bytes read per scan step.
 const SCAN_CHUNK: usize = 1024 * 1024;
-/// Candidate table blocks the search accepts before failing.
-const MAX_CANDIDATES: usize = 64;
+/// Complete affine stage regions the search accepts before failing. Real
+/// executables contain many affine tables and shifted windows that pass the
+/// cheap prefilter, so this bound only protects against a pathological image.
+const MAX_CANDIDATES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixedTablesError {
@@ -210,7 +212,7 @@ fn scan_section(
             return Err(FixedTablesError::Cancelled);
         }
         let window = (size - chunk_start).min(SCAN_CHUNK);
-        let read_len = (window + STAGE_TABLE_LEN).min(size - chunk_start);
+        let read_len = (window + STAGE_BYTES).min(size - chunk_start);
         let bytes = image
             .read_rva(base_rva + chunk_start as u64, read_len)
             .map_err(|_| FixedTablesError::Image("a data section cannot be read"))?;
@@ -227,6 +229,18 @@ fn scan_section(
             }
 
             if !stage_prefilter(&bytes[local..local + STAGE_TABLE_LEN]) {
+                local += SCAN_STEP;
+                continue;
+            }
+            // Shifted windows and unrelated tables also pass the cheap
+            // prefilter. A complete stage region keeps them from consuming
+            // the block-read and validation budget.
+            let stage_end = local + STAGE_BYTES;
+            if stage_end > read_len {
+                break;
+            }
+            if let Err(reason) = stage_region_ok(&bytes[local..stage_end]) {
+                *malformed = Some(reason);
                 local += SCAN_STEP;
                 continue;
             }
@@ -276,17 +290,7 @@ fn validate_block(block: &[u8]) -> Result<FixedTables, &'static str> {
         return Err("unexpected fixed table block length");
     }
 
-    let mut stage = [[0u8; STAGE_TABLE_LEN]; STAGE_TABLE_COUNT];
-    for (index, slot) in stage.iter_mut().enumerate() {
-        let table = &block[index * STAGE_TABLE_LEN..(index + 1) * STAGE_TABLE_LEN];
-        if !stage_table_ok(table) {
-            return Err("a stage-0 table is not an affine permutation");
-        }
-        slot.copy_from_slice(table);
-    }
-    if !pairwise_distinct(&stage) {
-        return Err("two stage-0 tables are identical");
-    }
+    let stage = stage_region_ok(&block[..STAGE_BYTES])?;
 
     let mut round = [[0u32; 256]; ROUND_TABLE_COUNT];
     let round_bytes = &block[STAGE_BYTES..];
@@ -306,6 +310,26 @@ fn validate_block(block: &[u8]) -> Result<FixedTables, &'static str> {
     Ok(FixedTables {
         inner: Arc::new(Tables { stage, round }),
     })
+}
+
+fn stage_region_ok(
+    region: &[u8],
+) -> Result<[[u8; STAGE_TABLE_LEN]; STAGE_TABLE_COUNT], &'static str> {
+    if region.len() != STAGE_BYTES {
+        return Err("unexpected stage region length");
+    }
+    let mut stage = [[0u8; STAGE_TABLE_LEN]; STAGE_TABLE_COUNT];
+    for (index, slot) in stage.iter_mut().enumerate() {
+        let table = &region[index * STAGE_TABLE_LEN..(index + 1) * STAGE_TABLE_LEN];
+        if !stage_table_ok(table) {
+            return Err("a stage-0 table is not an affine permutation");
+        }
+        slot.copy_from_slice(table);
+    }
+    if !pairwise_distinct(&stage) {
+        return Err("two stage-0 tables are identical");
+    }
+    Ok(stage)
 }
 
 fn stage_table_ok(table: &[u8]) -> bool {

@@ -14,8 +14,8 @@ use crate::rpf::metadata::probe::{
     AUTHENTICATION, ProbeError, ProbeOutcome, ProbeReport, probe, probe_with_limit,
 };
 use crate::rpf::metadata::provider::{
-    EncodedAesBlock, FixedTablesError, RecognizedSource, SourceError, recognize_fixed_tables,
-    recognize_fixed_tables_with, synthetic,
+    EncodedAesBlock, FixedTablesError, RecognizedSource, STAGE_TABLE_LEN, SourceError,
+    recognize_fixed_tables, recognize_fixed_tables_with, synthetic,
 };
 use crate::rpf::metadata::transform::{BlockDecrypt, CipherSource};
 
@@ -1307,6 +1307,26 @@ fn fixed_section(data: Vec<u8>) -> Section {
 fn recognizes_synthetic_fixed_tables() {
     let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
     let image = build_view(&[fixed_section(synthetic.fixed_bytes())], &[]);
+    let tables = recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap();
+    let block = EncodedAesBlock::new(synthetic.state_bytes(), tables).unwrap();
+    let mut value = synthetic::FIPS_CIPHERTEXT;
+    block.decrypt_block(&mut value);
+    assert_eq!(value, synthetic::FIPS_PLAINTEXT);
+}
+
+#[test]
+fn ignores_harmless_affine_windows_before_the_fixed_tables() {
+    let synthetic = synthetic::instance(&synthetic::FIPS_KEY);
+    let fixed = synthetic.fixed_bytes();
+    // Repeated affine tables make every 8-byte window a shifted affine table.
+    // These are not fixed-table blocks, and they must not consume the block
+    // candidate budget before the real block.
+    let mut data = Vec::new();
+    for _ in 0..10 {
+        data.extend_from_slice(&fixed[..STAGE_TABLE_LEN]);
+    }
+    data.extend_from_slice(&fixed);
+    let image = build_view(&[fixed_section(data)], &[]);
     let tables = recognize_fixed_tables(&image, &AtomicBool::new(false)).unwrap();
     let block = EncodedAesBlock::new(synthetic.state_bytes(), tables).unwrap();
     let mut value = synthetic::FIPS_CIPHERTEXT;
