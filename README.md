@@ -57,8 +57,10 @@ Archives stored in other archives open the same way, up to 8 levels deep.
 The explorer decompresses each one to a temporary file, up to 512 MB each and 2 GB per chain.
 To see the raw archive bytes, right-click it and choose **Open in Binary Inspector**.
 
-The RPF9 table of contents is encrypted, and Leonida Forge does not read it.
-It scans the archive data for zlib streams and lists what it finds instead.
+When the RPF9 table of contents is stored without encryption, Leonida Forge reads its native entries directly.
+The table of contents in retail game archives is encrypted, and Leonida Forge does not decrypt it.
+For those archives it scans the data for zlib streams and lists what it finds instead.
+That is scan recovery, not a complete native archive index, and it does not make this a full native GTA VI RPF9 reader.
 The first visit reads the whole archive. A 773 MB archive takes about 2 seconds from the disk cache.
 The index goes to `%APPDATA%\Leonida Forge\cache\rpf` and is reused until the archive's size or modification time changes.
 
