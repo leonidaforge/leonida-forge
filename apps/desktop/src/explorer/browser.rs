@@ -10,7 +10,7 @@ use gpui::{
 
 use super::{BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
 use crate::files::archive::Stage;
-use crate::files::{self, Entry, EntryKind, SortKey};
+use crate::files::{self, Entry, EntryKind, ListingLayout, SortKey};
 use crate::settings::ViewMode;
 use crate::ui;
 use crate::ui::assets::Icon;
@@ -150,7 +150,53 @@ impl Explorer {
                             )
                     })),
             )
+            .child(
+                div()
+                    .flex()
+                    .gap_0p5()
+                    .p_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::BACKGROUND))
+                    .children(ListingLayout::ALL.into_iter().map(|layout| {
+                        let active = self.layout == layout;
+                        div()
+                            .id(layout.label())
+                            .flex()
+                            .items_center()
+                            .h(px(26.))
+                            .px_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(gpui::transparent_black())
+                            .when(active, |el| {
+                                el.bg(rgb(theme::SELECTION))
+                                    .border_color(rgb(theme::SELECTION_BORDER))
+                            })
+                            .when(!active, |el| el.hover(|s| s.bg(rgb(theme::HOVER))))
+                            .when(show_labels, |el| el.child(layout.label()))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.set_layout(layout, cx)),
+                            )
+                    })),
+            )
             .child(div().flex_1())
+            .when_some(self.search.clone(), |el, search| {
+                let empty = search.read(cx).text().is_empty();
+                el.child(div().w(px(220.)).child(search))
+                    .when(!empty, |el| {
+                        el.child(ui::button("clear-filter", "Clear").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(search) = &this.search {
+                                    search.update(cx, |field, cx| field.clear(cx));
+                                }
+                                cx.notify();
+                            },
+                        )))
+                    })
+            })
             .child(div().text_color(rgb(theme::TEXT_MUTED)).child("Sort:"))
             .child(
                 div()
@@ -236,10 +282,26 @@ impl Explorer {
             }
         };
         let note = self.notes.get(dir);
+        let needle = self
+            .search
+            .as_ref()
+            .map(|search| search.read(cx).text().trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let entries = if needle.is_empty() {
+            entries
+        } else {
+            Arc::new(
+                entries
+                    .iter()
+                    .filter(|entry| matches_filter(entry, &needle))
+                    .cloned()
+                    .collect::<Vec<Entry>>(),
+            )
+        };
         if entries.is_empty() {
-            return match note {
+            return match (note, needle.is_empty()) {
                 // The note explains why nothing is listed; "empty" could be wrong.
-                Some(note) => div()
+                (Some(note), true) => div()
                     .flex()
                     .size_full()
                     .items_center()
@@ -253,7 +315,8 @@ impl Explorer {
                             .child(note.clone()),
                     )
                     .into_any_element(),
-                None => ui::centered_message("This folder is empty.", None),
+                (_, false) => ui::centered_message("No entries match the filter.", None),
+                (None, true) => ui::centered_message("This folder is empty.", None),
             };
         }
         let list_height = layout.center_height - if note.is_some() { NOTE_HEIGHT } else { 0. };
@@ -829,5 +892,69 @@ fn view_mode_icon(mode: ViewMode) -> Icon {
         ViewMode::List => Icon::ViewList,
         ViewMode::Details => Icon::ViewDetails,
         ViewMode::Tiles => Icon::ViewTiles,
+    }
+}
+
+/// Whether the entry matches a lower-case filter: its visible label, its
+/// stored name key or hash, and its type. Matching is a bounded substring
+/// test on the values the entry already carries, not an index.
+fn matches_filter(entry: &Entry, needle: &str) -> bool {
+    entry.name.to_ascii_lowercase().contains(needle)
+        || entry.type_name.to_ascii_lowercase().contains(needle)
+        || entry.details.iter().any(|(label, value)| {
+            matches!(*label, "Name hash" | "Name key" | "Type ID" | "Names")
+                && value.to_ascii_lowercase().contains(needle)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::files::Entry;
+
+    fn rpf_entry() -> Entry {
+        let mut entry = Entry::new(
+            "props/crate.rpf".to_string(),
+            PathBuf::from(r"pack.rpf\props\Row 00001"),
+            EntryKind::File,
+            Some(12),
+            None,
+        );
+        entry.type_name = "RPF9 entry, type 0 (rpf)".to_string();
+        entry.details = vec![
+            ("Name hash", "0xABCDEF0123456789".to_string()),
+            ("Name key", "0x1234ABCD".to_string()),
+            ("Type ID", "0 (meaning not established)".to_string()),
+            ("Names", "props/crate.rpf".to_string()),
+        ];
+        entry
+    }
+
+    #[test]
+    fn filter_matches_labels_hashes_types_and_candidates() {
+        let entry = rpf_entry();
+        for needle in [
+            "crate",
+            "abcdef0123456789",
+            "1234abcd",
+            "type 0",
+            "0 (meaning",
+            "props/crate",
+        ] {
+            assert!(matches_filter(&entry, needle), "{needle}");
+        }
+        assert!(!matches_filter(&entry, "crates"));
+        assert!(!matches_filter(&entry, "0x9999"));
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_through_the_caller_lower_case() {
+        let entry = rpf_entry();
+        // The caller lower-cases the needle; values are lowered here.
+        assert!(matches_filter(
+            &entry,
+            "props/CRATE.rpf".to_ascii_lowercase().as_str()
+        ));
+        assert!(!matches_filter(&entry, "Props/crate.rpf"));
     }
 }

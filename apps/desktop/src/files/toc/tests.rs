@@ -14,6 +14,7 @@ use crate::files;
 use crate::files::archive::{self, Location, locate, prepare_required};
 use crate::files::rpf::tests::{rpf_bytes, zlib};
 use crate::files::zip::tests::{zip_bytes, zip_bytes_with};
+use crate::files::{Access, ListingLayout};
 
 thread_local! {
     /// Full reads of a metadata area on this thread.
@@ -463,6 +464,68 @@ fn verified_paths_become_folders_and_unnamed_rows_come_last() {
 }
 
 #[test]
+fn flat_and_folder_layouts_share_one_row_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("layouts.rpf");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(hash64(b"packs/inner")),
+                ..spec(&[1; 16], RPF_TYPE)
+            },
+            Spec {
+                hash: Some(hash64(b"packs/inner/leaf")),
+                ..spec(&[2; 16], RPF_TYPE)
+            },
+            Spec {
+                hash: Some(hash64(b"unnamed")),
+                ..spec(&[3; 16], RPF_TYPE)
+            },
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("layouts.rpf.names.txt"),
+        "packs/inner.rpf\npacks/inner/leaf.rpf\n",
+    )
+    .unwrap();
+
+    let folders = Access::none().with_layout(ListingLayout::Folders);
+    let root = files::list_with(&path, &folders).unwrap();
+    assert_eq!(names_of(&root), ["packs", "Unnamed Entries"]);
+
+    // One list of every row, without opening the virtual folders.
+    let flat = Access::none().with_layout(ListingLayout::Flat);
+    let rows = files::list_with(&path, &flat).unwrap();
+    let labels: Vec<String> = rows.iter().map(|entry| entry.name.clone()).collect();
+    assert_eq!(
+        labels,
+        [
+            "inner.rpf".to_string(),
+            "leaf.rpf".to_string(),
+            format!("0x{:016X}.rpf", hash64(b"unnamed"))
+        ]
+    );
+    // The labels can repeat; the paths stay the canonical row paths.
+    assert_eq!(rows[0].path, path.join("packs").join("Row 00000"));
+    assert_eq!(
+        rows[1].path,
+        path.join("packs").join("inner").join("Row 00001")
+    );
+    assert_eq!(rows[2].path, path.join("Unnamed Entries").join("Row 00002"));
+    assert_eq!(files::read_with(&rows[1].path, &flat).unwrap(), [2; 16]);
+    let note = files::describe_with(&path, &flat).unwrap();
+    assert!(note.contains("one list"), "{note}");
+
+    // The folder view is unchanged afterwards.
+    let root = files::list_with(&path, &folders).unwrap();
+    assert_eq!(names_of(&root), ["packs", "Unnamed Entries"]);
+    let note = files::describe_with(&path, &folders).unwrap();
+    assert!(note.contains("shown as folders"), "{note}");
+}
+
+#[test]
 fn names_come_from_a_lut_beside_the_executable() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("lut.rpf");
@@ -495,9 +558,13 @@ fn names_come_from_a_lut_beside_the_executable() {
     let mut native = Native::read(&archive).unwrap();
     native.names = Names::read_with(&archive, &native.rows, &native.types, &builtin);
     native.layout = Layout::build(&native.rows, native.names.as_ref());
-    let root = native.list(&archive, Path::new("")).unwrap();
+    let root = native
+        .list(&archive, Path::new(""), ListingLayout::Folders)
+        .unwrap();
     assert_eq!(names_of(&root), ["Props", "Unnamed Entries"]);
-    let props = native.list(&archive, Path::new("Props")).unwrap();
+    let props = native
+        .list(&archive, Path::new("Props"), ListingLayout::Folders)
+        .unwrap();
     assert_eq!(names_of(&props), ["Item.ydr"]);
     assert_eq!(
         detail(&props[0], "Name source"),
@@ -505,7 +572,13 @@ fn names_come_from_a_lut_beside_the_executable() {
     );
     assert_eq!(detail(&props[0], "Name hash"), format!("0x{item:016X}"));
     assert_eq!(props[0].path, archive.path.join("Props").join("Row 00000"));
-    let unnamed = native.list(&archive, Path::new("Unnamed Entries")).unwrap();
+    let unnamed = native
+        .list(
+            &archive,
+            Path::new("Unnamed Entries"),
+            ListingLayout::Folders,
+        )
+        .unwrap();
     let labels: Vec<String> = unnamed.iter().map(|entry| entry.name.clone()).collect();
     assert_eq!(labels, [format!("0x{other:016X}.rpf")]);
 }

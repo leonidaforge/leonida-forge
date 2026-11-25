@@ -384,6 +384,28 @@ pub enum SortKey {
     Modified,
 }
 
+/// How the rows of an RPF9 archive are listed. The two modes never change a
+/// row's identity: its path stays `<folder>/Row NNNNN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ListingLayout {
+    /// Verified relative paths become virtual folders.
+    #[default]
+    Folders,
+    /// Every row of the archive is listed in one list at its root.
+    Flat,
+}
+
+impl ListingLayout {
+    pub const ALL: [ListingLayout; 2] = [ListingLayout::Folders, ListingLayout::Flat];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ListingLayout::Folders => "Folders",
+            ListingLayout::Flat => "Flat list",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Sort {
     pub key: SortKey,

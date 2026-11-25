@@ -627,7 +627,7 @@ fn region_file(dir: &Path, region: &Region) -> Entry {
 
 pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
     match contents(archive)? {
-        Contents::Native(native) => native.list(archive, inner),
+        Contents::Native(native) => native.list(archive, inner, archive.access.layout()),
         Contents::Recovered(index, _) => list_recovered(archive, &index, inner),
     }
 }
@@ -807,7 +807,9 @@ pub fn raw_source(archive: &Archive, inner: &Path) -> io::Result<Option<lforge_b
 /// `None` until the archive is indexed.
 pub fn describe(archive: &Archive, inner: &Path) -> Option<String> {
     let (index, reason) = match contents(archive).ok()? {
-        Contents::Native(native) => return native.describe(archive, inner),
+        Contents::Native(native) => {
+            return native.describe(archive, inner, archive.access.layout());
+        }
         Contents::Recovered(index, reason) => (index, reason),
     };
     let percent = |part: u64| match index.data_len() {
@@ -1389,15 +1391,21 @@ pub(crate) mod tests {
             &path,
             crate::files::toc::tests::native_rpf(&[crate::files::toc::tests::Spec {
                 hash: Some(lforge_rage9::rpf::names::hash64(b"data")),
+                key: Some(lforge_rage9::rpf::names::joaat(b"data")),
                 ..crate::files::toc::tests::spec(b"five bytes", 11)
             }]),
         )
         .unwrap();
         let rows = files::list(&path).unwrap();
         let row = &rows[0];
-        let hash = format!("0x{:016X}", lforge_rage9::rpf::names::hash64(b"data"));
-        assert_eq!(row.name, hash.as_str());
-        assert_eq!(detail(row, "Name hash"), Some(hash.as_str()));
+        // Type 11 uses the 32-bit class, so its label is the stored key.
+        let key = format!("0x{:08X}", lforge_rage9::rpf::names::joaat(b"data"));
+        assert_eq!(row.name, key.as_str());
+        assert_eq!(
+            detail(row, "Name hash"),
+            Some(format!("0x{:016X}", lforge_rage9::rpf::names::hash64(b"data")).as_str())
+        );
+        assert_eq!(detail(row, "Name key"), Some(key.as_str()));
         assert_eq!(detail(row, "Type ID"), Some("11 (meaning not established)"));
         assert!(detail(row, "Metadata").unwrap().starts_with("Unencrypted"));
         assert!(detail(row, "Contents").is_some());

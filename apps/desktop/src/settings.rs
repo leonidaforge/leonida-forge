@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::files::Sort;
+use crate::files::{ListingLayout, Sort};
 
 pub const DEFAULT_TREE_WIDTH: f32 = 240.;
 pub const DEFAULT_PREVIEW_WIDTH: f32 = 320.;
@@ -49,6 +49,9 @@ pub struct Settings {
     pub folders: Vec<PathBuf>,
     pub view_mode: ViewMode,
     pub sort: Sort,
+    /// Whether native RPF9 rows are shown by verified relative path or in one
+    /// flat list. Older files without the field get [`ListingLayout::Folders`].
+    pub layout: ListingLayout,
     pub preview_visible: bool,
     pub tree_width: f32,
     pub preview_width: f32,
@@ -66,6 +69,7 @@ impl Default for Settings {
             folders: Vec::new(),
             view_mode: ViewMode::default(),
             sort: Sort::default(),
+            layout: ListingLayout::default(),
             preview_visible: true,
             tree_width: DEFAULT_TREE_WIDTH,
             preview_width: DEFAULT_PREVIEW_WIDTH,
@@ -138,6 +142,7 @@ mod tests {
                 key: SortKey::Size,
                 descending: true,
             },
+            layout: ListingLayout::Flat,
             preview_visible: false,
             tree_width: 300.,
             preview_width: 260.,
@@ -157,6 +162,7 @@ mod tests {
         let settings = Settings::load(&path);
         assert!(!settings.preview_visible);
         assert_eq!(settings.executable, None);
+        assert_eq!(settings.layout, ListingLayout::Folders);
     }
 
     #[test]

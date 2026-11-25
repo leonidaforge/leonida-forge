@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use lforge_binary::pe::{ExecutableView, MAX_FILE_SIZE};
 
+use super::ListingLayout;
 use super::archive::{Stamp, file_stamp};
 
 /// Whether a file is unchanged since it was opened: its length and
@@ -94,12 +95,13 @@ impl fmt::Debug for Executable {
     }
 }
 
-/// The executable available to one operation. Passing it along instead of
-/// reaching for a global keeps each read bound to the source it was opened
-/// with.
+/// The executable available to one operation, and how RPF9 rows should be
+/// listed. Passing it along instead of reaching for a global keeps each read
+/// bound to the source and the view it was opened with.
 #[derive(Debug, Clone, Default)]
 pub struct Access {
     executable: Option<Arc<Executable>>,
+    layout: ListingLayout,
 }
 
 impl Access {
@@ -111,7 +113,18 @@ impl Access {
     pub fn with(executable: Arc<Executable>) -> Self {
         Self {
             executable: Some(executable),
+            layout: ListingLayout::default(),
         }
+    }
+
+    /// The same access with the rows listed in `layout`.
+    pub fn with_layout(mut self, layout: ListingLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub fn layout(&self) -> ListingLayout {
+        self.layout
     }
 
     /// The executable to authenticate with. A configured executable that has

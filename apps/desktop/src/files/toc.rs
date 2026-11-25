@@ -34,7 +34,7 @@ use lforge_rage9::rpf::names::{
 };
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
-use super::{Entry, EntryKind, count, folder, format_bytes_exact, format_size};
+use super::{Entry, EntryKind, ListingLayout, count, folder, format_bytes_exact, format_size};
 
 /// Larger tables of contents are not read.
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
@@ -392,7 +392,7 @@ impl Layout {
 /// The folder and file name a verified name describes, or `None` when it is
 /// not a safe relative path.
 fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, String)> {
-    let parts = relative_path(name)?;
+    let parts = names::relative_path(name)?;
     let (label, folder) = parts.split_last()?;
     let folder: Vec<String> = folder.iter().map(|part| (*part).to_string()).collect();
     // The folder of the unnamed group is reserved.
@@ -409,27 +409,6 @@ fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, String)> {
 /// upper case to lower case, so `DATA` and `data` are the same folder.
 fn folded(part: &str) -> String {
     part.to_ascii_lowercase()
-}
-
-/// The components of a relative path that cannot escape the archive. Names
-/// are untrusted: absolute paths, `.` and `..`, empty components, drive
-/// letters and characters Windows does not allow in a name are refused.
-fn relative_path(name: &str) -> Option<Vec<&str>> {
-    if name.is_empty() || name.starts_with(['/', '\\']) {
-        return None;
-    }
-    let parts: Vec<&str> = name.split(['/', '\\']).collect();
-    parts
-        .iter()
-        .all(|part| safe_component(part))
-        .then_some(parts)
-}
-
-fn safe_component(part: &str) -> bool {
-    !part.is_empty()
-        && part != "."
-        && part != ".."
-        && !part.contains([':', '<', '>', '"', '|', '?', '*'])
 }
 
 /// The components of `path` as text, or `None` when one is not UTF-8.
@@ -747,10 +726,29 @@ impl Native {
         }
     }
 
-    fn entry(&self, archive: &Archive, dir: &Path, index: usize) -> Entry {
+    /// The folder the row is listed in: the one its verified relative path
+    /// describes, the unnamed group, or the archive root. This is the folder
+    /// its path points into in both layouts, so a row's path is stable when
+    /// the layout changes.
+    fn row_dir(&self, archive: &Archive, index: usize) -> PathBuf {
+        match &self.layout.placements[index] {
+            Some(placement) => {
+                let mut dir = archive.path.clone();
+                for component in &placement.folder {
+                    dir.push(component);
+                }
+                dir
+            }
+            None if self.layout.grouped => archive.path.join(UNNAMED),
+            None => archive.path.clone(),
+        }
+    }
+
+    fn entry(&self, archive: &Archive, index: usize) -> Entry {
         let row = &self.rows[index];
         let path_name = row_name(row.row);
         let label = self.label(index);
+        let dir = self.row_dir(archive, index);
         let location = match &row.location {
             Ok(Some(location)) => Some(location),
             _ => None,
@@ -849,21 +847,32 @@ impl Native {
         entry
     }
 
-    pub fn list(&self, archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
+    pub fn list(
+        &self,
+        archive: &Archive,
+        inner: &Path,
+        layout: ListingLayout,
+    ) -> io::Result<Vec<Entry>> {
         if self.row(inner).is_some() {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
         }
         let parts = path_parts(inner).ok_or_else(not_found)?;
         let dir = archive.path.join(inner);
+        if layout == ListingLayout::Flat && parts.is_empty() {
+            // One list of every row, without opening the virtual folders.
+            return Ok((0..self.rows.len())
+                .map(|index| self.entry(archive, index))
+                .collect());
+        }
         if !self.layout.grouped {
             // No row has a usable path, so the rows are listed at the root.
             if !parts.is_empty() {
                 return Err(not_found());
             }
-            return Ok(self.unnamed(archive, &dir));
+            return Ok(self.unnamed(archive));
         }
         if parts.len() == 1 && parts[0] == UNNAMED {
-            return Ok(self.unnamed(archive, &dir));
+            return Ok(self.unnamed(archive));
         }
         let key: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
         let current = self.layout.folders.get(&key).ok_or_else(not_found)?;
@@ -881,12 +890,7 @@ impl Native {
                 folder(&dir, name, count(contents, "entry", "entries"))
             })
             .collect();
-        entries.extend(
-            current
-                .rows
-                .iter()
-                .map(|&index| self.entry(archive, &dir, index)),
-        );
+        entries.extend(current.rows.iter().map(|&index| self.entry(archive, index)));
         if key.is_empty() && !self.layout.unnamed.is_empty() {
             let mut group = folder(
                 &dir,
@@ -900,11 +904,11 @@ impl Native {
     }
 
     /// The rows a verified relative path cannot place, in row order.
-    fn unnamed(&self, archive: &Archive, dir: &Path) -> Vec<Entry> {
+    fn unnamed(&self, archive: &Archive) -> Vec<Entry> {
         self.layout
             .unnamed
             .iter()
-            .map(|&index| self.entry(archive, dir, index))
+            .map(|&index| self.entry(archive, index))
             .collect()
     }
 
@@ -968,8 +972,21 @@ impl Native {
         }
     }
 
-    pub fn describe(&self, archive: &Archive, inner: &Path) -> Option<String> {
+    pub fn describe(
+        &self,
+        archive: &Archive,
+        inner: &Path,
+        layout: ListingLayout,
+    ) -> Option<String> {
         let parts = path_parts(inner)?;
+        if parts.is_empty() && layout == ListingLayout::Flat {
+            return Some(format!(
+                "All {} of the archive's rows in one list, labelled by a verified name or by the \
+                 stored key. Switch to the folders view to see the verified relative paths as \
+                 folders. Row numbers remain the entry paths.",
+                count(self.rows.len(), "row", "rows")
+            ));
+        }
         if !parts.is_empty() {
             if self.layout.grouped && parts.len() == 1 && parts[0] == UNNAMED {
                 return Some(format!(

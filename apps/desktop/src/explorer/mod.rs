@@ -27,7 +27,9 @@ use lforge_rage9::rpf::Progress;
 
 use crate::files::archive::{Identified, Stage};
 use crate::files::shell::ShellWorker;
-use crate::files::{self, Access, Entry, EntryKind, Executable, Sort, SortKey, images};
+use crate::files::{
+    self, Access, Entry, EntryKind, Executable, ListingLayout, Sort, SortKey, images,
+};
 use crate::settings::{Settings, ViewMode};
 use crate::ui;
 use crate::ui::assets::Icon;
@@ -233,6 +235,7 @@ pub struct Explorer {
     selected: Option<PathBuf>,
     sort: Sort,
     view_mode: ViewMode,
+    layout: ListingLayout,
     preview_visible: bool,
     tree_width: f32,
     preview_width: f32,
@@ -251,6 +254,8 @@ pub struct Explorer {
     tree_scroll: UniformListScrollHandle,
     browser_scroll: UniformListScrollHandle,
     list_scroll: ScrollHandle,
+    /// Filters the visible listing by resolved name, stored key or type.
+    search: Option<Entity<ui::text_field::TextField>>,
     focus_handle: FocusHandle,
     settings_path: Option<PathBuf>,
     save_task: Option<Task<()>>,
@@ -279,6 +284,7 @@ impl Explorer {
             selected: None,
             sort: settings.sort,
             view_mode: settings.view_mode,
+            layout: settings.layout,
             preview_visible: settings.preview_visible,
             tree_width: settings.tree_width,
             preview_width: settings.preview_width,
@@ -296,6 +302,9 @@ impl Explorer {
             tree_scroll: UniformListScrollHandle::new(),
             browser_scroll: UniformListScrollHandle::new(),
             list_scroll: ScrollHandle::new(),
+            search: Some(
+                cx.new(|cx| ui::text_field::TextField::new("Filter names, hashes, types", cx)),
+            ),
             focus_handle: cx.focus_handle(),
             settings_path,
             save_task: None,
@@ -329,14 +338,16 @@ impl Explorer {
         &self.focus_handle
     }
 
-    /// The executable that may authenticate stored metadata, or none.
+    /// The executable that may authenticate stored metadata, or none, with the
+    /// listing layout the user selected.
     fn access(&self) -> Access {
-        match &self.executable {
+        let access = match &self.executable {
             ExecutableState::Ready(executable) => Access::with(executable.clone()),
             ExecutableState::Unset | ExecutableState::Checking | ExecutableState::Failed(_) => {
                 Access::none()
             }
-        }
+        };
+        access.with_layout(self.layout)
     }
 
     /// The configured executable's path, if any.
@@ -389,6 +400,17 @@ impl Explorer {
 
     fn selected_entry(&self) -> Option<&Entry> {
         let selected = self.selected.as_deref()?;
+        // A flat listing shows rows whose path points into a virtual folder,
+        // so the current listing is searched before the row's own folder.
+        if let Some(entries) = self.current_entries()
+            && let Some(entry) = entries.iter().find(|entry| entry.path == selected)
+        {
+            return Some(entry);
+        }
+        self.selected_entry_in(selected)
+    }
+
+    fn selected_entry_in(&self, selected: &Path) -> Option<&Entry> {
         let parent = selected.parent()?;
         match self.listings.get(parent)? {
             Listing::Loaded(entries) => entries.iter().find(|entry| entry.path == selected),
@@ -872,6 +894,20 @@ impl Explorer {
         cx.notify();
     }
 
+    /// Switches between the folder view and one flat list. The archive is not
+    /// reopened: only the listings are built again from the table of contents
+    /// that is already in memory.
+    fn set_layout(&mut self, layout: ListingLayout, cx: &mut Context<Self>) {
+        if self.layout == layout {
+            return;
+        }
+        self.layout = layout;
+        self.refresh(cx);
+        self.reveal = self.selected.clone();
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
         self.preview_visible = !self.preview_visible;
         self.schedule_save(cx);
@@ -972,6 +1008,7 @@ impl Explorer {
             folders: self.workspace.folders.clone(),
             view_mode: self.view_mode,
             sort: self.sort,
+            layout: self.layout,
             preview_visible: self.preview_visible,
             tree_width: self.tree_width,
             preview_width: self.preview_width,
