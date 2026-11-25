@@ -2803,3 +2803,200 @@ mod companions {
         );
     }
 }
+
+#[cfg(test)]
+mod real_payload_transform_probe {
+    //! Local, opt-in diagnostic: tries the archive descriptor as the key state
+    //! of the payload transform. It reads one real archive and never writes
+    //! game data. Enable with `LEONIDA_FORGE_EXECUTABLE` and
+    //! `LEONIDA_FORGE_ARCHIVE`.
+
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::atomic::AtomicBool;
+
+    use lforge_binary::pe::ExecutableView;
+
+    use super::*;
+    use crate::rpf::metadata::provider::select_source;
+    use crate::rpf::metadata::transform::{BLOCK_LEN, Block, BlockDecrypt, CipherDescriptor};
+
+    fn zlib_ok(bytes: &[u8]) -> Option<usize> {
+        let mut d = flate2::Decompress::new(true);
+        let mut out = vec![0u8; 1 << 20];
+        match d.decompress(bytes, &mut out, flate2::FlushDecompress::Finish) {
+            Ok(flate2::Status::StreamEnd) => Some(d.total_out() as usize),
+            _ => None,
+        }
+    }
+
+    fn add_be(iv: &Block, index: u64) -> Block {
+        let mut out = *iv;
+        let mut carry = index;
+        for byte in out.iter_mut().rev() {
+            let sum = u64::from(*byte) + (carry & 0xff);
+            *byte = sum as u8;
+            carry = (carry >> 8) + (sum >> 8);
+        }
+        out
+    }
+
+    fn xor_into(block: &mut Block, iv: &Block) {
+        for (b, i) in block.iter_mut().zip(iv) {
+            *b ^= i;
+        }
+    }
+
+    #[test]
+    #[ignore = "needs LEONIDA_FORGE_EXECUTABLE and LEONIDA_FORGE_ARCHIVE"]
+    fn payload_transform_key_state_probe() {
+        let (Ok(exe), Ok(archive)) = (
+            std::env::var("LEONIDA_FORGE_EXECUTABLE"),
+            std::env::var("LEONIDA_FORGE_ARCHIVE"),
+        ) else {
+            return;
+        };
+        let view = ExecutableView::open(std::path::Path::new(&exe)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut file = File::open(&archive).unwrap();
+        let stored = Stored::read(&mut file, verify::MAX_METADATA).unwrap();
+        let a_span = step1_a_span(stored.prefix(), stored.layout()).unwrap();
+        let selection = select_source(
+            &stored.bytes()[a_span],
+            stored.prefix().a_records,
+            stored.prefix().b_len,
+            &view,
+            stored.prefix().selector,
+            &cancel,
+        )
+        .unwrap();
+        let source = &selection.source;
+        let report = verify::open_authenticated(&mut file, &view, &cancel).unwrap();
+        let md = report.authenticated.unwrap();
+        let meta = md.metadata();
+        let a_table = &meta.bytes[meta.layout.a_table.clone()];
+        let offset = find_sub_block(a_table, 1).unwrap();
+        let start = meta.layout.b_block.start + offset as usize;
+        let descriptor = CipherDescriptor::parse(&meta.bytes[start..]).unwrap();
+        println!(
+            "archive descriptor: key_id={:#x} kind={:#x} iv={:02x?}",
+            descriptor.key_id, descriptor.kind, descriptor.parameter
+        );
+        let kind = descriptor.kind;
+        let key_id = descriptor.key_id;
+        let mut checked = 0;
+        for entry in md.metadata().entries() {
+            if entry.payload_transform != Ok(true) {
+                continue;
+            }
+            let Ok(Some(location)) = entry.location else {
+                continue;
+            };
+            if location.stored_len == 0 || location.stored_len > 4 * 1024 * 1024 {
+                continue;
+            }
+            let chunks = match &entry.chunks {
+                Ok(c) => c.is_some(),
+                Err(_) => continue,
+            };
+            let mut raw = vec![0u8; location.stored_len as usize];
+            file.seek(SeekFrom::Start(location.payload_offset)).unwrap();
+            file.read_exact(&mut raw).unwrap();
+            println!(
+                "row {} type {} mode {} chunks {} stored {} logical {}",
+                entry.row,
+                location.type_id,
+                location.mode,
+                chunks,
+                location.stored_len,
+                location.logical_len
+            );
+            // For chunked entries, brute-force key/IV/base over the first
+            // method-3 chunk. A correct combination must inflate it.
+            if let (Ok(Some(table)), true) = (&entry.chunks, chunks) {
+                let mut start = 0usize;
+                let mut first: Option<(usize, usize, usize)> = None;
+                for chunk in &table.chunks {
+                    if chunk.method == 3 {
+                        first = Some((
+                            start,
+                            chunk.compressed_len as usize,
+                            chunk.stored_len as usize,
+                        ));
+                        break;
+                    }
+                    start += chunk.stored_len as usize;
+                }
+                if let Some((off, compressed, stored)) = first
+                    && start + stored <= raw.len()
+                {
+                    let entry_units = location.payload_offset / 16;
+                    let chunk_units = (location.payload_offset + off as u64) / 16;
+                    let keys = [
+                        ("archive", key_id, kind, descriptor.parameter),
+                        (
+                            "static",
+                            source.descriptor().key_id(),
+                            source.descriptor().kind(),
+                            *source.descriptor().parameter(),
+                        ),
+                    ];
+                    let mut wins = Vec::new();
+                    for (kname, kid, kk, param) in keys {
+                        for mode in [0u8, 1] {
+                            let Some(block) = source.block_for_mode(kk, kid, mode) else {
+                                continue;
+                            };
+                            for (bname, base) in [
+                                ("pos0", 0u64),
+                                ("entry", entry_units),
+                                ("chunk", chunk_units),
+                            ] {
+                                let iv0 = add_be(&param, base);
+                                for (sname, perblock) in [("cbc", false), ("blk", true)] {
+                                    let mut buf = raw[off..off + stored].to_vec();
+                                    if perblock {
+                                        for (i, c) in buf
+                                            .as_chunks_mut::<BLOCK_LEN>()
+                                            .0
+                                            .iter_mut()
+                                            .enumerate()
+                                        {
+                                            let mut b16: Block = *c;
+                                            block.decrypt_block(&mut b16);
+                                            let iv = add_be(&iv0, i as u64);
+                                            xor_into(&mut b16, &iv);
+                                            c.copy_from_slice(&b16);
+                                        }
+                                    } else {
+                                        let mut iv = iv0;
+                                        for c in buf.as_chunks_mut::<BLOCK_LEN>().0.iter_mut() {
+                                            let stored_block: Block = *c;
+                                            let mut b16 = stored_block;
+                                            block.decrypt_block(&mut b16);
+                                            xor_into(&mut b16, &iv);
+                                            iv = stored_block;
+                                            c.copy_from_slice(&b16);
+                                        }
+                                    }
+                                    if zlib_ok(&buf[..compressed]).is_some() {
+                                        wins.push(format!("{kname}/mode{mode}/{bname}/{sname}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    println!(
+                        "  first method-3 chunk off {} compressed {} stored {} wins: {:?}",
+                        off, compressed, stored, wins
+                    );
+                }
+            }
+            checked += 1;
+            if checked >= 15 {
+                break;
+            }
+        }
+        println!("checked {checked} transformed stored rows");
+    }
+}

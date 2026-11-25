@@ -145,6 +145,29 @@ impl CipherSource for RecognizedSource {
     }
 }
 
+#[cfg(test)]
+impl RecognizedSource {
+    /// Test-only: the block operation for `key_id` under a chosen engine mode,
+    /// which selects a different key-provider state.
+    pub(crate) fn block_for_mode(
+        &self,
+        kind: u16,
+        key_id: u32,
+        mode: u8,
+    ) -> Option<EncodedAesBlock> {
+        let algorithm = match Algorithm::of(kind) {
+            Ok(algorithm @ Algorithm::Cbc) => algorithm,
+            _ => return None,
+        };
+        let state = self
+            .recognized
+            .registry()
+            .state_for_key(key_id, algorithm.id(), mode)
+            .ok()?;
+        EncodedAesBlock::new(state, self.tables.clone()).ok()
+    }
+}
+
 impl fmt::Debug for RecognizedSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The key identifier, the parameter and the state stay out of
