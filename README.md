@@ -128,6 +128,8 @@ RPF9 stores a hash of each entry's path, not the path. `archive metadata --entri
 
 The desktop explorer labels an entry with a verified unambiguous name, otherwise with the stored key in canonical hexadecimal form. Only `rpf` to type 0 is a confirmed extension, so unknown type IDs get no invented extension. Row numbers remain the entry paths and stay in details. Names come from the same embedded LUTs, `<archive>.names.txt` tables, and candidates in the LUT files beside `leonida-forge.exe`; a `.lut` next to an archive is not read.
 
+When a verified name is a relative path, the explorer shows it as folders, so `levels/americas/props/vampires_metadata.rpf` is filed under `levels`, `americas` and `props`. The archive stores no folders; each entry keeps its path `<folder>/Row NNNNN`, so a row has exactly one path. Names are untrusted input: absolute paths, `.`, `..`, empty components, drive letters and characters Windows refuses are never used to build a folder, and such a row keeps its stored key as the label. Rows without a usable path are listed after everything else in `Unnamed Entries`, labelled by their stored key. An archive where no name gives a usable path is listed flat at its root. The only folders an RPF9 archive stores itself are nested archives, which stay entries.
+
 The native index and candidate pipeline are available without a network service:
 
 ```sh

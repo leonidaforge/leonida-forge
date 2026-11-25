@@ -36,7 +36,7 @@ use super::archive::{
 };
 use super::executable::Executable;
 use super::toc;
-use super::{Entry, EntryKind, format_bytes_exact, format_size};
+use super::{Entry, EntryKind, count, folder, format_bytes_exact, format_size};
 
 pub const RECOVERED: &str = "Recovered Entries";
 pub const PAGES: &str = "Resource Pages";
@@ -456,26 +456,6 @@ fn not_found() -> io::Error {
         io::ErrorKind::NotFound,
         "the path does not exist in the archive",
     )
-}
-
-fn folder(dir: &Path, name: &str, contents: String) -> Entry {
-    let mut entry = Entry::new(
-        name.to_string(),
-        dir.join(name),
-        EntryKind::Directory,
-        None,
-        None,
-    );
-    entry.type_name = "Virtual folder".to_string();
-    entry.details = vec![("Contents", contents)];
-    entry
-}
-
-fn count(n: usize, one: &str, many: &str) -> String {
-    match n {
-        1 => format!("1 {one}"),
-        _ => format!("{n} {many}"),
-    }
 }
 
 fn compressed(len: u64) -> String {
@@ -1212,6 +1192,23 @@ pub(crate) mod tests {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Everything in `archive` up to `depth` folder levels below the root.
+    fn walk(archive: &Path, access: &Access, depth: usize) -> Vec<Entry> {
+        let entries = files::list_with(archive, access).unwrap_or_default();
+        let folders: Vec<PathBuf> = entries
+            .iter()
+            .filter(|entry| entry.is_dir())
+            .map(|entry| entry.path.clone())
+            .collect();
+        let mut all = entries;
+        if depth > 0 {
+            for folder in folders {
+                all.extend(walk(&folder, access, depth - 1));
+            }
+        }
+        all
+    }
+
     /// An RPF9 archive whose table of contents the engine processes, with two
     /// payloads in its data.
     fn processed_archive(dir: &Path) -> PathBuf {
@@ -1426,7 +1423,9 @@ pub(crate) mod tests {
         std::fs::copy(&source, &archive).unwrap();
 
         prepare_with(&archive, &access, false).unwrap();
-        let rows = files::list_with(&archive, &access).unwrap();
+        let entries = walk(&archive, &access, 3);
+        let rows: Vec<&Entry> = entries.iter().filter(|entry| !entry.is_dir()).collect();
+        assert!(!rows.is_empty());
         let named = rows
             .iter()
             .filter(|row| detail(row, "Names").is_some_and(|text| !text.starts_with("Unknown")))
@@ -1436,6 +1435,15 @@ pub(crate) mod tests {
             rows.iter()
                 .any(|row| !row.name.starts_with("0x") && !row.name.starts_with("Row "))
         );
+        // Verified paths become folders, and the unnamed group comes last.
+        let root = files::list_with(&archive, &access).unwrap();
+        assert!(
+            root.iter().any(|entry| entry.is_dir()),
+            "no virtual folders were reconstructed"
+        );
+        if let Some(position) = root.iter().position(|entry| entry.name == toc::UNNAMED) {
+            assert_eq!(position, root.len() - 1, "the unnamed group is not last");
+        }
     }
 
     /// Reads a real archive through the desktop layer, read-only. Set the
@@ -1454,13 +1462,12 @@ pub(crate) mod tests {
         let archive = PathBuf::from(archive);
 
         prepare_with(&archive, &access, false).unwrap();
-        let rows = files::list_with(&archive, &access).unwrap();
-        assert!(!rows.is_empty());
-        assert!(rows.iter().all(|row| row.name.starts_with("Row ")));
+        let entries = walk(&archive, &access, 3);
+        assert!(!entries.is_empty());
         let note = files::describe_with(&archive, &access).unwrap();
         assert!(note.contains("signature verified"), "{note}");
 
-        let readable = rows.iter().find(|row| {
+        let readable = entries.iter().find(|row| {
             row.kind == EntryKind::File
                 && detail(row, "Contents").is_some_and(|text| !text.starts_with("Not readable"))
         });
@@ -1472,7 +1479,8 @@ pub(crate) mod tests {
             }
             // A sample whose rows all need a transform this tool refuses.
             None => assert!(
-                rows.iter()
+                entries
+                    .iter()
                     .filter(|row| row.kind == EntryKind::File)
                     .all(|row| detail(row, "Contents")
                         .is_some_and(|text| text.starts_with("Not readable")))

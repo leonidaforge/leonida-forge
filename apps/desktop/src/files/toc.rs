@@ -7,15 +7,18 @@
 //! The table holds hashes of entry names, not names. Each entry keeps its row
 //! number as its stable path, `Row 00042`, and is labelled with a verified
 //! unambiguous resolved name, otherwise the stored key in canonical form.
-//! Names come from the LUT files embedded in the application and read beside
-//! the executable, and from the local table `<archive file>.names.txt` next to
-//! the file on disk. That table holds candidate paths relative to the archive,
-//! or explicit `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names
-//! are display data only: entry paths stay the row names.
+//! A verified name that is a safe relative path is shown as folders; every
+//! other row is listed after them in [`UNNAMED`]. Names come from the LUT files
+//! embedded in the application and read beside the executable, and from the
+//! local table `<archive file>.names.txt` next to the file on disk. That table
+//! holds candidate paths relative to the archive, or explicit
+//! `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names are display
+//! data only: entry paths stay the row names.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -31,11 +34,13 @@ use lforge_rage9::rpf::names::{
 };
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
-use super::{Entry, EntryKind, format_bytes_exact, format_size};
+use super::{Entry, EntryKind, count, folder, format_bytes_exact, format_size};
 
 /// Larger tables of contents are not read.
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
 pub const NAMES_SUFFIX: &str = ".names.txt";
+/// The folder that holds the rows a verified relative path cannot place.
+pub const UNNAMED: &str = "Unnamed Entries";
 
 const ROW_NOTE: &str = "Listed from the archive's table of contents. The label is a verified \
      unambiguous name, otherwise the stored key; the row number identifies the entry.";
@@ -198,6 +203,8 @@ fn companion_stamps(dir: Option<&Path>, records: &[Companion]) -> Vec<Option<Sta
 pub struct Native {
     rows: Vec<Row>,
     names: Option<Names>,
+    /// Where each row is listed, from the verified relative paths.
+    layout: Layout,
     companions: Companions,
     authentication: Authentication,
     types: Types,
@@ -270,6 +277,164 @@ impl Names {
             builtin: builtin.sources().to_vec(),
         })
     }
+
+    /// A verified unambiguous name of the row, if the tables have one.
+    fn verified_name(&self, row: u32) -> Option<&str> {
+        match &self.matches.row(row)?.resolution {
+            Resolution::Resolved(names) => names
+                .iter()
+                .find(|name| name.verified)
+                .map(|name| name.text.as_str()),
+            Resolution::Ambiguous(_) | Resolution::Unresolved => None,
+        }
+    }
+}
+
+/// Where one row is listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Placement {
+    /// Folder components, empty for the archive root.
+    folder: Vec<String>,
+    /// The visible file name, with only a confirmed extension.
+    label: String,
+}
+
+/// The virtual folders the verified relative paths describe.
+///
+/// The archive stores hashes of paths, not folders. A row whose verified
+/// unambiguous name is a safe relative path is listed under that path; every
+/// other row is listed in [`UNNAMED`]. Nothing here changes a row's identity:
+/// an entry's path stays `<folder>/Row NNNNN`, so each row has exactly one
+/// path.
+#[derive(Debug, Default)]
+struct Layout {
+    /// By row number, `None` for a row in the unnamed folder.
+    placements: Vec<Option<Placement>>,
+    /// Folder components, including the root as the empty list.
+    folders: BTreeMap<Vec<String>, VirtualFolder>,
+    /// Row numbers without a usable path, in row order.
+    unnamed: Vec<usize>,
+    /// Whether any row has a usable path. Without one, the rows are listed at
+    /// the archive root instead of inside a folder that would hold them all.
+    grouped: bool,
+}
+
+#[derive(Debug, Default)]
+struct VirtualFolder {
+    /// Row numbers listed directly in this folder.
+    rows: Vec<usize>,
+    /// Child folders by folded name, so `DATA` and `data` are one folder.
+    /// The value is the spelling of the first name that was placed here.
+    subfolders: BTreeMap<String, String>,
+}
+
+impl Layout {
+    fn build(rows: &[Row], names: Option<&Names>) -> Self {
+        let mut layout = Self {
+            placements: vec![None; rows.len()],
+            ..Self::default()
+        };
+        layout.folders.insert(Vec::new(), VirtualFolder::default());
+        for row in rows {
+            let Some(name) = names.and_then(|names| names.verified_name(row.row)) else {
+                continue;
+            };
+            let Some((folder, label)) = placement(name, row.type_id()) else {
+                continue;
+            };
+            let Some(position) = usize::try_from(row.row).ok().filter(|&p| p < rows.len()) else {
+                continue;
+            };
+            // The engine folds case and `\` in a path, so folder spellings
+            // that fold alike are one folder. The first spelling is kept.
+            let mut path: Vec<String> = Vec::new();
+            for component in &folder {
+                let folded = folded(component);
+                let existing = layout
+                    .folders
+                    .get(&path)
+                    .and_then(|parent| parent.subfolders.get(&folded))
+                    .cloned();
+                let display = match existing {
+                    Some(display) => display,
+                    None => {
+                        let display = component.clone();
+                        layout
+                            .folders
+                            .entry(path.clone())
+                            .or_default()
+                            .subfolders
+                            .insert(folded, display.clone());
+                        display
+                    }
+                };
+                path.push(display);
+            }
+            layout
+                .folders
+                .entry(path.clone())
+                .or_default()
+                .rows
+                .push(position);
+            layout.placements[position] = Some(Placement {
+                folder: path,
+                label,
+            });
+        }
+        layout.unnamed = (0..rows.len())
+            .filter(|&position| layout.placements[position].is_none())
+            .collect();
+        layout.grouped = layout.unnamed.len() < rows.len();
+        layout
+    }
+}
+
+/// The folder and file name a verified name describes, or `None` when it is
+/// not a safe relative path.
+fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, String)> {
+    let parts = relative_path(name)?;
+    let (label, folder) = parts.split_last()?;
+    let folder: Vec<String> = folder.iter().map(|part| (*part).to_string()).collect();
+    // The folder of the unnamed group is reserved.
+    if folder
+        .first()
+        .is_some_and(|part| folded(part) == folded(UNNAMED))
+    {
+        return None;
+    }
+    Some((folder, with_extension(label, type_id)))
+}
+
+/// The spelling two folder components are compared by: the engine folds ASCII
+/// upper case to lower case, so `DATA` and `data` are the same folder.
+fn folded(part: &str) -> String {
+    part.to_ascii_lowercase()
+}
+
+/// The components of a relative path that cannot escape the archive. Names
+/// are untrusted: absolute paths, `.` and `..`, empty components, drive
+/// letters and characters Windows does not allow in a name are refused.
+fn relative_path(name: &str) -> Option<Vec<&str>> {
+    if name.is_empty() || name.starts_with(['/', '\\']) {
+        return None;
+    }
+    let parts: Vec<&str> = name.split(['/', '\\']).collect();
+    parts
+        .iter()
+        .all(|part| safe_component(part))
+        .then_some(parts)
+}
+
+fn safe_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains([':', '<', '>', '"', '|', '?', '*'])
+}
+
+/// The components of `path` as text, or `None` when one is not UTF-8.
+fn path_parts(path: &Path) -> Option<Vec<&str>> {
+    path.iter().map(|part| part.to_str()).collect()
 }
 
 fn read_name_file(path: &Path) -> io::Result<(Vec<u8>, bool)> {
@@ -410,10 +575,12 @@ impl Native {
         let rows: Vec<Row> = metadata.entries().collect();
         let types = Types::default();
         let names = Names::read(archive, &rows, &types);
+        let layout = Layout::build(&rows, names.as_ref());
         let companions = Companions::read(archive, &metadata);
         Self {
             rows,
             names,
+            layout,
             companions,
             authentication,
             types,
@@ -466,12 +633,26 @@ impl Native {
     }
 
     fn row(&self, inner: &Path) -> Option<&Row> {
-        let mut components = inner.components();
-        let (Some(Component::Normal(name)), None) = (components.next(), components.next()) else {
-            return None;
+        let parts = path_parts(inner)?;
+        let (name, folder) = parts.split_last()?;
+        let row = self
+            .rows
+            .get(usize::try_from(parse_row_name(name)?).ok()?)?;
+        let placement = self
+            .layout
+            .placements
+            .get(usize::try_from(row.row).ok()?)?
+            .as_ref();
+        let matches = match placement {
+            Some(placement) => placement
+                .folder
+                .iter()
+                .map(String::as_str)
+                .eq(folder.iter().copied()),
+            None if self.layout.grouped => folder.len() == 1 && folder[0] == UNNAMED,
+            None => folder.is_empty(),
         };
-        let row = parse_row_name(name.to_str()?)?;
-        self.rows.get(usize::try_from(row).ok()?)
+        matches.then_some(row)
     }
 
     fn resolution(&self, row: u32) -> Option<&Resolution> {
@@ -508,12 +689,18 @@ impl Native {
         }
     }
 
-    /// The primary visible name: a verified unambiguous resolved name, else
-    /// the stored key in canonical form, with only a confirmed extension.
-    fn label(&self, row: &Row) -> String {
-        if let Some(name) = self.resolved_name(row.row) {
-            return with_extension(name, row.type_id());
+    /// The visible name of the row at `index`: the file name its verified
+    /// relative path ends in, else the stored key in canonical form.
+    fn label(&self, index: usize) -> String {
+        match &self.layout.placements[index] {
+            Some(placement) => placement.label.clone(),
+            None => self.key_label(&self.rows[index]),
         }
+    }
+
+    /// The stored key of the row in canonical form, with only a confirmed
+    /// extension.
+    fn key_label(&self, row: &Row) -> String {
         let hash = row.name_hash.as_ref().ok().and_then(|value| *value);
         let key = row.name_key.as_ref().ok().and_then(|value| *value);
         let stored = match row.type_id().and_then(|type_id| self.types.class(type_id)) {
@@ -528,13 +715,6 @@ impl Native {
         match stored {
             Some(key) => with_extension(&key.canonical(), row.type_id()),
             None => row_name(row.row),
-        }
-    }
-
-    fn resolved_name(&self, row: u32) -> Option<&str> {
-        match self.resolution(row)? {
-            Resolution::Resolved(names) => names.first().map(|name| name.text.as_str()),
-            Resolution::Ambiguous(_) | Resolution::Unresolved => None,
         }
     }
 
@@ -567,9 +747,10 @@ impl Native {
         }
     }
 
-    fn entry(&self, archive: &Archive, dir: &Path, row: &Row) -> Entry {
+    fn entry(&self, archive: &Archive, dir: &Path, index: usize) -> Entry {
+        let row = &self.rows[index];
         let path_name = row_name(row.row);
-        let label = self.label(row);
+        let label = self.label(index);
         let location = match &row.location {
             Ok(Some(location)) => Some(location),
             _ => None,
@@ -585,7 +766,6 @@ impl Native {
             location.map(|l| l.logical_len),
             None,
         );
-        entry.order = Some(row.row.into());
         entry.type_name = match location {
             Some(l) if l.type_id == names::RPF_TYPE => "RPF9 entry, type 0 (rpf)".to_string(),
             Some(l) => format!("RPF9 entry, type {}", l.type_id),
@@ -673,15 +853,59 @@ impl Native {
         if self.row(inner).is_some() {
             return Err(io::Error::new(io::ErrorKind::NotADirectory, "not a folder"));
         }
-        if inner.components().next().is_some() {
-            return Err(not_found());
-        }
+        let parts = path_parts(inner).ok_or_else(not_found)?;
         let dir = archive.path.join(inner);
-        Ok(self
-            .rows
+        if !self.layout.grouped {
+            // No row has a usable path, so the rows are listed at the root.
+            if !parts.is_empty() {
+                return Err(not_found());
+            }
+            return Ok(self.unnamed(archive, &dir));
+        }
+        if parts.len() == 1 && parts[0] == UNNAMED {
+            return Ok(self.unnamed(archive, &dir));
+        }
+        let key: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
+        let current = self.layout.folders.get(&key).ok_or_else(not_found)?;
+        let mut entries: Vec<Entry> = current
+            .subfolders
+            .values()
+            .map(|name| {
+                let mut path = key.clone();
+                path.push(name.clone());
+                let contents = self
+                    .layout
+                    .folders
+                    .get(&path)
+                    .map_or(0, |folder| folder.rows.len());
+                folder(&dir, name, count(contents, "entry", "entries"))
+            })
+            .collect();
+        entries.extend(
+            current
+                .rows
+                .iter()
+                .map(|&index| self.entry(archive, &dir, index)),
+        );
+        if key.is_empty() && !self.layout.unnamed.is_empty() {
+            let mut group = folder(
+                &dir,
+                UNNAMED,
+                count(self.layout.unnamed.len(), "entry", "entries"),
+            );
+            group.last = true;
+            entries.push(group);
+        }
+        Ok(entries)
+    }
+
+    /// The rows a verified relative path cannot place, in row order.
+    fn unnamed(&self, archive: &Archive, dir: &Path) -> Vec<Entry> {
+        self.layout
+            .unnamed
             .iter()
-            .map(|row| self.entry(archive, &dir, row))
-            .collect())
+            .map(|&index| self.entry(archive, dir, index))
+            .collect()
     }
 
     fn raw(&self, archive: &Archive, inner: &Path) -> io::Result<Source> {
@@ -722,9 +946,14 @@ impl Native {
     }
 
     pub fn file_prefix(&self, inner: &Path) -> Option<PathBuf> {
-        let first = inner.components().next()?;
-        let prefix = PathBuf::from(first.as_os_str());
-        self.row(&prefix).map(|_| prefix)
+        let mut prefix = PathBuf::new();
+        for component in inner.components() {
+            prefix.push(component);
+            if self.row(&prefix).is_some() {
+                return Some(prefix);
+            }
+        }
+        None
     }
 
     pub fn file_len(&self, inner: &Path) -> io::Result<u64> {
@@ -740,8 +969,22 @@ impl Native {
     }
 
     pub fn describe(&self, archive: &Archive, inner: &Path) -> Option<String> {
-        if inner.components().next().is_some() {
-            return None;
+        let parts = path_parts(inner)?;
+        if !parts.is_empty() {
+            if self.layout.grouped && parts.len() == 1 && parts[0] == UNNAMED {
+                return Some(format!(
+                    "{} without a verified relative path, labelled by their stored key. The \
+                     archive stores no names or folders; each entry's details keep the stored \
+                     hash, the key and any candidate names.",
+                    count(self.layout.unnamed.len(), "row", "rows")
+                ));
+            }
+            let key: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
+            return self.layout.folders.contains_key(&key).then(|| {
+                "Reconstructed from the relative path a verified name describes. The archive \
+                 stores neither names nor folders, and an entry's path stays its row number."
+                    .to_string()
+            });
         }
         let total = self.rows.len();
         let malformed = self
@@ -879,6 +1122,16 @@ impl Native {
                 if names.table.truncated() {
                     note.push_str(" The table was cut at its size limit.");
                 }
+            }
+        }
+        if self.layout.grouped {
+            note.push_str(" Verified relative paths are shown as folders.");
+            let unnamed = self.layout.unnamed.len();
+            if unnamed > 0 {
+                note.push_str(&format!(
+                    " The {} without one are at the end in {UNNAMED}.",
+                    count(unnamed, "row", "rows")
+                ));
             }
         }
         let companions = &self.companions;

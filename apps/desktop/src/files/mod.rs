@@ -51,6 +51,8 @@ pub struct Entry {
     /// Sorted by this instead of the name, for names that encode a number
     /// natural order cannot see, such as hexadecimal offsets.
     pub order: Option<u64>,
+    /// Sorted after every other entry of its folder, whatever the sort.
+    pub last: bool,
 }
 
 impl Entry {
@@ -71,6 +73,7 @@ impl Entry {
             type_name,
             details: Vec::new(),
             order: None,
+            last: false,
         }
     }
 
@@ -116,6 +119,27 @@ fn fallback_type_name(kind: EntryKind, extension: Option<&str>) -> String {
             Some(ext) => format!("{} file", ext.to_uppercase()),
             None => "File".to_string(),
         },
+    }
+}
+
+/// A folder an archive does not store, made from what its entries describe.
+pub(crate) fn folder(dir: &Path, name: &str, contents: String) -> Entry {
+    let mut entry = Entry::new(
+        name.to_string(),
+        dir.join(name),
+        EntryKind::Directory,
+        None,
+        None,
+    );
+    entry.type_name = "Virtual folder".to_string();
+    entry.details = vec![("Contents", contents)];
+    entry
+}
+
+pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {many}"),
     }
 }
 
@@ -386,6 +410,7 @@ pub fn sort_entries(entries: &mut [Entry], sort: Sort) {
         };
         b.is_dir()
             .cmp(&a.is_dir())
+            .then_with(|| a.last.cmp(&b.last))
             .then(ordering)
             .then_with(|| natural_cmp(&a.name, &b.name))
     });

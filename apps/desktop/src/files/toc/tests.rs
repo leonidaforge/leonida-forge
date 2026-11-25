@@ -362,7 +362,7 @@ fn duplicate_visible_labels_keep_distinct_entry_paths() {
 }
 
 #[test]
-fn names_come_from_candidate_paths() {
+fn verified_paths_become_folders_and_unnamed_rows_come_last() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("named.rpf");
     fs::write(
@@ -380,36 +380,61 @@ fn names_come_from_candidate_paths() {
                 hash: Some(hash64(b"other")),
                 ..spec(&[3; 16], RPF_TYPE)
             },
+            Spec {
+                hash: Some(hash64(b"packs/inner/leaf")),
+                ..spec(&[4; 16], RPF_TYPE)
+            },
         ]),
     )
     .unwrap();
     let candidates = temp.path().join("named.rpf.names.txt");
     fs::write(
         &candidates,
-        "packs/inner.rpf\r\nPACKS\\INNER.rpf\n\nreadme\n\"readme\"x\nmissing.rpf\nmodel.ydr\n",
+        "packs/inner.rpf\r\nPACKS\\INNER.rpf\n\npacks/inner/leaf.rpf\nreadme\n\"readme\"x\n\
+         missing.rpf\nmodel.ydr\n",
     )
     .unwrap();
 
-    let entries = files::list(&path).unwrap();
-    // The row stays the path; candidates are details.
+    // The verified relative paths are folders; the unnamed group is last.
+    let root = files::list(&path).unwrap();
+    assert_eq!(names_of(&root), ["packs", "Unnamed Entries"]);
+    assert!(root[0].is_dir());
+    assert!(root[1].is_dir());
+    let note = files::describe(&path).unwrap();
+    assert!(note.contains("shown as folders"), "{note}");
+    assert!(
+        note.contains("2 rows without one are at the end in Unnamed Entries"),
+        "{note}"
+    );
+
+    let packs = files::list(&root[0].path).unwrap();
+    assert_eq!(names_of(&packs), ["inner", "inner.rpf"]);
+    assert_eq!(
+        detail(&packs[1], "Names"),
+        "packs/inner.rpf, PACKS\\INNER.rpf"
+    );
+    // The entry path stays the row number, under the folder it was placed in.
+    assert_eq!(packs[1].path, path.join("packs").join("Row 00000"));
+    assert_eq!(files::read(&packs[1].path).unwrap(), [1; 16]);
+    let nested = files::list(&packs[0].path).unwrap();
+    assert_eq!(names_of(&nested), ["leaf.rpf"]);
+    assert_eq!(files::read(&nested[0].path).unwrap(), [4; 16]);
+    assert!(files::list(&packs[1].path).is_err());
+
+    let unnamed = files::list(&root[1].path).unwrap();
     let expected = [
-        "packs/inner.rpf".to_string(),
         format!("0x{:08X}", joaat(b"readme")),
         format!("0x{:016X}.rpf", hash64(b"other")),
     ];
-    assert_eq!(names_of(&entries).join("\n"), expected.join("\n"));
+    assert_eq!(names_of(&unnamed).join("\n"), expected.join("\n"));
+    assert!(detail(&unnamed[0], "Names").starts_with("Ambiguous: readme, \"readme\"x"));
     assert_eq!(
-        detail(&entries[0], "Names"),
-        "packs/inner.rpf, PACKS\\INNER.rpf"
-    );
-    assert!(detail(&entries[1], "Names").starts_with("Ambiguous: readme, \"readme\"x"));
-    assert_eq!(
-        detail(&entries[2], "Names"),
+        detail(&unnamed[1], "Names"),
         "Unknown: no candidate path or declared name has this entry's hash"
     );
     let note = files::describe(&path).unwrap();
     assert!(
-        note.contains("2 of 3 entries are named by the 6 candidate paths"),
+        note.contains("3 of 4 entries are named by the 7 candidate paths"),
         "{note}"
     );
     assert!(note.contains("1 ambiguously"), "{note}");
@@ -418,16 +443,23 @@ fn names_come_from_candidate_paths() {
         "{note}"
     );
 
+    // Only one path names a row: an alias is refused.
+    assert!(files::read(&path.join("Row 00000")).is_err());
+    assert!(files::read(&path.join("Packs").join("Row 00000")).is_err());
+    assert!(files::read(&path.join("packs").join("Row 00002")).is_err());
+    assert!(files::read(&path.join("Unnamed Entries").join("Row 00000")).is_err());
+
     // A changed candidate file is read again.
     fs::write(&candidates, "other.rpf\n").unwrap();
-    let entries = files::list(&path).unwrap();
-    assert_eq!(detail(&entries[2], "Names"), "other.rpf");
-    assert!(detail(&entries[0], "Names").starts_with("Unknown"));
+    let root = files::list(&path).unwrap();
+    assert_eq!(names_of(&root), ["other.rpf", "Unnamed Entries"]);
+    assert_eq!(files::read(&root[0].path).unwrap(), [3; 16]);
+    let unnamed = files::list(&root[1].path).unwrap();
+    assert_eq!(names_of(&unnamed).len(), 3);
+    assert!(detail(&unnamed[2], "Names").starts_with("Unknown"));
     fs::remove_file(&candidates).unwrap();
-    assert_eq!(
-        detail(&files::list(&path).unwrap()[2], "Names"),
-        "Unknown: no candidate path or declared name has this entry's hash"
-    );
+    let root = files::list(&path).unwrap();
+    assert_eq!(names_of(&root).len(), 4);
 }
 
 #[test]
@@ -462,17 +494,20 @@ fn names_come_from_a_lut_beside_the_executable() {
     let builtin = Builtin::load(Some(&directory));
     let mut native = Native::read(&archive).unwrap();
     native.names = Names::read_with(&archive, &native.rows, &native.types, &builtin);
-    let entries = native.list(&archive, Path::new("")).unwrap();
-    let labels: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    native.layout = Layout::build(&native.rows, native.names.as_ref());
+    let root = native.list(&archive, Path::new("")).unwrap();
+    assert_eq!(names_of(&root), ["Props", "Unnamed Entries"]);
+    let props = native.list(&archive, Path::new("Props")).unwrap();
+    assert_eq!(names_of(&props), ["Item.ydr"]);
     assert_eq!(
-        labels,
-        ["Props/Item.ydr".to_string(), format!("0x{other:016X}.rpf")]
-    );
-    assert_eq!(
-        detail(&entries[0], "Name source"),
+        detail(&props[0], "Name source"),
         "User mapping, verified by hash"
     );
-    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+    assert_eq!(detail(&props[0], "Name hash"), format!("0x{item:016X}"));
+    assert_eq!(props[0].path, archive.path.join("Props").join("Row 00000"));
+    let unnamed = native.list(&archive, Path::new("Unnamed Entries")).unwrap();
+    let labels: Vec<String> = unnamed.iter().map(|entry| entry.name.clone()).collect();
+    assert_eq!(labels, [format!("0x{other:016X}.rpf")]);
 }
 
 #[test]
@@ -535,22 +570,25 @@ fn names_can_be_declared_for_stored_keys() {
     )
     .unwrap();
 
-    let entries = files::list(&path).unwrap();
-    // The entry remains its row: a name never becomes a path.
-    assert_eq!(names_of(&entries), ["Props/Item.ydr", "Readme.txt"]);
+    let root = files::list(&path).unwrap();
+    // The entry remains its row; a name only decides where it is listed.
+    assert_eq!(names_of(&root), ["Props", "Readme.txt"]);
+    let props = files::list(&root[0].path).unwrap();
+    assert_eq!(names_of(&props), ["Item.ydr"]);
     assert_eq!(
-        entries[0].path.file_name().unwrap().to_str().unwrap(),
+        props[0].path.file_name().unwrap().to_str().unwrap(),
         "Row 00000"
     );
-    assert_eq!(detail(&entries[0], "Names"), "Props/Item.ydr");
+    assert_eq!(props[0].path, path.join("Props").join("Row 00000"));
+    assert_eq!(detail(&props[0], "Names"), "Props/Item.ydr");
     assert_eq!(
-        detail(&entries[0], "Name source"),
+        detail(&props[0], "Name source"),
         "User mapping, verified by hash"
     );
-    assert_eq!(detail(&entries[1], "Names"), "Readme.txt");
+    assert_eq!(detail(&root[1], "Names"), "Readme.txt");
     // The stored key is still shown unchanged.
-    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
-    assert_eq!(detail(&entries[1], "Name key"), format!("0x{readme:08X}"));
+    assert_eq!(detail(&props[0], "Name hash"), format!("0x{item:016X}"));
+    assert_eq!(detail(&root[1], "Name key"), format!("0x{readme:08X}"));
     let note = files::describe(&path).unwrap();
     assert!(
         note.contains("2 of 2 entries are named by the 2 name mappings"),
@@ -559,9 +597,14 @@ fn names_can_be_declared_for_stored_keys() {
     assert!(note.contains("2 of 2 name mappings are verified"), "{note}");
     assert!(note.contains("1 line was not a valid entry"), "{note}");
 
-    // A name that does not hash to the declared key stays a suggestion.
+    // A name that does not hash to the declared key stays a suggestion, so it
+    // is neither a label nor a folder.
     fs::write(&names, format!("hash64:{item:016X}\tnot/that/item\n")).unwrap();
     let entries = files::list(&path).unwrap();
+    assert_eq!(
+        names_of(&entries).join("\n"),
+        format!("0x{item:016X}.rpf\n0x{readme:08X}")
+    );
     assert_eq!(detail(&entries[0], "Names"), "not/that/item");
     assert_eq!(
         detail(&entries[0], "Name source"),
@@ -571,6 +614,87 @@ fn names_can_be_declared_for_stored_keys() {
     assert!(note.contains("0 of 1 name mappings are verified"), "{note}");
     assert!(note.contains("1 is unconfirmed"), "{note}");
     assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+}
+
+#[test]
+fn folder_spellings_that_fold_alike_are_one_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("folded.rpf");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(hash64(b"packs/a")),
+                ..spec(&[1; 16], RPF_TYPE)
+            },
+            Spec {
+                hash: Some(hash64(b"packs/b")),
+                ..spec(&[2; 16], RPF_TYPE)
+            },
+        ]),
+    )
+    .unwrap();
+    // The engine folds case, so both paths are in one folder, spelled as the
+    // first placed name spells it.
+    fs::write(
+        temp.path().join("folded.rpf.names.txt"),
+        "PACKS/A.rpf\npacks/B.rpf\n",
+    )
+    .unwrap();
+
+    let root = files::list(&path).unwrap();
+    assert_eq!(names_of(&root), ["PACKS"]);
+    let children = files::list(&root[0].path).unwrap();
+    assert_eq!(names_of(&children), ["A.rpf", "B.rpf"]);
+    assert_eq!(
+        files::read(&path.join("PACKS").join("Row 00001")).unwrap(),
+        [2; 16]
+    );
+    assert!(files::read(&path.join("packs").join("Row 00000")).is_err());
+}
+
+#[test]
+fn unsafe_names_are_not_used_for_folders() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("unsafe.rpf");
+    let names = [
+        (hash64(b"../../escape"), "../../escape.bin"),
+        (hash64(b"/abs/x"), "/abs/x.bin"),
+        (hash64(b"C:/x"), "C:/x.bin"),
+        (hash64(b"a/./b"), "a/./b.bin"),
+        (hash64(b"a//b"), "a//b.bin"),
+        (hash64(b"a/.."), "a/.."),
+    ];
+    let rows: Vec<Spec> = names
+        .iter()
+        .map(|(hash, _)| Spec {
+            hash: Some(*hash),
+            ..spec(&[7; 16], RPF_TYPE)
+        })
+        .collect();
+    fs::write(&path, native_rpf(&rows)).unwrap();
+    let table: String = names
+        .iter()
+        .map(|(hash, name)| format!("hash64:{hash:016X}\t{name}\n"))
+        .collect();
+    fs::write(temp.path().join("unsafe.rpf.names.txt"), table).unwrap();
+
+    // None of the names can place a row, so they are verified suggestions in
+    // the details, and every row keeps its key as the label.
+    let entries = files::list(&path).unwrap();
+    assert_eq!(entries.len(), names.len());
+    for (entry, (hash, name)) in entries.iter().zip(&names) {
+        assert_eq!(entry.name, format!("0x{hash:016X}.rpf"));
+        assert_eq!(detail(entry, "Names"), *name);
+        assert_eq!(
+            detail(entry, "Name source"),
+            "User mapping, verified by hash"
+        );
+    }
+    let note = files::describe(&path).unwrap();
+    assert!(!note.contains("shown as folders"), "{note}");
+    assert!(!note.contains("Unnamed Entries"), "{note}");
+    assert!(files::read(&path.join("Row 00000")).is_ok());
 }
 
 #[test]

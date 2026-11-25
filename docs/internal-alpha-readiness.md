@@ -38,6 +38,10 @@ pushed.
   the stored key. Unresolved and ambiguous rows use the stored key in canonical
   hexadecimal form as the visible label. Names are display data; the row number
   and stored hash remain authoritative.
+- File a row under the folders its verified relative path describes, without
+  changing its row number or path identity. Unsafe components (absolute paths,
+  `.`, `..`, empty, drive letters, refused characters) never create folders.
+  Rows without a usable path are listed last in `Unnamed Entries`.
 - Index native hashes, harvest candidate strings from readable payloads and the
   local executable, and export validated LUT files with `lforge names`.
 - Inspect any file as bytes in the Binary Inspector, including files inside
@@ -270,11 +274,12 @@ C++ Redistributable installed.
    the metadata status says the signature verified, and one readable row
    exports. Then clear the executable and confirm the archive no longer lists
    native rows. Place a `<archive>.names.txt` with a known candidate path next
-   to the archive, reopen it, and confirm the name appears while the row label
-   and stored hash stay. Remove the file and confirm the names return to
-   unknown. Then copy `rpf9-hash64.lut` beside the executable, reopen the
-   archive, and confirm its resolved names become entry labels while
-   `Row NNNNN` remains each path.
+   to the archive, reopen it, and confirm the row moves under the folders its
+   path describes while its stored hash and path stay. Remove the file and
+   confirm the names return to unknown. Then copy `rpf9-hash64.lut` beside the
+   executable, reopen the archive, and confirm the resolved names become
+   folders and labels, with `Unnamed Entries` last and `Row NNNNN` still each
+   path.
 8. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
 9. Open a plain file and an entry inside an archive in the Binary Inspector.
