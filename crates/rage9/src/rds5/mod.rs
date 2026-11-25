@@ -620,6 +620,38 @@ pub fn decode_block<R: Read + Seek>(
         check(cancel)?;
         let remaining = end - pos;
         if remaining == 0 {
+            // The stream can end on the last stored byte while the output
+            // buffer is full, in which case the decoder only reports it on the
+            // next call. Ask once more before rejecting the block.
+            let (out_before, in_before) = (zlib.total_out(), zlib.total_in());
+            let status = zlib
+                .decompress(&[], &mut output, FlushDecompress::None)
+                .map_err(|err| {
+                    invalid(format!("block {index} is not a valid zlib stream: {err}"))
+                })?;
+            let produced = (zlib.total_out() - out_before) as usize;
+            let consumed = zlib.total_in() - in_before;
+            if consumed != 0 {
+                return Err(invalid(format!(
+                    "the zlib decoder of block {index} consumes input after the stored range"
+                )));
+            }
+            if zlib.total_out() > limits.max_block_len {
+                return Err(invalid(format!(
+                    "block {index} decodes to more than the {} byte limit",
+                    limits.max_block_len
+                )));
+            }
+            if produced > 0 {
+                sink(&output[..produced]).map_err(Error::Io)?;
+            }
+            if status == ZlibStatus::StreamEnd {
+                return Ok(Decoded {
+                    len: zlib.total_out(),
+                    stored_len: block.stored_len,
+                    trailing: 0,
+                });
+            }
             return Err(invalid(format!(
                 "the zlib stream of block {index} ends before its {} stored bytes do",
                 block.stored_len

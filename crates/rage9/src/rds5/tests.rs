@@ -593,6 +593,35 @@ fn treats_a_wrong_length_as_a_limit_not_a_read() {
 }
 
 #[test]
+fn decodes_blocks_that_fill_the_output_buffer_exactly() {
+    for multiple in 1..=3usize {
+        let len = DECODE_OUTPUT * multiple;
+        let data = noise(len);
+        let bytes = Build::default().build(&[zlib(&data)], 0);
+        let mut container = read(&bytes).unwrap();
+        let mut source = Cursor::new(&bytes);
+        container
+            .classify(&mut source, usize::MAX, &AtomicBool::new(false))
+            .unwrap();
+        let mut decoded = Vec::new();
+        let report = decode_block(
+            &mut source,
+            &container,
+            0,
+            &Limits::default(),
+            &AtomicBool::new(false),
+            |chunk| {
+                decoded.extend_from_slice(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded, data, "{len} bytes");
+        assert_eq!(report.len, len as u64);
+    }
+}
+
+#[test]
 fn stops_when_cancelled() {
     let bytes = build_standard();
     let err = Container::read(
