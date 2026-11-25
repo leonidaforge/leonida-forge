@@ -53,6 +53,10 @@ pub struct Settings {
     pub tree_width: f32,
     pub preview_width: f32,
     pub last_directory: Option<PathBuf>,
+    /// A local game executable, used only to authenticate the processed table
+    /// of contents of RPF9 archives. Only the path is stored: no key state, IV
+    /// or executable bytes are kept.
+    pub executable: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -66,6 +70,7 @@ impl Default for Settings {
             tree_width: DEFAULT_TREE_WIDTH,
             preview_width: DEFAULT_PREVIEW_WIDTH,
             last_directory: None,
+            executable: None,
         }
     }
 }
@@ -137,10 +142,21 @@ mod tests {
             tree_width: 300.,
             preview_width: 260.,
             last_directory: Some(PathBuf::from(r"E:\Mods ä\cars")),
+            executable: Some(PathBuf::from(r"D:\Spiele\GTA VI\game.exe")),
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn settings_from_before_the_executable_option_load_without_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        fs::write(&path, r#"{ "preview_visible": false }"#).unwrap();
+        let settings = Settings::load(&path);
+        assert!(!settings.preview_visible);
+        assert_eq!(settings.executable, None);
     }
 
     #[test]

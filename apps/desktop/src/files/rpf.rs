@@ -1,11 +1,16 @@
-//! RPF9 archives, browsed through their own table of contents where it is
-//! stored unencrypted (see [`super::toc`]), and otherwise through the entries
-//! recovered from their data.
+//! RPF9 archives, browsed through their own table of contents (see
+//! [`super::toc`]) and otherwise through the entries recovered from their
+//! data.
 //!
-//! Recovery needs an index, which takes a scan of the whole archive. Until
-//! [`build_index`] has run, listings fail with an error that
-//! [`super::archive::prepare_required`] recognises, so the explorer can show progress and offer
-//! cancellation instead of blocking.
+//! A table of contents that the engine processes before reading is used only
+//! after it authenticated against a local executable ([`build_index`] with an
+//! [`super::executable::Access`]). Without one, or when authentication fails,
+//! the archive data can be scanned instead. Until that has happened, listings
+//! fail with an error that [`super::archive::prepare_required`],
+//! [`super::archive::executable_required`] or
+//! [`super::archive::authentication_failure`] recognises, so the explorer can
+//! show progress, ask which way to go and offer cancellation instead of
+//! blocking.
 //!
 //! Recovered entries have no names or folders. Inside an archive,
 //! `Recovered Entries` holds one virtual folder per kind of entry,
@@ -18,13 +23,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use lforge_rage9::resource::{Page, Segment};
+use lforge_rage9::rpf::metadata::verify;
 use lforge_rage9::rpf::{self, CacheKey, Index, Kind, Progress, Region, Resource, Status, Stream};
 
-use super::archive::{Archive, Dependency, Stamp, check_size, needs_prepare};
+use super::archive::{
+    Archive, Dependency, Stage, Stamp, authentication_failed, check_size, needs_executable,
+    needs_prepare,
+};
+use super::executable::Executable;
 use super::toc;
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
@@ -53,10 +63,29 @@ enum Contents {
     Recovered(Arc<Index>, Arc<str>),
 }
 
+/// Why the contents of an archive are not available yet.
+#[derive(Debug, Clone)]
+enum Unavailable {
+    /// The stored metadata needs processing, and no executable is configured.
+    Executable(Arc<str>),
+    /// The configured executable did not authenticate the stored metadata, or
+    /// is no longer the file that was selected.
+    Authentication(Arc<str>),
+    /// The stored metadata is not usable; the data can be scanned.
+    Recoverable(Arc<str>),
+    /// The stored metadata needs processing and an executable is configured.
+    /// Only [`build_index`] spends the time to authenticate it, so a cached
+    /// recovery index is not used in its place.
+    Deferred,
+}
+
 struct Cached {
     stamp: Stamp,
     /// Of the archive, as it was opened.
     dependencies: Vec<Dependency>,
+    /// The executable the contents were obtained with, so a different one is
+    /// never mixed into what was read with another.
+    executable: Option<(PathBuf, Stamp)>,
     contents: Contents,
     last_used: u64,
 }
@@ -123,6 +152,7 @@ fn remember(archive: &Archive, contents: Contents) -> Contents {
     let cached = Cached {
         stamp: archive.stamp,
         dependencies: archive.dependencies.clone(),
+        executable: archive.access.identity(),
         contents: contents.clone(),
         last_used: 0,
     };
@@ -144,6 +174,7 @@ fn in_memory(archive: &Archive) -> Option<Contents> {
     let cached = indexes.by_archive.get_mut(&archive.path)?;
     let current = cached.stamp == archive.stamp
         && cached.dependencies == archive.dependencies
+        && cached.executable == archive.access.identity()
         && match &cached.contents {
             Contents::Native(native) => native.is_current(archive),
             Contents::Recovered(index, _) => index.archive_len == archive.source.len(),
@@ -155,42 +186,142 @@ fn in_memory(archive: &Archive) -> Option<Contents> {
     Some(cached.contents.clone())
 }
 
-/// The table of contents, or why it cannot be used.
-fn probe(archive: &Archive) -> Result<Contents, Arc<str>> {
-    toc::Native::read(archive).map(|native| Contents::Native(Arc::new(native)))
+/// Authenticates the stored table of contents with `executable` and returns
+/// it. Only a passing signature check yields native entries.
+fn authenticate(
+    archive: &Archive,
+    executable: &Executable,
+    cancel: &AtomicBool,
+) -> Result<toc::Native, Arc<str>> {
+    let mut source = archive.source.clone();
+    let open = verify::open_authenticated(&mut source, executable.view(), cancel)
+        .map_err(|err| Arc::from(format!("The metadata could not be read: {err}.")))?;
+    let report = open.report;
+    let Some(authenticated) = open.authenticated else {
+        return Err(Arc::from(format!(
+            "{} did not authenticate the metadata: {} (stage {}).",
+            executable.name(),
+            report.outcome,
+            report.stage
+        )));
+    };
+    Ok(toc::Native::from_authenticated(
+        archive,
+        authenticated.into_metadata(),
+        report,
+    ))
 }
 
-/// The contents of `archive` from memory, its table of contents or the
-/// cache file, or why the table of contents cannot be used. Never scans.
-fn lookup(archive: &Archive) -> io::Result<Result<Contents, Arc<str>>> {
+/// The contents of `archive` from memory, its table of contents, a local
+/// executable or the cache file, or why they are not available. `allow_auth`
+/// decides whether the stored metadata may be authenticated here; only
+/// [`build_index`] does that, so a listing never spends that time and cannot
+/// preempt the progress and cancellation the explorer offers. Never scans.
+fn lookup(
+    archive: &Archive,
+    allow_auth: bool,
+    cancel: &AtomicBool,
+) -> io::Result<Result<Contents, Unavailable>> {
     if let Some(contents) = in_memory(archive) {
         return Ok(Ok(contents));
     }
-    let reason = match probe(archive) {
-        Ok(native) => return Ok(Ok(remember(archive, native))),
-        Err(reason) => reason,
+    let unreadable = match toc::Native::read(archive) {
+        Ok(native) => return Ok(Ok(remember(archive, Contents::Native(Arc::new(native))))),
+        Err(unreadable) => unreadable,
     };
-    if let Some(dir) = cache_dir()
+    let unreadable_reason = unreadable.reason().clone();
+    let mut failed: Option<Arc<str>> = None;
+    // Whether a recovery index kept for this archive may stand in for the
+    // table of contents. Not while an executable that could authenticate it
+    // is selected: the prepare step decides, and authenticating is preferred
+    // over recovery.
+    let mut may_scan = true;
+    match archive.access.executable() {
+        // A changed executable says nothing about this archive, so it is not
+        // used; the selection has to be repeated.
+        Some(executable) if !executable.is_current() => {
+            failed = Some(Arc::from(format!(
+                "{} changed since it was selected, so it was not used. Select it again, or \
+                 scan the archive data.",
+                executable.name()
+            )));
+        }
+        Some(executable) if allow_auth => match authenticate(archive, executable, cancel) {
+            Ok(native) => return Ok(Ok(remember(archive, Contents::Native(Arc::new(native))))),
+            Err(reason) => failed = Some(reason),
+        },
+        Some(_) => may_scan = false,
+        None => {}
+    }
+    // Recovery stays available whatever the table of contents did: an index
+    // kept for this archive is used, and carries the reason it was needed.
+    let reason = failed.clone().unwrap_or(unreadable_reason);
+    if may_scan
+        && let Some(dir) = cache_dir()
         && let Some(index) = rpf::load(&dir, &cache_key(archive)?, archive.source.len())
     {
         let recovered = Contents::Recovered(Arc::new(index), reason);
         return Ok(Ok(remember(archive, recovered)));
     }
-    Ok(Err(reason))
+    Ok(Err(match failed {
+        Some(reason) => Unavailable::Authentication(reason),
+        None if !may_scan => Unavailable::Deferred,
+        None => match unreadable {
+            toc::Unreadable::Processed(reason) => Unavailable::Executable(reason),
+            toc::Unreadable::Malformed(reason) => Unavailable::Recoverable(reason),
+        },
+    }))
 }
 
 fn contents(archive: &Archive) -> io::Result<Contents> {
-    lookup(archive)?.map_err(|_| needs_prepare(archive.path.clone()))
+    lookup(archive, false, &AtomicBool::new(false))?
+        .map_err(|_| needs_prepare(archive.path.clone()))
 }
 
 /// Reads the table of contents or, where it cannot be used, scans `archive`,
 /// unless its contents are in memory or in the cache. Keeps the result in
 /// memory.
-pub fn build_index(archive: &Archive, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
-    let reason = match lookup(archive)? {
+///
+/// With an executable configured, the stored metadata is authenticated first.
+/// `allow_scan` decides whether scanning may stand in for a table of contents
+/// that no executable authenticated; without it, the call fails with an error
+/// the explorer recognises and turns into a choice for the user.
+pub fn build_index(
+    archive: &Archive,
+    allow_scan: bool,
+    stage: &Stage,
+    progress: &Progress,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    stage.set(Stage::VERIFYING);
+    let unavailable = match lookup(archive, true, cancel)? {
         Ok(_) => return Ok(()),
-        Err(reason) => reason,
+        Err(unavailable) => unavailable,
     };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    match &unavailable {
+        Unavailable::Authentication(reason) if !allow_scan => {
+            return Err(authentication_failed(
+                archive.path.clone(),
+                reason.to_string(),
+            ));
+        }
+        Unavailable::Executable(reason) if !allow_scan => {
+            return Err(needs_executable(archive.path.clone(), reason.to_string()));
+        }
+        _ => {}
+    }
+    let reason = match unavailable {
+        Unavailable::Executable(reason)
+        | Unavailable::Authentication(reason)
+        | Unavailable::Recoverable(reason) => reason,
+        // Only reachable without an authentication attempt, which this
+        // function always makes.
+        Unavailable::Deferred => Arc::from("The table of contents is processed before use."),
+    };
+    stage.set(Stage::SCANNING);
     let key = cache_key(archive)?;
     let index = rpf::scan(archive.source.clone(), progress, cancel)?;
     if let Some(dir) = cache_dir()
@@ -744,6 +875,7 @@ pub(crate) mod tests {
 
     use crate::files;
     use crate::files::archive::{self, prepare_required};
+    use crate::files::{Access, Executable};
 
     pub(crate) fn zlib(data: &[u8]) -> Vec<u8> {
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -1035,11 +1167,11 @@ pub(crate) mod tests {
         let index = rpf::scan(source, &Progress::default(), &AtomicBool::new(false)).unwrap();
         Contents::Recovered(Arc::new(index), Arc::from("reason"))
     }
-
     fn cached(contents: &Contents) -> Cached {
         Cached {
             stamp: (0, None),
             dependencies: Vec::new(),
+            executable: None,
             contents: contents.clone(),
             last_used: 0,
         }
@@ -1070,5 +1202,249 @@ pub(crate) mod tests {
         let mut names: Vec<_> = indexes.by_archive.keys().cloned().collect();
         names.sort();
         assert_eq!(names, [PathBuf::from("d"), PathBuf::from("e")]);
+    }
+
+    fn detail<'a>(entry: &'a Entry, label: &str) -> Option<&'a str> {
+        entry
+            .details
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// An RPF9 archive whose table of contents the engine processes, with two
+    /// payloads in its data.
+    fn processed_archive(dir: &Path) -> PathBuf {
+        let archive = dir.join("data.rpf");
+        write_rpf(
+            &archive,
+            &[zlib(b"<?xml version=\"1.0\"?><a/>"), zlib(b"plain text")],
+        );
+        archive
+    }
+
+    fn prepare_with(archive: &Path, access: &Access, allow_scan: bool) -> io::Result<()> {
+        archive::prepare_with(
+            archive,
+            access,
+            allow_scan,
+            &Stage::default(),
+            &Progress::default(),
+            &AtomicBool::new(false),
+        )
+    }
+
+    /// An executable that opens as an image but holds no compatible metadata
+    /// state, as a game build this tool does not recognise would.
+    fn unrelated_executable(dir: &Path) -> Access {
+        let path = dir.join("other.exe");
+        fs::write(&path, crate::files::executable::tests::pe_bytes()).unwrap();
+        Access::with(Arc::new(Executable::open(&path).unwrap()))
+    }
+
+    #[test]
+    fn a_processed_archive_without_an_executable_asks_for_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let err = prepare_with(&archive, &Access::none(), false).unwrap_err();
+        let (path, reason) = archive::executable_required(&err).unwrap();
+        assert_eq!(path, archive.as_path());
+        assert!(reason.contains("processed"), "{reason}");
+        // Neither an authentication failure nor a scan request.
+        assert!(archive::authentication_failure(&err).is_none());
+        assert!(prepare_required(&err).is_none());
+        // Nothing was scanned, so the listing still cannot be produced.
+        let err = files::list(&archive).unwrap_err();
+        assert_eq!(prepare_required(&err), Some(archive.as_path()));
+    }
+
+    #[test]
+    fn an_unrelated_executable_fails_authentication_not_the_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let access = unrelated_executable(temp.path());
+        let err = prepare_with(&archive, &access, false).unwrap_err();
+        let (path, reason) = archive::authentication_failure(&err).unwrap();
+        assert_eq!(path, archive.as_path());
+        assert!(reason.contains("did not authenticate"), "{reason}");
+        // A failed authentication is not reported as a missing executable.
+        assert!(archive::executable_required(&err).is_none());
+    }
+
+    #[test]
+    fn recovery_stays_available_without_an_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        prepare_with(&archive, &Access::none(), true).unwrap();
+        assert_eq!(names(&files::list(&archive).unwrap()), [RECOVERED]);
+    }
+
+    #[test]
+    fn choosing_to_scan_keeps_recovered_entries_and_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let access = unrelated_executable(temp.path());
+        prepare_with(&archive, &access, true).unwrap();
+        assert_eq!(
+            names(&files::list_with(&archive, &access).unwrap()),
+            [RECOVERED]
+        );
+        let note = files::describe_with(&archive, &access).unwrap();
+        assert!(note.contains("did not authenticate"), "{note}");
+        assert!(!note.contains("stored unencrypted"), "{note}");
+    }
+
+    #[test]
+    fn selecting_an_executable_invalidates_contents_read_without_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        prepare_with(&archive, &Access::none(), true).unwrap();
+        assert!(files::list(&archive).is_ok());
+        let access = unrelated_executable(temp.path());
+        let err = files::list_with(&archive, &access).unwrap_err();
+        assert_eq!(prepare_required(&err), Some(archive.as_path()));
+    }
+
+    #[test]
+    fn a_changed_executable_is_not_used() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let path = temp.path().join("other.exe");
+        fs::write(&path, crate::files::executable::tests::pe_bytes()).unwrap();
+        let executable = Arc::new(Executable::open(&path).unwrap());
+        fs::write(&path, b"changed after it was opened").unwrap();
+        let access = Access::with(executable);
+        let err = prepare_with(&archive, &access, false).unwrap_err();
+        let (_, reason) = archive::authentication_failure(&err).unwrap();
+        assert!(reason.contains("changed"), "{reason}");
+    }
+
+    #[test]
+    fn cancellation_stops_before_any_scan_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let err = archive::prepare_with(
+            &archive,
+            &Access::none(),
+            false,
+            &Stage::default(),
+            &Progress::default(),
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn overlapping_opens_of_one_archive_both_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = processed_archive(temp.path());
+        let (one, two) = std::thread::scope(|scope| {
+            let other = scope.spawn(|| prepare_with(&archive, &Access::none(), true));
+            let one = prepare_with(&archive, &Access::none(), true);
+            (one, other.join().unwrap())
+        });
+        assert!(one.is_ok(), "{:?}", one.err());
+        assert!(two.is_ok(), "{:?}", two.err());
+        assert_eq!(names(&files::list(&archive).unwrap()), [RECOVERED]);
+    }
+
+    #[test]
+    fn an_executable_context_reaches_archives_stored_in_archives() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("outer.rpf");
+        // The inner archive is stored as one zlib stream in the outer
+        // archive, so scanning recovers it as a whole entry.
+        let inner = rpf_bytes(&[zlib(b"<?xml version=\"1.0\"?><inner/>")]);
+        write_rpf(&outer, &[zlib(&inner)]);
+        let access = unrelated_executable(temp.path());
+        prepare_with(&outer, &access, true).unwrap();
+
+        let root = files::list_with(&outer, &access).unwrap();
+        let recovered = root.iter().find(|entry| entry.name == RECOVERED).unwrap();
+        let kinds = files::list_with(&recovered.path, &access).unwrap();
+        let entries = files::list_with(&kinds[0].path, &access).unwrap();
+        let stored = &entries[0];
+
+        // The outer archive's context is carried into what is stored in it.
+        let archive::Location::Inside(outer_archive, _) =
+            archive::locate_with(&stored.path, &access).unwrap()
+        else {
+            panic!("expected an entry inside the outer archive");
+        };
+        assert_eq!(outer_archive.access.identity(), access.identity());
+
+        // Once it is opened, the nested archive keeps the same context.
+        prepare_with(&stored.path, &access, true).unwrap();
+        let archive::Location::Archive(nested) =
+            archive::locate_with(&stored.path, &access).unwrap()
+        else {
+            panic!("expected the stored entry to be an archive");
+        };
+        assert_eq!(nested.access.identity(), access.identity());
+    }
+
+    #[test]
+    fn native_rows_show_grounded_fields_and_their_metadata_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("native.rpf");
+        fs::write(
+            &path,
+            crate::files::toc::tests::native_rpf(&[crate::files::toc::tests::Spec {
+                hash: Some(lforge_rage9::rpf::names::hash64(b"data")),
+                ..crate::files::toc::tests::spec(b"five bytes", 11)
+            }]),
+        )
+        .unwrap();
+        let rows = files::list(&path).unwrap();
+        let row = &rows[0];
+        assert_eq!(row.name, "Row 00000");
+        let hash = format!("0x{:016X}", lforge_rage9::rpf::names::hash64(b"data"));
+        assert_eq!(detail(row, "Name hash"), Some(hash.as_str()));
+        assert_eq!(detail(row, "Type ID"), Some("11 (meaning not established)"));
+        assert!(detail(row, "Metadata").unwrap().starts_with("Unencrypted"));
+        assert!(detail(row, "Contents").is_some());
+    }
+
+    /// Reads a real archive through the desktop layer, read-only. Set the
+    /// environment variables to a local executable and one of its archives.
+    #[test]
+    #[ignore = "set LEONIDA_FORGE_EXECUTABLE and LEONIDA_FORGE_ARCHIVE to local files to run"]
+    fn local_authenticated_archive_smoke_test() {
+        let Some(executable) = std::env::var_os("LEONIDA_FORGE_EXECUTABLE") else {
+            panic!("set LEONIDA_FORGE_EXECUTABLE to a local executable to run this test");
+        };
+        let Some(archive) = std::env::var_os("LEONIDA_FORGE_ARCHIVE") else {
+            panic!("set LEONIDA_FORGE_ARCHIVE to a local archive to run this test");
+        };
+        let executable = Arc::new(Executable::open(Path::new(&executable)).unwrap());
+        let access = Access::with(executable);
+        let archive = PathBuf::from(archive);
+
+        prepare_with(&archive, &access, false).unwrap();
+        let rows = files::list_with(&archive, &access).unwrap();
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| row.name.starts_with("Row ")));
+        let note = files::describe_with(&archive, &access).unwrap();
+        assert!(note.contains("signature verified"), "{note}");
+
+        let readable = rows.iter().find(|row| {
+            row.kind == EntryKind::File
+                && detail(row, "Contents").is_some_and(|text| !text.starts_with("Not readable"))
+        });
+        match readable {
+            Some(row) => {
+                // The preview and export readers return exactly the logical size.
+                let bytes = files::read_with(&row.path, &access).unwrap();
+                assert_eq!(Some(bytes.len() as u64), row.size);
+            }
+            // A sample whose rows all need a transform this tool refuses.
+            None => assert!(
+                rows.iter()
+                    .filter(|row| row.kind == EntryKind::File)
+                    .all(|row| detail(row, "Contents")
+                        .is_some_and(|text| text.starts_with("Not readable")))
+            ),
+        }
     }
 }

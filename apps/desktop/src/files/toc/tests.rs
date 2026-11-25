@@ -412,8 +412,8 @@ fn unusable_tables_fall_back_to_recovery() {
     for (path, reason) in [
         (
             &encrypted,
-            "The table of contents is not read: it is encrypted: the static pass decrypts it \
-             with cipher type 16",
+            "The table of contents is processed before use: it is encrypted: the static pass \
+             decrypts it with cipher type 16",
         ),
         (&malformed, "The table of contents could not be read:"),
     ] {

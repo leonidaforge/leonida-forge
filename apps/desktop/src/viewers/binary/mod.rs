@@ -171,7 +171,12 @@ pub struct BinaryInspector {
 }
 
 impl BinaryInspector {
-    pub fn new(path: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        access: crate::files::Access,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -179,7 +184,7 @@ impl BinaryInspector {
         let open = cx.background_spawn({
             let path = path.clone();
             async move {
-                let mut file = files::open_binary(&path)?;
+                let mut file = files::open_binary_with(&path, &access)?;
                 let signature = lforge_binary::read_at(&mut file.source, 0, SIGNATURE_LEN)?;
                 io::Result::Ok(OpenFile {
                     source: file.source,

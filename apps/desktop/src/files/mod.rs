@@ -7,6 +7,7 @@
 pub mod archive;
 #[cfg(test)]
 mod eviction;
+pub mod executable;
 pub mod images;
 pub mod rpf;
 pub mod shell;
@@ -22,6 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use archive::{Identified, Location};
+pub use executable::{Access, Executable};
 use lforge_binary::Source;
 use serde::{Deserialize, Serialize};
 
@@ -121,10 +123,20 @@ pub fn is_supported_image(path: &Path) -> bool {
     extension(path).is_some_and(|ext| matches!(ext.as_str(), "png" | "jpg" | "jpeg"))
 }
 
-/// Lists the direct children of a directory, or of a folder inside an archive.
-/// Type names come from Windows where it knows the file type.
+/// Lists the direct children of a directory, or of a folder inside an archive,
+/// without an executable. Type names come from Windows where it knows the file
+/// type.
+#[cfg(test)]
 pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
-    let mut entries = match archive::locate(path)? {
+    list_with(path, &Access::none())
+}
+
+/// [`list`] with the executable that may authenticate a stored table of
+/// contents. Archives whose metadata needs it and have none fail with an
+/// error that [`archive::executable_required`] or
+/// [`archive::authentication_failure`] recognises.
+pub fn list_with(path: &Path, access: &Access) -> io::Result<Vec<Entry>> {
+    let mut entries = match archive::locate_with(path, access)? {
         Location::Archive(archive) => archive::list(&archive, Path::new(""))?,
         Location::Inside(archive, inner) => {
             if archive::is_file(&archive, &inner)? {
@@ -151,8 +163,13 @@ pub fn list(path: &Path) -> io::Result<Vec<Entry>> {
 
 /// Explains where the contents of a folder come from, when that is not
 /// obvious, e.g. for entries recovered from an RPF archive.
+#[cfg(test)]
 pub fn describe(path: &Path) -> Option<String> {
-    match archive::locate(path).ok()? {
+    describe_with(path, &Access::none())
+}
+
+pub fn describe_with(path: &Path, access: &Access) -> Option<String> {
+    match archive::locate_with(path, access).ok()? {
         Location::Archive(archive) => archive::describe(&archive, Path::new("")),
         Location::Inside(archive, inner) => archive::describe(&archive, &inner),
         Location::Plain => None,
@@ -162,8 +179,13 @@ pub fn describe(path: &Path) -> Option<String> {
 /// Identifies a file by its contents, wherever it is stored. Files inside
 /// archives are identified from their first bytes, so archives among them
 /// are only fully checked when they are opened.
+#[cfg(test)]
 pub fn identify(path: &Path) -> io::Result<Identified> {
-    match archive::locate_prepared(path)? {
+    identify_with(path, &Access::none())
+}
+
+pub fn identify_with(path: &Path, access: &Access) -> io::Result<Identified> {
+    match archive::locate_prepared_with(path, access)? {
         Location::Archive(archive) => Ok(Identified::Archive(archive.format)),
         Location::Inside(archive, inner) if archive::is_file(&archive, &inner)? => {
             archive::sniff(&archive, &inner)
@@ -181,9 +203,14 @@ pub fn split_location(path: &Path) -> Option<(&Path, &Path)> {
     (!inner.as_os_str().is_empty()).then_some((file, inner))
 }
 
-/// Reads a whole file, which may be inside an archive.
+/// Reads a whole file, which may be inside an archive, without an executable.
+#[cfg(test)]
 pub fn read(path: &Path) -> io::Result<Vec<u8>> {
-    match archive::locate_prepared(path)? {
+    read_with(path, &Access::none())
+}
+
+pub fn read_with(path: &Path, access: &Access) -> io::Result<Vec<u8>> {
+    match archive::locate_prepared_with(path, access)? {
         Location::Plain => fs::read(path),
         Location::Archive(archive) => archive::read_all(&archive),
         Location::Inside(archive, inner) => {
@@ -200,12 +227,17 @@ pub struct BinaryFile {
     pub modified: Option<SystemTime>,
 }
 
-/// Opens a file for random access. Files inside archives are extracted to a
-/// temporary file first, within the archive size limit. Windows deletes the
-/// temporary file when its last handle closes, also when the process exits
-/// abnormally.
+/// Opens a file for random access, without an executable. Files inside
+/// archives are extracted to a temporary file first, within the archive size
+/// limit. Windows deletes the temporary file when its last handle closes, also
+/// when the process exits abnormally.
+#[cfg(test)]
 pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
-    let location = archive::locate_prepared(path)?;
+    open_binary_with(path, &Access::none())
+}
+
+pub fn open_binary_with(path: &Path, access: &Access) -> io::Result<BinaryFile> {
+    let location = archive::locate_prepared_with(path, access)?;
     if let Location::Archive(archive) = &location
         && archive.depth > 1
     {
@@ -245,7 +277,20 @@ pub fn open_binary(path: &Path) -> io::Result<BinaryFile> {
 /// overwrite through the save dialog. Reuses the archive readers, so native,
 /// scan-recovered and ZIP contents are decoded through their existing paths
 /// (see [`archive::export_to`]).
+/// [`export_with`] without an executable.
+#[cfg(test)]
 pub fn export(source: &Path, dest: &Path, cancel: &AtomicBool) -> io::Result<u64> {
+    export_with(source, dest, &Access::none(), cancel)
+}
+
+/// [`export`] with the executable that may authenticate the stored table of
+/// contents the entry is listed from.
+pub fn export_with(
+    source: &Path,
+    dest: &Path,
+    access: &Access,
+    cancel: &AtomicBool,
+) -> io::Result<u64> {
     let dir = match dest.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
@@ -253,7 +298,7 @@ pub fn export(source: &Path, dest: &Path, cancel: &AtomicBool) -> io::Result<u64
     let mut temp = tempfile::NamedTempFile::new_in(&dir)?;
     let written = {
         let mut out = io::BufWriter::new(temp.as_file_mut());
-        let written = archive::export_to(source, &mut out, cancel)?;
+        let written = archive::export_to_with(source, access, &mut out, cancel)?;
         out.flush()?;
         written
     };

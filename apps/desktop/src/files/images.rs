@@ -17,8 +17,8 @@ pub struct DecodedImage {
 }
 
 /// Decodes the image at full resolution. The file may be inside an archive.
-pub fn load(path: &Path) -> Result<DecodedImage, String> {
-    let bytes = super::read(path).map_err(|err| err.to_string())?;
+pub fn load(path: &Path, access: &super::Access) -> Result<DecodedImage, String> {
+    let bytes = super::read_with(path, access).map_err(|err| err.to_string())?;
     let image = reader(&bytes)?.decode().map_err(|err| err.to_string())?;
     let (width, height) = (image.width(), image.height());
     Ok(DecodedImage {
@@ -32,8 +32,12 @@ pub fn load(path: &Path) -> Result<DecodedImage, String> {
 ///
 /// JPEGs are decoded at a reduced scale, so large photos are never decoded in
 /// full. PNG has no reduced decoding, so it is decoded fully and then scaled.
-pub fn load_thumbnail(path: &Path, max_side: u32) -> Result<DecodedImage, String> {
-    let bytes = super::read(path).map_err(|err| err.to_string())?;
+pub fn load_thumbnail(
+    path: &Path,
+    max_side: u32,
+    access: &super::Access,
+) -> Result<DecodedImage, String> {
+    let bytes = super::read_with(path, access).map_err(|err| err.to_string())?;
     let (width, height) = reader(&bytes)?
         .into_dimensions()
         .map_err(|err| err.to_string())?;
@@ -117,7 +121,7 @@ mod tests {
             .save(&path)
             .unwrap();
 
-        let thumbnail = load_thumbnail(&path, 64).unwrap();
+        let thumbnail = load_thumbnail(&path, 64, &super::super::Access::none()).unwrap();
         assert_eq!((thumbnail.width, thumbnail.height), (400, 100));
         let size = thumbnail.image.size(0);
         assert_eq!((size.width.0, size.height.0), (64, 16));
@@ -136,7 +140,7 @@ mod tests {
             .save(&path)
             .unwrap();
 
-        let thumbnail = load_thumbnail(&path, 128).unwrap();
+        let thumbnail = load_thumbnail(&path, 128, &super::super::Access::none()).unwrap();
         assert_eq!((thumbnail.width, thumbnail.height), (1024, 512));
         let size = thumbnail.image.size(0);
         assert_eq!((size.width.0, size.height.0), (128, 64));
@@ -149,12 +153,18 @@ mod tests {
         ImageBuffer::from_pixel(3, 2, Rgba([0u8, 0, 0, 255]))
             .save(&path)
             .unwrap();
-        let image = load(&path).unwrap();
+        let image = load(&path, &super::super::Access::none()).unwrap();
         assert_eq!((image.width, image.height), (3, 2));
 
         let broken = temp.path().join("broken.png");
         std::fs::write(&broken, b"not a png").unwrap();
-        assert!(load_thumbnail(&broken, 64).is_err());
-        assert!(load(&temp.path().join("missing.png")).is_err());
+        assert!(load_thumbnail(&broken, 64, &super::super::Access::none()).is_err());
+        assert!(
+            load(
+                &temp.path().join("missing.png"),
+                &super::super::Access::none()
+            )
+            .is_err()
+        );
     }
 }

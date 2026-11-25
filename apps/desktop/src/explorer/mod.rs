@@ -25,9 +25,9 @@ use gpui::{
 
 use lforge_rage9::rpf::Progress;
 
-use crate::files::archive::Identified;
+use crate::files::archive::{Identified, Stage};
 use crate::files::shell::ShellWorker;
-use crate::files::{self, Entry, EntryKind, Sort, SortKey, images};
+use crate::files::{self, Access, Entry, EntryKind, Executable, Sort, SortKey, images};
 use crate::settings::{Settings, ViewMode};
 use crate::ui;
 use crate::ui::assets::Icon;
@@ -62,10 +62,22 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+#[derive(Clone)]
 enum Listing {
     Loading,
     /// Waiting for the archive at this path to be decompressed or indexed.
     Indexing(PathBuf),
+    /// The archive's stored metadata needs processing, and no executable that
+    /// can authenticate it is selected.
+    NeedsExecutable {
+        archive: PathBuf,
+        reason: String,
+    },
+    /// The stored metadata did not authenticate with the selected executable.
+    AuthenticationFailed {
+        archive: PathBuf,
+        message: String,
+    },
     Loaded(Arc<Vec<Entry>>),
     Failed(String),
 }
@@ -80,9 +92,24 @@ enum Loaded {
 /// A background scan of one archive.
 struct IndexJob {
     progress: Arc<Progress>,
+    stage: Arc<files::archive::Stage>,
     cancel: Arc<AtomicBool>,
     _work: Task<()>,
     _ticker: Task<()>,
+}
+
+/// The local executable used to authenticate RPF9 metadata, and whether it
+/// could be opened.
+#[derive(Default)]
+enum ExecutableState {
+    /// No executable is configured.
+    #[default]
+    Unset,
+    /// Configured and being checked in the background.
+    Checking,
+    Ready(Arc<Executable>),
+    /// Configured but unusable, with the reason.
+    Failed(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -197,7 +224,9 @@ pub struct Explorer {
     listings: HashMap<PathBuf, Listing>,
     /// Explanations shown above a listing, see [`files::describe`].
     notes: HashMap<PathBuf, String>,
-    loading: HashSet<PathBuf>,
+    /// Per folder: the number of the latest listing request, so results for
+    /// older requests are dropped.
+    load_generations: HashMap<PathBuf, u64>,
     indexing: HashMap<PathBuf, IndexJob>,
     expanded: HashSet<PathBuf>,
     history: History,
@@ -225,6 +254,11 @@ pub struct Explorer {
     focus_handle: FocusHandle,
     settings_path: Option<PathBuf>,
     save_task: Option<Task<()>>,
+    /// The configured executable, its validation state, and the generation of
+    /// the latest check so a late result cannot replace a newer one.
+    configured_executable: Option<PathBuf>,
+    executable: ExecutableState,
+    executable_generation: u64,
     renderer_demo: Option<WindowHandle<RendererDemo>>,
     _quit_subscription: Subscription,
 }
@@ -238,7 +272,7 @@ impl Explorer {
             },
             listings: HashMap::new(),
             notes: HashMap::new(),
-            loading: HashSet::new(),
+            load_generations: HashMap::new(),
             indexing: HashMap::new(),
             expanded: HashSet::new(),
             history: History::default(),
@@ -265,6 +299,9 @@ impl Explorer {
             focus_handle: cx.focus_handle(),
             settings_path,
             save_task: None,
+            configured_executable: settings.executable.clone(),
+            executable: ExecutableState::Unset,
+            executable_generation: 0,
             renderer_demo: None,
             _quit_subscription: cx.on_app_quit(|this, _| {
                 this.save_task = None;
@@ -272,6 +309,10 @@ impl Explorer {
                 async {}
             }),
         };
+
+        if let Some(executable) = settings.executable {
+            this.check_executable(executable, cx);
+        }
 
         let roots: Vec<PathBuf> = this.workspace.root_paths().map(Path::to_path_buf).collect();
         for root in roots {
@@ -288,14 +329,30 @@ impl Explorer {
         &self.focus_handle
     }
 
+    /// The executable that may authenticate stored metadata, or none.
+    fn access(&self) -> Access {
+        match &self.executable {
+            ExecutableState::Ready(executable) => Access::with(executable.clone()),
+            ExecutableState::Unset | ExecutableState::Checking | ExecutableState::Failed(_) => {
+                Access::none()
+            }
+        }
+    }
+
+    /// The configured executable's path, if any.
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.configured_executable.clone()
+    }
+
     /// Reopens the last directory if it still exists, otherwise the GTA VI root.
     fn restore_directory(&mut self, last: Option<PathBuf>, cx: &mut Context<Self>) {
         let last = last.filter(|dir| self.workspace.root_of(dir).is_some());
         let fallback = self.workspace.gta.clone();
+        let access = self.access();
         let exists = cx.background_spawn({
             let last = last.clone();
             async move {
-                last.is_some_and(|dir| match files::list(&dir) {
+                last.is_some_and(|dir| match files::list_with(&dir, &access) {
                     Ok(_) => true,
                     // Opening it again starts indexing.
                     Err(err) => files::archive::prepare_required(&err).is_some(),
@@ -322,7 +379,11 @@ impl Explorer {
     fn current_entries(&self) -> Option<&Arc<Vec<Entry>>> {
         match self.current_listing()? {
             Listing::Loaded(entries) => Some(entries),
-            Listing::Loading | Listing::Indexing(_) | Listing::Failed(_) => None,
+            Listing::Loading
+            | Listing::Indexing(_)
+            | Listing::NeedsExecutable { .. }
+            | Listing::AuthenticationFailed { .. }
+            | Listing::Failed(_) => None,
         }
     }
 
@@ -331,25 +392,34 @@ impl Explorer {
         let parent = selected.parent()?;
         match self.listings.get(parent)? {
             Listing::Loaded(entries) => entries.iter().find(|entry| entry.path == selected),
-            Listing::Loading | Listing::Indexing(_) | Listing::Failed(_) => None,
+            Listing::Loading
+            | Listing::Indexing(_)
+            | Listing::NeedsExecutable { .. }
+            | Listing::AuthenticationFailed { .. }
+            | Listing::Failed(_) => None,
         }
     }
 
     /// Lists `dir` in the background. Cached contents stay visible until the
-    /// new listing arrives.
+    /// new listing arrives. A result for an older request for the same folder
+    /// is dropped, so a slow listing made with an executable that has since
+    /// been replaced cannot overwrite a newer one.
     fn load(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        if !self.loading.insert(dir.clone()) {
-            return;
-        }
+        let generation = {
+            let generation = self.load_generations.entry(dir.clone()).or_default();
+            *generation += 1;
+            *generation
+        };
         self.listings.entry(dir.clone()).or_insert(Listing::Loading);
         let sort = self.sort;
+        let access = self.access();
         let task = cx.background_spawn({
             let dir = dir.clone();
             async move {
-                match files::list(&dir) {
+                match files::list_with(&dir, &access) {
                     Ok(mut entries) => {
                         files::sort_entries(&mut entries, sort);
-                        Loaded::Entries(entries, files::describe(&dir))
+                        Loaded::Entries(entries, files::describe_with(&dir, &access))
                     }
                     Err(err) => match files::archive::prepare_required(&err) {
                         Some(archive) => Loaded::NeedsIndex(archive.to_path_buf()),
@@ -361,7 +431,9 @@ impl Explorer {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.loading.remove(&dir);
+                if this.load_generations.get(&dir) != Some(&generation) {
+                    return;
+                }
                 let listing = match result {
                     Loaded::Entries(mut entries, note) => {
                         if this.sort != sort {
@@ -375,7 +447,7 @@ impl Explorer {
                         Listing::Loaded(Arc::new(entries))
                     }
                     Loaded::NeedsIndex(archive) => {
-                        this.start_indexing(archive.clone(), cx);
+                        this.start_indexing(archive.clone(), false, cx);
                         Listing::Indexing(archive)
                     }
                     Loaded::Failed(err) => Listing::Failed(err),
@@ -390,17 +462,29 @@ impl Explorer {
     }
 
     /// Opens an archive in the background: decompresses it from the archive
-    /// it is stored in and scans it, as needed. Listings waiting for it are
-    /// loaded again when the scan ends.
-    fn start_indexing(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
+    /// it is stored in, authenticates its table of contents where possible and
+    /// scans it, as needed. Listings waiting for it are loaded again when the
+    /// scan ends.
+    fn start_indexing(&mut self, archive: PathBuf, allow_scan: bool, cx: &mut Context<Self>) {
         if self.indexing.contains_key(&archive) {
             return;
         }
         let progress = Arc::new(Progress::default());
+        let stage = Arc::new(files::archive::Stage::default());
         let cancel = Arc::new(AtomicBool::new(false));
+        let access = self.access();
         let work = cx.background_spawn({
-            let (archive, progress, cancel) = (archive.clone(), progress.clone(), cancel.clone());
-            async move { files::archive::prepare(&archive, &progress, &cancel) }
+            let (archive, progress, stage, cancel) = (
+                archive.clone(),
+                progress.clone(),
+                stage.clone(),
+                cancel.clone(),
+            );
+            async move {
+                files::archive::prepare_with(
+                    &archive, &access, allow_scan, &stage, &progress, &cancel,
+                )
+            }
         });
         let work = cx.spawn({
             let archive = archive.clone();
@@ -434,6 +518,7 @@ impl Explorer {
             archive,
             IndexJob {
                 progress,
+                stage,
                 cancel,
                 _work: work,
                 _ticker: ticker,
@@ -456,13 +541,28 @@ impl Explorer {
                 }
             }
             Err(err) => {
-                let message = if err.kind() == io::ErrorKind::Interrupted {
-                    "Opening the archive was cancelled. Press F5 to open it.".to_string()
-                } else {
-                    format!("The archive could not be opened: {err}")
-                };
+                let listing =
+                    if let Some((archive, reason)) = files::archive::executable_required(&err) {
+                        Listing::NeedsExecutable {
+                            archive: archive.to_path_buf(),
+                            reason: reason.to_string(),
+                        }
+                    } else if let Some((archive, message)) =
+                        files::archive::authentication_failure(&err)
+                    {
+                        Listing::AuthenticationFailed {
+                            archive: archive.to_path_buf(),
+                            message: message.to_string(),
+                        }
+                    } else if err.kind() == io::ErrorKind::Interrupted {
+                        Listing::Failed(
+                            "Opening the archive was cancelled. Press F5 to open it.".to_string(),
+                        )
+                    } else {
+                        Listing::Failed(format!("The archive could not be opened: {err}"))
+                    };
                 for dir in waiting {
-                    self.listings.insert(dir, Listing::Failed(message.clone()));
+                    self.listings.insert(dir, listing.clone());
                 }
             }
         }
@@ -476,11 +576,15 @@ impl Explorer {
         }
     }
 
-    /// The running scan of `archive`: its progress, if known yet, and
-    /// whether it was asked to stop.
-    fn indexing_state(&self, archive: &Path) -> Option<(Option<f32>, bool)> {
+    /// The running preparation of `archive`: its scan progress, if known yet,
+    /// the step it is in, and whether it was asked to stop.
+    fn indexing_state(&self, archive: &Path) -> Option<(Option<f32>, u8, bool)> {
         let job = self.indexing.get(archive)?;
-        Some((job.progress.fraction(), job.cancel.load(Ordering::Relaxed)))
+        Some((
+            job.progress.fraction(),
+            job.stage.get(),
+            job.cancel.load(Ordering::Relaxed),
+        ))
     }
 
     /// Asks Windows for the icons of file types not seen before.
@@ -564,6 +668,116 @@ impl Explorer {
         }
     }
 
+    /// Validates a configured executable in the background: it is opened
+    /// read-only and parsed as a PE image. A result for an older selection is
+    /// dropped, so a slow check cannot replace a newer one.
+    fn check_executable(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.executable_generation += 1;
+        let generation = self.executable_generation;
+        self.executable = ExecutableState::Checking;
+        cx.notify();
+        let opened = cx.background_spawn({
+            let path = path.clone();
+            async move { Executable::open(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = opened.await;
+            this.update(cx, |this, cx| {
+                if this.executable_generation != generation {
+                    return;
+                }
+                this.executable = match result {
+                    Ok(executable) => ExecutableState::Ready(Arc::new(executable)),
+                    // The reason is shown where the archive needs it. The
+                    // path stays out of the log.
+                    Err(err) => ExecutableState::Failed(err.to_string()),
+                };
+                // Listings read before this selection may have been recovered
+                // instead; they are listed again with the new context.
+                this.refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Lists again the folders that wait for an executable, so an archive that
+    /// was listed from recovered data is re-read with the new context.
+    fn reload_waiting_listings(&mut self, cx: &mut Context<Self>) {
+        let dirs: Vec<PathBuf> = self
+            .listings
+            .iter()
+            .filter(|(_, listing)| {
+                matches!(
+                    listing,
+                    Listing::NeedsExecutable { .. } | Listing::AuthenticationFailed { .. }
+                )
+            })
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        for dir in dirs {
+            self.load(dir, cx);
+        }
+    }
+
+    fn choose_executable(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select the GTA VI executable".into()),
+        });
+        cx.spawn(async move |this, cx| match paths.await {
+            Ok(Ok(Some(mut paths))) => {
+                if let Some(path) = paths.pop() {
+                    this.update(cx, |this, cx| this.set_executable(path, cx))
+                        .ok();
+                }
+            }
+            Ok(Ok(None)) | Err(_) => {}
+            Ok(Err(err)) => log::error!("executable picker failed: {err:#}"),
+        })
+        .detach();
+    }
+
+    /// Stores a selection and validates it. Only the path is stored; no key
+    /// state, IV or executable bytes are kept anywhere.
+    fn set_executable(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.configured_executable = Some(path.clone());
+        self.schedule_save(cx);
+        self.check_executable(path, cx);
+    }
+
+    fn clear_executable(&mut self, cx: &mut Context<Self>) {
+        if self.configured_executable.take().is_none() {
+            return;
+        }
+        self.executable_generation += 1;
+        self.executable = ExecutableState::Unset;
+        self.schedule_save(cx);
+        self.reload_waiting_listings(cx);
+        cx.notify();
+    }
+
+    /// Recovers the archive's entries by scanning its own data, instead of
+    /// authenticating its table of contents. The user chooses this when no
+    /// executable matches. Recovered entries are kept apart from native ones.
+    fn scan_instead(&mut self, archive: PathBuf, cx: &mut Context<Self>) {
+        for listing in self.listings.values_mut() {
+            let waiting = match listing {
+                Listing::NeedsExecutable { archive: a, .. }
+                | Listing::AuthenticationFailed { archive: a, .. } => *a == archive,
+                _ => false,
+            };
+            if waiting {
+                *listing = Listing::Indexing(archive.clone());
+            }
+        }
+        self.start_indexing(archive, true, cx);
+        cx.notify();
+    }
+
     fn select(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         self.selected = path;
         self.update_thumbnail(cx);
@@ -583,9 +797,10 @@ impl Explorer {
         }
         let path = entry.path.clone();
         let image = entry.is_supported_image();
+        let access = self.access();
         let identified = cx.background_spawn({
-            let path = path.clone();
-            async move { files::identify(&path) }
+            let (path, access) = (path.clone(), access.clone());
+            async move { files::identify_with(&path, &access) }
         });
         cx.spawn(async move |this, cx| {
             let identified = identified.await;
@@ -596,11 +811,11 @@ impl Explorer {
                 }
                 // Opening it explains why it is not a valid archive.
                 Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
-                Ok(Identified::Unknown) if image => open_image_viewer(path, cx),
-                Ok(Identified::Unknown) => open_binary_inspector(path, cx),
+                Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
+                Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
                 Err(err) => {
                     log::warn!("could not identify {}: {err}", path.display());
-                    open_binary_inspector(path, cx);
+                    open_binary_inspector(path, access, cx);
                 }
             })
             .ok();
@@ -761,6 +976,7 @@ impl Explorer {
             tree_width: self.tree_width,
             preview_width: self.preview_width,
             last_directory: self.current_dir().map(Path::to_path_buf),
+            executable: self.configured_executable.clone(),
         }
     }
 
@@ -932,13 +1148,14 @@ impl Explorer {
             return;
         }
         let cancel = Arc::new(AtomicBool::new(false));
+        let access = self.access();
         let task = cx.spawn({
             let cancel = cancel.clone();
             async move |this, cx| {
                 let result = cx
                     .background_spawn({
                         let (source, dest) = (source, dest.clone());
-                        async move { files::export(&source, &dest, &cancel) }
+                        async move { files::export_with(&source, &dest, &access, &cancel) }
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -1252,11 +1469,23 @@ impl Explorer {
             },
             Some(Listing::Loading) => "Loading…".to_string(),
             Some(Listing::Indexing(archive)) => match self.indexing_state(archive) {
-                Some((Some(fraction), _)) => format!("Indexing archive… {:.0}%", fraction * 100.0),
+                Some((Some(fraction), stage, _)) => {
+                    format!("{} {:.0}%", stage_label(stage), fraction * 100.0)
+                }
                 _ => "Opening archive…".to_string(),
             },
+            Some(Listing::NeedsExecutable { .. }) => "Executable needed".to_string(),
+            Some(Listing::AuthenticationFailed { .. }) => "Not authenticated".to_string(),
             Some(Listing::Failed(_)) => "Folder unavailable".to_string(),
             None => String::new(),
+        };
+        let executable = match &self.executable {
+            ExecutableState::Unset => None,
+            ExecutableState::Checking => Some("Checking executable…".to_string()),
+            ExecutableState::Ready(executable) => {
+                Some(format!("Executable ready: {}", executable.name()))
+            }
+            ExecutableState::Failed(_) => Some("Executable unusable".to_string()),
         };
         let selection = self.selected_entry().map(|entry| match entry.size {
             Some(size) => format!("1 item selected ({})", files::format_size(size)),
@@ -1290,6 +1519,10 @@ impl Explorer {
             .child(items)
             .when_some(selection, |el, selection| {
                 el.child(separator()).child(selection)
+            })
+            .when_some(executable, |el, executable| {
+                el.child(separator())
+                    .child(div().max_w(px(280.)).truncate().child(executable))
             })
             .child(div().flex_1())
             .when_some(location, |el, (glyph, root, relative)| {
@@ -1409,6 +1642,15 @@ fn window_title(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// Short text for the step an archive preparation is in.
+fn stage_label(stage: u8) -> &'static str {
+    match stage {
+        Stage::VERIFYING => "Authenticating…",
+        Stage::SCANNING => "Scanning…",
+        _ => "Indexing archive…",
+    }
+}
+
 /// The directory the save dialog opens in: the folder holding the archive the
 /// entry comes from, or the entry's own folder for a file on disk.
 fn initial_export_dir(source: &Path) -> PathBuf {
@@ -1457,12 +1699,12 @@ fn export_outcome(result: io::Result<u64>, caveat: Option<&str>, dest: &Path) ->
 }
 
 /// Opens any regular file, including archive entries and images, as bytes.
-fn open_binary_inspector(path: PathBuf, cx: &mut App) {
+fn open_binary_inspector(path: PathBuf, access: Access, cx: &mut App) {
     let mut options = window_options(&window_title(&path), size(px(1200.), px(760.)), cx);
     options.window_min_size = Some(size(px(720.), px(420.)));
     if let Err(err) = cx.open_window(options, |window, cx| {
         ui::close_through_gpui(window, cx);
-        let inspector = cx.new(|cx| BinaryInspector::new(path, window, cx));
+        let inspector = cx.new(|cx| BinaryInspector::new(path, access, window, cx));
         let focus_handle = inspector.read(cx).focus_handle().clone();
         focus_handle.focus(window, cx);
         inspector
@@ -1471,11 +1713,11 @@ fn open_binary_inspector(path: PathBuf, cx: &mut App) {
     }
 }
 
-fn open_image_viewer(path: PathBuf, cx: &mut App) {
+fn open_image_viewer(path: PathBuf, access: Access, cx: &mut App) {
     let options = window_options(&window_title(&path), size(px(960.), px(720.)), cx);
     if let Err(err) = cx.open_window(options, |window, cx| {
         ui::close_through_gpui(window, cx);
-        cx.new(|cx| ImageViewer::new(path, window, cx))
+        cx.new(|cx| ImageViewer::new(path, access, window, cx))
     }) {
         log::error!("failed to open image viewer: {err:#}");
     }
@@ -1623,5 +1865,12 @@ mod export_tests {
         std::fs::write(&archive, b"9FPR0000").unwrap();
         let entry = archive.join("Recovered Entries").join("XML").join("x.xml");
         assert_eq!(initial_export_dir(&entry), temp.path());
+    }
+
+    #[test]
+    fn archive_steps_have_short_labels() {
+        assert_eq!(stage_label(Stage::VERIFYING), "Authenticating…");
+        assert_eq!(stage_label(Stage::SCANNING), "Scanning…");
+        assert_eq!(stage_label(Stage::OPENING), "Indexing archive…");
     }
 }

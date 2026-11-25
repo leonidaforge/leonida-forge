@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use super::{BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
+use crate::files::archive::Stage;
 use crate::files::{self, Entry, EntryKind, SortKey};
 use crate::settings::ViewMode;
 use crate::ui;
@@ -24,8 +25,15 @@ const LIST_COLUMN_GAP: f32 = 4.;
 const NOTE_HEIGHT: f32 = 44.;
 const PROGRESS_WIDTH: f32 = 280.;
 const INDEXING_NOTE: &str = "Archives stored in other archives are decompressed to a temporary \
-     file first. The table of contents of RPF9 archives is encrypted, so their contents are \
-     recovered by scanning the archive data. The result is kept until the archive changes.";
+     file first. RPF9 entries are recovered by scanning the archive data, without names or \
+     folders. The result is kept until the archive changes.";
+const AUTHENTICATING_NOTE: &str = "The archive's table of contents is processed before use. It is \
+     read only when the signature verifies against the selected executable. This can take a \
+     moment on a large executable.";
+const NEEDS_EXECUTABLE_NOTE: &str = "Selecting a compatible local game executable lets the \
+     archive's own table of contents be read and authenticated, with entry names as hashes, sizes \
+     and types. Recovering by scanning reads the archive data instead and lists entries by kind \
+     and offset. The two are never mixed.";
 const IMAGE_ICON_COLOR: u32 = 0x7fb4ff;
 const DETAILS_NAME_MIN_WIDTH: f32 = 110.;
 const DETAILS_TYPE_WIDTH: f32 = 130.;
@@ -213,6 +221,16 @@ impl Explorer {
             Some(Listing::Indexing(archive)) => {
                 return self.render_indexing(archive.clone(), cx).into_any_element();
             }
+            Some(Listing::NeedsExecutable { archive, reason }) => {
+                return self
+                    .render_needs_executable(archive.clone(), reason.clone(), false, cx)
+                    .into_any_element();
+            }
+            Some(Listing::AuthenticationFailed { archive, message }) => {
+                return self
+                    .render_needs_executable(archive.clone(), message.clone(), true, cx)
+                    .into_any_element();
+            }
             Some(Listing::Failed(err)) => {
                 return ui::centered_message("This folder cannot be opened.", Some(err.clone()));
             }
@@ -307,12 +325,25 @@ impl Explorer {
         }
     }
 
-    /// Shown while an archive is decompressed or scanned before its contents
-    /// can be listed.
+    /// Shown while an archive is decompressed, authenticated or scanned before
+    /// its contents can be listed.
     fn render_indexing(&self, archive: PathBuf, cx: &Context<Self>) -> impl IntoElement {
         let state = self.indexing_state(&archive);
         let running = state.is_some();
-        let (fraction, cancelling) = state.unwrap_or((None, false));
+        let (fraction, stage, cancelling) = state.unwrap_or((None, Stage::OPENING, false));
+        let headline = match stage {
+            Stage::VERIFYING => "Authenticating the table of contents…",
+            Stage::SCANNING => "Recovering entries by scanning…",
+            _ => match fraction {
+                Some(_) => "Indexing archive…",
+                None => "Opening archive…",
+            },
+        };
+        let note = match stage {
+            Stage::VERIFYING => AUTHENTICATING_NOTE,
+            Stage::SCANNING => INDEXING_NOTE,
+            _ => INDEXING_NOTE,
+        };
         div()
             .flex()
             .flex_col()
@@ -322,10 +353,7 @@ impl Explorer {
             .gap_3()
             .p_4()
             .text_color(rgb(theme::TEXT_MUTED))
-            .child(div().text_color(rgb(theme::TEXT)).child(match fraction {
-                Some(_) => "Indexing archive…",
-                None => "Opening archive…",
-            }))
+            .child(div().text_color(rgb(theme::TEXT)).child(headline))
             .child(
                 div()
                     .w(px(PROGRESS_WIDTH))
@@ -344,13 +372,7 @@ impl Explorer {
                 Some(fraction) => format!("{:.0}%", fraction * 100.),
                 None => "Starting…".to_string(),
             }))
-            .child(
-                div()
-                    .max_w(px(460.))
-                    .text_xs()
-                    .text_center()
-                    .child(INDEXING_NOTE),
-            )
+            .child(div().max_w(px(460.)).text_xs().text_center().child(note))
             .when(running && !cancelling, |el| {
                 el.child(
                     ui::button("cancel-indexing", "Cancel").on_click(cx.listener(
@@ -364,6 +386,87 @@ impl Explorer {
             .when(cancelling, |el| {
                 el.child(div().text_xs().child("Cancelling…"))
             })
+    }
+
+    /// Shown when an archive's stored metadata needs an executable, or did not
+    /// authenticate with the selected one. The user either selects an
+    /// executable or chooses to scan the archive data. Native entries are
+    /// never listed unauthenticated.
+    fn render_needs_executable(
+        &self,
+        archive: PathBuf,
+        message: String,
+        failed: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let headline = if failed {
+            "The table of contents was not authenticated."
+        } else {
+            "The table of contents needs a local executable."
+        };
+        let executable = match &self.executable {
+            super::ExecutableState::Checking => {
+                Some("Checking the selected executable…".to_string())
+            }
+            super::ExecutableState::Failed(reason) => {
+                Some(format!("The selected executable cannot be used: {reason}"))
+            }
+            super::ExecutableState::Ready(_) | super::ExecutableState::Unset => None,
+        };
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .p_4()
+            .child(div().text_color(rgb(theme::TEXT)).child(headline))
+            .child(
+                div()
+                    .max_w(px(560.))
+                    .text_xs()
+                    .text_center()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(message),
+            )
+            .when_some(executable, |el, executable| {
+                el.child(
+                    div()
+                        .max_w(px(560.))
+                        .text_xs()
+                        .text_center()
+                        .text_color(rgb(theme::ERROR))
+                        .child(executable),
+                )
+            })
+            .child(
+                div()
+                    .max_w(px(560.))
+                    .text_xs()
+                    .text_center()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(NEEDS_EXECUTABLE_NOTE),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        ui::button("choose-executable", "Select Game Executable…").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.choose_executable(cx)
+                            }),
+                        ),
+                    )
+                    .child(ui::button("scan-instead", "Recover by Scanning").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.scan_instead(archive.clone(), cx)
+                        }),
+                    )),
+            )
     }
 
     /// Shown when no directory is open.

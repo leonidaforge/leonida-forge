@@ -1,8 +1,8 @@
 //! RPF9 archives listed from their own table of contents.
 //!
-//! Only metadata that the engine reads as stored is used. Metadata that the
-//! engine decrypts first is not read; such archives are recovered by
-//! scanning instead (see [`super::rpf`]).
+//! Metadata that the engine reads as stored is used directly. Metadata that the
+//! engine processes first is used only after it authenticated against a local
+//! executable (see [`super::rpf`]), or recovered by scanning instead.
 //!
 //! The table holds hashes of entry names, not names. Each entry is a file
 //! named after its row, `Row 00042`, which identifies it within the archive.
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_rage9::rpf::metadata::verify::VerifyReport;
 use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
 };
@@ -34,6 +35,55 @@ pub const NAMES_SUFFIX: &str = ".names.txt";
 const ROW_NOTE: &str = "Listed from the archive's table of contents. The name is the row \
      number: the table stores a hash of the original name, not the name.";
 
+/// Why the stored table of contents cannot be read as it is.
+#[derive(Debug, Clone)]
+/// The two cases are kept apart on purpose: one is solved by a compatible
+/// executable, the other only by scanning or not at all.
+pub enum Unreadable {
+    /// The engine processes the metadata before reading it. A local executable
+    /// can authenticate and decode it.
+    Processed(Arc<str>),
+    /// The stored metadata is not usable, whatever executable is supplied.
+    Malformed(Arc<str>),
+}
+
+impl Unreadable {
+    pub fn reason(&self) -> &Arc<str> {
+        match self {
+            Unreadable::Processed(reason) | Unreadable::Malformed(reason) => reason,
+        }
+    }
+}
+
+/// How the listed table of contents was obtained.
+#[derive(Debug, Clone)]
+pub enum Authentication {
+    /// The archive needs no processing pass: the stored bytes are the table the
+    /// engine reads. The signature has not been checked.
+    Unencrypted,
+    /// The signature verified against the selected executable and the
+    /// processed metadata decoded. This authenticates the table, not the
+    /// payloads it describes.
+    Authenticated(VerifyReport),
+}
+
+impl Authentication {
+    /// The short status shown with each entry and in the folder note.
+    pub fn text(&self) -> String {
+        match self {
+            Authentication::Unencrypted => {
+                "Unencrypted: the archive needs no processing pass, and the signature is not \
+                 checked."
+                    .to_string()
+            }
+            Authentication::Authenticated(report) => format!(
+                "Authenticated: the signature over this table verified against the selected \
+                 executable (stage {}). It covers the metadata, not the payloads.",
+                report.stage
+            ),
+        }
+    }
+}
 /// The candidate paths and which rows they name.
 struct Names {
     file: PathBuf,
@@ -137,6 +187,7 @@ pub struct Native {
     rows: Vec<Row>,
     names: Option<Names>,
     companions: Companions,
+    authentication: Authentication,
 }
 
 fn names_file(archive: &Archive) -> PathBuf {
@@ -244,30 +295,67 @@ fn size_text(len: u64) -> String {
 
 impl Native {
     /// The table of contents of `archive`, or why it is not used.
-    pub fn read(archive: &Archive) -> Result<Self, Arc<str>> {
-        let unreadable =
-            |err: Error| Arc::from(format!("The table of contents could not be read: {err}."));
+    pub fn read(archive: &Archive) -> Result<Self, Unreadable> {
+        let unreadable = |err: Error| {
+            Unreadable::Malformed(Arc::from(format!(
+                "The table of contents could not be read: {err}."
+            )))
+        };
         let mut source = archive.source.clone();
         // Decides from the header, and at most the A table, whether the
         // stored bytes can be used, before reading all of them.
         let probe = Stored::probe(&mut source).map_err(unreadable)?;
         if let Some(reason) = probe.unsupported() {
-            return Err(Arc::from(format!(
-                "The table of contents is not read: {reason}."
+            return Err(Unreadable::Processed(Arc::from(format!(
+                "The table of contents is processed before use: {reason}."
+            ))));
+        }
+        if !probe.processing.is_none() {
+            return Err(Unreadable::Processed(Arc::from(
+                "The table of contents is processed before use, and a local executable is needed \
+                 to authenticate it.",
             )));
         }
         #[cfg(test)]
         tests::FULL_READS.with(|reads| reads.set(reads.get() + 1));
         let stored = Stored::read(&mut source, MAX_METADATA).map_err(unreadable)?;
-        let metadata = stored.decode().map_err(unreadable)?;
+        let metadata = stored.decode().map_err(|err| match err {
+            Error::Transformed(_) => Unreadable::Processed(Arc::from(
+                "The table of contents is processed before use, and a local executable is needed \
+                 to authenticate it.",
+            )),
+            err => unreadable(err),
+        })?;
+        Ok(Self::from_metadata(
+            archive,
+            metadata,
+            Authentication::Unencrypted,
+        ))
+    }
+
+    /// The table of contents authenticated by a local executable. The caller
+    /// only gets an [`AuthenticatedMetadata`] from a passing signature check,
+    /// so no unverified metadata can be listed as native entries.
+    ///
+    /// [`AuthenticatedMetadata`]: lforge_rage9::rpf::metadata::verify::AuthenticatedMetadata
+    pub fn from_authenticated(archive: &Archive, metadata: Metadata, report: VerifyReport) -> Self {
+        Self::from_metadata(archive, metadata, Authentication::Authenticated(report))
+    }
+
+    fn from_metadata(
+        archive: &Archive,
+        metadata: Metadata,
+        authentication: Authentication,
+    ) -> Self {
         let rows: Vec<Row> = metadata.entries().collect();
         let names = Names::read(names_file(archive), &rows);
         let companions = Companions::read(archive, &metadata);
-        Ok(Self {
+        Self {
             rows,
             names,
             companions,
-        })
+            authentication,
+        }
     }
 
     /// Whether the candidate file and the companion files are unchanged
@@ -380,6 +468,7 @@ impl Native {
                 "Row",
                 format!("{} (identifies the entry in this archive)", row.row),
             ),
+            ("Metadata", self.authentication.text()),
             ("Names", self.names_text(row)),
         ];
         match &row.name_hash {
@@ -395,7 +484,12 @@ impl Native {
         match &row.location {
             Ok(Some(l)) => details.extend([
                 ("Location record", format!("{:?} layout", l.layout)),
+                (
+                    "Type ID",
+                    format!("{} (meaning not established)", l.type_id),
+                ),
                 ("Payload offset", format!("{:#x}", l.payload_offset)),
+                ("Logical size", size_text(l.logical_len)),
                 ("Stored size", size_text(l.stored_len)),
                 (
                     "Compression",
@@ -525,9 +619,21 @@ impl Native {
             .iter()
             .filter(|row| !matchable(row) || row.chunks.is_err() || row.read_source.is_err())
             .count();
+        let provenance = match &self.authentication {
+            Authentication::Unencrypted => {
+                "which is stored unencrypted, so its signature is not checked".to_string()
+            }
+            Authentication::Authenticated(report) => format!(
+                "after its signature verified against the selected executable (stage {}), so the \
+                 entries are authentic",
+                report.stage
+            ),
+        };
         let mut note = format!(
-            "Listed from the archive's table of contents, which is stored unencrypted: {} in \
-             table order, named after their row. The signature is not checked.",
+            "Listed from the archive's table of contents, {}: {} in table order, named after \
+             their row. Names are hashes of the original paths. The signature covers the \
+             metadata, not the payloads.",
+            provenance,
             match total {
                 1 => "1 entry".to_string(),
                 n => format!("{n} entries"),

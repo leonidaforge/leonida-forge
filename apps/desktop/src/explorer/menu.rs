@@ -164,7 +164,9 @@ impl Explorer {
                         )
                         .when_some(inspectable, |el, path| {
                             el.on_click(self.menu_action(
-                                move |_, _, cx| super::open_binary_inspector(path.clone(), cx),
+                                move |this, _, cx| {
+                                    super::open_binary_inspector(path.clone(), this.access(), cx)
+                                },
                                 cx,
                             ))
                         }),
@@ -186,6 +188,31 @@ impl Explorer {
                                 ))
                             },
                         ),
+                    )
+                    .child(ui::menu_separator())
+                    .child(
+                        ui::menu_item(
+                            "select-executable",
+                            "Select Game Executable…",
+                            false,
+                            true,
+                            None,
+                        )
+                        .on_click(self.menu_action(|this, _, cx| this.choose_executable(cx), cx)),
+                    )
+                    .child(
+                        ui::menu_item(
+                            "clear-executable",
+                            "Clear Executable",
+                            false,
+                            self.executable_path().is_some(),
+                            None,
+                        )
+                        .when(self.executable_path().is_some(), |el| {
+                            el.on_click(
+                                self.menu_action(|this, _, cx| this.clear_executable(cx), cx),
+                            )
+                        }),
                     )
                     .child(ui::menu_separator())
                     .child(
@@ -308,7 +335,9 @@ impl Explorer {
                             None,
                         )
                         .on_click(self.menu_action(
-                            move |_, _, cx| super::open_binary_inspector(path.clone(), cx),
+                            move |this, _, cx| {
+                                super::open_binary_inspector(path.clone(), this.access(), cx)
+                            },
                             cx,
                         )),
                     )

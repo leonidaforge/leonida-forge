@@ -107,6 +107,16 @@ impl Explorer {
                 kind: RowKind::Message("Indexing…"),
                 expanded: false,
             }),
+            Some(Listing::NeedsExecutable { .. }) => rows.push(TreeRow {
+                depth,
+                kind: RowKind::Message("Needs an executable"),
+                expanded: false,
+            }),
+            Some(Listing::AuthenticationFailed { .. }) => rows.push(TreeRow {
+                depth,
+                kind: RowKind::Message("Not authenticated"),
+                expanded: false,
+            }),
             Some(Listing::Failed(_)) => rows.push(TreeRow {
                 depth,
                 kind: RowKind::Message("Cannot open folder"),

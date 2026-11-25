@@ -19,7 +19,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -28,6 +28,7 @@ use lforge_core::archive::{self as identify, HEAD_LEN};
 pub use lforge_core::archive::{Format, Identified};
 use lforge_rage9::rpf::Progress;
 
+use super::executable::Access;
 use super::{Entry, EntryKind, format_size, rpf, zip};
 
 /// Caps what reading one file from an archive may allocate in memory or on disk.
@@ -94,10 +95,13 @@ pub struct Archive {
     /// Further files this archive's bytes come from, such as RPF9 companion
     /// files, for archives opened from another archive.
     pub dependencies: Vec<Dependency>,
+    /// The executable that may authenticate the stored table of contents.
+    /// Carried along so no reader has to look one up globally.
+    pub access: Access,
 }
 
 impl Archive {
-    fn on_disk(path: &Path) -> io::Result<Result<Self, Identified>> {
+    fn on_disk(path: &Path, access: &Access) -> io::Result<Result<Self, Identified>> {
         let file = File::open(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {
@@ -115,6 +119,7 @@ impl Archive {
                 decompressed: 0,
                 caveat: None,
                 dependencies: Vec::new(),
+                access: access.clone(),
             }),
             other => Err(other),
         })
@@ -151,6 +156,100 @@ pub fn prepare_required(err: &io::Error) -> Option<&Path> {
     Some(&inner.path)
 }
 
+/// An RPF9 archive whose stored table of contents needs processing, opened
+/// without an executable to authenticate it. The caller chooses between
+/// selecting an executable and scanning the archive data.
+#[derive(Debug)]
+struct NeedsExecutable {
+    path: PathBuf,
+    reason: String,
+}
+
+impl fmt::Display for NeedsExecutable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} has a processed table of contents and no compatible executable was supplied: {}",
+            file_name(&self.path),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for NeedsExecutable {}
+
+pub(super) fn needs_executable(path: PathBuf, reason: impl Into<String>) -> io::Error {
+    io::Error::other(NeedsExecutable {
+        path,
+        reason: reason.into(),
+    })
+}
+
+/// The archive, and why, that needs an executable before its native table of
+/// contents can be read.
+pub fn executable_required(err: &io::Error) -> Option<(&Path, &str)> {
+    let inner = err.get_ref()?.downcast_ref::<NeedsExecutable>()?;
+    Some((&inner.path, &inner.reason))
+}
+
+/// The stored table of contents was not accepted with the supplied
+/// executable: the authentication attempt failed, or the executable is no
+/// longer the one that was selected. The archive data can still be scanned.
+#[derive(Debug)]
+struct AuthenticationFailed {
+    path: PathBuf,
+    reason: String,
+}
+
+impl fmt::Display for AuthenticationFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the table of contents of {} could not be authenticated: {}",
+            file_name(&self.path),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for AuthenticationFailed {}
+
+pub(super) fn authentication_failed(path: PathBuf, reason: impl Into<String>) -> io::Error {
+    io::Error::other(AuthenticationFailed {
+        path,
+        reason: reason.into(),
+    })
+}
+
+/// The archive, and why, whose stored table of contents failed
+/// authentication.
+pub fn authentication_failure(err: &io::Error) -> Option<(&Path, &str)> {
+    let inner = err.get_ref()?.downcast_ref::<AuthenticationFailed>()?;
+    Some((&inner.path, &inner.reason))
+}
+
+/// What opening an archive is doing, for the explorer's progress view.
+#[derive(Debug, Default)]
+pub struct Stage(AtomicU8);
+
+impl Stage {
+    /// The archive is decompressed, read or awaited.
+    pub const OPENING: u8 = 0;
+    /// The stored table of contents is authenticated with the selected
+    /// executable.
+    pub const VERIFYING: u8 = 1;
+    /// The archive data is scanned for recovery.
+    pub const SCANNING: u8 = 2;
+
+    pub fn set(&self, stage: u8) {
+        self.0.store(stage, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u8 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -184,12 +283,21 @@ pub enum Location {
     Inside(Archive, PathBuf),
 }
 
-/// Resolves `path` through every archive it continues into.
+/// Resolves `path` through every archive it continues into, without an
+/// executable to authenticate stored metadata with.
+#[cfg(test)]
 pub fn locate(path: &Path) -> io::Result<Location> {
+    locate_with(path, &Access::none())
+}
+
+/// Resolves `path` through every archive it continues into. `access` is
+/// carried into the archives, so their tables of contents can be
+/// authenticated later.
+pub fn locate_with(path: &Path, access: &Access) -> io::Result<Location> {
     let Some(root) = path.ancestors().find(|ancestor| ancestor.is_file()) else {
         return Ok(Location::Plain);
     };
-    let mut archive = match Archive::on_disk(root)? {
+    let mut archive = match Archive::on_disk(root, access)? {
         Ok(archive) => archive,
         Err(_) if root == path => return Ok(Location::Plain),
         Err(identified) => return Err(not_an_archive(root, &identified)),
@@ -217,13 +325,27 @@ pub fn locate(path: &Path) -> io::Result<Location> {
 
 /// Like [`locate`], but opens the archives on the way without cancellation.
 /// For reading single files, where the explorer has opened them before.
+#[cfg(test)]
 pub fn locate_prepared(path: &Path) -> io::Result<Location> {
+    locate_prepared_with(path, &Access::none())
+}
+
+/// [`locate_prepared`] with the executable that may authenticate stored
+/// metadata.
+pub fn locate_prepared_with(path: &Path, access: &Access) -> io::Result<Location> {
     for _ in 0..MAX_ATTEMPTS {
-        match locate(path) {
+        match locate_with(path, access) {
             Err(err) => match prepare_required(&err) {
                 Some(archive) => {
                     let archive = archive.to_path_buf();
-                    prepare(&archive, &Progress::default(), &AtomicBool::new(false))?;
+                    prepare_with(
+                        &archive,
+                        access,
+                        true,
+                        &Stage::default(),
+                        &Progress::default(),
+                        &AtomicBool::new(false),
+                    )?;
                 }
                 None => return Err(err),
             },
@@ -235,15 +357,42 @@ pub fn locate_prepared(path: &Path) -> io::Result<Location> {
 
 /// Decompresses and indexes what `path` needs before it can be listed: the
 /// archives it continues into and, if it names an archive, that archive.
+/// Recovery is allowed, as for callers that have already chosen it.
+#[cfg(test)]
 pub fn prepare(path: &Path, progress: &Progress, cancel: &AtomicBool) -> io::Result<()> {
+    prepare_with(
+        path,
+        &Access::none(),
+        true,
+        &Stage::default(),
+        progress,
+        cancel,
+    )
+}
+
+/// [`prepare`] with the executable that may authenticate stored metadata.
+///
+/// `allow_scan` decides what happens when the table of contents needs a
+/// processed pass that no executable can authenticate: with it set, the
+/// archive data is scanned; without it, the call fails with
+/// [`executable_required`] or [`authentication_failure`] so the explorer can
+/// ask the user which way to go.
+pub fn prepare_with(
+    path: &Path,
+    access: &Access,
+    allow_scan: bool,
+    stage: &Stage,
+    progress: &Progress,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
     for _ in 0..MAX_ATTEMPTS {
-        let location = match locate(path) {
+        let location = match locate_with(path, access) {
             Ok(location) => location,
             Err(err) => match prepare_required(&err) {
                 // Always an archive that `path` continues into.
                 Some(outer) if outer != path => {
                     let outer = outer.to_path_buf();
-                    prepare(&outer, progress, cancel)?;
+                    prepare_with(&outer, access, allow_scan, stage, progress, cancel)?;
                     continue;
                 }
                 _ => return Err(err),
@@ -252,11 +401,12 @@ pub fn prepare(path: &Path, progress: &Progress, cancel: &AtomicBool) -> io::Res
         match location {
             Location::Archive(archive) => {
                 return match archive.format {
-                    Format::Rpf9 => rpf::build_index(&archive, progress, cancel),
+                    Format::Rpf9 => rpf::build_index(&archive, allow_scan, stage, progress, cancel),
                     Format::Zip => Ok(()),
                 };
             }
             Location::Inside(archive, inner) if is_file(&archive, &inner)? => {
+                stage.set(Stage::OPENING);
                 decompress(&archive, &inner, cancel)?;
             }
             Location::Inside(..) | Location::Plain => return Ok(()),
@@ -687,6 +837,7 @@ fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
         decompressed: parent.decompressed.saturating_add(entry.decompressed),
         caveat: entry.caveat.clone(),
         dependencies: entry.dependencies.clone(),
+        access: parent.access.clone(),
     })
 }
 
@@ -717,23 +868,44 @@ pub fn read_all(archive: &Archive) -> io::Result<Vec<u8>> {
 /// decoded through their existing paths, honouring companion read sources and
 /// the read limit. Only the file at `path` is read; no unrelated entry is
 /// decoded.
+/// [`export_to_with`] without an executable.
+#[cfg(test)]
 pub fn export_to(path: &Path, out: &mut dyn Write, cancel: &AtomicBool) -> io::Result<u64> {
-    export_to_within(path, out, MAX_READ, cancel)
+    export_to_with(path, &Access::none(), out, cancel)
+}
+
+/// [`export_to`] with the executable that may authenticate the stored table of
+/// contents the file is listed from.
+pub fn export_to_with(
+    path: &Path,
+    access: &Access,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> io::Result<u64> {
+    export_to_within(path, access, out, MAX_READ, cancel)
 }
 
 fn export_to_within(
     path: &Path,
+    access: &Access,
     out: &mut dyn Write,
     limit: u64,
     cancel: &AtomicBool,
 ) -> io::Result<u64> {
     for _ in 0..MAX_ATTEMPTS {
-        let location = match locate(path) {
+        let location = match locate_with(path, access) {
             Ok(location) => location,
             Err(err) => match prepare_required(&err) {
                 Some(archive) => {
                     let archive = archive.to_path_buf();
-                    prepare(&archive, &Progress::default(), cancel)?;
+                    prepare_with(
+                        &archive,
+                        access,
+                        true,
+                        &Stage::default(),
+                        &Progress::default(),
+                        cancel,
+                    )?;
                     continue;
                 }
                 None => return Err(err),
@@ -1319,10 +1491,18 @@ pub(crate) mod tests {
             .join(format!("0x{:010X}.xml", 0x100));
         let cancel = AtomicBool::new(false);
         let mut out = Vec::new();
-        let err = export_to_within(&entry, &mut out, (xml.len() - 1) as u64, &cancel).unwrap_err();
+        let err = export_to_within(
+            &entry,
+            &Access::none(),
+            &mut out,
+            (xml.len() - 1) as u64,
+            &cancel,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
         out.clear();
-        let written = export_to_within(&entry, &mut out, xml.len() as u64, &cancel).unwrap();
+        let written =
+            export_to_within(&entry, &Access::none(), &mut out, xml.len() as u64, &cancel).unwrap();
         assert_eq!(written, xml.len() as u64);
         assert_eq!(out, xml);
     }

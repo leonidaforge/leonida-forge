@@ -26,12 +26,17 @@ pub struct ImageViewer {
 }
 
 impl ImageViewer {
-    pub fn new(path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        path: PathBuf,
+        access: crate::files::Access,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let format = path
             .extension()
             .map(|ext| ext.to_string_lossy().to_uppercase())
             .unwrap_or_default();
-        let decode = cx.background_spawn(async move { images::load(&path) });
+        let decode = cx.background_spawn(async move { images::load(&path, &access) });
         let load = cx.spawn(async move |this, cx| {
             let result = decode.await;
             this.update(cx, |this, cx| {

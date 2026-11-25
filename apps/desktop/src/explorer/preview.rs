@@ -60,6 +60,7 @@ impl Explorer {
             .shell
             .as_ref()
             .map(|shell| shell.thumbnail(path.clone(), THUMBNAIL_SIZE));
+        let access = self.access();
         let task = cx.spawn({
             let path = path.clone();
             async move |this, cx| {
@@ -77,7 +78,7 @@ impl Explorer {
                                     dimensions: images::dimensions(&path),
                                 },
                                 None if is_image => {
-                                    match images::load_thumbnail(&path, THUMBNAIL_SIZE) {
+                                    match images::load_thumbnail(&path, THUMBNAIL_SIZE, &access) {
                                         Ok(decoded) => ThumbnailState::Ready {
                                             image: decoded.image,
                                             dimensions: Some((decoded.width, decoded.height)),
