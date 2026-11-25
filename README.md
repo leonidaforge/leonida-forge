@@ -45,9 +45,14 @@ lforge binary dump example.bin --offset 0x10 --length 128
 lforge binary search example.bin --hex "52 50 46 37"
 lforge binary search example.bin --text example --json
 lforge binary interpret example.bin --offset 0x10 --endian big --json
+lforge binary inspect example.bin --json       # recognised format and its structure
 ```
 
 Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage.
+
+A format is recognised from the file's first bytes, never from its extension, and the inspector shows what was recognised next to the signature. `binary inspect` reports the recognised format, its parsed structure, the byte ranges it read and the ranges it left uninterpreted. `--sample` bounds how many records and entries are listed, `--blocks` reads every block's storage selector instead of the first few, and `--verify` inflates every zlib block and reports what failed.
+
+Known formats are the RDS5 container, whose header, record array, ETPF chunk extent and block catalogue are parsed; the RBF0 prefix, of which only the 12 header bytes and the root name length are established; PSIN, by its four-byte magic only; and RPF9, which the archive commands read. No payload bytes are printed. A structure that breaks the documented contract is reported and exits with code 1; a file that matches no format is reported as unrecognised and still exits with code 0.
 
 ## RPF9 archives
 
@@ -129,6 +134,17 @@ lforge archive extract data.rpf --row 42 --output file.bin --executable game.exe
 Entries are identified by their row number in the table. `archive metadata --entries` lists them and reports, for each one, whether its contents are readable as stored, readable after supported decoding, or unavailable. When an entry is unavailable it gives the reason: an unsupported payload transform, an unsupported compression mode, a companion file that is missing or invalid, or malformed metadata. Readability is decided from the table of contents and the entry structure; a row reported as decoded can still fail when its compressed stream is read, in which case `archive extract` writes nothing and reports the error. It also reports whether the table was authenticated by a signature check or read without one because the archive needs no processing pass.
 
 `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
+
+`archive inspect` reads one row through the same decoder and reports its structure without writing a file:
+
+```sh
+lforge archive inspect data.rpf --row 42 --json --executable game.exe
+lforge archive inspect data.rpf --row 42 --blocks --verify
+```
+
+An RDS5 row is reported field by field: header values, the record array, the ETPF chunk position and extent, the entry table, and one catalogue entry per data block with its stored range and storage selector. Only zlib is identified as a block codec; a block with another selector, or with the zlib selector and no zlib header, is reported as unidentified and is never decoded by guesswork. `--verify` inflates each zlib block, reports the blocks that fail and compares the decoded total with the declared uncompressed total. Rows in the RBF0, PSIN and RPF9 formats are reported by prefix or signature only. In every case the row is decoded in memory; nothing is extracted and nothing is written.
+
+The `decoded` state in `archive metadata`, `ls`, `search` and `manifest` remains a structural state: it is decided from the table of contents and the chunk table, without inflating a stream. Use `archive inspect --verify` to check a row's streams, or `archive extract` to obtain the bytes.
 
 RPF9 stores a hash of each entry's path, not the path. `archive metadata --entries` always shows the stored hash and key. A name table can add candidate names, but a name is display data: it never changes a row's key, a payload offset, an authentication result or an extraction destination. Two LUT files, `rpf9-hash64.lut` and `rpf9-key32.lut`, are embedded in the binaries and always applied; a file with either name beside the executable is read as well and merged over it, which refreshes the table without a rebuild. `--name-file FILE` is repeatable and accepts a `.names.txt` table or a Leonida Forge LUT; without it, `<archive>.names.txt` next to the archive is used when present. The `.names.txt` format is UTF-8, one entry per line: a candidate path, or `hash64:HASH<TAB>NAME` and `key32:HASH<TAB>NAME` for a declared key. Candidate paths are verified by hashing them with the type's class. A declared name is verified only when its normalized form or its stem reproduces the key; otherwise it is reported as unconfirmed. Use `--archive-path`, `--mount-prefix` and `--extension` to describe paths that the built-in `rpf` mapping cannot.
 

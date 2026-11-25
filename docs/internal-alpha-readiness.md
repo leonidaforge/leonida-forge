@@ -53,6 +53,12 @@ pushed.
   and compare them with a Research checkout with `lforge names audit`.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
+- Inspect a recognised file format from its contents, in the Binary Inspector and
+  with `lforge binary inspect` and `lforge archive inspect`. The RDS5 container
+  reports its header, record array, ETPF chunk extent and block catalogue; an
+  RBF0 payload reports its prefix and root name length; PSIN and RPF9 are
+  recognised by signature only. An archive row is decoded in memory, so nothing
+  is extracted to inspect it.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
@@ -68,6 +74,10 @@ pushed.
   signature does not verify, an encrypted archive falls back to scan recovery.
 - Original names and folder structure for recovered entries. Names are archive
   offsets; grouping is by detected kind.
+- Any format whose structure is not documented. RDS5 blocks whose compressor
+  selector is not the identified zlib value are reported and never decoded; the
+  RBF0 body, the ETPF entry fields, the ETPF region after the entry table and the
+  upper half of the RDS5 block counter are not interpreted.
 - Virtual folder grouping from resolved native paths. The native list is flat;
   path-like candidate names are display data and do not become directories.
 - Payload transforms and compression modes beyond stored, raw DEFLATE and
