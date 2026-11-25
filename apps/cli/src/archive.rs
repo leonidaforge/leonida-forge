@@ -69,8 +69,10 @@ pub enum Command {
         /// List at most this many entries
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        /// A file with one candidate path per line, matched by name hash
-        #[arg(long)]
+        /// A local name table: candidate paths, or `hash64:HASH<TAB>name` and
+        /// `key32:HASH<TAB>name` mappings. Defaults to `<archive>.names.txt`
+        /// next to the archive when that file exists
+        #[arg(long = "name-file", visible_alias = "candidates")]
         candidates: Option<PathBuf>,
         /// The archive's own path, whose directory is the mount prefix
         #[arg(long, conflicts_with = "mount_prefix", requires = "candidates")]

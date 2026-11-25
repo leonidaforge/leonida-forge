@@ -463,6 +463,103 @@ fn metadata_explains_why_entries_are_unavailable() {
 }
 
 #[test]
+fn metadata_reports_declared_and_unconfirmed_name_mappings() {
+    use lforge_rage9::rpf::names::hash64;
+
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("mapped.rpf");
+    decoded_rpf(&archive, 0);
+    let hash = hash64(b"item");
+    let names = temp.path().join("names.txt");
+    std::fs::write(&names, format!("hash64:{hash:016X}\tItem.ydr\n")).unwrap();
+    let archive_text = archive.to_str().unwrap();
+    let names_text = names.to_str().unwrap();
+
+    let report = json(&lforge(
+        &[
+            "archive",
+            "metadata",
+            archive_text,
+            "--entries",
+            "--name-file",
+            names_text,
+            "--json",
+        ],
+        temp.path(),
+    ));
+    let summary = &report["entries"]["names"];
+    assert_eq!(summary["entries"], 1);
+    assert_eq!(summary["candidates"], 0);
+    assert_eq!(summary["mappings"], 1);
+    assert_eq!(summary["verified_mappings"], 1);
+    assert_eq!(summary["unconfirmed_mappings"], 0);
+    assert_eq!(summary["named_rows"], 1);
+    assert_eq!(summary["resolved_rows"], 1);
+    assert_eq!(summary["unresolved_rows"], 1);
+    let listed = report["entries"]["listed"].as_array().unwrap();
+    // The original key keeps its 16-digit hexadecimal form.
+    assert_eq!(listed[0]["name_hash"], format!("0x{hash:016X}"));
+    let resolution = &listed[0]["name_resolution"];
+    assert_eq!(resolution["status"], "resolved");
+    assert_eq!(resolution["namespace"], "hash64");
+    assert_eq!(resolution["candidates"][0]["name"], "Item.ydr");
+    assert_eq!(resolution["candidates"][0]["provenance"], "user_mapping");
+    assert_eq!(resolution["candidates"][0]["algorithm"], "hash64");
+    assert_eq!(resolution["candidates"][0]["verified"], true);
+    assert_eq!(listed[1]["name_resolution"]["status"], "unresolved");
+    assert_eq!(
+        listed[1]["name_resolution"]["candidates"],
+        Value::Array(vec![])
+    );
+
+    // A name next to the key that does not produce it stays unconfirmed.
+    std::fs::write(&names, format!("hash64:{hash:016X}\tNotTheName\n")).unwrap();
+    let report = json(&lforge(
+        &[
+            "archive",
+            "metadata",
+            archive_text,
+            "--entries",
+            "--name-file",
+            names_text,
+            "--json",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(report["entries"]["names"]["verified_mappings"], 0);
+    assert_eq!(report["entries"]["names"]["unconfirmed_mappings"], 1);
+    let candidate = &report["entries"]["listed"][0]["name_resolution"]["candidates"][0];
+    assert_eq!(candidate["name"], "NotTheName");
+    assert_eq!(candidate["verified"], false);
+    assert_eq!(candidate["provenance"], "user_mapping");
+
+    // Without a table the key namespace is still reported, and no name is.
+    let report = json(&lforge(
+        &["archive", "metadata", archive_text, "--entries", "--json"],
+        temp.path(),
+    ));
+    assert_eq!(report["entries"]["names"], Value::Null);
+    let resolution = &report["entries"]["listed"][0]["name_resolution"];
+    assert_eq!(resolution["status"], "unresolved");
+    assert_eq!(resolution["namespace"], "hash64");
+    assert_eq!(resolution["candidates"], Value::Array(vec![]));
+
+    // Without an explicit file the sidecar next to the archive is used.
+    let sidecar = temp.path().join("mapped.rpf.names.txt");
+    std::fs::write(&sidecar, "item.rpf\n").unwrap();
+    let report = json(&lforge(
+        &["archive", "metadata", archive_text, "--entries", "--json"],
+        temp.path(),
+    ));
+    assert_eq!(report["entries"]["names"]["sidecar"], true);
+    assert_eq!(report["entries"]["names"]["candidates"], 1);
+    assert_eq!(report["entries"]["names"]["named_rows"], 1);
+    let resolution = &report["entries"]["listed"][0]["name_resolution"];
+    assert_eq!(resolution["candidates"][0]["name"], "item.rpf");
+    assert_eq!(resolution["candidates"][0]["provenance"], "candidate_path");
+}
+
+#[test]
 fn metadata_rejects_invalid_arguments() {
     let temp = tempfile::tempdir().unwrap();
     let archive = temp.path().join("decoded.rpf");

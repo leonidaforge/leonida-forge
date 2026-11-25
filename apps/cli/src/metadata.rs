@@ -1,7 +1,6 @@
 //! `lforge archive metadata`: the RPF9 table of contents as stored, and its
 //! entries where it can be read without decryption.
 
-use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -12,7 +11,10 @@ use lforge_rage9::rpf::metadata::transform::{self, Algorithm};
 use lforge_rage9::rpf::metadata::{
     CompanionStatus, Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
 };
-use lforge_rage9::rpf::names::{self, Candidate, Class, Matches, MountPrefix, Types};
+use lforge_rage9::rpf::names::{
+    self, CandidateOutcome, Class, MountPrefix, Namespace, Provenance, Resolver, RowNames,
+    StringTable, Types,
+};
 use serde_json::{Value, json};
 
 use crate::native::{self, Alternates, Authentication};
@@ -63,26 +65,40 @@ pub fn parse_extension(text: &str) -> Result<Extension, String> {
     })
 }
 
-/// The name inputs, if the caller supplied candidates.
+/// The local name table and the address rules it is applied under.
 struct Naming {
-    candidates: Vec<Vec<u8>>,
+    path: PathBuf,
+    sidecar: bool,
+    table: StringTable,
     prefix: MountPrefix,
     types: Types,
 }
 
 impl Naming {
-    fn read(options: &Options) -> Result<Option<Self>, String> {
-        let Some(path) = &options.candidates else {
-            return Ok(None);
+    fn read(options: &Options, archive: &Path) -> Result<Option<Self>, String> {
+        let (path, sidecar) = match &options.candidates {
+            Some(path) => (path.clone(), false),
+            None => {
+                let path = sidecar_path(archive);
+                if path.is_file() {
+                    (path, true)
+                } else {
+                    let addressing = options.archive_path.is_some()
+                        || options.mount_prefix.is_some()
+                        || !options.extensions.is_empty();
+                    if addressing {
+                        return Err(format!(
+                            "--archive-path, --mount-prefix and --extension need a name table; \
+                             pass --name-file or place one at {}",
+                            path.display()
+                        ));
+                    }
+                    return Ok(None);
+                }
+            }
         };
-        let text =
-            fs::read(path).map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        let candidates = text
-            .split(|&b| b == b'\n')
-            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-            .filter(|line| !line.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect();
+        let table = StringTable::read(&path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
         let prefix = match (&options.mount_prefix, &options.archive_path) {
             (Some(mount), _) => MountPrefix::mounted(mount.as_bytes()).ok_or_else(|| {
                 format!(
@@ -102,15 +118,23 @@ impl Naming {
             }
         }
         Ok(Some(Self {
-            candidates,
+            path,
+            sidecar,
+            table,
             prefix,
             types,
         }))
     }
 }
 
+fn sidecar_path(archive: &Path) -> PathBuf {
+    let mut name = archive.file_name().unwrap_or_default().to_os_string();
+    name.push(".names.txt");
+    archive.with_file_name(name)
+}
+
 pub fn run(path: &Path, options: &Options) -> Result<(), String> {
-    let naming = Naming::read(options)?;
+    let naming = Naming::read(options, path)?;
     // Open failures are command failures, not per-archive report states.
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
@@ -278,7 +302,8 @@ fn entry_json(
     entry: &Entry,
     source: &Source,
     alternates: &[Option<Source>],
-    names: Option<(&Matches, &Naming)>,
+    names: &RowNames,
+    show_names: bool,
 ) -> Value {
     let location = &entry.location;
     let mut value = json!({
@@ -304,17 +329,51 @@ fn entry_json(
         "raw": raw_json(entry, source, alternates),
         "contents": contents_json(entry, source, alternates),
     });
-    if let Some((matches, naming)) = names
-        && let Some(row) = matches.row(entry.row)
-    {
-        value["names"] = row
-            .candidates
+    value["name_resolution"] = resolution_json(names);
+    if show_names {
+        value["names"] = names
+            .resolution
+            .names()
             .iter()
-            .map(|&n| json!(String::from_utf8_lossy(&naming.candidates[n])))
+            .map(|name| json!(name.text))
             .collect();
-        value["ambiguous"] = json!(row.ambiguous);
+        value["ambiguous"] = json!(names.resolution.is_ambiguous());
     }
     value
+}
+
+fn resolution_json(row: &RowNames) -> Value {
+    let status = if row.resolution.is_ambiguous() {
+        "ambiguous"
+    } else if row.resolution.is_resolved() {
+        "resolved"
+    } else {
+        "unresolved"
+    };
+    let namespace = match row.namespace {
+        Namespace::Hash64 => json!("hash64"),
+        Namespace::Key32 => json!("key32"),
+        Namespace::Mixed => json!("mixed"),
+        Namespace::Unknown => Value::Null,
+    };
+    json!({
+        "status": status,
+        "namespace": namespace,
+        "candidates": row
+            .resolution
+            .names()
+            .iter()
+            .map(|name| json!({
+                "name": name.text,
+                "provenance": name.provenance.text(),
+                "algorithm": match name.algorithm {
+                    Class::Hash64 => "hash64",
+                    Class::Key32 => "key32",
+                },
+                "verified": name.verified,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn report(path: &Path, options: &Options, naming: Option<&Naming>) -> Value {
@@ -449,42 +508,75 @@ fn entries_json(
     if let Some(companions) = companions_json(alternates) {
         value["companions"] = companions;
     }
-    let matches = naming.map(|naming| {
-        let candidates: Vec<Candidate> = naming
+    let empty_table = StringTable::default();
+    let default_types = Types::default();
+    let (table, types, prefix) = match naming {
+        Some(naming) => (&naming.table, &naming.types, naming.prefix),
+        None => (&empty_table, &default_types, MountPrefix::EMPTY),
+    };
+    let resolved = Resolver::new(table, types, prefix).resolve(&entries);
+    if let Some(naming) = naming {
+        let count = |provenance: Provenance, outcome: fn(&CandidateOutcome) -> bool| {
+            resolved
+                .candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.provenance == provenance && outcome(&candidate.outcome)
+                })
+                .count()
+        };
+        let unresolved = count(Provenance::CandidatePath, |outcome| {
+            matches!(outcome, CandidateOutcome::Unresolved(_))
+        });
+        let unmatched = count(Provenance::CandidatePath, |outcome| {
+            matches!(outcome, CandidateOutcome::NoRow)
+        });
+        let verified = resolved
             .candidates
             .iter()
-            .map(|c| Candidate::Path(c))
-            .collect();
-        names::match_entries(&entries, &naming.prefix, &naming.types, &candidates)
-    });
-    let matches = match matches {
-        None => None,
-        Some(Ok(matches)) => {
-            let matched = matches
-                .rows
-                .iter()
-                .filter(|r| !r.candidates.is_empty())
-                .count();
-            let unresolved = matches.candidates.iter().filter(|c| c.is_err()).count();
-            value["names"] = json!({
-                "candidates": matches.candidates.len(),
-                "unresolved_candidates": unresolved,
-                "named_rows": matched,
-                "ambiguous_rows": matches.rows.iter().filter(|r| r.ambiguous).count(),
-            });
-            Some(matches)
-        }
-        Some(Err(err)) => {
-            value["names"] = json!({ "error": err.to_string() });
-            None
-        }
-    };
+            .filter(|candidate| {
+                candidate.provenance == Provenance::UserMapping && candidate.verified
+            })
+            .count();
+        let named = resolved
+            .rows
+            .iter()
+            .filter(|row| !row.resolution.names().is_empty())
+            .count();
+        value["names"] = json!({
+            "source": naming.path.to_string_lossy(),
+            "sidecar": naming.sidecar,
+            "entries": naming.table.entries().len(),
+            "candidates": naming.table.candidates(),
+            "mappings": naming.table.mappings(),
+            "unresolved_candidates": unresolved,
+            "unmatched_candidates": unmatched,
+            "named_rows": named,
+            "resolved_rows": resolved.rows.iter().filter(|row| row.resolution.is_resolved()).count(),
+            "ambiguous_rows": resolved.rows.iter().filter(|row| row.resolution.is_ambiguous()).count(),
+            "unresolved_rows": resolved.rows.len() - named,
+            "verified_mappings": verified,
+            "unconfirmed_mappings": naming.table.mappings() - verified,
+            "skipped_lines": naming.table.skipped(),
+            "duplicate_lines": naming.table.duplicates(),
+            "truncated": naming.table.truncated(),
+            "unusable_rows": resolved.unusable_rows,
+        });
+    }
     if options.entries {
-        let names = matches.as_ref().zip(naming);
         value["listed"] = entries
             .iter()
             .take(options.limit)
-            .map(|entry| entry_json(entry, source, alternates.sources(), names))
+            .enumerate()
+            .map(|(position, entry)| {
+                entry_json(
+                    entry,
+                    source,
+                    alternates.sources(),
+                    &resolved.rows[position],
+                    naming.is_some(),
+                )
+            })
             .collect();
     }
     value
@@ -597,11 +689,16 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
             Some(error) => writeln!(out, "names:       not matched: {}", text(error))?,
             None => writeln!(
                 out,
-                "names:       {} of {} candidates unresolved, {} rows named, {} ambiguous",
+                "names:       {} of {} candidates unresolved, {} rows named, {} ambiguous \
+                 ({} resolved, {} unresolved), {} unverified mappings, {} skipped lines",
                 names["unresolved_candidates"],
                 names["candidates"],
                 names["named_rows"],
-                names["ambiguous_rows"]
+                names["ambiguous_rows"],
+                names["resolved_rows"],
+                names["unresolved_rows"],
+                names["unconfirmed_mappings"],
+                names["skipped_lines"]
             )?,
         }
     }
