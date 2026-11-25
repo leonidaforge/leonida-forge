@@ -42,23 +42,28 @@ Native RPF9 reading is available when the archive's table of contents is stored
 without encryption. Leonida Forge then reads native entries with stored bytes,
 raw DEFLATE, chunked payloads and companion-file payloads.
 
-The CLI can also read encrypted table-of-contents metadata when given a
-compatible local executable with `--executable`. It authenticates the metadata
-signature before listing or extracting native entries. The executable and the
-archive are read only; the executable is not copied or cached. Payload bytes
-are not covered by the metadata signature.
+Encrypted table-of-contents metadata needs a compatible local executable. In the
+explorer, choose **File > Select Game Executable…** and pick the game's main
+`.exe`. **File > Clear Executable** removes the selection. Only the path is
+stored. The executable and the archive are read only; the executable is not
+copied, and no key state is stored. The metadata signature is checked before
+native entries are listed or exported. When the archive needs no executable, or
+when authentication fails, the explorer offers recovery by scanning instead.
+Payload bytes are not covered by the metadata signature.
 
-The desktop explorer does not yet offer executable selection. For encrypted
-archives it scans the data for zlib streams and lists recovery candidates
-instead. Recovered entries are named by archive offset. Their original names
-and folder structure are unknown, and the scan does not produce a complete
-archive inventory.
+The CLI takes the same executable with `--executable`.
+
+Recovered entries are named by archive offset. Their original names and folder
+structure are unknown, and the scan does not produce a complete archive
+inventory. Recovered and native entries are never mixed in one list.
 
 This is not full native GTA VI RPF9 support.
 
 ## Features
 
 - Browse folders, ZIP archives and RPF9 archives as one tree.
+- List an RPF9 archive's own entries after authenticating its table of contents
+  against a local game executable.
 - Recover entries from encrypted RPF9 archives and group them by detected kind.
 - Reconstruct RAGE resources from consecutive page streams.
 - Inspect any file as bytes in the Binary Inspector.
@@ -67,8 +72,8 @@ This is not full native GTA VI RPF9 support.
 
 ## Known limitations
 
-- Encrypted RPF9 table-of-contents metadata needs `--executable` in the CLI;
-  the desktop explorer does not decrypt it.
+- Encrypted RPF9 table-of-contents metadata needs a compatible local
+  executable. Without one, only recovery by scanning is available.
 - Native entries keep hash names. Recovered entries have no original names or
   paths.
 - A recovered entry can be partial or unverified. The UI reports its status,

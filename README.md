@@ -58,11 +58,24 @@ The explorer decompresses each one to a temporary file, up to 512 MB each and 2 
 To see the raw archive bytes, right-click it and choose **Open in Binary Inspector**.
 
 When the RPF9 table of contents is stored without encryption, Leonida Forge reads its native entries directly.
-The table of contents in retail game archives is encrypted, and Leonida Forge does not decrypt it.
-For those archives it scans the data for zlib streams and lists what it finds instead.
+In retail game archives the engine processes the table before reading it.
+For those archives Leonida Forge can authenticate the table against a compatible local game executable that you select, and then list the archive's own entries.
+Without such an executable, or when authentication fails, it offers to recover entries by scanning the data instead.
 That is scan recovery, not a complete native archive index, and it does not make this a full native GTA VI RPF9 reader.
 The first visit reads the whole archive. A 773 MB archive takes about 2 seconds from the disk cache.
 The index goes to `%APPDATA%\Leonida Forge\cache\rpf` and is reused until the archive's size or modification time changes.
+Recovered entries and native entries are never mixed in one list.
+
+## Local executable
+
+Authenticated native listing needs a game executable that matches the archive, for example the game's main `.exe` from your own installation.
+Choose **File > Select Game Executable…** and pick the file. **File > Clear Executable** removes the selection.
+Only the path is stored, in the settings file above.
+Leonida Forge opens the executable read-only, never copies or modifies it, and stores no keys, key state or IVs.
+Nothing is downloaded, and no key service is used.
+The recognizer checks the executable's structure and fails explicitly when it finds no compatible state, so a changed or unrelated executable simply does not authenticate.
+If the file is moved, replaced or unreadable, Leonida Forge reports that and asks you to select it again.
+Each time an archive is opened, the executable is checked against the file that was selected.
 
 Inside an archive:
 
@@ -100,14 +113,14 @@ A candidate is one recovered entry, identified by the archive offset of its firs
 
 `recover --id ID --output FILE` re-decodes one candidate and writes its bytes with the same output safety as `archive extract`. The streams are checked against the index as they are read, the output goes through a temporary file and replaces an existing file only with `--overwrite`, and a failed decode leaves no partial file. A partial or unverified candidate is written with a note that bytes may be missing. A decode that succeeds is not proof that the bytes are an authentic original file.
 
-Where the table of contents is stored without encryption, it can be read directly instead of scanned.
+Where the table of contents is stored without encryption, it can be read directly instead of scanned. With a compatible local game executable, `--executable` authenticates a processed table of contents first.
 
 ```sh
-lforge archive metadata data.rpf --entries         # the native entries and how each one reads
-lforge archive extract data.rpf --row 42 --output file.bin
+lforge archive metadata data.rpf --entries --executable game.exe   # the native entries and how each one reads
+lforge archive extract data.rpf --row 42 --output file.bin --executable game.exe
 ```
 
-Entries are identified by their row number in the table. `archive metadata --entries` lists them and reports, for each one, whether its contents are readable as stored, readable after supported decoding, or unavailable. When an entry is unavailable it gives the reason: an unsupported payload transform, an unsupported compression mode, a companion file that is missing or invalid, or malformed metadata.
+Entries are identified by their row number in the table. `archive metadata --entries` lists them and reports, for each one, whether its contents are readable as stored, readable after supported decoding, or unavailable. When an entry is unavailable it gives the reason: an unsupported payload transform, an unsupported compression mode, a companion file that is missing or invalid, or malformed metadata. It also reports whether the table was authenticated by a signature check or read without one because the archive needs no processing pass.
 
 `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
 

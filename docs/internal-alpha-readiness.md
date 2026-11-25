@@ -1,7 +1,7 @@
 # Internal Alpha readiness
 
 Scope: the Windows desktop explorer, its export workflow and the Windows x64
-package for an internal, recovery-focused Alpha. Date: 2026-11-24.
+package for an internal, recovery-focused Alpha. Date: 2026-11-25.
 
 ## Verdict
 
@@ -10,9 +10,11 @@ ZIP. The scan-recovery, inspect and export pipeline works in automated tests and
 against the real archives recorded below. The packaged desktop binary starts on
 this Windows 11 machine and its window responds.
 
-Full native encrypted RPF9 support is not ready and remains under research. The
-table-of-contents decryption key is not available, so the tools refuse encrypted
-native metadata instead of guessing. That is correct behaviour.
+Full native encrypted RPF9 support is not ready and remains under research. A
+processed table of contents is read only after its signature verifies against a
+local game executable that the user selects, and no key material is extracted or
+stored. Without such an executable the tools refuse native metadata instead of
+guessing, and scanning stays the fallback.
 
 Public publication is not approved. No GitHub Release is created and no tag is
 pushed.
@@ -27,6 +29,9 @@ pushed.
   inspection.
 - Read native RPF9 entries where the table of contents is stored unencrypted:
   stored bytes, raw DEFLATE, chunked payloads, and companion-file payloads.
+- Read a processed table of contents after authenticating it against a local
+  game executable selected in the explorer. Native rows keep their row number
+  and name hash, and are never merged with recovered entries.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
 - Export one entry to a chosen path, from the entry context menu and the File
@@ -39,8 +44,9 @@ pushed.
 
 ## Unsupported functionality
 
-- Decrypting the native RPF9 table of contents. The static pass uses a cipher
-  whose key is not available, so encrypted archives fall back to scan recovery.
+- Extracting key material from the game executable, or authenticating native
+  metadata without a compatible local executable. Without one, or when the
+  signature does not verify, an encrypted archive falls back to scan recovery.
 - Original names and folder structure for recovered entries. Names are archive
   offsets; grouping is by detected kind.
 - Payload transforms and compression modes beyond stored, raw DEFLATE and
@@ -140,8 +146,10 @@ clean-machine test.
   few seconds. The message never claims recovered bytes are an original file.
 - Only one export request is active at a time. A save dialog holds the slot, so
   a second request is refused while the dialog is open or an export is running.
-- Opening an archive shows indexing progress and offers cancellation instead of
-  blocking.
+- Opening an archive shows the current step and offers cancellation instead of
+  blocking. A processed table of contents is authenticated in the background,
+  and the archive explains whether it needs an executable or failed
+  authentication, with a way to select one or recover by scanning.
 
 ## Packaging decision
 
@@ -244,8 +252,14 @@ C++ Redistributable installed.
    decoded bytes with a known-good extraction.
 5. Open an RPF9 archive with unencrypted table-of-contents metadata. Confirm
    native entries are listed and one readable entry exports correctly.
-6. Open an encrypted retail RPF9 archive. Confirm indexing progress appears,
-   recovery grouping and status are shown, and the limitation is explained.
+6. Open an encrypted retail RPF9 archive without an executable selected.
+   Confirm the archive asks for an executable or for recovery, and that
+   choosing recovery shows indexing progress and grouped candidates.
+7. With a compatible local executable selected through **File > Select Game
+   Executable…**, open the same archive again. Confirm native rows are listed,
+   the metadata status says the signature verified, and one readable row
+   exports. Then clear the executable and confirm the archive no longer lists
+   native rows.
 7. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
 8. Open a plain file and an entry inside an archive in the Binary Inspector.
@@ -277,8 +291,9 @@ Still required before a public prerelease:
 
 - Complete the clean-machine checklist above, including the desktop interactions
   that have no automated test.
-- Decide the supported RPF9 claim. Native encrypted metadata remains unreadable,
-  so public text must keep the recovery scope.
+- Decide the supported RPF9 claim. Native metadata needs a compatible local
+  executable, so public text must describe both authenticated native listing and
+  the recovery fallback.
 - Add an application icon, version resource and manifest if the desktop is
   published outside the internal group.
 - Complete a third-party license-text audit for every bundled component.
