@@ -350,10 +350,7 @@ fn rejects_an_unobserved_version() {
 fn rejects_a_short_or_foreign_payload() {
     assert_eq!(parse(b"RBF").unwrap_err().kind, ErrorKind::NotRbf0);
     assert_eq!(parse(b"RBF0").unwrap_err().kind, ErrorKind::TooShort);
-    assert_eq!(
-        parse(&MAGIC.to_vec()).unwrap_err().kind,
-        ErrorKind::TooShort
-    );
+    assert_eq!(parse(&MAGIC).unwrap_err().kind, ErrorKind::TooShort);
     // The versioned marker without its version word.
     let mut bytes = MAGIC.to_vec();
     bytes.extend_from_slice(&u16v(HEADER_MARKER));

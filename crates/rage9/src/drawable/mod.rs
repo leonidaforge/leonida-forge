@@ -553,10 +553,8 @@ impl<'a> Walk<'a> {
             prefix_gap: 0,
             attributes: Vec::new(),
         };
-        if let Some(layout) = layout
-            && let Some(view) = self.layout(layout, &mut buffer)
-        {
-            let _ = view;
+        if let Some(layout) = layout {
+            let _ = self.layout(layout, &mut buffer);
         }
         Some(buffer)
     }
@@ -831,7 +829,7 @@ fn graphics_base(graphics: &[u8], offsets: &[u32]) -> GraphicsBase {
         [] => GraphicsBase::Unavailable,
         [base] => GraphicsBase::Unique {
             base: *base,
-            supports: distinct.len() as usize,
+            supports: distinct.len(),
         },
         _ => GraphicsBase::Ambiguous {
             candidates: candidates.len(),

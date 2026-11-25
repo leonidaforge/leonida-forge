@@ -1130,7 +1130,7 @@ pub fn reconstruct_texture<R: Read + Seek>(
     let last = &container.blocks[first_block + block_count as usize - 1];
     let virtual_end = last.virtual_position + last.virtual_len;
     let texels = u64::from(entry.width()) * u64::from(entry.height());
-    let bytes_per_texel = (texels > 0 && decoded_len % texels == 0)
+    let bytes_per_texel = (texels > 0 && decoded_len.is_multiple_of(texels))
         .then(|| u32::try_from(decoded_len / texels).ok())
         .flatten();
     let complete = decoded_len == virtual_end.saturating_sub(virtual_start);

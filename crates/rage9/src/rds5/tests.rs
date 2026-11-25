@@ -741,7 +741,7 @@ fn decodes_a_stored_block_verbatim() {
         classes: vec![0x00],
         ..Build::default()
     }
-    .build(&[data.clone()], 0);
+    .build(std::slice::from_ref(&data), 0);
     let mut container = read(&bytes).unwrap();
     let mut source = Cursor::new(&bytes);
     container
@@ -957,7 +957,8 @@ fn rejects_an_index_that_cannot_exist() {
 }
 
 /// A descriptor with the fields the research defines.
-fn descriptor(
+#[derive(Clone, Copy)]
+struct Descriptor {
     width: u32,
     height: u32,
     mip: u8,
@@ -967,14 +968,34 @@ fn descriptor(
     kind: u8,
     tile: u8,
     page: u32,
-) -> [u32; 4] {
-    let w0 = (width - 1) | ((height - 1) << 14) | (u32::from(mip) << 28);
-    let w1 = u32::from(flags)
-        | (u32::from(format) << 3)
-        | (u32::from(array_minus_one) << 10)
-        | (u32::from(kind) << 20)
-        | (u32::from(tile) << 24);
-    [w0, w1, page, 0]
+}
+
+impl Default for Descriptor {
+    fn default() -> Self {
+        Self {
+            width: 64,
+            height: 64,
+            mip: 0,
+            flags: 0,
+            format: 98,
+            array_minus_one: 0,
+            kind: 2,
+            tile: 0,
+            page: 1,
+        }
+    }
+}
+
+impl Descriptor {
+    fn bytes(self) -> [u32; 4] {
+        let w0 = (self.width - 1) | ((self.height - 1) << 14) | (u32::from(self.mip) << 28);
+        let w1 = u32::from(self.flags)
+            | (u32::from(self.format) << 3)
+            | (u32::from(self.array_minus_one) << 10)
+            | (u32::from(self.kind) << 20)
+            | (u32::from(self.tile) << 24);
+        [w0, w1, self.page, 0]
+    }
 }
 
 #[test]
@@ -982,7 +1003,15 @@ fn reconstructs_a_single_block_texture() {
     let texels = 1024u32 * 512;
     let data = noise(texels as usize);
     let bytes = Build {
-        entries: vec![descriptor(1024, 512, 0, 1, 98, 0, 2, 0, 1)],
+        entries: vec![
+            Descriptor {
+                width: 1024,
+                height: 512,
+                flags: 1,
+                ..Descriptor::default()
+            }
+            .bytes(),
+        ],
         ..Build::default()
     }
     .build(&[zlib(&data)], 0);
@@ -1022,10 +1051,16 @@ fn reconstructs_a_stored_class_texture_verbatim() {
     let data = noise(0x1000);
     let bytes = Build {
         classes: vec![0x00],
-        entries: vec![descriptor(64, 64, 0, 0, 71, 0, 2, 0, 1)],
+        entries: vec![
+            Descriptor {
+                format: 71,
+                ..Descriptor::default()
+            }
+            .bytes(),
+        ],
         ..Build::default()
     }
-    .build(&[data.clone()], 0);
+    .build(std::slice::from_ref(&data), 0);
     let mut container = read(&bytes).unwrap();
     let mut decoded = Vec::new();
     let report = reconstruct_texture(
@@ -1049,7 +1084,7 @@ fn reconstructs_a_stored_class_texture_verbatim() {
 fn refuses_a_texture_whose_block_class_is_undecoded() {
     let bytes = Build {
         classes: vec![0x04],
-        entries: vec![descriptor(64, 64, 0, 0, 98, 0, 2, 0, 1)],
+        entries: vec![Descriptor::default().bytes()],
         ..Build::default()
     }
     .build(&[vec![0x55; 0x1000]], 0);
@@ -1070,7 +1105,13 @@ fn refuses_a_texture_whose_block_class_is_undecoded() {
 #[test]
 fn refuses_a_locator_page_that_is_not_a_block_start() {
     let bytes = Build {
-        entries: vec![descriptor(64, 64, 0, 0, 98, 0, 2, 0, 7)],
+        entries: vec![
+            Descriptor {
+                page: 7,
+                ..Descriptor::default()
+            }
+            .bytes(),
+        ],
         ..Build::default()
     }
     .build(&[zlib(&vec![0u8; 0x1000])], 0);
