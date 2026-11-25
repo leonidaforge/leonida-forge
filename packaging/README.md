@@ -74,8 +74,10 @@ This is not full native GTA VI RPF9 support.
 
 - Encrypted RPF9 table-of-contents metadata needs a compatible local
   executable. Without one, only recovery by scanning is available.
-- Native entries keep hash names. Recovered entries have no original names or
-  paths.
+- Native entries keep their stored hash names. A local `<archive>.names.txt`
+  table can supply candidate paths or declared key/name mappings; verified
+  names are display data and never replace the hash or an entry path.
+- Recovered entries have no original names or paths.
 - A recovered entry can be partial or unverified. The UI reports its status,
   and an export keeps that caveat in the result message.
 - Payload transforms and compression modes beyond the supported list are

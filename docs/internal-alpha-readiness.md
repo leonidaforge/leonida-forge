@@ -32,6 +32,10 @@ pushed.
 - Read a processed table of contents after authenticating it against a local
   game executable selected in the explorer. Native rows keep their row number
   and name hash, and are never merged with recovered entries.
+- Show a native row's name from a local `<archive>.names.txt` table next to the
+  archive: candidate paths, or declared `hash64`/`key32` mappings. A name is
+  marked verified only when hashing reproduces the stored key. Names are
+  display data; the row number and stored hash remain authoritative.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
 - Export one entry to a chosen path, from the entry context menu and the File
@@ -259,7 +263,10 @@ C++ Redistributable installed.
    Executable…**, open the same archive again. Confirm native rows are listed,
    the metadata status says the signature verified, and one readable row
    exports. Then clear the executable and confirm the archive no longer lists
-   native rows.
+   native rows. Place a `<archive>.names.txt` with a known candidate path next
+   to the archive, reopen it, and confirm the name appears while the row label
+   and stored hash stay. Remove the file and confirm the names return to
+   unknown.
 8. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
 9. Open a plain file and an entry inside an archive in the Binary Inspector.
