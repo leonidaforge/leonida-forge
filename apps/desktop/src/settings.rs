@@ -11,6 +11,10 @@ use crate::files::{ListingLayout, Sort};
 pub const DEFAULT_TREE_WIDTH: f32 = 240.;
 pub const DEFAULT_PREVIEW_WIDTH: f32 = 320.;
 
+fn default_details_widths() -> [f32; 3] {
+    [130., 80., 120.]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     Icons,
@@ -52,6 +56,9 @@ pub struct Settings {
     /// Whether native RPF9 rows are shown by verified relative path or in one
     /// flat list. Older files without the field get [`ListingLayout::Folders`].
     pub layout: ListingLayout,
+    /// Widths of the Type, Size and Modified columns in the details view.
+    #[serde(default = "default_details_widths")]
+    pub details_widths: [f32; 3],
     pub preview_visible: bool,
     pub tree_width: f32,
     pub preview_width: f32,
@@ -70,6 +77,7 @@ impl Default for Settings {
             view_mode: ViewMode::default(),
             sort: Sort::default(),
             layout: ListingLayout::default(),
+            details_widths: default_details_widths(),
             preview_visible: true,
             tree_width: DEFAULT_TREE_WIDTH,
             preview_width: DEFAULT_PREVIEW_WIDTH,
@@ -143,6 +151,7 @@ mod tests {
                 descending: true,
             },
             layout: ListingLayout::Flat,
+            details_widths: [150., 90., 140.],
             preview_visible: false,
             tree_width: 300.,
             preview_width: 260.,
@@ -163,6 +172,7 @@ mod tests {
         assert!(!settings.preview_visible);
         assert_eq!(settings.executable, None);
         assert_eq!(settings.layout, ListingLayout::Folders);
+        assert_eq!(settings.details_widths, default_details_widths());
     }
 
     #[test]
@@ -182,5 +192,6 @@ mod tests {
         assert_eq!(settings.view_mode, ViewMode::List);
         assert!(settings.preview_visible);
         assert_eq!(settings.tree_width, DEFAULT_TREE_WIDTH);
+        assert_eq!(settings.details_widths, default_details_widths());
     }
 }

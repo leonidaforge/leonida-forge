@@ -2,12 +2,20 @@
 //!
 //! Characters come from key events, so IME composition is not supported.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
-    Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, SharedString, Window, div,
-    prelude::*, px, rgb,
+    Bounds, Context, EventEmitter, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    SharedString, TextRun, Window, canvas, div, font, prelude::*, px, rgb,
 };
 
 use super::theme;
+
+/// Font size of the field's text and the height it is shaped at.
+const TEXT_SIZE: f32 = 13.;
+/// Left padding and border before the first glyph: `px_2` plus the 1px border.
+const TEXT_INSET: f32 = 9.;
 
 pub enum TextFieldEvent {
     /// Enter was pressed; `shift` is set for Shift+Enter.
@@ -20,6 +28,9 @@ pub struct TextField {
     cursor: usize,
     placeholder: SharedString,
     focus_handle: FocusHandle,
+    /// The field's bounds in window coordinates, captured each frame so a
+    /// click can be mapped to a byte index.
+    bounds: Rc<Cell<Bounds<Pixels>>>,
 }
 
 impl EventEmitter<TextFieldEvent> for TextField {}
@@ -31,6 +42,7 @@ impl TextField {
             cursor: 0,
             placeholder: placeholder.into(),
             focus_handle: cx.focus_handle(),
+            bounds: Rc::default(),
         }
     }
 
@@ -56,6 +68,28 @@ impl TextField {
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
+    }
+
+    /// The byte index of the glyph nearest to window position `x`.
+    fn cursor_at(&self, x: Pixels, window: &Window) -> usize {
+        let left = self.bounds.get().left() + px(TEXT_INSET);
+        let local = x - left;
+        if local <= px(0.) || self.text.is_empty() {
+            return 0;
+        }
+        let run = TextRun {
+            len: self.text.len(),
+            font: font(theme::MONO_FONT),
+            color: rgb(theme::TEXT).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let layout =
+            window
+                .text_system()
+                .layout_line(self.text.as_str(), px(TEXT_SIZE), &[run], None);
+        layout.closest_index_for_x(local).min(self.text.len())
     }
 
     fn previous_boundary(&self) -> usize {
@@ -116,24 +150,27 @@ impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
         let (before, after) = self.text.split_at(self.cursor);
+        let bounds = self.bounds.clone();
         div()
             .id("text-field")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.cursor = this.text.len();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.cursor = this.cursor_at(event.position.x, window);
                     this.focus(window, cx);
                     cx.notify();
                 }),
             )
+            .relative()
             .flex()
             .items_center()
             .h(px(26.))
             .px_2()
             .overflow_hidden()
             .whitespace_nowrap()
+            .text_size(px(TEXT_SIZE))
             .rounded_md()
             .border_1()
             .border_color(rgb(if focused {
@@ -144,6 +181,10 @@ impl Render for TextField {
             .bg(rgb(theme::PANEL))
             .font_family(theme::MONO_FONT)
             .cursor_text()
+            .child(div().absolute().inset_0().child(canvas(
+                move |field_bounds, _, _| bounds.set(field_bounds),
+                |_, _, _, _| {},
+            )))
             .when(self.text.is_empty() && !focused, |el| {
                 el.text_color(rgb(theme::TEXT_DISABLED))
                     .child(self.placeholder.clone())

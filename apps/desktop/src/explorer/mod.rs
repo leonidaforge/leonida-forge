@@ -17,10 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, DispatchPhase, Entity, FocusHandle, FontWeight, KeyBinding, MouseButton,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, RenderImage, ScrollHandle,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
-    WindowHandle, WindowOptions, actions, canvas, div, prelude::*, px, rgb, size,
+    AnyElement, App, Bounds, Context, DispatchPhase, Div, Entity, FocusHandle, FontWeight,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
+    Pixels, Point, RenderImage, ScrollHandle, Stateful, Subscription, Task, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas,
+    div, prelude::*, px, rgb, size,
 };
 
 use lforge_rage9::rpf::Progress;
@@ -52,11 +53,14 @@ const MAX_TREE_WIDTH: f32 = 480.;
 const MIN_PREVIEW_WIDTH: f32 = 220.;
 const MAX_PREVIEW_WIDTH: f32 = 560.;
 const MIN_CENTER_WIDTH: f32 = 440.;
+const MIN_DETAILS_COLUMN: f32 = 60.;
+const MAX_DETAILS_COLUMN: f32 = 420.;
+const SCROLLBAR_WIDTH: f32 = 10.;
+const MIN_SCROLLBAR_THUMB: f32 = 24.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("alt-left", GoBack, Some(KEY_CONTEXT)),
-        KeyBinding::new("backspace", GoBack, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-right", GoForward, Some(KEY_CONTEXT)),
         KeyBinding::new("alt-up", GoUp, Some(KEY_CONTEXT)),
         KeyBinding::new("f5", Refresh, Some(KEY_CONTEXT)),
@@ -134,6 +138,46 @@ enum Menu {
 enum Divider {
     Tree,
     Preview,
+}
+
+/// A details column being resized by dragging its right edge.
+#[derive(Clone, Copy)]
+struct ColumnDrag {
+    column: usize,
+    start_x: f32,
+    start_width: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Vertical,
+    Horizontal,
+}
+
+/// A scrollbar thumb being dragged, with the pointer's offset inside it.
+#[derive(Clone)]
+struct ScrollDrag {
+    handle: ScrollHandle,
+    axis: Axis,
+    grab: f32,
+}
+
+fn clamp_details_column(width: f32) -> f32 {
+    width.clamp(MIN_DETAILS_COLUMN, MAX_DETAILS_COLUMN)
+}
+
+/// The thumb length and its position along the track. `offset` is the
+/// positive distance scrolled, `max` the remaining scrollable distance and
+/// `viewport` the track length.
+fn scrollbar_geometry(offset: f32, max: f32, viewport: f32) -> (f32, f32) {
+    if max <= 0.5 || viewport <= 0. {
+        return (0., 0.);
+    }
+    let thumb = (viewport * viewport / (viewport + max))
+        .max(MIN_SCROLLBAR_THUMB)
+        .min(viewport);
+    let position = (offset / max).clamp(0., 1.) * (viewport - thumb);
+    (thumb, position)
 }
 
 /// A running or finished export of one file to a chosen destination.
@@ -241,6 +285,9 @@ pub struct Explorer {
     preview_width: f32,
     open_menu: Option<Menu>,
     resizing: Option<Divider>,
+    column_drag: Option<ColumnDrag>,
+    scroll_drag: Option<ScrollDrag>,
+    details_widths: [f32; 3],
     export: Option<Export>,
     export_requests: ExportRequests,
     thumbnail: Option<Thumbnail>,
@@ -254,6 +301,7 @@ pub struct Explorer {
     tree_scroll: UniformListScrollHandle,
     browser_scroll: UniformListScrollHandle,
     list_scroll: ScrollHandle,
+    preview_scroll: ScrollHandle,
     /// Filters the visible listing by resolved name, stored key or type.
     search: Option<Entity<ui::text_field::TextField>>,
     focus_handle: FocusHandle,
@@ -290,6 +338,9 @@ impl Explorer {
             preview_width: settings.preview_width,
             open_menu: None,
             resizing: None,
+            column_drag: None,
+            scroll_drag: None,
+            details_widths: settings.details_widths.map(clamp_details_column),
             export: None,
             export_requests: ExportRequests::default(),
             thumbnail: None,
@@ -302,6 +353,7 @@ impl Explorer {
             tree_scroll: UniformListScrollHandle::new(),
             browser_scroll: UniformListScrollHandle::new(),
             list_scroll: ScrollHandle::new(),
+            preview_scroll: ScrollHandle::new(),
             search: Some(
                 cx.new(|cx| ui::text_field::TextField::new("Filter names, hashes, types", cx)),
             ),
@@ -1009,6 +1061,7 @@ impl Explorer {
             view_mode: self.view_mode,
             sort: self.sort,
             layout: self.layout,
+            details_widths: self.details_widths,
             preview_visible: self.preview_visible,
             tree_width: self.tree_width,
             preview_width: self.preview_width,
@@ -1317,7 +1370,7 @@ impl Render for Explorer {
                     .child(self.render_browser(&layout, reveal, cx))
                     .when(self.preview_visible, |el| {
                         el.child(self.render_divider(Divider::Preview, cx))
-                            .child(self.render_preview(layout.preview))
+                            .child(self.render_preview(layout.preview, cx))
                     }),
             )
             .child(self.render_status_bar())
@@ -1432,6 +1485,204 @@ impl Explorer {
             )
     }
 
+    /// A visible scrollbar for a scroll handle. `axis` selects a vertical bar
+    /// on the right or a horizontal bar at the bottom. The bar occupies its own
+    /// layout space, so it never covers the content.
+    fn render_scrollbar(
+        &self,
+        handle: ScrollHandle,
+        axis: Axis,
+        id: &'static str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let bounds = handle.bounds();
+        let (offset, max, viewport) = match axis {
+            Axis::Vertical => (
+                -f32::from(handle.offset().y),
+                f32::from(handle.max_offset().y),
+                f32::from(bounds.size.height),
+            ),
+            Axis::Horizontal => (
+                -f32::from(handle.offset().x),
+                f32::from(handle.max_offset().x),
+                f32::from(bounds.size.width),
+            ),
+        };
+        let scrollable = max > 0.5 && viewport > 0.;
+        let (thumb, position) = scrollbar_geometry(offset, max, viewport);
+        let active = self
+            .scroll_drag
+            .as_ref()
+            .is_some_and(|drag| drag.axis == axis);
+        let thumb_color = if active { theme::ACCENT } else { theme::HOVER };
+        let click_handle = handle.clone();
+        div()
+            .id(id)
+            .relative()
+            .flex_none()
+            .when(axis == Axis::Vertical, |el| {
+                el.w(px(SCROLLBAR_WIDTH)).h_full()
+            })
+            .when(axis == Axis::Horizontal, |el| {
+                el.h(px(SCROLLBAR_WIDTH)).w_full()
+            })
+            .bg(rgb(theme::BACKGROUND))
+            .when(scrollable, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .when(axis == Axis::Vertical, |el| {
+                            el.top(px(position))
+                                .left(px(2.))
+                                .w(px(SCROLLBAR_WIDTH - 4.))
+                                .h(px(thumb))
+                        })
+                        .when(axis == Axis::Horizontal, |el| {
+                            el.left(px(position))
+                                .top(px(2.))
+                                .h(px(SCROLLBAR_WIDTH - 4.))
+                                .w(px(thumb))
+                        })
+                        .rounded_sm()
+                        .bg(rgb(thumb_color))
+                        .hover(|s| s.bg(rgb(theme::TEXT_DISABLED))),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.begin_scroll_drag(click_handle.clone(), axis, event.position, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Starts dragging a scrollbar thumb at `position`. A click outside the
+    /// thumb centres it there first.
+    fn begin_scroll_drag(
+        &mut self,
+        handle: ScrollHandle,
+        axis: Axis,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = handle.bounds();
+        let (local, offset, max, viewport) = match axis {
+            Axis::Vertical => (
+                f32::from(position.y) - f32::from(bounds.top()),
+                -f32::from(handle.offset().y),
+                f32::from(handle.max_offset().y),
+                f32::from(bounds.size.height),
+            ),
+            Axis::Horizontal => (
+                f32::from(position.x) - f32::from(bounds.left()),
+                -f32::from(handle.offset().x),
+                f32::from(handle.max_offset().x),
+                f32::from(bounds.size.width),
+            ),
+        };
+        if max <= 0.5 || viewport <= 0. {
+            return;
+        }
+        let (thumb, thumb_position) = scrollbar_geometry(offset, max, viewport);
+        let grab = if (thumb_position..thumb_position + thumb).contains(&local) {
+            local - thumb_position
+        } else {
+            thumb / 2.
+        };
+        self.scroll_drag = Some(ScrollDrag { handle, axis, grab });
+        self.scroll_drag_to(position, cx);
+    }
+
+    /// Moves the active scrollbar to follow the pointer.
+    fn scroll_drag_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = &self.scroll_drag else {
+            return;
+        };
+        let bounds = drag.handle.bounds();
+        let (local, max, viewport) = match drag.axis {
+            Axis::Vertical => (
+                f32::from(position.y) - f32::from(bounds.top()),
+                f32::from(drag.handle.max_offset().y),
+                f32::from(bounds.size.height),
+            ),
+            Axis::Horizontal => (
+                f32::from(position.x) - f32::from(bounds.left()),
+                f32::from(drag.handle.max_offset().x),
+                f32::from(bounds.size.width),
+            ),
+        };
+        if max <= 0.5 || viewport <= 0. {
+            return;
+        }
+        let (thumb, _) = scrollbar_geometry(0., max, viewport);
+        let travel = (viewport - thumb).max(0.);
+        let fraction = if travel > 0. {
+            ((local - drag.grab) / travel).clamp(0., 1.)
+        } else {
+            0.
+        };
+        let mut offset = drag.handle.offset();
+        match drag.axis {
+            Axis::Vertical => offset.y = px(-fraction * max),
+            Axis::Horizontal => offset.x = px(-fraction * max),
+        }
+        drag.handle.set_offset(offset);
+        cx.notify();
+    }
+
+    fn resize_column(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.column_drag else {
+            return;
+        };
+        let Some(width) = self.details_widths.get_mut(drag.column) else {
+            return;
+        };
+        *width = clamp_details_column(drag.start_width + (x - drag.start_x));
+        cx.notify();
+    }
+
+    /// The draggable right edge of a details header column.
+    fn column_grip(&self, column: usize, cx: &Context<Self>) -> Stateful<Div> {
+        let active = self.column_drag.is_some_and(|drag| drag.column == column);
+        div()
+            .id(("column-grip", column))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(-2.5))
+            .w(px(5.))
+            .cursor_col_resize()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(2.))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(rgb(if active {
+                        theme::SELECTION_BORDER
+                    } else {
+                        theme::BORDER
+                    })),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let Some(&width) = this.details_widths.get(column) else {
+                        return;
+                    };
+                    this.column_drag = Some(ColumnDrag {
+                        column,
+                        start_x: f32::from(event.position.x),
+                        start_width: width,
+                    });
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
     fn render_divider(&self, divider: Divider, cx: &Context<Self>) -> impl IntoElement {
         let active = self.resizing == Some(divider);
         div()
@@ -1479,12 +1730,25 @@ impl Explorer {
                             if this.resizing.is_some() {
                                 this.resize_to(event.position, window, cx);
                             }
+                            if this.column_drag.is_some() {
+                                this.resize_column(f32::from(event.position.x), cx);
+                            }
+                            if this.scroll_drag.is_some() {
+                                this.scroll_drag_to(event.position, cx);
+                            }
                         });
                     }
                 });
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                     if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
                         this.update(cx, |this, cx| {
+                            if this.scroll_drag.take().is_some() {
+                                cx.notify();
+                            }
+                            if this.column_drag.take().is_some() {
+                                this.schedule_save(cx);
+                                cx.notify();
+                            }
                             if this.resizing.take().is_some() {
                                 this.schedule_save(cx);
                                 cx.notify();
@@ -1774,6 +2038,28 @@ mod export_tests {
         );
         entry.details = details;
         entry
+    }
+
+    #[test]
+    fn details_columns_clamp_to_their_limits() {
+        assert_eq!(clamp_details_column(10.), MIN_DETAILS_COLUMN);
+        assert_eq!(clamp_details_column(1000.), MAX_DETAILS_COLUMN);
+        assert_eq!(clamp_details_column(150.), 150.);
+    }
+
+    #[test]
+    fn scrollbar_thumb_shows_the_visible_fraction() {
+        // Nothing to scroll: no thumb.
+        assert_eq!(scrollbar_geometry(0., 0., 100.), (0., 0.));
+        // Half the content visible: half-height thumb at the top.
+        assert_eq!(scrollbar_geometry(0., 100., 100.), (50., 0.));
+        // Half way through: the thumb has travelled half the free track.
+        let (thumb, position) = scrollbar_geometry(50., 100., 100.);
+        assert_eq!(thumb, 50.);
+        assert_eq!(position, 25.);
+        // A very long list keeps a usable minimum thumb.
+        let (thumb, _) = scrollbar_geometry(0., 1_000_000., 100.);
+        assert_eq!(thumb, MIN_SCROLLBAR_THUMB);
     }
 
     #[test]

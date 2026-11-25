@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{
-    Context, FontWeight, ObjectFit, RenderImage, SharedString, Task, div, img, prelude::*, px, rgb,
+    Context, Div, FontWeight, ObjectFit, RenderImage, SharedString, Stateful, Task, div, img,
+    prelude::*, px, rgb,
 };
 
 use super::Explorer;
@@ -109,7 +110,7 @@ impl Explorer {
         });
     }
 
-    pub(super) fn render_preview(&self, width: f32) -> impl IntoElement {
+    pub(super) fn render_preview(&self, width: f32, cx: &Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
@@ -129,7 +130,18 @@ impl Explorer {
                     .child("Preview"),
             )
             .child(match self.selected_entry() {
-                Some(entry) => self.render_entry_preview(entry).into_any_element(),
+                Some(entry) => div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_entry_preview(entry).flex_1().min_w_0())
+                    .child(self.render_scrollbar(
+                        self.preview_scroll.clone(),
+                        super::Axis::Vertical,
+                        "preview-scrollbar",
+                        cx,
+                    ))
+                    .into_any_element(),
                 None => div()
                     .flex()
                     .flex_1()
@@ -142,7 +154,7 @@ impl Explorer {
             })
     }
 
-    fn render_entry_preview(&self, entry: &Entry) -> impl IntoElement {
+    fn render_entry_preview(&self, entry: &Entry) -> Stateful<Div> {
         let thumbnail = self
             .thumbnail
             .as_ref()
@@ -212,6 +224,7 @@ impl Explorer {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .track_scroll(&self.preview_scroll)
             .overflow_y_scroll()
             .px_3()
             .pb_3()

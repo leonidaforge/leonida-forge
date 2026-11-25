@@ -156,19 +156,34 @@ impl Explorer {
                     .child("Workspaces"),
             )
             .child(
-                uniform_list(
-                    "tree",
-                    rows.len(),
-                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                        range
-                            .map(|ix| this.render_tree_row(ix, &rows[ix], cx).into_any_element())
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(&self.tree_scroll)
-                .flex_1()
-                .px_1p5()
-                .pb_2(),
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        uniform_list(
+                            "tree",
+                            rows.len(),
+                            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|ix| {
+                                        this.render_tree_row(ix, &rows[ix], cx).into_any_element()
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .track_scroll(&self.tree_scroll)
+                        .flex_1()
+                        .min_w_0()
+                        .px_1p5()
+                        .pb_2(),
+                    )
+                    .child(self.render_scrollbar(
+                        self.tree_scroll.0.borrow().base_handle.clone(),
+                        super::Axis::Vertical,
+                        "tree-scrollbar",
+                        cx,
+                    )),
             )
     }
 

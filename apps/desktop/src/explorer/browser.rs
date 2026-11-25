@@ -8,7 +8,7 @@ use gpui::{
     uniform_list,
 };
 
-use super::{BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
+use super::{Axis, BROWSER_HEADER_HEIGHT, Explorer, Layout, Listing, Menu};
 use crate::files::archive::Stage;
 use crate::files::{self, Entry, EntryKind, ListingLayout, SortKey};
 use crate::settings::ViewMode;
@@ -36,9 +36,6 @@ const NEEDS_EXECUTABLE_NOTE: &str = "Selecting a compatible local game executabl
      and offset. The two are never mixed.";
 const IMAGE_ICON_COLOR: u32 = 0x7fb4ff;
 const DETAILS_NAME_MIN_WIDTH: f32 = 110.;
-const DETAILS_TYPE_WIDTH: f32 = 130.;
-const DETAILS_SIZE_WIDTH: f32 = 80.;
-const DETAILS_MODIFIED_WIDTH: f32 = 120.;
 
 fn grid_cell(mode: ViewMode) -> Option<(f32, f32)> {
     match mode {
@@ -103,7 +100,7 @@ impl Explorer {
                     .flex_1()
                     .min_h_0()
                     .on_click(cx.listener(|this, _, _, cx| this.select(None, cx)))
-                    .child(self.render_browser_content(layout, reveal, cx)),
+                    .child(self.render_browser_body(layout, reveal, cx)),
             )
     }
 
@@ -250,6 +247,41 @@ impl Explorer {
             SortKey::Modified => "Modified (oldest)",
         }
         .to_string()
+    }
+
+    /// The listing plus its scrollbar. The bar sits beside or below the
+    /// content, according to the direction that can actually scroll.
+    fn render_browser_body(
+        &self,
+        layout: &Layout,
+        reveal: Option<&Path>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let content = self.render_browser_content(layout, reveal, cx);
+        let (handle, axis) = match self.view_mode {
+            ViewMode::List => (self.list_scroll.clone(), Axis::Horizontal),
+            ViewMode::Details | ViewMode::Icons | ViewMode::SmallIcons | ViewMode::Tiles => (
+                self.browser_scroll.0.borrow().base_handle.clone(),
+                Axis::Vertical,
+            ),
+        };
+        match axis {
+            Axis::Vertical => div()
+                .flex()
+                .size_full()
+                .min_h_0()
+                .child(div().flex_1().min_w_0().min_h_0().child(content))
+                .child(self.render_scrollbar(handle, axis, "browser-scrollbar", cx))
+                .into_any_element(),
+            Axis::Horizontal => div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_h_0()
+                .child(div().flex_1().min_h_0().child(content))
+                .child(self.render_scrollbar(handle, axis, "browser-scrollbar", cx))
+                .into_any_element(),
+        }
     }
 
     fn render_browser_content(
@@ -616,10 +648,23 @@ impl Explorer {
                             .flex_1()
                             .min_w(px(DETAILS_NAME_MIN_WIDTH)),
                     )
-                    .child(header_cell(SortKey::Type, "Type").w(px(DETAILS_TYPE_WIDTH)))
-                    .child(header_cell(SortKey::Size, "Size").w(px(DETAILS_SIZE_WIDTH)))
                     .child(
-                        header_cell(SortKey::Modified, "Modified").w(px(DETAILS_MODIFIED_WIDTH)),
+                        header_cell(SortKey::Type, "Type")
+                            .relative()
+                            .w(px(self.details_widths[0]))
+                            .child(self.column_grip(0, cx)),
+                    )
+                    .child(
+                        header_cell(SortKey::Size, "Size")
+                            .relative()
+                            .w(px(self.details_widths[1]))
+                            .child(self.column_grip(1, cx)),
+                    )
+                    .child(
+                        header_cell(SortKey::Modified, "Modified")
+                            .relative()
+                            .w(px(self.details_widths[2]))
+                            .child(self.column_grip(2, cx)),
                     ),
             )
             .child(
@@ -661,20 +706,20 @@ impl Explorer {
             )
             .child(
                 cell()
-                    .w(px(DETAILS_TYPE_WIDTH))
+                    .w(px(self.details_widths[0]))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(entry.type_name.clone()),
             )
             .child(
                 cell()
-                    .w(px(DETAILS_SIZE_WIDTH))
+                    .w(px(self.details_widths[1]))
                     .flex()
                     .justify_end()
                     .child(entry.size.map(files::format_size).unwrap_or_default()),
             )
             .child(
                 cell()
-                    .w(px(DETAILS_MODIFIED_WIDTH))
+                    .w(px(self.details_widths[2]))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(
                         entry
