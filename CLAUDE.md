@@ -30,3 +30,12 @@ Write documentation for developers who need to use or maintain the software, not
 - Keep the desktop UI thread free of blocking work. Filesystem access, image decoding and rendering run on background threads.
 - Before committing, run the CI checks: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 - Commit messages follow Conventional Commits.
+
+## Development workflow
+
+Development is feature-driven.
+
+- The user defines or approves a feature. Implement it from the established format knowledge when that knowledge exists.
+- A numbered research backlog is knowledge, not a queue. Do not start a research iteration on your own.
+- When a missing fact blocks a feature, name that fact precisely and propose a focused research request for approval. Do not invent behavior to avoid the request.
+- State a capability for what it is: recognized, structurally inspected, parsed, integrity verified, decoded, reconstructed at byte level, partial, ambiguous, unsupported, malformed or not evaluated. A structural parse is not a semantic decode.

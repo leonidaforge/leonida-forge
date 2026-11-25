@@ -1,7 +1,7 @@
 # Internal Alpha readiness
 
 Scope: the Windows desktop explorer, its export workflow and the Windows x64
-package for an internal, recovery-focused Alpha. Date: 2026-11-25.
+package for an internal, recovery-focused Alpha. Date: 2026-11-26.
 
 ## Verdict
 
@@ -57,16 +57,24 @@ pushed.
   with `lforge binary inspect` and `lforge archive inspect`. Both front ends use
   the same recogniser in `lforge-core`. The RDS5 container reports its header,
   record array, ETPF chunk extent, block catalogue, block storage classes and
-  per-element descriptor values, and `binary inspect --texture` reconstructs one
-  element's bytes; an RBF0 document reports its token stream, object tree, name
-  dictionary and string and attribute value counts and lengths; a GFx
-  version-42 container reports its header, extent, frame fields and tag walk;
-  PSIN and RPF9 are recognised by signature only.
+  per-element descriptor values; `binary inspect --texture` reconstructs one
+  element's bytes and reports its components, and the Binary Inspector shows the
+  first element's chain; an RBF0 document reports its token stream, object tree,
+  name dictionary and string and attribute value counts and lengths; a GFx
+  version-42 container reports its header, extent, frame fields and tag walk; a
+  PSIN payload reports its section walk, family, descriptor or block table,
+  section table, body structure and checksum; an EDUP payload reports its entry
+  framing and opaque trailing blob; an ADAT payload reports its header, tables,
+  chunk records, packet framing, block classes, rate values and position table;
+  a KB2 container reports its header, frame index checks and audio record
+  counts. RPF9 is recognised by signature only.
   `archive inspect --enter` follows mixed ZIP/RPF9 nesting, and a row or ZIP
   entry is decoded in memory, so nothing is extracted to inspect it.
   `archive resource --drawable` walks the drawable structure of a reconstructed
-  resource: header fields, LOD slots, models, geometries, vertex-buffer layout
-  arithmetic, index ranges and the shader group.
+  resource: header fields, LOD slots, models, geometries, bounds arrays, vertex
+  buffer and declaration arithmetic, index counts and the shader group's
+  parameter hashes and slot states. `archive resource --dictionary` reads the
+  reconstructed system segment as a texture dictionary, record by record.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
@@ -88,10 +96,22 @@ pushed.
   meaning of every name, the header words and the attribute position is unknown;
   GFx tag bodies are opaque; the ETPF entry fields, the ETPF region after the
   entry table and the upper half of the RDS5 block counter are not interpreted.
-- Vertex semantics. A drawable's bounds, layout codes, index descriptor fields
-  and material parameter values are reported as stored values. No vertex
-  position, triangle, mesh or texture reference is reconstructed, and the
-  graphics base is reported only when two distinct pointers support it.
+- Semantic decoding. PSIN gives no tag, field, block or value a meaning; EDUP
+  does not scan a texture store and keeps its trailing blob opaque; ADAT names no
+  codec, decodes no audio and does not materialise packets; KB2 decodes no frame
+  and names no codec; texture dictionaries expose their records but decode no
+  pixel and resolve no texture reference.
+- Vertex semantics. A drawable's bounds, layout codes, declaration bytes, index
+  descriptor fields and material parameter values are reported as stored values.
+  No vertex position, triangle, mesh or texture reference is reconstructed, and
+  the graphics base is reported only when two distinct pointers support it.
+  The 58 header-union exceptions observed in the research remain unexplained; a
+  difference there is reported and does not invalidate the drawable.
+- Resource-level inspection in the desktop. The Binary Inspector covers the
+  payload formats by content, but the explorer has no resource viewer that
+  reconstructs a resource's two segments, so dictionary, drawable and RDS5
+  element inspection stay on the CLI. The blocker is the missing segment-aware
+  resource view, not the parsers, which are shared.
 - Virtual folder grouping from resolved native paths. The native list is flat;
   path-like candidate names are display data and do not become directories.
 - Payload transforms and compression modes beyond stored, raw DEFLATE and
@@ -148,7 +168,7 @@ Automated, run for this package:
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: pass.
-- `cargo test --workspace --locked`: 338 tests pass across the binary, core,
+- `cargo test --workspace --locked`: 835 tests pass across the binary, core,
   rage9, renderer, CLI and desktop crates, including unit, integration and doc
   tests.
 - `cargo build --workspace --locked`: pass.
@@ -328,7 +348,16 @@ C++ Redistributable installed.
     on an RPF9 archive.
 15. Run `lforge.exe archive recover <archive> --list`, then export one
     candidate. Confirm overwrite protection and the unverified-bytes note.
-16. Check that `%APPDATA%\Leonida Forge` holds settings and the archive index,
+16. Inspect a PSIN, EDUP, ADAT and KB2 payload with `lforge.exe binary inspect`
+    and in the Binary Inspector. Confirm each report names its family or
+    variant, and that no codec, pixel, frame or field meaning is claimed.
+17. On a resource whose system segment is a texture dictionary, run
+    `lforge.exe archive resource <archive> <id> --dictionary` and
+    `--dictionary --record 0`. Confirm the records, extents and name checks.
+18. On a drawable resource, run `lforge.exe archive resource <archive> <id>
+--drawable`. Confirm the bounds, index counts, declaration entries and
+    material slot states, and that no vertex position or triangle is produced.
+19. Check that `%APPDATA%\Leonida Forge` holds settings and the archive index,
     and that no game file changed.
 
 Record which steps ran, the Windows build, the GPU and any archive samples used.
@@ -337,6 +366,19 @@ Do not put game files in the package or the repository.
 ## Remaining blockers
 
 For the internal Alpha, none. The package is ready to hand to testers.
+
+Capabilities awaiting real-data acceptance, because this build's checks used
+synthetic fixtures only:
+
+- The corrected raw-continuation resource reconstruction, and the archive
+  information path across the affected resources.
+- Texture dictionary recognition and record parsing on the sampled population.
+- The extended drawable walk on the two documented samples.
+- PSIN `LSCH` and `PMAP` payloads, EDUP tables, ADAT variants and KB2 rows.
+
+Semantic decoding is blocked on research, not on application work: texture pixel
+format, texture-reference selection among equal hashes, mesh and material
+rendering, and audio and video decoding. None of these is scheduled.
 
 Still required before a public prerelease:
 
