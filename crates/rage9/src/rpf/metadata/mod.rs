@@ -1101,6 +1101,28 @@ impl Metadata {
         Ok(self.field(row, keys::PAYLOAD_TRANSFORM)?.is_some())
     }
 
+    /// The payload-transform descriptor of `row`: the value of the
+    /// [`keys::PAYLOAD_TRANSFORM`] field, which the engine hands to its cipher
+    /// initializer as `u32` key identifier, `u16` cipher type and 16-byte
+    /// parameter. `None` if the row has no such field.
+    ///
+    /// The descriptor's key identifier and type select a key state and an
+    /// algorithm through the engine's registry. The block operation of that
+    /// algorithm is not implemented here, so a caller MUST NOT use this to
+    /// decode a payload.
+    pub fn payload_cipher(&self, row: u32) -> Result<Option<CipherDescriptor>, Error> {
+        let Some(value) = self.field(row, keys::PAYLOAD_TRANSFORM)? else {
+            return Ok(None);
+        };
+        CipherDescriptor::parse(value).map(Some).ok_or_else(|| {
+            invalid(format!(
+                "the payload transform descriptor of row {row} is {} bytes, shorter than {}",
+                value.len(),
+                CipherDescriptor::LEN
+            ))
+        })
+    }
+
     /// The alternate source the entry's stored bytes are read through. `None`
     /// for the main source: the column is absent, the cell is null or the
     /// value is `0xFFFFFFFF`.

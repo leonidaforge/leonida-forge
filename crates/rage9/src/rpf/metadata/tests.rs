@@ -539,6 +539,65 @@ fn reports_the_payload_transform_flag() {
     assert!(!metadata.payload_transform(1).unwrap());
 }
 
+/// A descriptor shaped like the engine's: key identifier, cipher type and
+/// 16-byte parameter, followed by stream fields that the reader ignores.
+fn transform_value(key_id: u32, kind: u16, parameter: [u8; 16]) -> Vec<u8> {
+    let mut value = vec![0u8; 64];
+    value[0..4].copy_from_slice(&key_id.to_le_bytes());
+    value[4..6].copy_from_slice(&kind.to_le_bytes());
+    value[6..22].copy_from_slice(&parameter);
+    value[0x38..0x3c].copy_from_slice(&4u32.to_le_bytes());
+    value
+}
+
+#[test]
+fn reads_the_payload_transform_descriptor() {
+    use crate::rpf::metadata::transform::{Algorithm, CipherDescriptor};
+
+    let parameter = [
+        0x75, 0x83, 0x2e, 0x88, 0xa4, 0x56, 0x13, 0x33, 0x67, 0xe5, 0x89, 0xc6, 0x0a, 0x10, 0x83,
+        0xb8,
+    ];
+    let value = transform_value(0x1000_0029, 0x11, parameter);
+    let columns = [
+        Column::new(keys::PAYLOAD_TRANSFORM, 64, &[&value], &[Some(0), None]),
+        Column::new(KEY_X, 1, &[&[0]], &[Some(0), Some(0)]),
+    ];
+    let metadata = Build::default().metadata(&columns);
+
+    let cipher = metadata.payload_cipher(0).unwrap().unwrap();
+    assert_eq!(
+        cipher,
+        CipherDescriptor {
+            key_id: 0x1000_0029,
+            kind: 0x11,
+            parameter,
+        }
+    );
+    // Type 0x11 selects algorithm 0x11, whose block operation is not
+    // implemented, so readers must keep refusing transformed payloads.
+    assert_eq!(Algorithm::of(cipher.kind).unwrap().id(), 0x11);
+    assert!(metadata.payload_cipher(1).unwrap().is_none());
+    // The flag accessor keeps reporting presence alone.
+    assert!(metadata.payload_transform(0).unwrap());
+    assert!(!metadata.payload_transform(1).unwrap());
+}
+
+#[test]
+fn rejects_a_short_payload_transform_descriptor() {
+    let columns = [Column::new(
+        keys::PAYLOAD_TRANSFORM,
+        8,
+        &[&[0u8; 8]],
+        &[Some(0)],
+    )];
+    let metadata = Build::default().metadata(&columns);
+    let reason = invalid_reason(metadata.payload_cipher(0));
+    assert!(reason.contains("shorter than 22"), "{reason}");
+    // Presence alone still holds, so the transform flag is unaffected.
+    assert!(metadata.payload_transform(0).unwrap());
+}
+
 fn header_with(edit: impl FnOnce(&mut Vec<u8>)) -> Result<Metadata, Error> {
     let columns = [Column::new(KEY_X, 4, &[&[1, 2, 3, 4]], &[Some(0)])];
     let mut bytes = Build::default().build(&columns);
@@ -2806,10 +2865,17 @@ mod companions {
 
 #[cfg(test)]
 mod real_payload_transform_probe {
-    //! Local, opt-in diagnostic: tries the archive descriptor as the key state
-    //! of the payload transform. It reads one real archive and never writes
-    //! game data. Enable with `LEONIDA_FORGE_EXECUTABLE` and
-    //! `LEONIDA_FORGE_ARCHIVE`.
+    //! Local, opt-in diagnostics for the payload transform. They read one real
+    //! archive and never write game data. Enable with
+    //! `LEONIDA_FORGE_EXECUTABLE` and `LEONIDA_FORGE_ARCHIVE`.
+    //!
+    //! [`payload_transform_key_state_probe`] is the Phase 11 baseline: it feeds
+    //! the archive and static descriptors to the algorithm-`0x10` block. Its
+    //! failure is expected, because the transform descriptor is the value of
+    //! the entry's transform field, not the archive descriptor.
+    //!
+    //! [`payload_transform_descriptor_probe`] reports the descriptor the engine
+    //! actually uses and stops before any transformation.
 
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
@@ -2845,6 +2911,78 @@ mod real_payload_transform_probe {
         for (b, i) in block.iter_mut().zip(iv) {
             *b ^= i;
         }
+    }
+
+    #[test]
+    #[ignore = "needs LEONIDA_FORGE_EXECUTABLE and LEONIDA_FORGE_ARCHIVE"]
+    fn payload_transform_descriptor_probe() {
+        use crate::rpf::metadata::transform::Algorithm;
+
+        let (Ok(exe), Ok(archive)) = (
+            std::env::var("LEONIDA_FORGE_EXECUTABLE"),
+            std::env::var("LEONIDA_FORGE_ARCHIVE"),
+        ) else {
+            return;
+        };
+        let limit = std::env::var("LEONIDA_FORGE_PROBE_ROWS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15usize);
+        let view = ExecutableView::open(std::path::Path::new(&exe)).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut file = File::open(&archive).unwrap();
+        let report = verify::open_authenticated(&mut file, &view, &cancel).unwrap();
+        let md = report.authenticated.unwrap();
+        let meta = md.metadata();
+
+        // Stage accounting for the engine's pipeline. No key state is read and
+        // no byte is transformed here.
+        let mut examined = 0usize;
+        let mut descriptors = 0usize;
+        let mut malformed = 0usize;
+        let mut kinds = std::collections::BTreeMap::new();
+        let mut key_ids = std::collections::BTreeSet::new();
+        let mut algorithms = std::collections::BTreeMap::new();
+        let mut chunked = 0usize;
+        for entry in meta.entries() {
+            if entry.payload_transform != Ok(true) {
+                continue;
+            }
+            if examined == limit {
+                break;
+            }
+            examined += 1;
+            let cipher = match &entry.payload_cipher {
+                Ok(Some(cipher)) => cipher,
+                Ok(None) => continue,
+                Err(_) => {
+                    malformed += 1;
+                    continue;
+                }
+            };
+            descriptors += 1;
+            *kinds.entry(cipher.kind).or_insert(0usize) += 1;
+            key_ids.insert(cipher.key_id);
+            let algorithm = Algorithm::of(cipher.kind)
+                .map(|a| a.id())
+                .unwrap_or(u8::MAX);
+            *algorithms.entry(algorithm).or_insert(0usize) += 1;
+            if matches!(&entry.chunks, Ok(Some(_))) {
+                chunked += 1;
+            }
+        }
+        println!(
+            "transformed rows examined: {examined}, descriptors: {descriptors}, \
+             malformed: {malformed}, chunked: {chunked}"
+        );
+        println!("cipher types: {kinds:?}");
+        println!("algorithm identifiers: {algorithms:?}");
+        println!("distinct key identifiers: {}", key_ids.len());
+        println!(
+            "earliest failure stage: cipher initialization not implemented \
+             (the algorithm-0x11 keystream block is not reproduced); \
+             no byte was transformed and no payload was decoded"
+        );
     }
 
     #[test]

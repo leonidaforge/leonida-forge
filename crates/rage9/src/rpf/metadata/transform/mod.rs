@@ -63,13 +63,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A cipher descriptor, from the executable or from `B` sub-block 1.
+/// A cipher descriptor, from the executable, from `B` sub-block 1, or from an
+/// entry's payload-transform field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CipherDescriptor {
     pub key_id: u32,
     /// The cipher type.
     pub kind: u16,
-    /// For algorithm 0x10, the initial IV.
+    /// For algorithm 0x10, the initial IV. For algorithm 0x11, the base the
+    /// counter starts from; that algorithm's block operation is not
+    /// implemented here.
     pub parameter: Block,
 }
 

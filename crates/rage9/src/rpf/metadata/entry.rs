@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use lforge_binary::Source;
 
+use super::transform::CipherDescriptor;
 use super::{ChunkTable, Error, Location, Metadata, Payload, invalid};
 
 /// A field of a row: `Ok(None)` if the row has no value for it, `Err` with
@@ -22,6 +23,9 @@ pub struct Entry {
     pub name_key: Field<u32>,
     pub chunks: Field<ChunkTable>,
     pub payload_transform: Result<bool, String>,
+    /// The descriptor the payload transform initializes its cipher with, when
+    /// the row carries one.
+    pub payload_cipher: Field<CipherDescriptor>,
     /// The alternate source the payload is read through. `None` for the main
     /// source.
     pub read_source: Field<u32>,
@@ -43,6 +47,7 @@ impl Entry {
             name_key: metadata.name_key(row).map_err(reason),
             chunks: metadata.chunk_table(row).map_err(reason),
             payload_transform: metadata.payload_transform(row).map_err(reason),
+            payload_cipher: metadata.payload_cipher(row).map_err(reason),
             read_source: metadata.read_source(row).map_err(reason),
         }
     }
