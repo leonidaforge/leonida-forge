@@ -1,7 +1,8 @@
 //! `lforge archive metadata`: the RPF9 table of contents as stored, and its
 //! entries where it can be read without decryption.
 
-use std::io::{self, BufWriter, Write};
+use std::fs;
+use std::io::{self, BufWriter, Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +13,7 @@ use lforge_rage9::rpf::metadata::{
     CompanionStatus, Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, CandidateOutcome, Class, MountPrefix, Namespace, Provenance, Resolver, RowNames,
+    self, CandidateOutcome, Class, Lut, MountPrefix, Namespace, Provenance, Resolver, RowNames,
     StringTable, Types,
 };
 use serde_json::{Value, json};
@@ -25,7 +26,7 @@ const MAX_METADATA: u64 = 256 * 1024 * 1024;
 pub struct Options {
     pub entries: bool,
     pub limit: usize,
-    pub candidates: Option<PathBuf>,
+    pub candidates: Vec<PathBuf>,
     pub archive_path: Option<String>,
     pub mount_prefix: Option<String>,
     pub extensions: Vec<Extension>,
@@ -67,38 +68,82 @@ pub fn parse_extension(text: &str) -> Result<Extension, String> {
 
 /// The local name table and the address rules it is applied under.
 struct Naming {
-    path: PathBuf,
+    sources: Vec<NameSource>,
     sidecar: bool,
     table: StringTable,
     prefix: MountPrefix,
     types: Types,
 }
 
+struct NameSource {
+    path: PathBuf,
+    kind: &'static str,
+    namespace: Option<&'static str>,
+    entries: usize,
+    verified: usize,
+    added: usize,
+}
+
 impl Naming {
     fn read(options: &Options, archive: &Path) -> Result<Option<Self>, String> {
-        let (path, sidecar) = match &options.candidates {
-            Some(path) => (path.clone(), false),
-            None => {
-                let path = sidecar_path(archive);
-                if path.is_file() {
-                    (path, true)
-                } else {
-                    let addressing = options.archive_path.is_some()
-                        || options.mount_prefix.is_some()
-                        || !options.extensions.is_empty();
-                    if addressing {
-                        return Err(format!(
-                            "--archive-path, --mount-prefix and --extension need a name table; \
-                             pass --name-file or place one at {}",
-                            path.display()
-                        ));
-                    }
-                    return Ok(None);
+        let (paths, sidecar) = if options.candidates.is_empty() {
+            let path = sidecar_path(archive);
+            if path.is_file() {
+                (vec![path], true)
+            } else {
+                let addressing = options.archive_path.is_some()
+                    || options.mount_prefix.is_some()
+                    || !options.extensions.is_empty();
+                if addressing {
+                    return Err(format!(
+                        "--archive-path, --mount-prefix and --extension need a name table; \
+                         pass --name-file or place one at {}",
+                        path.display()
+                    ));
                 }
+                return Ok(None);
             }
+        } else {
+            (options.candidates.clone(), false)
         };
-        let table = StringTable::read(&path)
-            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        let mut table = StringTable::default();
+        let mut sources = Vec::new();
+        for path in paths {
+            let (bytes, truncated) = read_bounded(&path)?;
+            if is_lut(&bytes) {
+                if truncated {
+                    return Err(format!(
+                        "{} is larger than the LUT size limit",
+                        path.display()
+                    ));
+                }
+                let lut = Lut::parse(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+                let entries = lut.entries().len();
+                let verified = lut.verified();
+                let namespace = Some(lut.namespace().namespace());
+                let added = table.merge_lut(&lut);
+                sources.push(NameSource {
+                    path,
+                    kind: "lut",
+                    namespace,
+                    entries,
+                    verified,
+                    added,
+                });
+            } else {
+                let part = StringTable::parse(&bytes, truncated);
+                let entries = part.entries().len();
+                let added = table.merge(part);
+                sources.push(NameSource {
+                    path,
+                    kind: "names_txt",
+                    namespace: None,
+                    entries,
+                    verified: 0,
+                    added,
+                });
+            }
+        }
         let prefix = match (&options.mount_prefix, &options.archive_path) {
             (Some(mount), _) => MountPrefix::mounted(mount.as_bytes()).ok_or_else(|| {
                 format!(
@@ -118,13 +163,32 @@ impl Naming {
             }
         }
         Ok(Some(Self {
-            path,
+            sources,
             sidecar,
             table,
             prefix,
             types,
         }))
     }
+}
+
+fn read_bounded(path: &Path) -> Result<(Vec<u8>, bool), String> {
+    let limit = names::table::MAX_BYTES.max(names::lut::MAX_BYTES);
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let truncated = bytes.len() as u64 > limit;
+    if truncated {
+        bytes.truncate(limit as usize);
+    }
+    Ok((bytes, truncated))
+}
+
+fn is_lut(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let text = String::from_utf8_lossy(bytes);
+    text.trim_start().starts_with("# leonida-forge-lut:")
 }
 
 fn sidecar_path(archive: &Path) -> PathBuf {
@@ -545,7 +609,19 @@ fn entries_json(
             .filter(|row| !row.resolution.names().is_empty())
             .count();
         value["names"] = json!({
-            "source": naming.path.to_string_lossy(),
+            "source": naming.sources.first().map(|source| source.path.to_string_lossy().into_owned()).unwrap_or_default(),
+            "sources": naming
+                .sources
+                .iter()
+                .map(|source| json!({
+                    "path": source.path.to_string_lossy(),
+                    "kind": source.kind,
+                    "namespace": source.namespace,
+                    "entries": source.entries,
+                    "verified": source.verified,
+                    "added": source.added,
+                }))
+                .collect::<Vec<_>>(),
             "sidecar": naming.sidecar,
             "entries": naming.table.entries().len(),
             "candidates": naming.table.candidates(),

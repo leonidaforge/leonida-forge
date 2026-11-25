@@ -69,11 +69,11 @@ pub enum Command {
         /// List at most this many entries
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        /// A local name table: candidate paths, or `hash64:HASH<TAB>name` and
-        /// `key32:HASH<TAB>name` mappings. Defaults to `<archive>.names.txt`
-        /// next to the archive when that file exists
+        /// A local name table: candidate paths, `hash64:HASH<TAB>name` and
+        /// `key32:HASH<TAB>name` mappings, or a `.lut` file. Repeatable.
+        /// Defaults to `<archive>.names.txt` next to the archive when it exists
         #[arg(long = "name-file", visible_alias = "candidates")]
-        candidates: Option<PathBuf>,
+        candidates: Vec<PathBuf>,
         /// The archive's own path, whose directory is the mount prefix
         #[arg(long, conflicts_with = "mount_prefix", requires = "candidates")]
         archive_path: Option<String>,

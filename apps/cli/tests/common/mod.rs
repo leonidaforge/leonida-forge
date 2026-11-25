@@ -149,6 +149,9 @@ pub struct Spec {
     pub source: Option<u32>,
     pub has_location: bool,
     pub shift: u32,
+    pub type_id: u8,
+    pub hash: Option<u64>,
+    pub key: Option<u32>,
 }
 
 pub fn spec(payload: &[u8]) -> Spec {
@@ -161,14 +164,17 @@ pub fn spec(payload: &[u8]) -> Spec {
         source: None,
         has_location: true,
         shift: 0,
+        type_id: 0,
+        hash: None,
+        key: None,
     }
 }
 
-fn record_a(stored16: u32, offset16: u32, logical: u64, mode: u8) -> Vec<u8> {
+fn record_a(stored16: u32, offset16: u32, logical: u64, mode: u8, type_id: u8) -> Vec<u8> {
     let mut value = Vec::new();
     value.extend_from_slice(&stored16.to_le_bytes());
     value.extend_from_slice(&offset16.to_le_bytes());
-    let packed = logical | (u64::from(mode) << 56);
+    let packed = logical | (u64::from(type_id) << 48) | (u64::from(mode) << 56);
     value.extend_from_slice(&packed.to_le_bytes());
     value
 }
@@ -202,7 +208,7 @@ pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
         let logical = spec.logical.unwrap_or(spec.payload.len() as u64);
         locations.push(
             spec.has_location
-                .then(|| record_a(stored16, offset16, logical, spec.mode)),
+                .then(|| record_a(stored16, offset16, logical, spec.mode, spec.type_id)),
         );
         data.extend_from_slice(&spec.payload);
         data.resize(data.len().next_multiple_of(16), 0);
@@ -213,7 +219,7 @@ pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
         .max()
         .unwrap_or(8)
         .max(8);
-    let columns = vec![
+    let mut columns = vec![
         column(keys::LOCATION_A, 16, locations),
         column(
             keys::CHUNK_TABLE,
@@ -245,6 +251,26 @@ pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
                 .collect(),
         ),
     ];
+    if specs.iter().any(|spec| spec.hash.is_some()) {
+        columns.push(column(
+            keys::NAME_HASH,
+            8,
+            specs
+                .iter()
+                .map(|spec| spec.hash.map(|hash| hash.to_le_bytes().to_vec()))
+                .collect(),
+        ));
+    }
+    if specs.iter().any(|spec| spec.key.is_some()) {
+        columns.push(column(
+            keys::NAME_KEY,
+            4,
+            specs
+                .iter()
+                .map(|spec| spec.key.map(|key| key.to_le_bytes().to_vec()))
+                .collect(),
+        ));
+    }
     let b_len = if companions.is_empty() { 0x150 } else { 0x600 };
     let mut bytes = Build {
         b_len,

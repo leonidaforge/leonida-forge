@@ -58,6 +58,20 @@ pub struct Opened {
 /// oversized metadata is rejected. `limit` caps the metadata area read into
 /// memory.
 pub fn open_metadata(path: &Path, limit: u64, executable: Option<&Path>) -> Result<Opened, String> {
+    open_metadata_cancellable(path, limit, executable, &AtomicBool::new(false))
+}
+
+/// [`open_metadata`] with a cancellation flag. Cancellation is checked before
+/// expensive reads and passed to the authentication path.
+pub fn open_metadata_cancellable(
+    path: &Path,
+    limit: u64,
+    executable: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<Opened, String> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -86,7 +100,7 @@ pub fn open_metadata(path: &Path, limit: u64, executable: Option<&Path>) -> Resu
     };
     let view = ExecutableView::open(executable)
         .map_err(|err| format!("cannot open {}: {err}", executable.display()))?;
-    let open: OpenReport = open_authenticated(&mut source.clone(), &view, &AtomicBool::new(false))
+    let open: OpenReport = open_authenticated(&mut source.clone(), &view, cancel)
         .map_err(|err| format!("{}: {err}", path.display()))?;
     let report = open.report;
     let Some(authenticated) = open.authenticated else {

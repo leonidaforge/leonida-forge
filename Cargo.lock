@@ -2593,6 +2593,7 @@ dependencies = [
  "lforge-binary",
  "lforge-core",
  "lforge-rage9",
+ "serde",
  "serde_json",
  "tempfile",
 ]

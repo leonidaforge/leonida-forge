@@ -2,6 +2,7 @@ mod archive;
 mod binary;
 mod extract;
 mod metadata;
+mod names;
 mod native;
 mod output;
 mod probe;
@@ -38,6 +39,9 @@ enum Command {
     /// List what can be recovered from RPF9 archives, without modifying them
     #[command(subcommand)]
     Archive(archive::Command),
+    /// Index native name hashes, harvest candidate names and export LUT files
+    #[command(subcommand)]
+    Names(names::Command),
 }
 
 fn main() -> ExitCode {
@@ -46,6 +50,7 @@ fn main() -> ExitCode {
         Command::Info { json } => info(json),
         Command::Binary(command) => report(binary::run(command)),
         Command::Archive(command) => report(archive::run(command)),
+        Command::Names(command) => report(names::run(command)),
     }
 }
 
