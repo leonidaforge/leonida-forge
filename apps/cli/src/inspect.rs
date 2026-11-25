@@ -6,30 +6,32 @@
 //! meaning is unknown is reported as the number it stores, and an unknown
 //! region is reported as a range, never as a guess. No payload bytes are
 //! printed: block payloads stay behind [`lforge_rage9::rds5::decode_block`].
+//!
+//! `archive inspect` reads the decoded logical payload of a native row or ZIP
+//! entry, at any nesting level reached with `--enter`. `--raw` selects the
+//! bytes as they are stored instead, and fails explicitly when a transform or
+//! codec is not supported. The document separates the two.
 
-use std::io::{Read, Seek};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
-use lforge_rage9::rbf0;
-use lforge_rage9::rds5::{self, Container, Storage};
+use lforge_core::archive::Format;
+use lforge_core::inspect as recognition;
+use lforge_rage9::rpf::metadata::{Entry, Payload};
 use serde_json::{Map, Value, json};
+use zip::ZipArchive;
 
 use crate::native::{self, Alternates};
+use crate::nested::{self, Selector};
 
 /// The schema of an inspection document.
-pub const SCHEMA: &str = "leonida-forge.format-inspection/1";
-/// Bytes read to recognise a format.
-const SIGNATURE_LEN: usize = 16;
+pub const SCHEMA: &str = recognition::SCHEMA;
 /// As in `archive metadata`.
 const MAX_METADATA: u64 = 256 * 1024 * 1024;
-/// Block failures listed by `--verify`; the count is always complete.
-const MAX_FAILURES: usize = 20;
 /// Blocks and entries shown by default.
-pub const DEFAULT_SAMPLE: usize = 8;
-/// The largest sample the command accepts.
-pub const MAX_SAMPLE: usize = 256;
+pub const DEFAULT_SAMPLE: usize = recognition::DEFAULT_SAMPLE;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -42,31 +44,29 @@ pub struct Options {
     pub json: bool,
 }
 
-/// Where the inspected bytes came from.
-enum Origin<'a> {
-    File(&'a Path),
-    Row {
-        archive: &'a Path,
-        row: u32,
-        executable: Option<&'a Path>,
-    },
-}
-
-impl Origin<'_> {
-    fn json(&self) -> Value {
-        match self {
-            Origin::File(path) => json!({ "file": path_string(path) }),
-            Origin::Row {
-                archive,
-                row,
-                executable,
-            } => json!({
-                "archive": path_string(archive),
-                "row": row,
-                "executable": executable.map(path_string),
-            }),
+impl Options {
+    fn recognition(&self) -> recognition::Options {
+        recognition::Options {
+            sample: self.sample,
+            blocks: self.blocks,
+            verify: self.verify,
         }
     }
+}
+
+/// The final entry to inspect in the last archive of a chain.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Selection {
+    pub row: Option<u32>,
+    pub zip: Option<usize>,
+    /// Inspect the bytes as stored instead of the decoded payload.
+    pub raw: bool,
+}
+
+/// Where the inspected bytes came from, as the document reports it.
+struct Context {
+    source: Value,
+    provenance: Value,
 }
 
 fn path_string(path: &Path) -> String {
@@ -76,489 +76,478 @@ fn path_string(path: &Path) -> String {
         .into_owned()
 }
 
+fn file_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// Inspects a file on disk.
 pub fn file(path: &Path, options: &Options) -> Result<(), String> {
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     let len = source.len();
-    inspect(&mut source, len, Origin::File(path), options)
+    let provenance = json!({
+        "depth": 0,
+        "root": {
+            "kind": "file",
+            "name": file_name(path),
+            "format": Value::Null,
+            "format_id": Value::Null,
+        },
+        "chain": [],
+        "selection": { "kind": "none" },
+        "representation": {
+            "kind": "file",
+            "decoded": true,
+            "note": "the bytes of a file on disk; nothing was decoded",
+        },
+    });
+    let context = Context {
+        source: json!({ "file": path_string(path) }),
+        provenance,
+    };
+    emit(&mut source, len, context, options)
 }
 
-pub fn row(
+/// Inspects a native row or ZIP entry of an archive, after descending through
+/// `enters`.
+pub fn archive(
     file: &Path,
-    row: u32,
     executable: Option<&Path>,
+    enters: &[Selector],
+    selection: &Selection,
     options: &Options,
 ) -> Result<(), String> {
-    let opened = native::open_metadata(file, MAX_METADATA, executable)?;
+    if selection.row.is_some() && selection.zip.is_some() {
+        return Err("--row and --zip select different entries; give one".to_string());
+    }
+    let cancel = AtomicBool::new(false);
+    let resolved = nested::resolve(file, executable, enters, &cancel)?;
+    // `archive inspect FILE` without any selection keeps reading row 0, as it
+    // always has. With `--enter`, a missing selection inspects the entered
+    // archive itself.
+    let legacy_row = enters.is_empty() && selection.row.is_none() && selection.zip.is_none();
+    let row = selection.row.or(legacy_row.then_some(0));
+    let source = json!({
+        "archive": path_string(file),
+        "row": row,
+        "zip": selection.zip,
+        "executable": executable.map(path_string),
+        "entered": enters.iter().map(Selector::label).collect::<Vec<_>>(),
+    });
+    let representation = |kind: &'static str, decoded: bool, note: &str, error: Option<String>| {
+        let mut value = json!({ "kind": kind, "decoded": decoded, "note": note });
+        if let Some(error) = error {
+            value["error"] = json!(error);
+        }
+        value
+    };
+
+    match (selection.zip, row) {
+        (None, None) => {
+            // No final selection: inspect the last archive file itself.
+            let mut source_file = Source::open(&resolved.path)
+                .map_err(|err| format!("cannot open the nested archive: {err}"))?;
+            let len = source_file.len();
+            let representation = representation(
+                "file",
+                true,
+                "the bytes of the nested archive itself; its rows need --row",
+                None,
+            );
+            let provenance = resolved.provenance_json(json!({ "kind": "none" }), representation);
+            emit(
+                &mut source_file,
+                len,
+                Context { source, provenance },
+                options,
+            )
+        }
+        (None, Some(row)) => {
+            if resolved.format != Format::Rpf9 {
+                return Err(format!(
+                    "the last archive is {}; --row selects an RPF9 row, use --zip for a ZIP entry",
+                    resolved.format
+                ));
+            }
+            inspect_row(
+                &resolved,
+                row,
+                executable,
+                selection.raw,
+                source,
+                representation,
+                options,
+            )
+        }
+        (Some(index), None) => {
+            if resolved.format != Format::Zip {
+                return Err(format!(
+                    "the last archive is {}; --zip selects a ZIP entry, use --row for an RPF9 row",
+                    resolved.format
+                ));
+            }
+            inspect_zip(
+                &resolved,
+                index,
+                selection.raw,
+                source,
+                representation,
+                options,
+            )
+        }
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    }
+}
+
+fn inspect_row(
+    resolved: &nested::Resolved,
+    row: u32,
+    executable: Option<&Path>,
+    raw: bool,
+    source: Value,
+    representation: impl Fn(&'static str, bool, &str, Option<String>) -> Value,
+    options: &Options,
+) -> Result<(), String> {
+    let opened = native::open_metadata(&resolved.path, MAX_METADATA, executable)?;
     let rows = opened.metadata.rows();
     if row >= rows {
         return Err(match rows {
-            0 => format!("the table of contents of {} has no rows", file.display()),
+            0 => "the nested archive has no rows".to_string(),
             1 => format!("row {row} is out of range: the only row is 0"),
             _ => format!("row {row} is out of range: the rows are 0 to {}", rows - 1),
         });
     }
     let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
-    let alternates = Alternates::resolve(file, &opened.metadata);
-    let mut payload = entry
-        .payload(&opened.source, alternates.sources())
-        .map_err(|err| format!("row {row} cannot be read: {err}"))?;
-    let len = payload.len();
-    let origin = Origin::Row {
-        archive: file,
-        row,
-        executable,
-    };
-    inspect(&mut payload, len, origin, options)
+    let alternates = Alternates::resolve(&resolved.path, &opened.metadata);
+    let selection = json!({ "kind": "row", "index": row, "raw": raw });
+
+    if raw {
+        return match stored_bytes(&entry, &opened.source, &alternates) {
+            Ok(mut stored) => {
+                let len = stored.source.len();
+                let provenance = resolved.provenance_json(
+                    selection,
+                    representation("stored", false, stored.note, None),
+                );
+                emit(
+                    &mut stored.source,
+                    len,
+                    Context { source, provenance },
+                    options,
+                )
+            }
+            Err(err) => {
+                let note = "the stored bytes of the row cannot be read";
+                let provenance = resolved.provenance_json(
+                    selection,
+                    representation("stored", false, note, Some(err.clone())),
+                );
+                emit_failure(source, provenance, "decoding", err, options)
+            }
+        };
+    }
+
+    match entry.payload(&opened.source, alternates.sources()) {
+        Ok(payload) => {
+            let len = payload.len();
+            let note = "decoded through the existing RPF9 row decoder";
+            let provenance =
+                resolved.provenance_json(selection, representation("logical", true, note, None));
+            emit_payload(payload, len, Context { source, provenance }, options)
+        }
+        Err(err) => {
+            let note = "the row cannot be decoded by this build";
+            let provenance = resolved.provenance_json(
+                selection,
+                representation("logical", false, note, Some(err.to_string())),
+            );
+            emit_failure(source, provenance, "decoding", err.to_string(), options)
+        }
+    }
 }
 
-fn inspect<R: Read + Seek>(
-    source: &mut R,
-    len: u64,
-    origin: Origin<'_>,
+/// The bytes of a row as they are stored, including a compressed, chunked or
+/// transformed representation. A row stored as it is gives its contents.
+struct StoredSource {
+    source: Source,
+    /// How the bytes relate to the row's contents.
+    note: &'static str,
+}
+
+fn stored_bytes(
+    entry: &Entry,
+    main: &Source,
+    alternates: &Alternates,
+) -> Result<StoredSource, String> {
+    let location = match &entry.location {
+        Ok(Some(location)) => *location,
+        Ok(None) => return Err(format!("row {} has no location record", entry.row)),
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed location record: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let chunked = match &entry.chunks {
+        Ok(chunks) => chunks.is_some(),
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed chunk table: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let transformed = match &entry.payload_transform {
+        Ok(flag) => *flag,
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed payload transform flag: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let source = match &entry.read_source {
+        Ok(None) => main,
+        Ok(Some(index)) => usize::try_from(*index)
+            .ok()
+            .and_then(|index| alternates.sources().get(index)?.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "row {} reads through alternate source {index}, which is not available",
+                    entry.row
+                )
+            })?,
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed read source: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let plain = location.mode == 0 && !chunked && !transformed;
+    let len = if plain {
+        location.logical_len
+    } else {
+        location.stored_len
+    };
+    let end = location
+        .payload_offset
+        .checked_add(len)
+        .ok_or_else(|| format!("the stored range of row {} overflows", entry.row))?;
+    if end > source.len() {
+        return Err(format!(
+            "row {} ends at {end:#x}, after the end of the archive ({:#x})",
+            entry.row,
+            source.len()
+        ));
+    }
+    let source = source.slice(location.payload_offset, len).map_err(|err| {
+        format!(
+            "the stored range of row {} cannot be read: {err}",
+            entry.row
+        )
+    })?;
+    let note = if plain {
+        "the bytes as stored, which are the row's contents"
+    } else if transformed {
+        "the stored representation before the unsupported payload transform; it may include alignment padding"
+    } else {
+        "the stored representation before decoding; it may include alignment padding"
+    };
+    Ok(StoredSource { source, note })
+}
+
+fn inspect_zip(
+    resolved: &nested::Resolved,
+    index: usize,
+    raw: bool,
+    source: Value,
+    representation: impl Fn(&'static str, bool, &str, Option<String>) -> Value,
     options: &Options,
 ) -> Result<(), String> {
-    let head = lforge_binary::read_at(source, 0, SIGNATURE_LEN)
-        .map_err(|err| format!("cannot read the signature: {err}"))?;
-    let (format, structure, failure) = if rds5::is_rds5(&head) {
-        rds5_structure(source, len, options)
-    } else if rbf0::is_rbf0(&head) {
-        rbf0_structure(&head)
-    } else if head.starts_with(b"PSIN") {
-        psin_structure()
-    } else if lforge_rage9::rpf::is_rpf9(&head) {
-        nested_archive_structure()
-    } else {
-        (None, Value::Null, None)
-    };
+    let archive = Source::open(&resolved.path)
+        .map_err(|err| format!("cannot open the nested archive: {err}"))?;
+    let mut zip = ZipArchive::new(BufReader::new(archive))
+        .map_err(|err| format!("cannot read the ZIP archive: {err}"))?;
+    if index >= zip.len() {
+        return Err(format!(
+            "ZIP entry {index} is out of range: the entries are 0 to {}",
+            zip.len().saturating_sub(1)
+        ));
+    }
+    let selection = json!({ "kind": "zip", "index": index, "raw": raw });
 
+    if raw {
+        let file = zip
+            .by_index_raw(index)
+            .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
+        if file.is_dir() {
+            return Err(format!("ZIP entry {index} is a directory, not a file"));
+        }
+        if file.encrypted() {
+            return Err(format!(
+                "ZIP entry {index} is encrypted; its stored bytes cannot be read"
+            ));
+        }
+        let Some(start) = file.data_start() else {
+            return Err(format!(
+                "ZIP entry {index} has no stored range; it cannot be read as stored"
+            ));
+        };
+        let compressed = file.compressed_size();
+        drop(file);
+        let mut stored = Source::open(&resolved.path)
+            .map_err(|err| format!("cannot open the nested archive: {err}"))?
+            .slice(start, compressed)
+            .map_err(|err| format!("ZIP entry {index} is out of range: {err}"))?;
+        let len = stored.len();
+        let note = "the bytes as stored in the ZIP entry, before decompression";
+        let provenance =
+            resolved.provenance_json(selection, representation("stored", false, note, None));
+        emit(&mut stored, len, Context { source, provenance }, options)
+    } else {
+        let mut file = zip
+            .by_index(index)
+            .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
+        if file.is_dir() {
+            return Err(format!("ZIP entry {index} is a directory, not a file"));
+        }
+        let len = file.size();
+        if len > nested::MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "ZIP entry {index} decodes to {len} bytes, more than the {} byte limit",
+                nested::MAX_ARCHIVE_BYTES
+            ));
+        }
+        let mut temp = tempfile::NamedTempFile::new()
+            .map_err(|err| format!("cannot create a temporary file: {err}"))?;
+        std::io::copy(&mut file.by_ref().take(len.saturating_add(1)), &mut temp)
+            .map_err(|err| format!("ZIP entry {index} cannot be decoded: {err}"))?;
+        temp.as_file_mut()
+            .flush()
+            .map_err(|err| format!("cannot write the temporary file: {err}"))?;
+        let written = temp
+            .as_file()
+            .metadata()
+            .map_err(|err| err.to_string())?
+            .len();
+        if written != len {
+            return Err(format!(
+                "ZIP entry {index} decoded to {written} bytes, not its declared {len}"
+            ));
+        }
+        let (file, temp_path) = temp.into_parts();
+        let mut stored = Source::from_file(file)
+            .map_err(|err| format!("cannot reopen the temporary file: {err}"))?;
+        let note = "decompressed through the ZIP reader; its CRC-32 was checked";
+        let provenance =
+            resolved.provenance_json(selection, representation("logical", true, note, None));
+        let result = emit(&mut stored, len, Context { source, provenance }, options);
+        // The temporary file is removed once the report is written.
+        drop(temp_path);
+        result
+    }
+}
+
+fn emit_payload(
+    mut payload: Payload,
+    len: u64,
+    context: Context,
+    options: &Options,
+) -> Result<(), String> {
+    emit(&mut payload, len, context, options)
+}
+
+fn emit_failure(
+    source: Value,
+    provenance: Value,
+    stage: &'static str,
+    message: String,
+    options: &Options,
+) -> Result<(), String> {
+    let document = json!({
+        "schema": SCHEMA,
+        "tool": tool_json(),
+        "source": source,
+        "provenance": provenance,
+        "size": Value::Null,
+        "signature": Value::Null,
+        "format": Value::Null,
+        "structure": Value::Null,
+        "raw": raw_json(),
+        "failure_stage": stage,
+        "failure": message,
+    });
+    print_document(&document, options);
+    Err(message)
+}
+
+fn raw_json() -> Value {
+    json!({
+        "available": true,
+        "note": "the bytes are read-only; `binary dump` shows any range of a file",
+    })
+}
+
+fn tool_json() -> Value {
+    json!({
+        "name": "lforge",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn emit<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    context: Context,
+    options: &Options,
+) -> Result<(), String> {
+    let cancellation = AtomicBool::new(false);
+    let report = recognition::inspect(source, len, &options.recognition(), &cancellation)
+        .map_err(|err| format!("cannot read the signature: {err}"))?;
+    let failure_stage = report.failure.as_ref().map(|failure| failure.stage);
     let mut document = Map::new();
     document.insert("schema".into(), json!(SCHEMA));
-    document.insert("source".into(), origin.json());
+    document.insert("tool".into(), tool_json());
+    document.insert("source".into(), context.source);
+    document.insert("provenance".into(), context.provenance);
     document.insert("size".into(), json!(len));
-    document.insert("signature".into(), json!(lforge_binary::hex_bytes(&head)));
-    document.insert("format".into(), format.unwrap_or(Value::Null));
-    document.insert("structure".into(), structure);
     document.insert(
-        "raw".into(),
-        json!({
-            "available": true,
-            "note": "the bytes are read-only; `binary dump` shows any range",
-        }),
+        "signature".into(),
+        json!(lforge_binary::hex_bytes(&report.signature)),
+    );
+    document.insert(
+        "format".into(),
+        report
+            .format
+            .map(|format| format.json())
+            .unwrap_or(Value::Null),
+    );
+    document.insert("structure".into(), report.structure);
+    document.insert("raw".into(), raw_json());
+    document.insert(
+        "failure_stage".into(),
+        failure_stage.map_or(Value::Null, |stage| json!(stage)),
     );
     let document = Value::Object(document);
-
-    if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&document).expect("JSON value")
-        );
-    } else {
-        print_text(&document);
-    }
-    match failure {
-        Some(error) => Err(error),
+    print_document(&document, options);
+    match report.failure {
+        Some(failure) => Err(failure.message),
         None => Ok(()),
     }
 }
 
-/// A recognised format, its structure, and why it could not be parsed.
-type Structure = (Option<Value>, Value, Option<String>);
-
-fn format_json(id: &str, name: &str, support: &str, detail: &str) -> Value {
-    json!({
-        "id": id,
-        "name": name,
-        "support": support,
-        "detail": detail,
-    })
-}
-
-fn rds5_structure<R: Read + Seek>(source: &mut R, len: u64, options: &Options) -> Structure {
-    let format = format_json(
-        "rds5",
-        "RDS5",
-        "structural",
-        "header, record array, ETPF chunk extent and block catalogue",
-    );
-    let limits = rds5::Limits::default();
-    let cancel = AtomicBool::new(false);
-    let mut container = match Container::read(source, len, &limits, &cancel) {
-        Ok(container) => container,
-        Err(err) => {
-            return (
-                Some(format),
-                json!({ "valid": false, "error": err.to_string() }),
-                Some(err.to_string()),
-            );
-        }
-    };
-
-    let sample = options.sample.clamp(1, MAX_SAMPLE);
-    let classified = if options.blocks {
-        container.classify(source, usize::MAX, &cancel).unwrap_or(0)
+fn print_document(document: &Value, options: &Options) {
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(document).expect("JSON value")
+        );
     } else {
-        container.classify(source, sample, &cancel).unwrap_or(0)
-    };
-
-    let mut diagnostics: Vec<Value> = container
-        .warnings
-        .iter()
-        .map(|warning| json!({ "severity": "warning", "message": warning }))
-        .collect();
-    let mut unknown: Vec<Value> = Vec::new();
-    let mut failure = None;
-
-    let verified = options.verify.then(|| {
-        let mut checked = 0u64;
-        let mut decoded = 0u64;
-        let mut failures: Vec<Value> = Vec::new();
-        let mut failed = 0u64;
-        for block in &container.blocks {
-            if !block.storage.is_zlib() {
-                continue;
-            }
-            checked += 1;
-            let mut len = 0u64;
-            let result = rds5::decode_block(source, &container, block.index, &limits, &cancel, |_| {
-                Ok(())
-            })
-            .map(|report| {
-                len = report.len;
-            });
-            match result {
-                Ok(()) => decoded += len,
-                Err(err) => {
-                    failed += 1;
-                    if failures.len() < MAX_FAILURES {
-                        failures.push(json!({
-                            "block": block.index,
-                            "offset": hex(block.offset),
-                            "error": err.to_string(),
-                        }));
-                    }
-                }
-            }
-        }
-        let present = 0x1000u64.saturating_add(decoded);
-        if decoded > 0 && present != u64::from(container.uncompressed_total) {
-            diagnostics.push(json!({
-                "severity": "note",
-                "message": format!(
-                    "0x{present:X} decoded bytes do not reproduce the declared uncompressed total 0x{:X}",
-                    container.uncompressed_total
-                ),
-            }));
-        }
-        if failed > 0 {
-            failure = Some(format!("{failed} zlib blocks did not decode"));
-        }
-        json!({
-            "zlib_blocks": checked,
-            "decoded_bytes": decoded,
-            "failures": failed,
-            "failure_sample": failures,
-        })
-    });
-
-    if container.entry_count > 0 {
-        unknown.push(json!({
-            "offset": hex(container.entry_table_offset() + container.entry_table_len()),
-            "length": container.region_len(),
-            "field": "ETPF content after the entry table",
-            "reason": "length is probable, content unknown",
-        }));
+        print_text(document);
     }
-    for block in container
-        .blocks
-        .iter()
-        .filter(|block| !block.storage.is_zlib() && block.storage != Storage::Unread)
-    {
-        unknown.push(json!({
-            "offset": hex(block.offset),
-            "length": block.stored_len,
-            "field": format!("block {}", block.index),
-            "reason": match block.storage {
-                Storage::NotZlib => "carries the zlib selector value but is not zlib",
-                Storage::Unidentified(_) => "compressor selector not identified",
-                _ => "",
-            },
-        }));
-    }
-
-    let records: Vec<Value> = container
-        .records
-        .iter()
-        .take(sample)
-        .map(|record| {
-            let role = if record.index == 0 {
-                "chunk"
-            } else if record.index == container.record_count() - 1 {
-                "end"
-            } else {
-                "block"
-            };
-            let mut value = json!({
-                "index": record.index,
-                "role": role,
-                "offset": hex(record.offset),
-                "high_byte": format!("0x{:02X}", record.high_byte),
-                "selector": record.selector(),
-                "second_word": hex(u64::from(record.second_word)),
-            });
-            if role == "block" {
-                value["counter"] = json!(record.counter());
-                value["unknown"] = json!(record.upper());
-            } else if role == "chunk" {
-                value["layout_flag"] = json!(record.second_word >> 28);
-            }
-            value
-        })
-        .collect();
-    let entries: Vec<Value> = container
-        .entries(source, 0, sample as u32)
-        .unwrap_or_default()
-        .iter()
-        .map(|entry| {
-            json!({
-                "index": entry.index,
-                "words": entry.words.iter().map(|word| format!("0x{word:08X}")).collect::<Vec<_>>(),
-                "page": entry.page(),
-            })
-        })
-        .collect();
-
-    // The selector value is reported per group: the research identifies only
-    // selector 0, and selectors 1, 2 and 3 each select an unknown codec.
-    let mut by_storage = Map::new();
-    let mut counts: Vec<(String, usize)> = vec![
-        (
-            "zlib".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::Zlib)
-                .count(),
-        ),
-        (
-            "not_zlib".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::NotZlib)
-                .count(),
-        ),
-        (
-            "unread".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::Unread)
-                .count(),
-        ),
-    ];
-    for selector in 1..=3u8 {
-        counts.push((
-            format!("selector_{selector}"),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::Unidentified(selector))
-                .count(),
-        ));
-    }
-    for (name, count) in counts {
-        if count > 0 {
-            by_storage.insert(name, json!(count));
-        }
-    }
-    let stored_bytes: u64 = container.blocks.iter().map(|block| block.stored_len).sum();
-    let blocks: Vec<Value> = container
-        .blocks
-        .iter()
-        .take(sample)
-        .map(|block| {
-            json!({
-                "index": block.index,
-                "record": block.record,
-                "offset": hex(block.offset),
-                "stored_len": block.stored_len,
-                "selector": block.selector(),
-                "storage": block.storage.name(),
-                "counter": block.counter,
-            })
-        })
-        .collect();
-
-    let mut ranges = vec![
-        json!({ "offset": hex(0), "length": rds5::HEADER_LEN, "field": "header" }),
-        json!({
-            "offset": hex(rds5::HEADER_LEN),
-            "length": u64::from(container.record_count()) * 8,
-            "field": "record array",
-        }),
-        json!({ "offset": hex(container.etpf_offset), "length": 0x10, "field": "ETPF header" }),
-        json!({
-            "offset": hex(container.entry_table_offset()),
-            "length": container.entry_table_len(),
-            "field": "ETPF entry table",
-        }),
-        json!({
-            "offset": hex(container.content_end),
-            "length": container.first_block - container.content_end,
-            "field": "zero padding",
-        }),
-    ];
-    if let Some((first, last)) = container.blocks.first().zip(container.blocks.last()) {
-        ranges.push(json!({
-            "offset": hex(first.offset),
-            "length": last.offset + last.stored_len - first.offset,
-            "field": "blocks",
-        }));
-    }
-
-    let structure = json!({
-        "valid": true,
-        "header": {
-            "version": format!("0x{:08X}", container.version),
-            "record_count": container.record_count(),
-            "uncompressed_total": container.uncompressed_total,
-        },
-        "records": {
-            "count": container.record_count(),
-            "blocks": container.blocks.len(),
-            "shown": records.len(),
-            "items": records,
-        },
-        "chunk": {
-            "offset": hex(container.etpf_offset),
-            "type": format!("0x{:X}", rds5::ETPF_TYPE),
-            "entry_count": container.entry_count,
-            "field_m": container.field_m,
-            "content_end": hex(container.content_end),
-            "shown": entries.len(),
-            "entry_sample": entries,
-        },
-        "blocks": {
-            "count": container.blocks.len(),
-            "stored_bytes": stored_bytes,
-            "classified": classified,
-            "by_storage": by_storage,
-            "shown": blocks.len(),
-            "items": blocks,
-        },
-        "first_block": hex(container.first_block),
-        "parsed_ranges": ranges,
-        "unknown_regions": unknown,
-        "verified": verified.unwrap_or(Value::Null),
-        "diagnostics": diagnostics,
-        "limitations": [
-            "entry fields and the block record's upper second word have no established meaning",
-            "the ETPF content after the entry table is not interpreted",
-            "page sizes and pixel formats are not part of this container",
-            "a block whose compressor selector is not identified is not decoded",
-        ],
-    });
-    (Some(format), structure, failure)
-}
-
-fn rbf0_structure(head: &[u8]) -> Structure {
-    let format = format_json(
-        "rbf0",
-        "RBF0",
-        "header",
-        "the fixed prefix and the root name length; the body grammar is unknown",
-    );
-    match rbf0::Header::parse(head) {
-        Ok(header) => (
-            Some(format),
-            json!({
-                "valid": true,
-                "prefix": {
-                    "len": rbf0::PREFIX_LEN,
-                    "word": format!("0x{:04X}", header.word),
-                    "flags": header.flags,
-                    "root_name_len": header.root_name_len,
-                },
-                "parsed_ranges": [
-                    { "offset": hex(0), "length": rbf0::PREFIX_LEN, "field": "prefix" },
-                ],
-                "unknown_regions": [
-                    {
-                        "offset": hex(rbf0::PREFIX_LEN as u64 + u64::from(header.root_name_len)),
-                        "length": Value::Null,
-                        "field": "body",
-                        "reason": "the tag grammar and type system are not decoded",
-                    },
-                ],
-                "diagnostics": [],
-                "limitations": [
-                    "the `u16` at +0x04 and the `u32` at +0x06 have no established meaning",
-                    "the root name is payload text and is not printed",
-                    "the body is not parsed; field names and values are not reported",
-                ],
-            }),
-            None,
-        ),
-        Err(err) => (
-            Some(format),
-            json!({ "valid": false, "error": err.describe() }),
-            Some(err.describe().to_string()),
-        ),
-    }
-}
-
-fn psin_structure() -> Structure {
-    let format = format_json(
-        "psin",
-        "PSIN",
-        "recognition",
-        "the magic only; no header field, record structure or purpose is established",
-    );
-    (
-        Some(format),
-        json!({
-            "valid": true,
-            "unknown_regions": [
-                {
-                    "offset": hex(4),
-                    "length": Value::Null,
-                    "field": "payload",
-                    "reason": "no field or record meaning is established",
-                },
-            ],
-            "diagnostics": [],
-            "limitations": [
-                "only the four-byte magic is established",
-                "no checked field in the first 32 bytes equals the payload size",
-            ],
-        }),
-        None,
-    )
-}
-
-fn nested_archive_structure() -> Structure {
-    let format = format_json(
-        "rpf9",
-        "RPF9",
-        "recognition",
-        "a nested archive; its table of contents is read by the archive commands",
-    );
-    (
-        Some(format),
-        json!({
-            "valid": true,
-            "diagnostics": [],
-            "limitations": [
-                "inspection of a nested archive's own rows needs the archive commands",
-            ],
-        }),
-        None,
-    )
-}
-
-fn hex(value: u64) -> String {
-    format!("0x{value:016X}")
 }
 
 /// Prints a document as `key: value` lines, recursing one level per object.
@@ -590,9 +579,48 @@ fn print_text(document: &Value) {
             println!("file:        {file}");
         }
         if let Some(archive) = source.get("archive").and_then(Value::as_str) {
-            let row = source.get("row").and_then(Value::as_u64).unwrap_or(0);
-            println!("archive:     {archive} row {row}");
+            match (
+                source.get("row").and_then(Value::as_u64),
+                source.get("zip").and_then(Value::as_u64),
+            ) {
+                (Some(row), _) => println!("archive:     {archive} row {row}"),
+                (None, Some(zip)) => println!("archive:     {archive} ZIP entry {zip}"),
+                (None, None) => println!("archive:     {archive}"),
+            }
         }
+    }
+    if let Some(provenance) = map.get("provenance").and_then(Value::as_object) {
+        if let Some(chain) = provenance.get("chain").and_then(Value::as_array)
+            && !chain.is_empty()
+        {
+            let path = chain
+                .iter()
+                .map(|step| {
+                    let selector = step.get("selector").and_then(Value::as_str).unwrap_or("-");
+                    let format = step.get("format").and_then(Value::as_str).unwrap_or("-");
+                    format!("{selector} -> {format}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("entered:     {path}");
+        }
+        if let Some(representation) = provenance.get("representation").and_then(Value::as_object) {
+            let kind = representation
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let decoded = representation
+                .get("decoded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            println!("bytes:       {kind} (decoded: {decoded})");
+            if let Some(error) = representation.get("error").and_then(Value::as_str) {
+                println!("decode:      {error}");
+            }
+        }
+    }
+    if let Some(stage) = map.get("failure_stage").and_then(Value::as_str) {
+        println!("failure:     {stage}");
     }
     if let Some(structure) = map.get("structure").and_then(Value::as_object) {
         println!();

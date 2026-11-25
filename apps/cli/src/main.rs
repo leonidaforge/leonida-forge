@@ -5,6 +5,7 @@ mod inspect;
 mod metadata;
 mod names;
 mod native;
+mod nested;
 mod output;
 mod probe;
 mod recover;

@@ -21,6 +21,13 @@ const RECOVERY_NOTE: &str = "The table of contents is encrypted and is not read.
 
 const NOTHING_RECOVERED: &str = "No zlib streams were found, so no entries can be listed. This does not mean the archive is empty.";
 
+/// The schema of an `archive info` document. Version 1 is the first version
+/// with an explicit identifier; its `kind` values use the corrected names,
+/// including `psin` where earlier builds said `pso`.
+const INFO_SCHEMA: &str = "leonida-forge.archive-info/1";
+/// The schema of an `archive list` document, with the same kind naming.
+const LIST_SCHEMA: &str = "leonida-forge.archive-list/1";
+
 /// Resource streams are only listed after they inflated completely.
 const TRANSPORT_NOTE: &str = "every stream inflated completely with a valid checksum";
 
@@ -108,7 +115,12 @@ pub enum Command {
     /// Export one native table-of-contents entry, decoded where supported
     Extract {
         file: PathBuf,
-        /// The row index of the entry, as `archive metadata --entries` lists it
+        /// Descend into an archive stored in the previous one: `row:N` for a
+        /// native RPF9 row, `zip:N` for a ZIP entry. Repeatable
+        #[arg(long = "enter", value_name = "SELECTOR")]
+        enters: Vec<crate::nested::Selector>,
+        /// The row index of the entry, as `archive metadata --entries` lists
+        /// it, in the archive reached by the last `--enter`
         #[arg(long)]
         row: u32,
         /// Where to write the entry's contents
@@ -122,13 +134,25 @@ pub enum Command {
         #[arg(long)]
         executable: Option<PathBuf>,
     },
-    /// Inspect the decoded contents of one native row in a recognised format,
-    /// without extracting it to a file
+    /// Inspect the decoded contents of one native row or ZIP entry in a
+    /// recognised format, without extracting it to a file
     Inspect {
         file: PathBuf,
-        /// The row index of the entry, as `archive metadata --entries` lists it
-        #[arg(long, default_value_t = 0)]
-        row: u32,
+        /// Descend into an archive stored in the previous one: `row:N` for a
+        /// native RPF9 row, `zip:N` for a ZIP entry. Repeatable
+        #[arg(long = "enter", value_name = "SELECTOR")]
+        enters: Vec<crate::nested::Selector>,
+        /// The row index of the entry in the last archive. Without `--enter`
+        /// and `--zip`, row 0 is read; with `--enter`, a missing selection
+        /// inspects the entered archive itself
+        #[arg(long, conflicts_with = "zip")]
+        row: Option<u32>,
+        /// The ZIP entry index in the last archive
+        #[arg(long, value_name = "INDEX", conflicts_with = "row")]
+        zip: Option<usize>,
+        /// Inspect the bytes as stored instead of the decoded payload
+        #[arg(long)]
+        raw: bool,
         /// The executable to recognize the metadata key provider in. Required
         /// only for encrypted metadata
         #[arg(long)]
@@ -150,6 +174,10 @@ pub enum Command {
     /// with resolved names, type, extension and readability
     Ls {
         file: PathBuf,
+        /// Descend into an archive stored in the previous one before listing
+        /// its rows: `row:N` for a native RPF9 row, `zip:N` for a ZIP entry
+        #[arg(long = "enter", value_name = "SELECTOR")]
+        enters: Vec<crate::nested::Selector>,
         /// The executable to recognize the metadata key provider in. Required
         /// only for encrypted metadata
         #[arg(long)]
@@ -305,23 +333,37 @@ pub fn run(command: Command) -> Result<(), String> {
         ),
         Command::Extract {
             file,
+            enters,
             row,
             output,
             overwrite,
             executable,
-        } => extract::run(&file, row, &output, overwrite, executable.as_deref()),
+        } => {
+            let cancel = AtomicBool::new(false);
+            let resolved = (!enters.is_empty())
+                .then(|| crate::nested::resolve(&file, executable.as_deref(), &enters, &cancel))
+                .transpose()?;
+            let path = resolved
+                .as_ref()
+                .map_or(file.as_path(), |r| r.path.as_path());
+            extract::run(path, row, &output, overwrite, executable.as_deref())
+        }
         Command::Inspect {
             file,
+            enters,
             row,
+            zip,
+            raw,
             executable,
             sample,
             blocks,
             verify,
             json,
-        } => crate::inspect::row(
+        } => crate::inspect::archive(
             &file,
-            row,
             executable.as_deref(),
+            &enters,
+            &crate::inspect::Selection { row, zip, raw },
             &crate::inspect::Options {
                 sample,
                 blocks,
@@ -331,19 +373,27 @@ pub fn run(command: Command) -> Result<(), String> {
         ),
         Command::Ls {
             file,
+            enters,
             executable,
             candidates,
             offset,
             limit,
             json,
-        } => rows::run_ls(rows::LsOptions {
-            file,
-            executable,
-            candidates,
-            offset,
-            limit,
-            json,
-        }),
+        } => {
+            let cancel = AtomicBool::new(false);
+            let resolved = (!enters.is_empty())
+                .then(|| crate::nested::resolve(&file, executable.as_deref(), &enters, &cancel))
+                .transpose()?;
+            let path = resolved.as_ref().map_or(file, |r| r.path.clone());
+            rows::run_ls(rows::LsOptions {
+                file: path,
+                executable,
+                candidates,
+                offset,
+                limit,
+                json,
+            })
+        }
         Command::Search {
             path,
             executable,
@@ -515,6 +565,7 @@ fn info(path: &Path, no_cache: bool, json: bool) -> Result<(), String> {
 
     if json {
         let info = json!({
+            "schema": INFO_SCHEMA,
             "path": std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy(),
             "format": "RPF9",
             "size": index.archive_len,
@@ -700,6 +751,7 @@ fn list_json(index: &Index, out: &mut impl Write) -> io::Result<()> {
         })
         .collect();
     let listing = json!({
+        "schema": LIST_SCHEMA,
         "note": if index.entries.is_empty() {
             format!("{RECOVERY_NOTE} {NOTHING_RECOVERED}")
         } else {

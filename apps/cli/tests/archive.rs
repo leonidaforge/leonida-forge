@@ -614,3 +614,31 @@ fn metadata_rejects_invalid_arguments() {
     let output = lforge(&["archive", "metadata", "missing.rpf"], temp.path());
     assert_eq!(output.status.code(), Some(1));
 }
+
+#[test]
+fn a_psin_stream_is_named_psin_not_pso() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("psin.rpf");
+    write_rpf(&path, &[zlib(b"PSIN\x00\x00\x00\x00synthetic payload")]);
+    let path = path.to_str().unwrap();
+
+    let listing = json(&lforge(
+        &["archive", "list", path, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(listing["schema"], "leonida-forge.archive-list/1");
+    let entries = listing["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["kind"], "psin");
+    let text = serde_json::to_string(&listing)
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(!text.contains("\"pso\""), "{text}");
+
+    let info = json(&lforge(
+        &["archive", "info", path, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(info["schema"], "leonida-forge.archive-info/1");
+    assert_eq!(info["by_kind"][0]["kind"], "psin");
+}

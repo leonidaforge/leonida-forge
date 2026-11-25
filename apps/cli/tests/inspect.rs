@@ -111,7 +111,7 @@ fn binary_inspect_reports_an_rds5_container() {
     assert!(output.status.success(), "{}", common::stderr(&output));
 
     let document = json(&output);
-    assert_eq!(document["schema"], "leonida-forge.format-inspection/1");
+    assert_eq!(document["schema"], "leonida-forge.format-inspection/2");
     assert_eq!(document["format"]["id"], "rds5");
     assert_eq!(document["format"]["support"], "structural");
     assert_eq!(

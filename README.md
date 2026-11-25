@@ -50,9 +50,9 @@ lforge binary inspect example.bin --json       # recognised format and its struc
 
 Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage.
 
-A format is recognised from the file's first bytes, never from its extension, and the inspector shows what was recognised next to the signature. `binary inspect` reports the recognised format, its parsed structure, the byte ranges it read and the ranges it left uninterpreted. `--sample` bounds how many records and entries are listed, `--blocks` reads every block's storage selector instead of the first few, and `--verify` inflates every zlib block and reports what failed.
+A format is recognised from the file's first bytes, never from its extension, and the inspector shows what was recognised next to the signature. The CLI and the desktop Binary Inspector use the same recogniser and parser in `lforge-core`, so a format means the same thing in both. `binary inspect` reports the recognised format, its parsed structure, the byte ranges it read and the ranges it left uninterpreted. `--sample` bounds how many records and entries are listed, `--blocks` reads every block's storage selector instead of the first few, and `--verify` inflates every zlib block and reports what failed.
 
-Known formats are the RDS5 container, whose header, record array, ETPF chunk extent and block catalogue are parsed; the RBF0 prefix, of which only the 12 header bytes and the root name length are established; PSIN, by its four-byte magic only; and RPF9, which the archive commands read. No payload bytes are printed. A structure that breaks the documented contract is reported and exits with code 1; a file that matches no format is reported as unrecognised and still exits with code 0.
+Known formats are the RDS5 container, whose header, record array, ETPF chunk extent and block catalogue are parsed; the RBF0 prefix, of which only the 12 header bytes and the root name length are established; PSIN, by its four-byte magic only; and RPF9, which the archive commands read. PSIN is reported as recognition only: nothing relates it to a confirmed PSO format, and a PSIN payload gets no `.pso` extension. No payload bytes are printed. A structure that breaks the documented contract is reported and exits with code 1; a file that matches no format is reported as unrecognised and still exits with code 0.
 
 ## RPF9 archives
 
@@ -84,7 +84,7 @@ Each time an archive is opened, the executable is checked against the file that 
 
 Inside an archive:
 
-- `Recovered Entries` has one folder per detected kind, such as `XML`, `PSO` or `Resources`.
+- `Recovered Entries` has one folder per detected kind, such as `XML`, `PSIN` or `Resources`.
   Files are named after their archive offset, for example `0x000000B000.xml`. Original names and folders are unknown.
 - `Resource Pages` has one file per page of each reconstructed resource.
 - `Unrecovered Regions` holds bytes that are not zlib streams, shown as stored.
@@ -118,6 +118,8 @@ A candidate is one recovered entry, identified by the archive offset of its firs
 
 `recover --id ID --output FILE` re-decodes one candidate and writes its bytes with the same output safety as `archive extract`. The streams are checked against the index as they are read, the output goes through a temporary file and replaces an existing file only with `--overwrite`, and a failed decode leaves no partial file. A partial or unverified candidate is written with a note that bytes may be missing. A decode that succeeds is not proof that the bytes are an authentic original file.
 
+`archive info`, `archive list` and `archive recover --list` carry explicit schemas (`leonida-forge.archive-info/1`, `leonida-forge.archive-list/1`, `leonida-forge.recovery-list/1`). A payload that starts with `PSIN` is reported with the kind `psin`; earlier builds called it `pso`. Nothing establishes a relation to a PSO format, and the recovered entry is given no `.pso` extension.
+
 Where the table of contents is stored without encryption, it can be read directly instead of scanned. With a compatible local game executable, `--executable` authenticates a processed table of contents first.
 
 ```sh
@@ -135,14 +137,26 @@ Entries are identified by their row number in the table. `archive metadata --ent
 
 `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
 
-`archive inspect` reads one row through the same decoder and reports its structure without writing a file:
+`archive inspect` reads one row or ZIP entry through the same decoder and reports its structure without writing a file:
 
 ```sh
 lforge archive inspect data.rpf --row 42 --json --executable game.exe
 lforge archive inspect data.rpf --row 42 --blocks --verify
+lforge archive inspect outer.rpf --executable game.exe --enter row:12 --row 4 --json
+lforge archive inspect outer.rpf --executable game.exe --enter row:12 --enter zip:3 --row 7 --json
+lforge archive inspect outer.rpf --enter row:12 --zip 0 --json
+lforge archive inspect outer.rpf --row 42 --raw --json
 ```
 
+`--enter SEL` is repeatable and descends into an archive stored in the current one. `row:N` selects a native RPF9 row; `zip:N` selects a ZIP entry by central-directory index. The entered payload must be a valid archive recognised from its contents, never from its name. `--row N` and `--zip N` select the final entry in the last archive; without either, `archive inspect FILE` keeps reading row 0, and with `--enter` it inspects the entered archive itself. Entries are identified by index at every level, so two entries with the same visible name are never confused. The ZIP reader does not keep two entries with the same full name, so such an archive cannot be represented; identity is never taken from a name in any case. The same `--enter` selectors work with `archive extract` and `archive ls`.
+
 An RDS5 row is reported field by field: header values, the record array, the ETPF chunk position and extent, the entry table, and one catalogue entry per data block with its stored range and storage selector. Only zlib is identified as a block codec; a block with another selector, or with the zlib selector and no zlib header, is reported as unidentified and is never decoded by guesswork. `--verify` inflates each zlib block, reports the blocks that fail and compares the decoded total with the declared uncompressed total. Rows in the RBF0, PSIN and RPF9 formats are reported by prefix or signature only. In every case the row is decoded in memory; nothing is extracted and nothing is written.
+
+Structured inspection reads the decoded logical payload: an entry stored as raw DEFLATE or in chunks is decoded first, and an unsupported transform or codec is reported as a decoding failure instead of being passed to a parser. `--raw` asks for the bytes as they are stored instead. For a row stored compressed, in chunks or behind a transform, that is the stored representation before decoding, which may include alignment padding; it is never presented as the row's decoded contents.
+
+The inspection document uses schema `leonida-forge.format-inspection/2`. Version 2 adds `provenance`, `representation` and `failure_stage`; the version 1 fields keep their meaning. `provenance` reports the root file, every `--enter` step in order with its selector and archive format, the per-level authentication status where an RPF9 table was opened, the decoded byte total, and that a valid metadata signature does not authenticate payload bytes. `representation` states whether the inspected bytes are logical or stored and whether they were decoded, with the decode error when they were not. Offsets stay hexadecimal strings.
+
+Nested traversal enforces the same limits at every level: at most 8 archives in a chain, 512 MiB decoded per intermediate archive, 2 GiB decoded per chain, 1M rows or ZIP entries, checked offset arithmetic, cancellation and automatic temporary-file removal. An RPF9 archive at any depth is opened through the same metadata authentication as a top-level one; without a compatible executable, a processed table of contents is refused rather than read unverified.
 
 The `decoded` state in `archive metadata`, `ls`, `search` and `manifest` remains a structural state: it is decided from the table of contents and the chunk table, without inflating a stream. Use `archive inspect --verify` to check a row's streams, or `archive extract` to obtain the bytes.
 

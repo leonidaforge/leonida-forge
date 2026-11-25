@@ -209,6 +209,16 @@ pub fn chunk2(logical: u32, stored_len: u32, padding: u32, method: u8) -> u64 {
 
 /// An archive for `specs`, with `companions` listed in `B` sub-block 3.
 pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
+    assemble_inner(specs, companions, 0)
+}
+
+/// An archive whose metadata declares a processing pass (`hdr[0x2E]`), so it
+/// needs an executable to be read like a retail archive.
+pub fn assemble_processed(specs: &[Spec], selector: u8) -> Vec<u8> {
+    assemble_inner(specs, &[], selector)
+}
+
+fn assemble_inner(specs: &[Spec], companions: &[(Vec<u8>, u64)], selector: u8) -> Vec<u8> {
     let mut data = Vec::new();
     let mut locations: Vec<Option<Vec<u8>>> = Vec::new();
     for spec in specs {
@@ -283,6 +293,7 @@ pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
     let b_len = if companions.is_empty() { 0x150 } else { 0x600 };
     let mut bytes = Build {
         b_len,
+        selector,
         ..Build::default()
     }
     .build(&columns);

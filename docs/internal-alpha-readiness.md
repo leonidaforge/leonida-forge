@@ -54,11 +54,12 @@ pushed.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
 - Inspect a recognised file format from its contents, in the Binary Inspector and
-  with `lforge binary inspect` and `lforge archive inspect`. The RDS5 container
-  reports its header, record array, ETPF chunk extent and block catalogue; an
-  RBF0 payload reports its prefix and root name length; PSIN and RPF9 are
-  recognised by signature only. An archive row is decoded in memory, so nothing
-  is extracted to inspect it.
+  with `lforge binary inspect` and `lforge archive inspect`. Both front ends use
+  the same recogniser in `lforge-core`. The RDS5 container reports its header,
+  record array, ETPF chunk extent and block catalogue; an RBF0 payload reports
+  its prefix and root name length; PSIN and RPF9 are recognised by signature
+  only. `archive inspect --enter` follows mixed ZIP/RPF9 nesting, and a row or
+  ZIP entry is decoded in memory, so nothing is extracted to inspect it.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
@@ -117,7 +118,7 @@ recorded here. They were not repeated for this package.
   without error; reported as not necessarily empty.
 - Mid archive (6.6 MB): 277 entries from 954 streams across 55 regions, of which
   257 were complete XML and 20 were unverified text or binary.
-- Mid archive (4.3 MB): 1013 entries, of which 1012 were complete PSO data.
+- Mid archive (4.3 MB): 1013 entries, of which 1012 were complete PSIN payloads.
 - Export of a complete recovered XML entry wrote exactly the declared decoded
   size and produced valid XML.
 - Export of an unverified entry wrote the declared size and printed a caveat
