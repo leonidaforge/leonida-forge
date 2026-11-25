@@ -217,6 +217,13 @@ impl Kind {
         }
     }
 
+    /// Whether [`Kind::extension`] is a neutral display fallback rather than
+    /// an established extension for the format. A PSIN payload is named `.bin`
+    /// because nothing establishes its real extension.
+    pub fn extension_is_synthetic(self) -> bool {
+        matches!(self, Kind::Psin | Kind::Resource | Kind::Binary)
+    }
+
     /// Whether data of this kind is only expected at the start of a file.
     pub fn is_file_start(self) -> bool {
         !matches!(self, Kind::Text | Kind::Binary)

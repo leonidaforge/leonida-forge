@@ -261,6 +261,73 @@ pub enum Command {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Inventory the entries of supported archives as a deterministic,
+    /// machine-readable manifest, optionally descending into nested archives
+    Inventory {
+        /// An archive file, or a directory searched recursively for .rpf and
+        /// .zip files
+        path: PathBuf,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// A local name table, or a `.lut` file. The built-in LUTs always apply
+        #[arg(long = "name-file", visible_alias = "candidates")]
+        candidates: Vec<PathBuf>,
+        /// Enter archives stored inside an archive, recognised from content
+        #[arg(long)]
+        recursive: bool,
+        /// jsonl (a header, then one record per line, then a summary) or json
+        /// (one document)
+        #[arg(long, value_parser = crate::inventory::OutputFormat::parse, default_value = "jsonl")]
+        format: crate::inventory::OutputFormat,
+        /// Where to write the inventory. Defaults to standard output
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long)]
+        overwrite: bool,
+        /// Archives in a chain, counting the root
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_depth)]
+        max_depth: usize,
+        /// Archives opened, roots included
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_archives)]
+        max_archives: u64,
+        /// Entries recorded, all archives included
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_entries)]
+        max_entries: u64,
+        /// Largest payload decoded into temporary storage
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_entry_bytes)]
+        max_entry_bytes: u64,
+        /// Total payload bytes decoded into temporary storage
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_decoded_bytes)]
+        max_decoded_bytes: u64,
+        /// Temporary storage held on one chain
+        #[arg(long, default_value_t = crate::inventory::Limits::default().max_temp_bytes)]
+        max_temp_bytes: u64,
+        /// Only emit entries whose recognised content format has this id
+        #[arg(long = "content-format")]
+        content_format: Option<String>,
+        /// Only emit entries of this RPF9 type id
+        #[arg(long = "type", value_name = "TYPE")]
+        type_id: Option<u8>,
+        /// Only emit entries whose name or resolved name contains this text
+        #[arg(long)]
+        name: Option<String>,
+        /// Only emit entries with this stored hash64 or key32
+        #[arg(long, value_parser = rows::parse_hash)]
+        hash: Option<lforge_rage9::rpf::names::Key>,
+        /// Only emit entries whose payload is readable: true or false
+        #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
+        readable: Option<bool>,
+        /// Only emit entries stopped at this failure stage
+        #[arg(long = "failure-stage")]
+        failure_stage: Option<String>,
+        /// Only emit entries in an archive nested this many levels under the
+        /// root
+        #[arg(long)]
+        depth: Option<usize>,
+    },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
     #[command(group(
@@ -439,6 +506,53 @@ pub fn run(command: Command) -> Result<(), String> {
             format,
             output,
             overwrite,
+        }),
+        Command::Inventory {
+            path,
+            executable,
+            candidates,
+            recursive,
+            format,
+            output,
+            overwrite,
+            max_depth,
+            max_archives,
+            max_entries,
+            max_entry_bytes,
+            max_decoded_bytes,
+            max_temp_bytes,
+            content_format,
+            type_id,
+            name,
+            hash,
+            readable,
+            failure_stage,
+            depth,
+        } => crate::inventory::run(crate::inventory::Options {
+            path,
+            executable,
+            candidates,
+            recursive,
+            format,
+            output,
+            overwrite,
+            limits: crate::inventory::Limits {
+                max_depth,
+                max_archives,
+                max_entries,
+                max_entry_bytes,
+                max_decoded_bytes,
+                max_temp_bytes,
+            },
+            filters: crate::inventory::Filters {
+                content_format,
+                type_id,
+                name,
+                hash,
+                readable,
+                failure_stage,
+                depth,
+            },
         }),
         Command::Probe {
             file,
@@ -728,6 +842,8 @@ fn list_json(index: &Index, out: &mut impl Write) -> io::Result<()> {
                 "id": id(entry.offset),
                 "offset": entry.offset,
                 "kind": entry.kind.name(),
+                "extension": entry.kind.extension(),
+                "extension_synthetic": entry.kind.extension_is_synthetic(),
                 "status": entry.status.name(),
                 "size": entry.len,
                 "compressed_size": entry.stored_len,

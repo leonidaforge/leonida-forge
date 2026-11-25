@@ -91,8 +91,29 @@ impl Listing {
         })
     }
 
-    fn alternates(&self) -> Alternates {
+    /// The alternate read sources of this archive.
+    pub fn alternates(&self) -> Alternates {
         Alternates::resolve(&self.archive, &self.opened.metadata)
+    }
+
+    /// The opened archive, its authentication and its source.
+    pub fn opened(&self) -> &Opened {
+        &self.opened
+    }
+
+    /// The rows, in row order.
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// The names resolved for `row`, if the row was resolved at all.
+    pub fn row_names(&self, row: u32) -> Option<&RowNames> {
+        self.resolved.row(row)
+    }
+
+    /// The confirmed extension of a type ID, as text.
+    pub fn extension_for(&self, type_id: u8) -> Option<&str> {
+        self.extension(type_id)
     }
 
     /// The confirmed extension of a type ID, as text.
