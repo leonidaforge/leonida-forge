@@ -65,6 +65,12 @@ pub enum Command {
         /// Walk the drawable structure of the reconstructed segments
         #[arg(long)]
         drawable: bool,
+        /// Read the reconstructed segments as a texture dictionary
+        #[arg(long)]
+        dictionary: bool,
+        /// With `--dictionary`, show one record in full
+        #[arg(long, requires = "dictionary")]
+        record: Option<u32>,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -377,8 +383,10 @@ pub fn run(command: Command) -> Result<(), String> {
             id,
             no_cache,
             drawable,
+            dictionary,
+            record,
             json,
-        } => resource(&file, id, no_cache, drawable, json),
+        } => resource(&file, id, no_cache, drawable, dictionary, record, json),
         Command::Metadata {
             file,
             entries,
@@ -798,15 +806,15 @@ fn list(path: &Path, no_cache: bool, json: bool) -> Result<(), String> {
         .map_err(|err| format!("cannot write output: {err}"))
 }
 
-/// Bytes reconstructed for a drawable walk.
-const MAX_DRAWABLE_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes reconstructed for a drawable walk or a dictionary read.
+const MAX_RECONSTRUCT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Reconstructs the resource and walks its drawable structure.
-fn inspect_drawable(
+/// Reconstructs the two segments of a resource.
+fn reconstruct_segments(
     path: &Path,
     index: &Index,
     resource: &Resource,
-) -> Result<lforge_rage9::drawable::Report, String> {
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let entry = index
         .entry_at(resource.offset)
         .ok_or_else(|| "the resource has no entry to reconstruct".to_string())?;
@@ -817,7 +825,7 @@ fn inspect_drawable(
         source,
         index,
         entry,
-        MAX_DRAWABLE_BYTES,
+        MAX_RECONSTRUCT_BYTES,
         &mut bytes,
         &AtomicBool::new(false),
     )
@@ -829,8 +837,23 @@ fn inspect_drawable(
             bytes.len()
         ));
     }
-    lforge_rage9::drawable::inspect(&bytes[..system_len], &bytes[system_len..])
+    let (system, graphics) = bytes.split_at(system_len);
+    Ok((system.to_vec(), graphics.to_vec()))
+}
+
+/// Reconstructs the resource and walks its drawable structure.
+fn inspect_drawable(
+    path: &Path,
+    index: &Index,
+    resource: &Resource,
+) -> Result<lforge_rage9::drawable::Report, String> {
+    let (system, graphics) = reconstruct_segments(path, index, resource)?;
+    lforge_rage9::drawable::inspect(&system, &graphics)
         .ok_or_else(|| "the resource does not have the drawable chain shape".to_string())
+}
+
+fn aabb_json(aabb: lforge_rage9::drawable::Aabb) -> Value {
+    json!({ "min": aabb.min, "max": aabb.max })
 }
 
 fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
@@ -865,6 +888,16 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
                         "capacity": model.capacity,
                         "word_14": model.word_14,
                         "flags": model.flags,
+                        "bounds": model.bounds.as_ref().map(|bounds| json!({
+                            "offset": bounds.at,
+                            "records": bounds.records,
+                            "aggregate": aabb_json(bounds.aggregate),
+                            "per_geometry": bounds.per_geometry.iter().map(|aabb| aabb_json(*aabb)).collect::<Vec<Value>>(),
+                            "extra_min_equal": bounds.extra_min_equal,
+                            "extra_max_equal": bounds.extra_max_equal,
+                            "union_matches": bounds.union_matches,
+                            "union_delta": bounds.union_delta,
+                        })),
                         "geometries": model.geometries.iter().map(|geometry| {
                             json!({
                                 "offset": geometry.at,
@@ -877,19 +910,32 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
                                     "word_10": buffer.word_10,
                                     "graphics": buffer.graphics,
                                     "vertex_count": buffer.vertex_count,
+                                    "packed_flags": buffer.packed_flags,
                                     "declared_bytes": buffer.declared_bytes,
                                     "attribute_bytes": buffer.attribute_bytes,
                                     "layout_end": buffer.layout_end,
                                     "prefix_gap": buffer.prefix_gap,
                                     "attributes": attributes(buffer),
+                                    "declarations": buffer.declarations.iter().map(|declaration| json!({
+                                        "format": declaration.format,
+                                        "offset": declaration.offset,
+                                        "matches_layout": declaration.matches_layout,
+                                    })).collect::<Vec<Value>>(),
                                 })),
                                 "index": geometry.index.as_ref().map(|index| json!({
                                     "offset": index.at,
                                     "clusters": index.clusters,
+                                    "count_a": index.count_a,
+                                    "count_b": index.count_b,
+                                    "count_word": index.count_word,
+                                    "low_byte": index.low_byte,
+                                    "high_byte": index.high_byte,
                                     "elements": index.elements,
                                     "unit": index.unit,
                                     "graphics": index.graphics,
                                     "in_bounds": index.in_bounds,
+                                    "header": index.header,
+                                    "header_matches": index.header_matches,
                                     "range": index.range.map(|range| json!({
                                         "segment": range.segment.name(),
                                         "offset": range.offset,
@@ -908,6 +954,7 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
             "state": "unique",
             "base": base,
             "supports": supports,
+            "note": "the marker bytes are a sample observation, not a signature",
         }),
         GraphicsBase::Ambiguous { candidates } => json!({
             "state": "ambiguous",
@@ -937,18 +984,55 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
         "lod": lod,
         "empty_slots": report.empty_slots,
         "graphics_base": graphics_base,
+        "model_union": {
+            "matches": report.model_union.matches,
+            "delta": report.model_union.delta,
+            "models": report.model_union.models,
+            "trivial": report.model_union.trivial,
+            "tolerance": lforge_rage9::drawable::AABB_TOLERANCE,
+        },
+        "header_union": report.header_union.map(|check| json!({
+            "matches": check.matches,
+            "delta": check.delta,
+            "finite": check.finite,
+            "note": "independent of the model check and never a failure; the research records no tolerance for this comparison, so the model tolerance is used as a display threshold",
+        })),
+        "materials": {
+            "shaders": report.materials.shaders,
+            "declared_slots": report.materials.declared_slots,
+            "bound": report.materials.bound,
+            "unbound": report.materials.unbound,
+            "invalid": report.materials.invalid,
+            "distinct_keys": report.materials.distinct_keys,
+            "key_resolution": "not evaluated",
+            "note": "keys are hashes; no dictionary record is selected",
+        },
         "shader_group": report.shader_group.as_ref().map(|group| json!({
             "offset": group.at,
             "count": group.count,
             "capacity": group.capacity,
             "shaders": group.shaders.iter().map(|shader| json!({
                 "offset": shader.at,
+                "shader_hash": format!("0x{:08X}", shader.shader_hash),
                 "marker": format!("0x{:08X}", shader.marker),
                 "texture_parameters": shader.texture_parameters,
                 "total_parameters": shader.total_parameters,
                 "word_06": shader.word_06,
                 "slots": shader.slots,
                 "bound_slots": shader.bound_slots,
+                "parameters": shader.parameters.iter().map(|parameter| json!({
+                    "index": parameter.index,
+                    "name_hash": format!("0x{:08X}", parameter.name_hash),
+                    "packed": parameter.packed,
+                    "class": parameter.class,
+                    "slot": parameter.slot,
+                    "texture": parameter.texture,
+                })).collect::<Vec<Value>>(),
+                "slot_states": shader.slot_states.iter().map(|slot| json!({
+                    "index": slot.index,
+                    "state": slot.state.name(),
+                    "key": slot.key.map(|key| format!("0x{key:016X}")),
+                })).collect::<Vec<Value>>(),
             })).collect::<Vec<Value>>(),
         })),
         "issues": report.issues.iter().map(|issue| issue.to_string()).collect::<Vec<String>>(),
@@ -956,7 +1040,9 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
             "layout slots and format codes are values, not semantics",
             "the 0x80-byte vertex prefix has no established meaning",
             "index descriptors are structural; no triangle is formed",
-            "material parameters, texture keys and mesh export are not supported",
+            "vertex positions are not decoded",
+            "material hashes are candidates, not recovered names",
+            "texture keys are not resolved to dictionary records",
         ],
     })
 }
@@ -1104,6 +1190,8 @@ fn resource(
     offset: u64,
     no_cache: bool,
     drawable: bool,
+    dictionary: bool,
+    record: Option<u32>,
     json: bool,
 ) -> Result<(), String> {
     let (index, _) = index(path, no_cache)?;
@@ -1116,12 +1204,32 @@ fn resource(
     } else {
         None
     };
+    let dictionary = if dictionary {
+        let (system, graphics) = reconstruct_segments(path, &index, resource)?;
+        Some(
+            lforge_core::dictionary::report(
+                &system,
+                graphics.len() as u64,
+                record,
+                lforge_core::dictionary::DEFAULT_RECORD_SAMPLE,
+            )
+            .map_err(|err| format!("the resource is not a texture dictionary: {err}"))?,
+        )
+    } else {
+        None
+    };
     let mut report = resource_json(&index, resource);
     if let Some(drawable_report) = &drawable {
         report
             .as_object_mut()
             .expect("object")
             .insert("drawable".into(), drawable_json(drawable_report));
+    }
+    if let Some(dictionary_report) = &dictionary {
+        report
+            .as_object_mut()
+            .expect("object")
+            .insert("dictionary".into(), dictionary_report.clone());
     }
     if json {
         let mut value = json!({ "id": id(resource.offset), "offset": resource.offset });
@@ -1175,8 +1283,8 @@ fn resource(
     );
     println!();
     println!(
-        "{:<12} {:<9} {:>12} {:>12} {:>7}",
-        "page", "segment", "size", "compressed", "streams"
+        "{:<12} {:<9} {:<8} {:>12} {:>12} {:>7}",
+        "page", "segment", "storage", "size", "compressed", "streams"
     );
     for (page, streams) in index.resource_pages(resource) {
         let (offset, stored) = match page.storage {
@@ -1187,9 +1295,10 @@ fn resource(
             ),
         };
         println!(
-            "{:<12} {:<9} {:>12} {:>12} {:>7}",
+            "{:<12} {:<9} {:<8} {:>12} {:>12} {:>7}",
             id(offset),
             page.segment.name(),
+            page.storage.name(),
             page.len,
             stored,
             page.stream_count
@@ -1251,6 +1360,71 @@ fn resource(
         }
         for issue in &drawable.issues {
             println!("warning: drawable: {issue}");
+        }
+        println!(
+            "bounds:      model union {} (delta {:.6}), header union {}",
+            if drawable.model_union.matches {
+                "matches"
+            } else {
+                "differs"
+            },
+            drawable.model_union.delta,
+            match drawable.header_union {
+                Some(check) if check.matches => "matches",
+                Some(_) => "differs (not a failure)",
+                None => "not evaluated",
+            }
+        );
+        println!(
+            "materials:   {} bound, {} unbound, {} invalid of {} slots; keys not resolved",
+            drawable.materials.bound,
+            drawable.materials.unbound,
+            drawable.materials.invalid,
+            drawable.materials.declared_slots
+        );
+    }
+    if let Some(dictionary) = &dictionary {
+        println!();
+        let empty = dictionary["empty"].as_bool().unwrap_or(false);
+        if empty {
+            println!("dictionary:  empty; no hash or value array");
+        } else {
+            println!(
+                "dictionary:  {} hashes of {} capacity, {} records; allocation partition {}",
+                dictionary["hash_count"],
+                dictionary["hash_capacity"],
+                dictionary["value_count"],
+                if dictionary["checks"]["partition_ok"].as_bool() == Some(true) {
+                    "agrees"
+                } else {
+                    "does not agree"
+                }
+            );
+        }
+        if let Some(record) = dictionary.get("record") {
+            println!("             record {}", record["index"]);
+            println!(
+                "             {} × {}, format {}, {} mip levels",
+                record["width"], record["height"], record["format_id"], record["mip_levels"]
+            );
+            println!(
+                "             name {} {}",
+                record["name"]["variant"].as_str().unwrap_or("-"),
+                record["name"]["check"].as_str().unwrap_or("-")
+            );
+        } else if let Some(items) = dictionary["records"]["items"].as_array() {
+            for record in items {
+                println!(
+                    "             {:<4} at {} {} × {} format {:<3} {} mip  name {}",
+                    record["index"],
+                    record["offset"].as_str().unwrap_or("-"),
+                    record["width"],
+                    record["height"],
+                    record["format_id"],
+                    record["mip_levels"],
+                    record["name"]["check"].as_str().unwrap_or("-"),
+                );
+            }
         }
     }
     Ok(())

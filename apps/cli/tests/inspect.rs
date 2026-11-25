@@ -542,3 +542,155 @@ fn refuses_to_export_a_texture_over_its_input() {
     let message = common::stderr(&output);
     assert!(message.contains("one of the inputs"), "{message}");
 }
+
+/// A PSIN payload with one unsupported section and a matching `CHKS`.
+fn psin() -> Vec<u8> {
+    let mut bytes = b"PSIN".to_vec();
+    bytes.extend_from_slice(&8u32.to_be_bytes());
+    bytes.extend_from_slice(b"ZZZZ");
+    bytes.extend_from_slice(&16u32.to_be_bytes());
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes
+}
+
+#[test]
+fn binary_inspect_reports_a_psin_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "payload.bin", &psin());
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "psin");
+    assert_eq!(document["format"]["support"], "structural");
+    assert_eq!(document["structure"]["family"], "other");
+    assert_eq!(document["structure"]["sections"]["count"], 1);
+    assert_eq!(document["structure"]["checksum"]["status"], "unsupported");
+
+    let text = lforge(&["binary", "inspect", path.to_str().unwrap()]);
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(
+        stdout.contains("format:      PSIN (structural)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn binary_inspect_reports_an_edup_table() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bytes = b"EDUP".to_vec();
+    bytes.extend_from_slice(&2u32.to_le_bytes());
+    for (first, second) in [(1u64, 5u64), (2, 5)] {
+        bytes.extend_from_slice(&first.to_le_bytes());
+        bytes.extend_from_slice(&second.to_le_bytes());
+    }
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&[0u8; 16]);
+    let path = write(temp.path(), "table.bin", &bytes);
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "edup");
+    assert_eq!(document["structure"]["count"], 2);
+    assert_eq!(document["structure"]["second_distinct"], 1);
+    assert_eq!(document["structure"]["trailing_blob"]["length"], 16);
+    assert_eq!(
+        document["structure"]["key_direction"]["status"],
+        "not evaluated"
+    );
+}
+
+#[test]
+fn binary_inspect_reports_an_adat_header() {
+    let temp = tempfile::tempdir().unwrap();
+    // Version 1, variant 0xFF21, one stream, no chunk records.
+    let mut bytes = vec![0u8; 0x1E];
+    bytes[..4].copy_from_slice(b"ADAT");
+    bytes[4..8].copy_from_slice(&0xFF21_0001u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[0x0C..0x10].copy_from_slice(&0x1Eu32.to_le_bytes());
+    let path = write(temp.path(), "audio.bin", &bytes);
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "adat");
+    assert_eq!(document["structure"]["variant"], "0x0000FF21");
+    let text = serde_json::to_string(&document).unwrap().to_lowercase();
+    assert!(!text.contains("opus"), "{text}");
+}
+
+#[test]
+fn binary_inspect_reports_a_kb2_container() {
+    let temp = tempfile::tempdir().unwrap();
+    let size = 0x30 + 4 * 3;
+    let mut bytes = vec![0u8; size];
+    bytes[..4].copy_from_slice(b"KB2n");
+    bytes[4..8].copy_from_slice(&((size - 8) as u32).to_le_bytes());
+    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[0x0C..0x10].copy_from_slice(&4u32.to_le_bytes());
+    bytes[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
+    bytes[0x14..0x18].copy_from_slice(&16u32.to_le_bytes());
+    bytes[0x18..0x1C].copy_from_slice(&16u32.to_le_bytes());
+    bytes[0x1C..0x20].copy_from_slice(&30u32.to_le_bytes());
+    bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+    for (index, value) in [0x3Cu32 | 1, 0x3C, size as u32].into_iter().enumerate() {
+        let at = 0x30 + 4 * index;
+        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    let path = write(temp.path(), "movie.bin", &bytes);
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "kb2");
+    assert_eq!(document["structure"]["variant"], "KB2n");
+    assert_eq!(document["structure"]["header"]["frame_count"], 2);
+    assert_eq!(
+        document["structure"]["frame_index"]["checks"]["monotone"],
+        true
+    );
+    // The word alpha occurs only in the disclaimer that the bit is unnamed.
+    let limitations = document["structure"]["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        limitations.contains("not established as an alpha flag"),
+        "{limitations}"
+    );
+}
+
+#[test]
+fn binary_inspect_never_panics_on_damaged_input() {
+    let temp = tempfile::tempdir().unwrap();
+    for (name, mut bytes) in [
+        ("psin.bin", psin()),
+        ("edup.bin", {
+            let mut bytes = b"EDUP".to_vec();
+            bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+            bytes
+        }),
+        ("adat.bin", {
+            let mut bytes = vec![0u8; 0x20];
+            bytes[..4].copy_from_slice(b"ADAT");
+            bytes
+        }),
+        ("kb2.bin", {
+            let mut bytes = vec![0u8; 0x40];
+            bytes[..4].copy_from_slice(b"KB2j");
+            bytes
+        }),
+    ] {
+        bytes.truncate(bytes.len() / 2);
+        let path = write(temp.path(), name, &bytes);
+        let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+        // A structural failure exits 1 with a document, never a panic.
+        assert!(
+            output.status.code() == Some(0) || output.status.code() == Some(1),
+            "{name}: {:?}",
+            output.status
+        );
+        assert!(!common::stderr(&output).contains("panicked"), "{name}");
+    }
+}

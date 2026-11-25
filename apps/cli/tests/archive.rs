@@ -666,3 +666,292 @@ fn a_psin_stream_is_named_psin_not_pso() {
     assert_eq!(info["schema"], "leonida-forge.archive-info/1");
     assert_eq!(info["by_kind"][0]["kind"], "psin");
 }
+
+/// Two resources where the second is the raw-continuation shape: two
+/// declared system pages, one compressed page of a full page unit, one stored
+/// raw page, and a first stream that is not archive stream index zero.
+fn raw_continuation_archive(dir: &Path) -> (std::path::PathBuf, u64, u64) {
+    let path = dir.join("continuation.rpf");
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..4].copy_from_slice(b"9FPR");
+    bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+
+    // A leading resource, so the one under test is not at stream zero.
+    bytes.resize(0x1010, 0);
+    let mut leading = vec![0u8; 0x100];
+    leading[8..16].copy_from_slice(&0x5000_00C0u64.to_le_bytes());
+    leading[0xC8] = 1;
+    bytes.extend_from_slice(&zlib(&leading));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+
+    bytes.resize(bytes.len().next_multiple_of(0x1000) + 16, 0);
+    let mut system = vec![0u8; 0x1_0000];
+    system[8..16].copy_from_slice(&0x5000_0100u64.to_le_bytes());
+    system[0x108] = 2;
+    system[0x109] = 0;
+    let offset = bytes.len() as u64;
+    bytes.extend_from_slice(&zlib(&system));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    let raw_at = bytes.len() as u64;
+    bytes.extend((0..0x600u32).map(|i| (i % 251) as u8 + 1));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    std::fs::write(&path, bytes).unwrap();
+    (path, offset, raw_at)
+}
+
+#[test]
+fn a_raw_continuation_resource_after_another_one_does_not_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, offset, raw_at) = raw_continuation_archive(temp.path());
+    let path = path.to_str().unwrap();
+
+    let info = json(&lforge(
+        &["archive", "info", path, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(info["resources"]["count"], 2);
+    assert_eq!(info["resources"]["complete"], 2);
+    assert_eq!(info["resources"]["system_pages"], 3);
+    assert_eq!(info["resources"]["system_size"], 0x100 + 0x1_0600);
+    assert_eq!(info["resources"]["graphics_pages"], 0);
+
+    let id = format!("0x{:X}", offset);
+    let report = json(&lforge(
+        &["archive", "resource", path, &id, "--json", "--no-cache"],
+        temp.path(),
+    ));
+    assert_eq!(report["status"], "complete");
+    assert_eq!(report["system_size"], 0x1_0600);
+    assert_eq!(report["graphics_size"], 0);
+    assert_eq!(report["page_map"]["system_pages"], 2);
+    assert_eq!(report["page_map"]["graphics_pages"], 0);
+    let pages = report["pages"].as_array().unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0]["storage"], "streams");
+    assert_eq!(pages[0]["size"], 0x1_0000);
+    assert_eq!(pages[1]["storage"], "raw");
+    assert_eq!(pages[1]["offset"], raw_at);
+    assert_eq!(pages[1]["size"], 0x600);
+    assert!(report["issues"].as_array().unwrap().is_empty());
+
+    let text = lforge(
+        &["archive", "resource", path, &id, "--no-cache"],
+        temp.path(),
+    );
+    assert!(text.status.success());
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(stdout.contains("status:      complete"), "{stdout}");
+    assert!(stdout.contains("raw"), "{stdout}");
+}
+
+#[test]
+fn a_damaged_tail_after_a_resource_is_reported_not_counted() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, offset, raw_at) = raw_continuation_archive(temp.path());
+    // Replace the stored tail with bytes that start like a zlib stream and do
+    // not inflate.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut damaged = zlib(&vec![0x5Au8; 0x800]);
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xFF;
+    bytes.truncate(raw_at as usize);
+    bytes.extend_from_slice(&damaged);
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    std::fs::write(&path, bytes).unwrap();
+
+    let id = format!("0x{:X}", offset);
+    let report = json(&lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--json",
+            "--no-cache",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(report["status"], "partial");
+    assert_eq!(report["pages"].as_array().unwrap().len(), 1);
+    assert!(
+        report["issues"][0]
+            .as_str()
+            .unwrap()
+            .contains("start like a zlib stream"),
+        "{report}"
+    );
+    assert_eq!(report["system_size"], 0x1_0000);
+}
+
+fn put_u16(bytes: &mut [u8], at: usize, value: u16) {
+    bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(bytes: &mut [u8], at: usize, value: u32) {
+    bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], at: usize, value: u64) {
+    bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+/// A resource whose system segment is a two-record texture dictionary.
+fn dictionary_archive(dir: &Path) -> (std::path::PathBuf, u64) {
+    let path = dir.join("dictionary.rpf");
+    let mut system = vec![0u8; 0x400];
+    put_u64(&mut system, 0x08, 0x5000_0000 | 0x0C0);
+    put_u64(&mut system, 0x20, 0x5000_0000 | 0x0E0);
+    put_u16(&mut system, 0x28, 2);
+    put_u16(&mut system, 0x2A, 2);
+    put_u64(&mut system, 0x30, 0x5000_0000 | 0x0F0);
+    put_u16(&mut system, 0x38, 2);
+    put_u16(&mut system, 0x3A, 2);
+    // The page map: one system page and one graphics page.
+    system[0x0C0 + 8] = 1;
+    system[0x0C0 + 9] = 1;
+    put_u32(&mut system, 0x0E0, 0x1111_1111);
+    put_u32(&mut system, 0x0E4, 0x2222_2222);
+    put_u64(&mut system, 0x0F0, 0x5000_0000 | 0x120);
+    put_u64(&mut system, 0x0F8, 0x5000_0000 | 0x190);
+    // Record 0: a named 128 x 64 texture with format 98.
+    put_u32(&mut system, 0x128, 1);
+    put_u64(&mut system, 0x138, 0x6000_0000);
+    put_u64(&mut system, 0x150, 0x5000_0000 | 0x260);
+    put_u16(&mut system, 0x158, 128);
+    put_u16(&mut system, 0x15A, 64);
+    system[0x15F] = 98;
+    put_u16(&mut system, 0x162, 1);
+    // Record 1: unnamed, at graphics offset 0x800.
+    put_u32(&mut system, 0x198, 1);
+    put_u64(&mut system, 0x1A8, 0x6000_0800);
+    put_u16(&mut system, 0x1C8, 64);
+    put_u16(&mut system, 0x1CA, 64);
+    system[0x1CF] = 71;
+    put_u16(&mut system, 0x1D2, 1);
+    // The name record carries the folded hash of the text at 0x290.
+    put_u64(&mut system, 0x260, 0x5000_0000 | 0x288);
+    put_u64(&mut system, 0x270, 6);
+    let hash = lforge_rage9::rpf::names::joaat(b"diffuse");
+    put_u32(&mut system, 0x278, hash);
+    system[0x290..0x298].copy_from_slice(b"diffuse\0");
+
+    let mut graphics = vec![0u8; 0x1000];
+    graphics[0] = 0x42;
+    graphics[0x800] = 0x42;
+
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..4].copy_from_slice(b"9FPR");
+    bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes.resize(0x1010, 0);
+    let offset = bytes.len() as u64;
+    bytes.extend_from_slice(&zlib(&system));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    bytes.extend_from_slice(&zlib(&graphics));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    std::fs::write(&path, bytes).unwrap();
+    (path, offset)
+}
+
+#[test]
+fn a_resource_dictionary_is_inspected_record_by_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, offset) = dictionary_archive(temp.path());
+    let id = format!("0x{:X}", offset);
+    let report = json(&lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--dictionary",
+            "--json",
+            "--no-cache",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(report["status"], "complete");
+    let dictionary = &report["dictionary"];
+    assert_eq!(dictionary["hash_count"], 2);
+    assert_eq!(dictionary["value_count"], 2);
+    assert_eq!(dictionary["empty"], false);
+    assert_eq!(dictionary["checks"]["partition_ok"], true);
+    assert_eq!(dictionary["checks"]["hash_sorted_unique"], true);
+    let records = dictionary["records"]["items"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["width"], 128);
+    assert_eq!(records[0]["height"], 64);
+    assert_eq!(records[0]["format_id"], 98);
+    assert_eq!(records[0]["name"]["check"], "matched");
+    assert_eq!(records[1]["format_id"], 71);
+    assert_eq!(records[1]["name"]["variant"], "pointer");
+    assert_eq!(records[1]["name"]["check"], "not checked");
+    assert_eq!(records[0]["allocation"]["extent"], 0x800);
+
+    let one = json(&lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--dictionary",
+            "--record",
+            "1",
+            "--json",
+            "--no-cache",
+        ],
+        temp.path(),
+    ));
+    assert_eq!(one["dictionary"]["record"]["index"], 1);
+    assert!(one["dictionary"]["records"].is_null());
+
+    let text = lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--dictionary",
+            "--no-cache",
+        ],
+        temp.path(),
+    );
+    assert!(text.status.success());
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    assert!(stdout.contains("dictionary:"), "{stdout}");
+    assert!(stdout.contains("128"), "{stdout}");
+}
+
+#[test]
+fn a_resource_that_is_not_a_dictionary_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("plain.rpf");
+    // A resource whose hash-array field is not a pointer.
+    let mut system = vec![0u8; 0x100];
+    put_u64(&mut system, 0x08, 0x5000_0000 | 0x0C0);
+    put_u64(&mut system, 0x20, 0x7000_0000_0000_0000);
+    system[0x0C0 + 8] = 1;
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..4].copy_from_slice(b"9FPR");
+    bytes[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+    bytes.resize(0x1010, 0);
+    let offset = bytes.len() as u64;
+    bytes.extend_from_slice(&zlib(&system));
+    bytes.resize(bytes.len().next_multiple_of(16), 0);
+    std::fs::write(&path, bytes).unwrap();
+
+    let id = format!("0x{:X}", offset);
+    let output = lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--dictionary",
+            "--no-cache",
+        ],
+        temp.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let message = String::from_utf8(output.stderr).unwrap();
+    assert!(message.contains("not a texture dictionary"), "{message}");
+}
