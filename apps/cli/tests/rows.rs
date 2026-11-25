@@ -143,6 +143,61 @@ fn searches_by_name_hash_type_extension_and_readability() {
         "--json",
     ]));
     assert_eq!(readable["matched"], 3);
+    // Companion discovery runs once per opened archive, not once per row.
+    assert_eq!(readable["companions_resolved"], 1);
+}
+
+#[test]
+fn hash_search_uses_only_the_class_column() {
+    let temp = tempfile::tempdir().unwrap();
+    // A row that stores both keys must not match through the column its type
+    // class does not make authoritative.
+    let mut hash_row = spec(b"hash row");
+    hash_row.type_id = 0;
+    hash_row.hash = Some(hash64(b"alpha"));
+    hash_row.key = Some(joaat(b"beta"));
+    let mut key_row = spec(b"key row");
+    key_row.type_id = 11;
+    key_row.hash = Some(hash64(b"gamma"));
+    key_row.key = Some(joaat(b"delta"));
+    let mut unknown_row = spec(b"unknown row");
+    unknown_row.type_id = 5;
+    unknown_row.hash = Some(hash64(b"epsilon"));
+    unknown_row.key = Some(joaat(b"zeta"));
+    let path = write_archive(
+        temp.path(),
+        "classes.rpf",
+        &assemble(&[hash_row, key_row, unknown_row], &[]),
+    );
+    let path = path.to_str().unwrap();
+    let search = |hash: String| {
+        json(&lforge(&[
+            "archive", "search", path, "--hash", &hash, "--json",
+        ]))
+    };
+
+    let hash64_alpha = search(format!("{:#018X}", hash64(b"alpha")));
+    assert_eq!(hash64_alpha["matched"], 1);
+    assert_eq!(hash64_alpha["rows"][0]["row"], 0);
+
+    // The 32-bit column of a hash64-class row is not authoritative.
+    let key32_beta = search(format!("{:#010X}", joaat(b"beta")));
+    assert_eq!(key32_beta["matched"], 0);
+
+    // The 64-bit column of a key32-class row is not authoritative.
+    let hash64_gamma = search(format!("{:#018X}", hash64(b"gamma")));
+    assert_eq!(hash64_gamma["matched"], 0);
+
+    let key32_delta = search(format!("{:#010X}", joaat(b"delta")));
+    assert_eq!(key32_delta["matched"], 1);
+    assert_eq!(key32_delta["rows"][0]["row"], 1);
+
+    // An unknown class has no authoritative column at all.
+    assert_eq!(
+        search(format!("{:#018X}", hash64(b"epsilon")))["matched"],
+        0
+    );
+    assert_eq!(search(format!("{:#010X}", joaat(b"zeta")))["matched"], 0);
 }
 
 #[test]

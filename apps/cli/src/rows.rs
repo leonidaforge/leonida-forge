@@ -403,7 +403,12 @@ pub fn parse_hash(text: &str) -> Result<Key, String> {
     }
 }
 
-fn matches(listing: &Listing, position: usize, options: &SearchOptions) -> bool {
+fn matches(
+    listing: &Listing,
+    position: usize,
+    options: &SearchOptions,
+    alternates: &Alternates,
+) -> bool {
     let entry = &listing.entries[position];
     if let Some(type_id) = options.type_id
         && entry.type_id() != Some(type_id)
@@ -419,7 +424,6 @@ fn matches(listing: &Listing, position: usize, options: &SearchOptions) -> bool 
         }
     }
     if let Some(readable) = options.readable {
-        let alternates = listing.alternates();
         let state = native::contents_state(entry, &listing.opened.source, alternates.sources());
         if state.readable != readable {
             return false;
@@ -439,15 +443,31 @@ fn matches(listing: &Listing, position: usize, options: &SearchOptions) -> bool 
         }
     }
     if let Some(hash) = options.hash {
-        let matching = match hash {
-            Key::Hash64(value) => entry.name_hash.as_ref().ok().copied().flatten() == Some(value),
-            Key::Key32(value) => entry.name_key.as_ref().ok().copied().flatten() == Some(value),
-        };
-        if !matching {
+        // Only the column of the row's established type class may match, the
+        // same contract the resolver uses. An unknown class has no
+        // authoritative hash column, so it matches neither search width.
+        let class = entry
+            .type_id()
+            .and_then(|type_id| listing.types.class(type_id));
+        if !hash_matches(class, entry, hash) {
             return false;
         }
     }
     true
+}
+
+/// Whether `entry`, whose type class is `class`, stores `hash` in the column
+/// that class makes authoritative. A row of one class never matches the other
+/// class's column, even when both columns hold a value; a row of unknown class
+/// matches neither.
+fn hash_matches(class: Option<Class>, entry: &Entry, hash: Key) -> bool {
+    if class != Some(hash.class()) {
+        return false;
+    }
+    match hash {
+        Key::Hash64(value) => entry.name_hash.as_ref().ok().copied().flatten() == Some(value),
+        Key::Key32(value) => entry.name_key.as_ref().ok().copied().flatten() == Some(value),
+    }
 }
 
 pub fn run_search(options: SearchOptions) -> Result<(), String> {
@@ -465,6 +485,8 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
     let mut skipped = Vec::new();
     let mut found = Vec::new();
     let mut matched = 0usize;
+    // One companion resolution per opened archive, reused for every row.
+    let mut companions_resolved = 0usize;
     let offset = options.offset;
     // Collect in a deterministic order: archives sorted, rows in row order.
     for archive in &archives {
@@ -500,8 +522,9 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             }
         };
         let alternates = listing.alternates();
+        companions_resolved += 1;
         for position in 0..listing.entries.len() {
-            if !matches(&listing, position, &options) {
+            if !matches(&listing, position, &options, &alternates) {
                 continue;
             }
             matched += 1;
@@ -520,6 +543,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             "limit": options.limit,
             "returned": found.len(),
             "truncated": matched > offset + found.len(),
+            "companions_resolved": companions_resolved,
             "archives_truncated": truncated,
             "skipped": skipped,
             "rows": found,
@@ -649,6 +673,58 @@ fn write_line(writer: &mut dyn Write, value: &Value) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name_hash: Option<u64>, name_key: Option<u32>) -> Entry {
+        Entry {
+            row: 0,
+            location: Ok(None),
+            name_hash: Ok(name_hash),
+            name_key: Ok(name_key),
+            chunks: Ok(None),
+            payload_transform: Ok(false),
+            read_source: Ok(None),
+        }
+    }
+
+    #[test]
+    fn hash_search_matches_only_the_class_column() {
+        // A row that stores both keys must not match through the column its
+        // type class does not make authoritative.
+        let both = entry(Some(0x1234), Some(0x5678));
+        assert!(hash_matches(
+            Some(Class::Hash64),
+            &both,
+            Key::Hash64(0x1234)
+        ));
+        assert!(!hash_matches(
+            Some(Class::Hash64),
+            &both,
+            Key::Key32(0x5678)
+        ));
+        assert!(hash_matches(Some(Class::Key32), &both, Key::Key32(0x5678)));
+        assert!(!hash_matches(
+            Some(Class::Key32),
+            &both,
+            Key::Hash64(0x1234)
+        ));
+        // An unknown class has no authoritative column.
+        assert!(!hash_matches(None, &both, Key::Hash64(0x1234)));
+        assert!(!hash_matches(None, &both, Key::Key32(0x5678)));
+        // A different value does not match.
+        assert!(!hash_matches(
+            Some(Class::Hash64),
+            &both,
+            Key::Hash64(0x9999)
+        ));
+        // A malformed column never matches.
+        let mut broken = both.clone();
+        broken.name_hash = Err("bad".to_string());
+        assert!(!hash_matches(
+            Some(Class::Hash64),
+            &broken,
+            Key::Hash64(0x1234)
+        ));
+    }
 
     #[test]
     fn parses_both_hash_widths_exactly() {
