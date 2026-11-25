@@ -109,6 +109,19 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Revalidate LUT records and compare the bundled tables with a Research
+    /// checkout. Reads only; writes nothing
+    Audit {
+        /// A directory holding `rpf9-hash64.lut` and `rpf9-key32.lut` to audit
+        /// instead of the bundled tables
+        #[arg(long)]
+        lut: Option<PathBuf>,
+        /// A Research checkout's `names` directory to compare with
+        #[arg(long)]
+        research: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +250,11 @@ pub fn run(command: Command) -> Result<(), String> {
                 Ok(())
             }
         }
+        Command::Audit {
+            lut,
+            research,
+            json,
+        } => audit(lut.as_deref(), research.as_deref(), json),
     }
 }
 
@@ -274,13 +292,45 @@ struct Discovery {
     truncated: bool,
     types: Types,
     namespace_rows: NamespaceRows,
+    type_rows: BTreeMap<Option<u8>, TypeRows>,
 }
+
+/// One matched row, by archive path and row number.
+type RowId = (String, u32);
+/// Record count and the distinct rows one source produced.
+type SourceStats = (usize, BTreeSet<RowId>);
+/// Record count, distinct keys and distinct rows of one source and namespace.
+type ProvenanceStats = (usize, BTreeSet<String>, BTreeSet<RowId>);
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct NamespaceRows {
     hash64: usize,
     key32: usize,
     unknown: usize,
+}
+
+/// How the rows of one type ID populate the two key columns. This is
+/// observation, not a class assignment: the namespace a type uses is only
+/// established when its class is.
+#[derive(Debug, Clone, Default, Serialize)]
+struct TypeRows {
+    rows: usize,
+    hash64_only: usize,
+    key32_only: usize,
+    both: usize,
+    neither: usize,
+}
+
+impl TypeRows {
+    fn add(&mut self, hash: bool, key: bool) {
+        self.rows += 1;
+        match (hash, key) {
+            (true, true) => self.both += 1,
+            (true, false) => self.hash64_only += 1,
+            (false, true) => self.key32_only += 1,
+            (false, false) => self.neither += 1,
+        }
+    }
 }
 
 impl Discovery {
@@ -293,6 +343,23 @@ impl Discovery {
             "truncated": self.truncated,
             "rows": self.index.rows(),
             "namespace_rows": self.namespace_rows,
+            "type_rows": self
+                .type_rows
+                .iter()
+                .map(|(type_id, rows)| {
+                    let mut value = serde_json::to_value(rows).unwrap_or(Value::Null);
+                    value["type_id"] = match type_id {
+                        Some(type_id) => json!(type_id),
+                        None => Value::Null,
+                    };
+                    value["namespace"] = match type_id.and_then(|t| self.types.class(t)) {
+                        Some(Class::Hash64) => json!("hash64"),
+                        Some(Class::Key32) => json!("key32"),
+                        None => Value::Null,
+                    };
+                    value
+                })
+                .collect::<Vec<_>>(),
             "unique_keys": {
                 "hash64": self.index.unique_keys_in(Class::Hash64),
                 "key32": self.index.unique_keys_in(Class::Key32),
@@ -315,6 +382,26 @@ fn print_index_text(summary: &Value) -> Result<(), String> {
         summary["namespace_rows"]["key32"],
         summary["namespace_rows"]["unknown"]
     );
+    for rows in summary["type_rows"].as_array().into_iter().flatten() {
+        let type_id = match &rows["type_id"] {
+            Value::Null => "none".to_string(),
+            other => other.to_string(),
+        };
+        println!(
+            "type {type_id:<4} {:>6} rows: {} hash64-only, {} key32-only, {} both, {} neither, \
+             namespace {}",
+            rows["rows"],
+            rows["hash64_only"],
+            rows["key32_only"],
+            rows["both"],
+            rows["neither"],
+            match &rows["namespace"] {
+                Value::Null => "unknown",
+                Value::String(namespace) => namespace.as_str(),
+                _ => "?",
+            }
+        );
+    }
     println!(
         "unique keys: {} hash64, {} key32",
         summary["unique_keys"]["hash64"], summary["unique_keys"]["key32"]
@@ -347,6 +434,7 @@ fn discover(
         truncated,
         types: Types::default(),
         namespace_rows: NamespaceRows::default(),
+        type_rows: BTreeMap::new(),
     };
     for path in paths {
         if cancel.load(Ordering::Relaxed) {
@@ -388,6 +476,11 @@ fn discover(
                 Some(Class::Key32) => discovery.namespace_rows.key32 += 1,
                 None => discovery.namespace_rows.unknown += 1,
             }
+            discovery
+                .type_rows
+                .entry(type_id)
+                .or_default()
+                .add(hash.is_some(), key.is_some());
         }
         let alternates = Alternates::resolve(&path, &opened.metadata);
         discovery.archives.push(IndexedArchive {
@@ -421,53 +514,14 @@ fn collect_archives(
     limits: ScanLimits,
     cancel: &AtomicBool,
 ) -> Result<(Vec<PathBuf>, bool), String> {
-    if root.is_file() {
-        return Ok((vec![root.to_path_buf()], false));
-    }
-    let mut files = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    let mut truncated = false;
-    while let Some((directory, depth)) = stack.pop() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".to_string());
-        }
-        if depth > limits.max_depth {
-            truncated = true;
-            continue;
-        }
-        let Ok(entries) = fs::read_dir(&directory) else {
-            continue;
-        };
-        let mut children: Vec<_> = entries.filter_map(Result::ok).collect();
-        children.sort_by_key(|entry| entry.path());
-        for entry in children {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_dir() {
-                stack.push((path, depth + 1));
-            } else if file_type.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
-            {
-                files.push(path);
-                if files.len() >= limits.max_archives {
-                    truncated = true;
-                    break;
-                }
-            }
-        }
-        if files.len() >= limits.max_archives {
-            break;
-        }
-    }
-    files.sort();
-    Ok((files, truncated))
+    native::collect_archives(
+        root,
+        native::ScanLimits {
+            max_depth: limits.max_depth,
+            max_archives: limits.max_archives,
+        },
+        cancel,
+    )
 }
 
 fn relative(root: &Path, path: &Path) -> String {
@@ -555,6 +609,7 @@ struct Harvester<'a> {
     payload_skip_reasons: BTreeMap<String, usize>,
     payload_bytes: u64,
     sections: usize,
+    sections_skipped: usize,
     executable_bytes: u64,
     strings: usize,
     sensitive: usize,
@@ -581,6 +636,7 @@ impl<'a> Harvester<'a> {
             payload_skip_reasons: BTreeMap::new(),
             payload_bytes: 0,
             sections: 0,
+            sections_skipped: 0,
             executable_bytes: 0,
             strings: 0,
             sensitive: 0,
@@ -706,6 +762,7 @@ impl<'a> Harvester<'a> {
             }
             let name = section.name().to_string();
             if skip_section(&name) {
+                self.sections_skipped += 1;
                 continue;
             }
             let range = section.virtual_range();
@@ -879,6 +936,25 @@ impl<'a> Harvester<'a> {
     }
 
     fn summary(&self, root: &Path, executable: &Path, output_path: &Path) -> Value {
+        let mut by_source: BTreeMap<&str, SourceStats> = BTreeMap::new();
+        let mut by_namespace: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut by_archive: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut by_type: BTreeMap<Option<u8>, usize> = BTreeMap::new();
+        for record in &self.records {
+            let source = by_source.entry(record.source.kind.as_str()).or_default();
+            source.0 += 1;
+            *by_namespace.entry(record.namespace.as_str()).or_default() += 1;
+            for row in &record.rows {
+                source.1.insert((row.archive.clone(), row.row));
+                *by_archive.entry(row.archive.as_str()).or_default() += 1;
+                *by_type.entry(row.type_id).or_default() += 1;
+            }
+        }
+        let ambiguous_keys = self
+            .key_names
+            .values()
+            .filter(|names| names.len() > 1)
+            .count();
         json!({
             "root": root.display().to_string(),
             "executable": executable.display().to_string(),
@@ -893,6 +969,7 @@ impl<'a> Harvester<'a> {
             },
             "executable_section": {
                 "sections": self.sections,
+                "sections_skipped": self.sections_skipped,
                 "bytes": self.executable_bytes,
             },
             "candidates": {
@@ -905,7 +982,19 @@ impl<'a> Harvester<'a> {
                 "unique_keys": self.matched_keys.len(),
                 "rows": self.matched_rows.len(),
                 "ambiguous": self.records.iter().filter(|record| record.ambiguous).count(),
+                "ambiguous_keys": ambiguous_keys,
+                "by_namespace": by_namespace,
+                "by_source": by_source
+                    .iter()
+                    .map(|(kind, (records, rows))| json!({ "kind": kind, "records": records, "rows": rows.len() }))
+                    .collect::<Vec<_>>(),
+                "by_archive": by_archive,
+                "by_type": by_type
+                    .iter()
+                    .map(|(type_id, rows)| json!({ "type_id": type_id, "rows": rows }))
+                    .collect::<Vec<_>>(),
             },
+            "unresolved_rows": self.discovery.index.rows() - self.matched_rows.len(),
             "truncated": self.truncated,
         })
     }
@@ -996,6 +1085,9 @@ struct ExportSummary {
     skipped: usize,
     unverified: usize,
     ambiguous_hashes: usize,
+    /// Which input source and namespace each accepted record came from, with
+    /// distinct keys and rows. Aggregate only: never the strings themselves.
+    sources: Vec<Value>,
     files: Vec<ExportedFile>,
 }
 
@@ -1016,6 +1108,7 @@ fn export_lut(
     overwrite: bool,
 ) -> Result<ExportSummary, String> {
     let mut mappings: BTreeMap<Class, BTreeMap<u64, BTreeSet<String>>> = BTreeMap::new();
+    let mut provenance: BTreeMap<(String, String), ProvenanceStats> = BTreeMap::new();
     let mut skipped = 0;
     let mut unverified = 0;
     let mut bytes = 0u64;
@@ -1070,6 +1163,14 @@ fn export_lut(
             skipped += 1;
             continue;
         };
+        let source = provenance
+            .entry((record.source.kind.clone(), record.namespace.clone()))
+            .or_default();
+        source.0 += 1;
+        source.1.insert(record.hash.clone());
+        for row in &record.rows {
+            source.2.insert((row.archive.clone(), row.row));
+        }
         mappings
             .entry(class)
             .or_default()
@@ -1146,6 +1247,18 @@ fn export_lut(
         skipped,
         unverified: total_unverified + unverified,
         ambiguous_hashes: total_ambiguous,
+        sources: provenance
+            .into_iter()
+            .map(|((kind, namespace), (records, keys, rows))| {
+                json!({
+                    "kind": kind,
+                    "namespace": namespace,
+                    "records": records,
+                    "keys": keys.len(),
+                    "rows": rows.len(),
+                })
+            })
+            .collect(),
         files,
     })
 }
@@ -1187,18 +1300,253 @@ fn print_harvest_text(summary: &Value) -> Result<(), String> {
         summary["candidates"]["strings"]
     );
     println!(
-        "executable:  {} sections, {} bytes",
-        summary["executable_section"]["sections"], summary["executable_section"]["bytes"]
+        "executable:  {} sections, {} skipped, {} bytes",
+        summary["executable_section"]["sections"],
+        summary["executable_section"]["sections_skipped"],
+        summary["executable_section"]["bytes"]
     );
     println!(
-        "matches:     {} records, {} keys, {} rows, {} ambiguous",
+        "matches:     {} records, {} keys, {} rows, {} ambiguous ({} ambiguous keys)",
         summary["matches"]["records"],
         summary["matches"]["unique_keys"],
         summary["matches"]["rows"],
-        summary["matches"]["ambiguous"]
+        summary["matches"]["ambiguous"],
+        summary["matches"]["ambiguous_keys"]
     );
+    println!("unresolved:  {} rows", summary["unresolved_rows"]);
     println!("output:      {}", summary["output"].as_str().unwrap_or("?"));
     Ok(())
+}
+
+const AUDIT_SCHEMA: &str = "leonida-forge.lut-audit/1";
+
+#[derive(Debug, Default)]
+struct LutAudit {
+    file: String,
+    namespace: Option<String>,
+    entries: usize,
+    verified: usize,
+    unverified: Vec<String>,
+    duplicate_records: usize,
+    keys: usize,
+    ambiguous_keys: usize,
+    ambiguous_examples: Vec<String>,
+    normalized_duplicates: usize,
+    path_unsafe: usize,
+    path_unsafe_examples: Vec<String>,
+    extensions: BTreeMap<String, usize>,
+    problem: Option<String>,
+}
+
+impl LutAudit {
+    fn ok(&self) -> bool {
+        self.problem.is_none() && self.verified == self.entries
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "file": self.file,
+            "namespace": self.namespace,
+            "entries": self.entries,
+            "verified": self.verified,
+            "unverified": self.unverified.len(),
+            "unverified_examples": self.unverified,
+            "duplicate_records": self.duplicate_records,
+            "keys": self.keys,
+            "ambiguous_keys": self.ambiguous_keys,
+            "ambiguous_examples": self.ambiguous_examples,
+            "normalized_duplicates": self.normalized_duplicates,
+            "path_unsafe": self.path_unsafe,
+            "path_unsafe_examples": self.path_unsafe_examples,
+            "extensions": self.extensions,
+            "problem": self.problem,
+            "ok": self.ok(),
+        })
+    }
+}
+
+fn audit_one(file: &str, lut: &Lut) -> LutAudit {
+    let mut audit = LutAudit {
+        file: file.to_string(),
+        namespace: Some(lut.namespace().namespace().to_string()),
+        entries: lut.entries().len(),
+        duplicate_records: lut.duplicates(),
+        ..LutAudit::default()
+    };
+    let mut by_key: BTreeMap<(Class, u64), BTreeSet<Vec<u8>>> = BTreeMap::new();
+    let mut spellings: BTreeMap<(Class, u64, Vec<u8>), usize> = BTreeMap::new();
+    for entry in lut.entries() {
+        if entry.verified {
+            audit.verified += 1;
+        } else if audit.unverified.len() < 20 {
+            audit
+                .unverified
+                .push(format!("{} {}", entry.hash.canonical(), entry.name));
+        }
+        let normalized = lforge_rage9::rpf::names::table::normalized(&entry.name);
+        by_key
+            .entry((entry.hash.class(), entry.hash.value()))
+            .or_default()
+            .insert(normalized.clone());
+        *spellings
+            .entry((entry.hash.class(), entry.hash.value(), normalized))
+            .or_default() += 1;
+        if lforge_rage9::rpf::names::relative_path(&entry.name).is_none() {
+            audit.path_unsafe += 1;
+            if audit.path_unsafe_examples.len() < 20 {
+                audit.path_unsafe_examples.push(entry.name.clone());
+            }
+        }
+        if let Some(extension) = extension_of(&entry.name) {
+            *audit
+                .extensions
+                .entry(extension.to_ascii_lowercase())
+                .or_default() += 1;
+        }
+    }
+    audit.normalized_duplicates = spellings.values().map(|count| count - 1).sum();
+    audit.keys = by_key.len();
+    audit.ambiguous_keys = by_key.values().filter(|names| names.len() > 1).count();
+    for ((class, value), names) in by_key.iter().filter(|(_, names)| names.len() > 1).take(20) {
+        let key = match class {
+            Class::Hash64 => Key::Hash64(*value).canonical(),
+            Class::Key32 => Key::Key32(*value as u32).canonical(),
+        };
+        let names: Vec<String> = names
+            .iter()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        audit
+            .ambiguous_examples
+            .push(format!("{key}: {}", names.join(", ")));
+    }
+    audit
+}
+
+fn read_lut(path: &Path) -> Result<Lut, String> {
+    Lut::read(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn bundled_lut(file: &str, lut_dir: Option<&Path>) -> Result<Lut, String> {
+    match lut_dir {
+        Some(dir) => read_lut(&dir.join(file)),
+        None => lforge_rage9::rpf::names::builtin::embedded()
+            .find(|(name, _)| *name == file)
+            .map(|(_, bytes)| Lut::parse(bytes).map_err(|err| err.to_string()))
+            .unwrap_or_else(|| Err(format!("no bundled table named {file}"))),
+    }
+}
+
+fn audit(lut_dir: Option<&Path>, research: Option<&Path>, json: bool) -> Result<(), String> {
+    let mut audits = Vec::new();
+    for file in ["rpf9-hash64.lut", "rpf9-key32.lut"] {
+        let audit = match bundled_lut(file, lut_dir) {
+            Ok(lut) => audit_one(file, &lut),
+            Err(problem) => LutAudit {
+                file: file.to_string(),
+                problem: Some(problem),
+                ..LutAudit::default()
+            },
+        };
+        audits.push(audit);
+    }
+    let mut research_report = Value::Null;
+    let mut research_ok = true;
+    if let Some(dir) = research {
+        let mut files = Vec::new();
+        for file in ["rpf9-hash64.lut", "rpf9-key32.lut"] {
+            let mut value = json!({ "file": file });
+            let bundled = bundled_lut(file, lut_dir);
+            let source = read_lut(&dir.join(file));
+            match (bundled, source) {
+                (Err(problem), _) | (_, Err(problem)) => {
+                    research_ok = false;
+                    value["problem"] = json!(problem);
+                }
+                (Ok(bundled), Ok(source)) => {
+                    let identical = bundled.to_text() == source.to_text();
+                    research_ok &= identical;
+                    let bundled_set: BTreeSet<(Key, &str)> = bundled
+                        .entries()
+                        .iter()
+                        .map(|entry| (entry.hash, entry.name.as_str()))
+                        .collect();
+                    let source_set: BTreeSet<(Key, &str)> = source
+                        .entries()
+                        .iter()
+                        .map(|entry| (entry.hash, entry.name.as_str()))
+                        .collect();
+                    value["identical_canonical_text"] = json!(identical);
+                    value["bundled_entries"] = json!(bundled.entries().len());
+                    value["research_entries"] = json!(source.entries().len());
+                    value["missing_from_bundled"] =
+                        json!(source_set.difference(&bundled_set).count());
+                    value["only_in_bundled"] = json!(bundled_set.difference(&source_set).count());
+                }
+            }
+            files.push(value);
+        }
+        research_report = json!({
+            "directory": dir.display().to_string(),
+            "files": files,
+            "ok": research_ok,
+        });
+    }
+    let ok = audits.iter().all(LutAudit::ok) && research_ok;
+    let document = json!({
+        "schema": AUDIT_SCHEMA,
+        "luts": audits.iter().map(LutAudit::json).collect::<Vec<_>>(),
+        "research": research_report,
+        "ok": ok,
+    });
+    if json {
+        print_json(&document)?;
+    } else {
+        for audit in &audits {
+            match &audit.problem {
+                Some(problem) => println!("{}: not read: {problem}", audit.file),
+                None => {
+                    println!(
+                        "{}: {} entries ({} verified), {} keys, {} ambiguous keys, {} \
+                         normalized duplicates, {} path-unsafe names, {} duplicate records",
+                        audit.file,
+                        audit.entries,
+                        audit.verified,
+                        audit.keys,
+                        audit.ambiguous_keys,
+                        audit.normalized_duplicates,
+                        audit.path_unsafe,
+                        audit.duplicate_records
+                    );
+                    for example in &audit.unverified {
+                        println!("  unverified: {example}");
+                    }
+                    for example in &audit.ambiguous_examples {
+                        println!("  ambiguous: {example}");
+                    }
+                    for example in &audit.path_unsafe_examples {
+                        println!("  unsafe path: {example}");
+                    }
+                }
+            }
+        }
+        if !research_report.is_null() {
+            println!(
+                "research: {}",
+                if research_ok {
+                    "matches the bundled tables"
+                } else {
+                    "differs from the bundled tables"
+                }
+            );
+        }
+        println!("result: {}", if ok { "ok" } else { "problems found" });
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err("the LUT audit found problems".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1292,11 +1640,25 @@ mod tests {
             Class::Key32,
             &variant("synthetic/x.xml")
         ));
-        assert!(!occurrence_allows(
+        // Type 11 uses the 32-bit class, established from the executable.
+        assert!(occurrence_allows(
             &types,
             Some(11),
             Class::Key32,
             &variant("synthetic/x.xml")
+        ));
+        // A type with no established class is not promoted.
+        assert!(!occurrence_allows(
+            &types,
+            Some(13),
+            Class::Key32,
+            &variant("synthetic/x.xml")
+        ));
+        assert!(!occurrence_allows(
+            &types,
+            Some(0),
+            Class::Key32,
+            &variant("synthetic/x.rpf")
         ));
     }
 
