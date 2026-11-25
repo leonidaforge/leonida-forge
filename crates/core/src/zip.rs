@@ -39,6 +39,9 @@ const METHOD_DEFLATE: u16 = 8;
 
 /// The flag that marks an encrypted entry.
 const FLAG_ENCRYPTED: u16 = 0x0001;
+/// The flag that marks an entry whose local header leaves the CRC and sizes
+/// zero for a data descriptor to follow the payload.
+const DATA_DESCRIPTOR_FLAG: u16 = 0x0008;
 /// The flag that marks a UTF-8 name.
 const FLAG_UTF8: u16 = 0x0800;
 
@@ -172,6 +175,13 @@ impl Entry {
 
     pub fn is_encrypted(&self) -> bool {
         self.flags & FLAG_ENCRYPTED != 0
+    }
+
+    /// Whether the local header leaves the CRC and sizes zero for a data
+    /// descriptor to follow the payload. The central directory still carries
+    /// the values this reader uses.
+    pub fn has_data_descriptor(&self) -> bool {
+        self.flags & DATA_DESCRIPTOR_FLAG != 0
     }
 
     /// Whether the name is declared UTF-8.
@@ -533,11 +543,22 @@ fn read_exact_at(reader: &mut (impl Read + Seek), offset: u64, len: usize) -> io
     Ok(bytes)
 }
 
-fn read_at(reader: &mut (impl Read + Seek), offset: u64, len: usize) -> io::Result<Vec<u8>> {
-    reader.seek(SeekFrom::Start(offset))?;
-    let mut bytes = Vec::with_capacity(len);
-    reader.take(len as u64).read_to_end(&mut bytes)?;
-    Ok(bytes)
+/// Reads exactly `len` bytes, reporting a short read as a malformed record
+/// rather than indexing past the bytes that were read.
+fn read_full_at(
+    reader: &mut (impl Read + Seek),
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>, Error> {
+    read_exact_at(reader, offset, len).map_err(|err| {
+        if err.kind() == io::ErrorKind::UnexpectedEof {
+            Error::malformed(format!(
+                "the file ends before the {len} bytes at {offset:#x} that its records declare"
+            ))
+        } else {
+            Error::from(err)
+        }
+    })
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
@@ -560,7 +581,7 @@ fn find_directory(reader: &mut (impl Read + Seek), len: u64) -> Result<Directory
     }
     let tail_len = len.min(END_RECORD_LEN + MAX_COMMENT_LEN);
     let tail_start = len - tail_len;
-    let tail = read_at(reader, tail_start, tail_len as usize)?;
+    let tail = read_full_at(reader, tail_start, tail_len as usize)?;
     let last = tail.len() - END_RECORD_LEN as usize;
     let at = (0..=last).rev().find(|&at| {
         tail[at..].starts_with(&END_RECORD)
@@ -587,7 +608,7 @@ fn find_directory(reader: &mut (impl Read + Seek), len: u64) -> Result<Directory
                 "the ZIP64 end of central directory locator is missing",
             ));
         };
-        let locator = read_at(reader, locator_offset, ZIP64_LOCATOR_LEN as usize)?;
+        let locator = read_full_at(reader, locator_offset, ZIP64_LOCATOR_LEN as usize)?;
         if !locator.starts_with(&ZIP64_LOCATOR) {
             return Err(Error::malformed(
                 "the ZIP64 end of central directory locator is missing",
@@ -602,7 +623,7 @@ fn find_directory(reader: &mut (impl Read + Seek), len: u64) -> Result<Directory
                 "the ZIP64 end of central directory record lies outside the file",
             ));
         }
-        let record = read_at(reader, record_offset, ZIP64_END_RECORD_LEN as usize)?;
+        let record = read_full_at(reader, record_offset, ZIP64_END_RECORD_LEN as usize)?;
         if !record.starts_with(&ZIP64_END_RECORD) {
             return Err(Error::malformed(
                 "the ZIP64 end of central directory record is invalid",
@@ -809,6 +830,9 @@ mod tests {
         method: u16,
         flags: u16,
         crc: Option<u32>,
+        /// Whether the local header defers the sizes and CRC to a data
+        /// descriptor, leaving zeros in their place.
+        descriptor: bool,
     }
 
     impl File {
@@ -819,6 +843,7 @@ mod tests {
                 method: METHOD_STORED,
                 flags: 0,
                 crc: None,
+                descriptor: false,
             }
         }
 
@@ -829,6 +854,7 @@ mod tests {
                 method: METHOD_DEFLATE,
                 flags: 0,
                 crc: None,
+                descriptor: false,
             }
         }
     }
@@ -859,15 +885,20 @@ mod tests {
             };
             let crc = file.crc.unwrap_or_else(|| crc32(&file.data));
             let offset = out.len() as u32;
+            let (local_crc, local_compressed, local_uncompressed) = if file.descriptor {
+                (0u32, 0u32, 0u32)
+            } else {
+                (crc, stored.len() as u32, file.data.len() as u32)
+            };
             out.extend_from_slice(&LOCAL_HEADER);
             out.extend_from_slice(&20u16.to_le_bytes());
             out.extend_from_slice(&file.flags.to_le_bytes());
             out.extend_from_slice(&file.method.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&crc.to_le_bytes());
-            out.extend_from_slice(&(stored.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(file.data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&local_crc.to_le_bytes());
+            out.extend_from_slice(&local_compressed.to_le_bytes());
+            out.extend_from_slice(&local_uncompressed.to_le_bytes());
             out.extend_from_slice(&(file.name.len() as u16).to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes());
             out.extend_from_slice(file.name.as_bytes());
@@ -912,6 +943,28 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap()
+    }
+
+    /// Claims a larger file than it can read, as a file truncated between the
+    /// length check and the read behaves.
+    struct BeyondEnd {
+        cursor: Cursor<Vec<u8>>,
+        claimed: u64,
+    }
+
+    impl Read for BeyondEnd {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.cursor.read(buf)
+        }
+    }
+
+    impl Seek for BeyondEnd {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            match pos {
+                SeekFrom::End(0) => Ok(self.claimed),
+                other => self.cursor.seek(other),
+            }
+        }
     }
 
     fn decode(archive: &Archive, bytes: &[u8], index: usize) -> Result<Vec<u8>, Error> {
@@ -1000,6 +1053,33 @@ mod tests {
         let err = decode(&archive, &bytes, 0).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Malformed);
         assert!(err.message.contains("CRC-32"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_entry_with_a_data_descriptor_decodes_from_the_central_sizes() {
+        let mut file = File::stored("descriptor.bin", b"payload");
+        file.flags = DATA_DESCRIPTOR_FLAG;
+        file.descriptor = true;
+        let bytes = build(&[file]);
+        let archive = read(&bytes);
+        let entry = archive.entry(0).unwrap();
+        assert!(entry.has_data_descriptor());
+        assert_eq!(entry.compressed_size, 7);
+        assert_eq!(entry.uncompressed_size, 7);
+        assert_eq!(decode(&archive, &bytes, 0).unwrap(), b"payload".to_vec());
+    }
+
+    #[test]
+    fn a_short_read_of_the_tail_is_malformed() {
+        let bytes = build(&[File::stored("a.bin", b"a")]);
+        let mut reader = BeyondEnd {
+            cursor: Cursor::new(bytes.clone()),
+            claimed: bytes.len() as u64 + 10,
+        };
+        let err =
+            Archive::read(&mut reader, &Limits::default(), &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Malformed);
+        assert!(err.message.contains("ends before"), "{}", err.message);
     }
 
     #[test]
