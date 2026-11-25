@@ -35,6 +35,7 @@ pub(super) fn detect(source: &mut Source) -> Option<Report> {
         sample: SAMPLE_BLOCKS,
         blocks: false,
         verify: false,
+        texture: None,
     };
     let report = recognition::inspect(source, len, &options, &AtomicBool::new(false)).ok()?;
     let format = report.format?;

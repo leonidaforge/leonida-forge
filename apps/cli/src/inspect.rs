@@ -13,7 +13,7 @@
 //! codec is not supported. The document separates the two.
 
 use std::io::{Read, Seek, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
@@ -33,7 +33,7 @@ const MAX_METADATA: u64 = 256 * 1024 * 1024;
 /// Blocks and entries shown by default.
 pub const DEFAULT_SAMPLE: usize = recognition::DEFAULT_SAMPLE;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Options {
     /// How many records and entries are included.
     pub sample: usize,
@@ -41,6 +41,12 @@ pub struct Options {
     pub blocks: bool,
     /// Decode every decodable block and report what failed.
     pub verify: bool,
+    /// The RDS5 descriptor whose byte-level chain is reported.
+    pub texture: Option<u32>,
+    /// Where the reconstructed bytes of `texture` are written.
+    pub output: Option<PathBuf>,
+    /// Replace the output file if it already exists.
+    pub overwrite: bool,
     pub json: bool,
 }
 
@@ -50,6 +56,7 @@ impl Options {
             sample: self.sample,
             blocks: self.blocks,
             verify: self.verify,
+            texture: self.texture,
         }
     }
 }
@@ -106,7 +113,34 @@ pub fn file(path: &Path, options: &Options) -> Result<(), String> {
         source: json!({ "file": path_string(path) }),
         provenance,
     };
-    emit(&mut source, len, context, options)
+    emit(&mut source, len, context, options)?;
+    // An explicit byte-level export of one descriptor, when asked for.
+    if let (Some(descriptor), Some(output)) = (options.texture, options.output.as_deref()) {
+        crate::output::ensure_not_input(output, &[path])?;
+        let mut source =
+            Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+        let len = source.len();
+        let cancel = AtomicBool::new(false);
+        let written = crate::output::write_file(output, options.overwrite, |writer| {
+            recognition::rds5_texture(&mut source, len, descriptor, &cancel, |bytes| {
+                writer.write_all(bytes)
+            })
+            .map(|report| report.decoded_len)
+            .map_err(|err| format!("descriptor {descriptor} cannot be reconstructed: {err}"))
+        })?;
+        if options.json {
+            eprintln!(
+                "reconstructed descriptor {descriptor}: {written} bytes to {}",
+                output.display()
+            );
+        } else {
+            println!(
+                "reconstructed descriptor {descriptor}: {written} bytes to {}",
+                output.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Inspects a native row or ZIP entry of an archive, after descending through

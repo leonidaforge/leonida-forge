@@ -53,19 +53,18 @@ fn rds5(blocks: &[Vec<u8>]) -> Vec<u8> {
     );
     set_u32(&mut bytes, 0x0C, 0x1600_0000);
     for (index, offset) in offsets.iter().enumerate() {
-        // Record 0 is the chunk record. Block 0 starts at virtual 0, and
-        // each block inflates to one 0x1000 unit.
-        let (class, page_term) = if index == 0 {
-            (0u32, 0u32)
+        // Record 0 is the chunk record. Block 0 starts at page 1, and each
+        // block inflates to one 0x1000 unit.
+        let (class, page_term, counter) = if index == 0 {
+            (0u32, 0u32, 0u32)
         } else {
-            (0x20u32, ((index - 1) % 4) as u32)
+            (0x20u32, ((index) % 4) as u32, (index / 4) as u32)
         };
         let lo = ((*offset as u32 / 0x100) & MASK) | (class << 24) | (page_term << 30);
         set_u32(&mut bytes, 0x10 + 8 * index, lo);
         if index > 0 && index <= blocks.len() {
             let block = &blocks[index - 1];
             let padding = (up(block.len(), 0x100) - block.len()) as u32;
-            let counter = ((index - 1) / 4) as u32;
             set_u32(&mut bytes, 0x14 + 8 * index, (padding << 20) | counter);
         }
     }
@@ -75,10 +74,12 @@ fn rds5(blocks: &[Vec<u8>]) -> Vec<u8> {
     set_u32(&mut bytes, record_end + 0x0C, 0x40);
     for index in 0..blocks.len() {
         let at = record_end + 0x10 + 16 * index;
-        set_u32(&mut bytes, at, 0xC001);
-        set_u32(&mut bytes, at + 4, 0x20);
+        // A 64 by 64 texture with format id 98, kind 2 and tile mode 0, whose
+        // first page is the block start at page `index + 1`.
+        set_u32(&mut bytes, at, 63 | (63 << 14));
+        set_u32(&mut bytes, at + 4, 1 | (98 << 3) | (2 << 20));
         set_u32(&mut bytes, at + 8, index as u32 + 1);
-        set_u32(&mut bytes, at + 12, 1);
+        set_u32(&mut bytes, at + 12, 0);
     }
     let mut pos = first_block;
     for block in blocks {
@@ -486,4 +487,58 @@ fn inspect_output_is_stable() {
     {
         assert!(record["offset"].as_str().unwrap().starts_with("0x"));
     }
+}
+
+#[test]
+fn binary_inspect_reports_and_exports_one_texture() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "texture.bin", &rds5(&[block()]));
+    let out = temp.path().join("reconstructed.bin");
+    let output = lforge(&[
+        "binary",
+        "inspect",
+        path.to_str().unwrap(),
+        "--texture",
+        "0",
+        "--output",
+        out.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    let texture = &document["structure"]["texture"];
+    assert_eq!(texture["descriptor"], 0);
+    assert_eq!(texture["width"], 64);
+    assert_eq!(texture["height"], 64);
+    assert_eq!(texture["format_id"], 98);
+    assert_eq!(texture["kind"], 2);
+    assert_eq!(texture["classes"][0], 0x20);
+    assert_eq!(texture["decoded_len"], 0x1000);
+    assert_eq!(texture["bytes_per_texel"], 1);
+    assert_eq!(texture["complete"], true);
+    assert_eq!(
+        texture["representation"],
+        "reconstructed bytes, not a decoded image"
+    );
+    assert_eq!(std::fs::read(&out).unwrap().len(), 0x1000);
+}
+
+#[test]
+fn refuses_to_export_a_texture_over_its_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "texture.bin", &rds5(&[block()]));
+    let output = lforge(&[
+        "binary",
+        "inspect",
+        path.to_str().unwrap(),
+        "--texture",
+        "0",
+        "--output",
+        path.to_str().unwrap(),
+        "--overwrite",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let message = common::stderr(&output);
+    assert!(message.contains("one of the inputs"), "{message}");
 }

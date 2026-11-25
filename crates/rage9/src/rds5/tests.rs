@@ -19,6 +19,8 @@ struct Build {
     ambiguous: Vec<bool>,
     /// Second word per block: counter, page term and padding.
     second_words: Vec<u32>,
+    /// Descriptor words per entry. Defaults to a placeholder.
+    entries: Vec<[u32; 4]>,
 }
 
 impl Default for Build {
@@ -28,6 +30,7 @@ impl Default for Build {
             classes: Vec::new(),
             ambiguous: Vec::new(),
             second_words: Vec::new(),
+            entries: Vec::new(),
         }
     }
 }
@@ -82,9 +85,10 @@ impl Build {
 
         // Virtual positions advance by each block's inflated length, in
         // units of 0x4000 (counter) and 0x1000 (page term). Record 0 is the
-        // chunk record, so record `k + 1` starts block `k`.
+        // chunk record, so record `k + 1` starts block `k`. The first block
+        // starts at page 1, as in every sampled store.
         let mut virtual_positions = vec![0u64; record_count];
-        let mut acc = 0u64;
+        let mut acc = 0x1000u64;
         for (k, block) in blocks.iter().enumerate() {
             let class = self.classes.get(k).copied().unwrap_or(0x20);
             virtual_positions[k + 1] = acc;
@@ -134,10 +138,14 @@ impl Build {
         set_u32(&mut bytes, record_end + 0x0C, field_m);
         for index in 0..entry_count {
             let at = record_end + 0x10 + index * ENTRY_LEN as usize;
-            set_u32(&mut bytes, at, 0xC001);
-            set_u32(&mut bytes, at + 4, 0x20);
-            set_u32(&mut bytes, at + 8, index as u32 + 1);
-            set_u32(&mut bytes, at + 12, 1);
+            let words =
+                self.entries
+                    .get(index)
+                    .copied()
+                    .unwrap_or([0xC001, 0x20, index as u32 + 1, 1]);
+            for (word, value) in words.iter().enumerate() {
+                set_u32(&mut bytes, at + 4 * word, *value);
+            }
         }
         let mut pos = first_block;
         for block in blocks {
@@ -946,4 +954,153 @@ fn rejects_an_index_that_cannot_exist() {
         .to_string();
         assert!(err.contains("does not exist"), "{err}");
     }
+}
+
+/// A descriptor with the fields the research defines.
+fn descriptor(
+    width: u32,
+    height: u32,
+    mip: u8,
+    flags: u8,
+    format: u8,
+    array_minus_one: u16,
+    kind: u8,
+    tile: u8,
+    page: u32,
+) -> [u32; 4] {
+    let w0 = (width - 1) | ((height - 1) << 14) | (u32::from(mip) << 28);
+    let w1 = u32::from(flags)
+        | (u32::from(format) << 3)
+        | (u32::from(array_minus_one) << 10)
+        | (u32::from(kind) << 20)
+        | (u32::from(tile) << 24);
+    [w0, w1, page, 0]
+}
+
+#[test]
+fn reconstructs_a_single_block_texture() {
+    let texels = 1024u32 * 512;
+    let data = noise(texels as usize);
+    let bytes = Build {
+        entries: vec![descriptor(1024, 512, 0, 1, 98, 0, 2, 0, 1)],
+        ..Build::default()
+    }
+    .build(&[zlib(&data)], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    let mut decoded = Vec::new();
+    let report = reconstruct_texture(
+        &mut source,
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |chunk| {
+            decoded.extend_from_slice(chunk);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(decoded, data);
+    assert_eq!(report.width, 1024);
+    assert_eq!(report.height, 512);
+    assert_eq!(report.format_id, 98);
+    assert_eq!(report.kind, 2);
+    assert_eq!(report.mip, 0);
+    assert_eq!(report.first_page, 1);
+    assert_eq!(report.block_count, 1);
+    assert_eq!(report.classes, vec![0x20]);
+    assert_eq!(report.decoded_len, u64::from(texels));
+    assert_eq!(report.virtual_start, 0x1000);
+    assert_eq!(report.virtual_end, 0x1000 + u64::from(texels));
+    assert_eq!(report.bytes_per_texel, Some(1));
+    assert!(report.complete, "{report:?}");
+}
+
+#[test]
+fn reconstructs_a_stored_class_texture_verbatim() {
+    let data = noise(0x1000);
+    let bytes = Build {
+        classes: vec![0x00],
+        entries: vec![descriptor(64, 64, 0, 0, 71, 0, 2, 0, 1)],
+        ..Build::default()
+    }
+    .build(&[data.clone()], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut decoded = Vec::new();
+    let report = reconstruct_texture(
+        &mut Cursor::new(&bytes),
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |chunk| {
+            decoded.extend_from_slice(chunk);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(decoded, data);
+    assert_eq!(report.classes, vec![0x00]);
+    assert!(report.complete);
+}
+
+#[test]
+fn refuses_a_texture_whose_block_class_is_undecoded() {
+    let bytes = Build {
+        classes: vec![0x04],
+        entries: vec![descriptor(64, 64, 0, 0, 98, 0, 2, 0, 1)],
+        ..Build::default()
+    }
+    .build(&[vec![0x55; 0x1000]], 0);
+    let mut container = read(&bytes).unwrap();
+    let err = reconstruct_texture(
+        &mut Cursor::new(&bytes),
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("storage class 0x04"), "{err}");
+}
+
+#[test]
+fn refuses_a_locator_page_that_is_not_a_block_start() {
+    let bytes = Build {
+        entries: vec![descriptor(64, 64, 0, 0, 98, 0, 2, 0, 7)],
+        ..Build::default()
+    }
+    .build(&[zlib(&vec![0u8; 0x1000])], 0);
+    let mut container = read(&bytes).unwrap();
+    let err = reconstruct_texture(
+        &mut Cursor::new(&bytes),
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("not a block start"), "{err}");
+}
+
+#[test]
+fn reports_a_descriptor_that_does_not_exist() {
+    let bytes = Build::default().build(&[zlib(&vec![0u8; 0x1000])], 0);
+    let mut container = read(&bytes).unwrap();
+    let err = reconstruct_texture(
+        &mut Cursor::new(&bytes),
+        &mut container,
+        5,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("does not exist"), "{err}");
 }

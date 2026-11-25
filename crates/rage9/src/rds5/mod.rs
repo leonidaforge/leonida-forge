@@ -327,9 +327,10 @@ impl Entry {
         (self.words[1] & 0x7) as u8
     }
 
-    /// `w1[3:9]`. A format identifier, not a decoded pixel format.
+    /// `w1[3:9]`, seven bits. A format identifier, not a decoded pixel
+    /// format.
     pub fn format_id(&self) -> u8 {
-        ((self.words[1] >> 3) & 0x3F) as u8
+        ((self.words[1] >> 3) & 0x7F) as u8
     }
 
     /// `w1[10:19] + 1`.
@@ -1010,6 +1011,171 @@ fn copy_range<R: Read + Seek>(
         sink(&buf[..read]).map_err(Error::Io)?;
     }
     Ok(())
+}
+
+/// The byte-level chain from one descriptor to its reconstructed bytes.
+///
+/// Only the relations the research established are reported: the descriptor
+/// fields, the referenced virtual range, the blocks it covers, the decoded
+/// byte count and, when the count divides evenly, the bytes per texel. No
+/// pixel format, tile layout or mip meaning is claimed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureReport {
+    pub descriptor: u32,
+    pub width: u32,
+    pub height: u32,
+    pub mip: u8,
+    pub format_id: u8,
+    pub kind: u8,
+    pub tile_mode: u8,
+    pub first_page: u32,
+    pub first_block: u32,
+    pub block_count: u32,
+    pub virtual_start: u64,
+    pub virtual_end: u64,
+    pub decoded_len: u64,
+    pub classes: Vec<u8>,
+    /// `decoded_len / (width * height)` when it divides evenly. A size
+    /// relation, not a pixel-format interpretation.
+    pub bytes_per_texel: Option<u32>,
+    /// Whether the decoded bytes and the virtual range agree.
+    pub complete: bool,
+    pub notes: Vec<String>,
+}
+
+/// Reconstructs one descriptor's bytes, streams them to `sink`, and reports
+/// the chain. Blocks are decoded by class; a block of an undecoded class
+/// refuses the whole chain rather than returning partial bytes.
+pub fn reconstruct_texture<R: Read + Seek>(
+    source: &mut R,
+    container: &mut Container,
+    descriptor: u32,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<TextureReport, Error> {
+    if descriptor >= container.entry_count {
+        return Err(invalid(format!(
+            "descriptor {descriptor} does not exist; the chunk holds {}",
+            container.entry_count
+        )));
+    }
+    let entry = container
+        .entries(source, descriptor, 1)?
+        .pop()
+        .ok_or_else(|| invalid(format!("descriptor {descriptor} cannot be read")))?;
+    let first_page = entry.locator_page();
+    if first_page == 0 {
+        return Err(invalid(format!(
+            "descriptor {descriptor} has no locator page"
+        )));
+    }
+    let first_block = container
+        .blocks
+        .iter()
+        .position(|block| block.virtual_position / 0x1000 == u64::from(first_page))
+        .ok_or_else(|| {
+            invalid(format!(
+                "the locator page {first_page} of descriptor {descriptor} is not a block start"
+            ))
+        })?;
+    // The range runs to the next descriptor's first page, or to the end
+    // record for the last descriptor.
+    let end_page =
+        if usize::try_from(descriptor).unwrap_or(usize::MAX) + 1 < container.entry_count as usize {
+            let next = container
+                .entries(source, descriptor + 1, 1)?
+                .pop()
+                .map(|entry| entry.locator_page());
+            match next {
+                Some(page) if page > first_page => u64::from(page),
+                _ => {
+                    return Err(invalid(format!(
+                        "descriptor {} does not start after descriptor {descriptor}",
+                        descriptor + 1
+                    )));
+                }
+            }
+        } else {
+            container
+                .records
+                .last()
+                .map(|record| record.virtual_position() / 0x1000)
+                .unwrap_or(0)
+        };
+    let mut block_count = 0u32;
+    for block in &container.blocks[first_block..] {
+        if block.virtual_position / 0x1000 >= end_page {
+            break;
+        }
+        block_count += 1;
+    }
+    if block_count == 0 {
+        return Err(invalid(format!("descriptor {descriptor} covers no block")));
+    }
+
+    // Classify every block once; decode_block refuses an unclassified one.
+    container.classify(source, usize::MAX, cancel)?;
+    let mut decoded_len = 0u64;
+    let mut classes = Vec::with_capacity(block_count as usize);
+    for offset in 0..block_count {
+        let index = first_block as u32 + offset;
+        let before = container.decoded_total;
+        decode_block(source, container, index, limits, cancel, &mut sink)?;
+        decoded_len += container.decoded_total - before;
+        classes.push(container.blocks[index as usize].class_id);
+    }
+
+    let virtual_start = container.blocks[first_block].virtual_position;
+    let last = &container.blocks[first_block + block_count as usize - 1];
+    let virtual_end = last.virtual_position + last.virtual_len;
+    let texels = u64::from(entry.width()) * u64::from(entry.height());
+    let bytes_per_texel = (texels > 0 && decoded_len % texels == 0)
+        .then(|| u32::try_from(decoded_len / texels).ok())
+        .flatten();
+    let complete = decoded_len == virtual_end.saturating_sub(virtual_start);
+
+    let mut notes = Vec::new();
+    if bytes_per_texel != Some(1) {
+        notes.push(
+            "the only measured size relation is one byte per texel for the sampled descriptor"
+                .to_string(),
+        );
+    }
+    if entry.mip() != 0 {
+        notes.push("mip semantics for multi-level textures are not established".to_string());
+    }
+    if entry.kind() != 2 {
+        notes.push("only the 2D kind was followed end to end".to_string());
+    }
+    if entry.tile_mode() != 0 {
+        notes.push("the tile mode has no established meaning".to_string());
+    }
+    if !complete {
+        notes.push(format!(
+            "decoded {decoded_len} bytes for a virtual range of {}",
+            virtual_end.saturating_sub(virtual_start)
+        ));
+    }
+    Ok(TextureReport {
+        descriptor,
+        width: entry.width(),
+        height: entry.height(),
+        mip: entry.mip(),
+        format_id: entry.format_id(),
+        kind: entry.kind(),
+        tile_mode: entry.tile_mode(),
+        first_page,
+        first_block: first_block as u32,
+        block_count,
+        virtual_start,
+        virtual_end,
+        decoded_len,
+        classes,
+        bytes_per_texel,
+        complete,
+        notes,
+    })
 }
 
 /// A zlib header: DEFLATE, a window of at most 32 KiB, no preset dictionary,

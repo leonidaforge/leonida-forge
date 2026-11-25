@@ -72,12 +72,21 @@ pub enum Command {
         /// Records and entries included in the report
         #[arg(long, default_value_t = crate::inspect::DEFAULT_SAMPLE)]
         sample: usize,
-        /// Read every block's storage selector instead of the first sample
+        /// Read every block's storage class instead of the first sample
         #[arg(long)]
         blocks: bool,
-        /// Inflate every zlib block and report what fails
+        /// Decode every decodable block and report what fails
         #[arg(long)]
         verify: bool,
+        /// Report the byte-level chain of this RDS5 descriptor
+        #[arg(long, value_name = "INDEX")]
+        texture: Option<u32>,
+        /// Write the reconstructed bytes of `--texture` here
+        #[arg(long, requires = "texture")]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long, requires = "output")]
+        overwrite: bool,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -154,6 +163,9 @@ pub fn run(command: Command) -> Result<(), String> {
             sample,
             blocks,
             verify,
+            texture,
+            output,
+            overwrite,
             json,
         } => crate::inspect::file(
             &file,
@@ -161,6 +173,9 @@ pub fn run(command: Command) -> Result<(), String> {
                 sample,
                 blocks,
                 verify,
+                texture,
+                output,
+                overwrite,
                 json,
             },
         ),

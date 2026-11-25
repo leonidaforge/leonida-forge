@@ -95,10 +95,12 @@ impl FormatInfo {
 pub struct Options {
     /// How many records and entries are included.
     pub sample: usize,
-    /// Read every block's storage selector instead of the first `sample`.
+    /// Read every block's storage class instead of the first `sample`.
     pub blocks: bool,
-    /// Inflate every zlib block and report what failed.
+    /// Decode every decodable block and report what failed.
     pub verify: bool,
+    /// The RDS5 descriptor whose byte-level chain is reported.
+    pub texture: Option<u32>,
 }
 
 impl Default for Options {
@@ -107,6 +109,7 @@ impl Default for Options {
             sample: DEFAULT_SAMPLE,
             blocks: false,
             verify: false,
+            texture: None,
         }
     }
 }
@@ -515,6 +518,12 @@ fn rds5_structure<R: Read + Seek>(
     }
 
     let keys = container.keys(source).ok();
+    let texture = options.texture.map(|descriptor| {
+        match texture_chain(source, &mut container, descriptor, &limits, cancel) {
+            Ok(report) => texture_json(&report),
+            Err(err) => json!({ "descriptor": descriptor, "error": err.to_string() }),
+        }
+    });
     let structure = json!({
         "valid": true,
         "header": {
@@ -551,6 +560,7 @@ fn rds5_structure<R: Read + Seek>(
             "items": blocks,
         },
         "first_block": hex(container.first_block),
+        "texture": texture,
         "parsed_ranges": ranges,
         "unknown_regions": unknown,
         "verified": verified.unwrap_or(Value::Null),
@@ -573,6 +583,55 @@ fn rds5_structure<R: Read + Seek>(
         warning: container.warnings.first().cloned(),
     };
     (structure, Some(summary), failure)
+}
+
+/// Reconstructs one RDS5 descriptor's bytes into `sink` and returns the
+/// chain. The bytes are never part of the returned report.
+pub fn rds5_texture<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    descriptor: u32,
+    cancel: &AtomicBool,
+    sink: impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<rds5::TextureReport, String> {
+    let limits = rds5::Limits::default();
+    let mut container =
+        Container::read(source, len, &limits, cancel).map_err(|err| err.to_string())?;
+    rds5::reconstruct_texture(source, &mut container, descriptor, &limits, cancel, sink)
+        .map_err(|err| err.to_string())
+}
+
+fn texture_chain<R: Read + Seek>(
+    source: &mut R,
+    container: &mut Container,
+    descriptor: u32,
+    limits: &rds5::Limits,
+    cancel: &AtomicBool,
+) -> Result<rds5::TextureReport, rds5::Error> {
+    rds5::reconstruct_texture(source, container, descriptor, limits, cancel, |_| Ok(()))
+}
+
+fn texture_json(report: &rds5::TextureReport) -> Value {
+    json!({
+        "descriptor": report.descriptor,
+        "width": report.width,
+        "height": report.height,
+        "mip": report.mip,
+        "format_id": report.format_id,
+        "kind": report.kind,
+        "tile_mode": report.tile_mode,
+        "first_page": report.first_page,
+        "first_block": report.first_block,
+        "block_count": report.block_count,
+        "classes": report.classes,
+        "virtual_start": hex(report.virtual_start),
+        "virtual_end": hex(report.virtual_end),
+        "decoded_len": report.decoded_len,
+        "bytes_per_texel": report.bytes_per_texel,
+        "complete": report.complete,
+        "notes": report.notes,
+        "representation": "reconstructed bytes, not a decoded image",
+    })
 }
 
 fn rbf0_structure<R: Read + Seek>(
