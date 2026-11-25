@@ -122,6 +122,30 @@ pub enum Command {
         #[arg(long)]
         executable: Option<PathBuf>,
     },
+    /// Inspect the decoded contents of one native row in a recognised format,
+    /// without extracting it to a file
+    Inspect {
+        file: PathBuf,
+        /// The row index of the entry, as `archive metadata --entries` lists it
+        #[arg(long, default_value_t = 0)]
+        row: u32,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Records and entries included in the report
+        #[arg(long, default_value_t = crate::inspect::DEFAULT_SAMPLE)]
+        sample: usize,
+        /// Read every block's storage selector instead of the first sample
+        #[arg(long)]
+        blocks: bool,
+        /// Inflate every zlib block and report what fails
+        #[arg(long)]
+        verify: bool,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List the authenticated native rows of one archive as stable records,
     /// with resolved names, type, extension and readability
     Ls {
@@ -286,6 +310,25 @@ pub fn run(command: Command) -> Result<(), String> {
             overwrite,
             executable,
         } => extract::run(&file, row, &output, overwrite, executable.as_deref()),
+        Command::Inspect {
+            file,
+            row,
+            executable,
+            sample,
+            blocks,
+            verify,
+            json,
+        } => crate::inspect::row(
+            &file,
+            row,
+            executable.as_deref(),
+            &crate::inspect::Options {
+                sample,
+                blocks,
+                verify,
+                json,
+            },
+        ),
         Command::Ls {
             file,
             executable,

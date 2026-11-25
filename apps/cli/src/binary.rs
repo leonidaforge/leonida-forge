@@ -66,6 +66,22 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a recognised file format from its contents
+    Inspect {
+        file: PathBuf,
+        /// Records and entries included in the report
+        #[arg(long, default_value_t = crate::inspect::DEFAULT_SAMPLE)]
+        sample: usize,
+        /// Read every block's storage selector instead of the first sample
+        #[arg(long)]
+        blocks: bool,
+        /// Inflate every zlib block and report what fails
+        #[arg(long)]
+        verify: bool,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Clap treats a field spelled `Vec<_>` as a list of values; the alias keeps
@@ -133,6 +149,21 @@ pub fn run(command: Command) -> Result<(), String> {
             };
             interpret(&file, offset, endian, json)
         }
+        Command::Inspect {
+            file,
+            sample,
+            blocks,
+            verify,
+            json,
+        } => crate::inspect::file(
+            &file,
+            &crate::inspect::Options {
+                sample,
+                blocks,
+                verify,
+                json,
+            },
+        ),
     }
 }
 

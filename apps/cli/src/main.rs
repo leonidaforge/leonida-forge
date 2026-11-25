@@ -1,6 +1,7 @@
 mod archive;
 mod binary;
 mod extract;
+mod inspect;
 mod metadata;
 mod names;
 mod native;
