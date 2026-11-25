@@ -131,6 +131,9 @@ pub(crate) fn classify(head: &[u8]) -> Kind {
     if head.starts_with(b"RBF0") {
         return Kind::Rbf;
     }
+    if crate::gfx::is_version_42(head) {
+        return Kind::Gfx;
+    }
     if head.starts_with(b"\x89PNG\r\n\x1A\n") {
         return Kind::Png;
     }

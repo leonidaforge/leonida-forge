@@ -111,6 +111,25 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             }
             fields
         }
+        Some(Summary::Gfx {
+            version,
+            declared_len,
+            rect_len,
+            frame_rate,
+            frame_count,
+            tags,
+            max_depth,
+        }) => vec![
+            ("Version", version.to_string()),
+            ("Declared length", declared_len.to_string()),
+            ("RECT", format!("{rect_len} bytes")),
+            (
+                "Frame rate",
+                format!("{}.{}", frame_rate >> 8, frame_rate & 0xFF),
+            ),
+            ("Frames", frame_count.to_string()),
+            ("Tags", format!("{tags} (depth {max_depth})")),
+        ],
         Some(Summary::Psin) | Some(Summary::Rpf9) | None => Vec::new(),
     }
 }

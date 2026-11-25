@@ -13,6 +13,7 @@
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use lforge_rage9::gfx;
 use lforge_rage9::rbf0;
 use lforge_rage9::rds5::{self, Container, Storage};
 use serde_json::{Map, Value, json};
@@ -62,6 +63,13 @@ pub const PSIN: FormatInfo = FormatInfo {
     name: "PSIN",
     support: "recognition",
     detail: "the magic only; no header field, record structure or purpose is established",
+};
+
+pub const GFX: FormatInfo = FormatInfo {
+    id: "gfx",
+    name: "GFx",
+    support: "structural",
+    detail: "the version-42 header, the RECT extent, frame rate and count, and the tag walk; tag bodies are opaque",
 };
 
 pub const RPF9: FormatInfo = FormatInfo {
@@ -137,6 +145,16 @@ pub enum Summary {
         body: Option<Rbf0Body>,
     },
     Psin,
+    Gfx {
+        version: u8,
+        declared_len: u32,
+        rect_len: usize,
+        frame_rate: u16,
+        frame_count: u16,
+        /// Top-level tags, then nested records.
+        tags: usize,
+        max_depth: usize,
+    },
     Rpf9,
 }
 
@@ -168,6 +186,8 @@ pub fn recognise(head: &[u8]) -> Option<FormatInfo> {
         Some(RDS5)
     } else if rbf0::is_rbf0(head) {
         Some(RBF0)
+    } else if gfx::is_gfx(head) {
+        Some(GFX)
     } else if head.starts_with(b"PSIN") {
         Some(PSIN)
     } else if lforge_rage9::rpf::is_rpf9(head) {
@@ -192,6 +212,7 @@ pub fn inspect<R: Read + Seek>(
     let (structure, summary, failure) = match format {
         Some(format) if format == RDS5 => rds5_structure(source, len, options, cancel),
         Some(format) if format == RBF0 => rbf0_structure(source, len, options, cancel),
+        Some(format) if format == GFX => gfx_structure(source, len, options, cancel),
         Some(format) if format == PSIN => (psin_structure(), Some(Summary::Psin), None),
         Some(format) if format == RPF9 => (rpf9_structure(), Some(Summary::Rpf9), None),
         _ => (Value::Null, None, None),
@@ -759,6 +780,128 @@ fn rbf0_document(document: &rbf0::Document, options: &Options) -> Value {
     })
 }
 
+/// The largest GFx payload read for structural parsing.
+const MAX_GFX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn gfx_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    if len > MAX_GFX_BYTES {
+        let message =
+            format!("the payload is {len} bytes, more than the {MAX_GFX_BYTES} byte parse limit");
+        return (
+            json!({ "valid": false, "error": message.clone() }),
+            None,
+            Some(Failure {
+                stage: "structure",
+                message,
+            }),
+        );
+    }
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match gfx::parse(&bytes, &gfx::Limits::default(), cancel) {
+        Ok(document) => {
+            let header = &document.header;
+            let sample = options.sample.clamp(1, MAX_SAMPLE);
+            let tags: Vec<Value> = document
+                .tags
+                .iter()
+                .take(sample)
+                .map(|tag| {
+                    json!({
+                        "offset": hex(tag.offset as u64),
+                        "code": tag.code,
+                        "length": tag.length,
+                        "depth": tag.depth,
+                        "body": { "start": tag.body.start, "end": tag.body.end },
+                    })
+                })
+                .collect();
+            let structure = json!({
+                "valid": true,
+                "header": {
+                    "version": header.version,
+                    "declared_len": header.declared_len,
+                    "payload_len": bytes.len(),
+                    "rect_len": header.rect_len,
+                    "nbits": header.nbits,
+                    "frame_rate_8_8": header.frame_rate,
+                    "frame_count": header.frame_count,
+                    "tag_start": header.tag_start,
+                },
+                "tags": {
+                    "top_level": document.top_level,
+                    "total": document.tags.len(),
+                    "max_depth": document.max_depth,
+                    "shown": tags.len(),
+                    "items": tags,
+                },
+                "parsed_ranges": [
+                    { "offset": hex(0), "length": 8, "field": "identifier and length" },
+                    {
+                        "offset": hex(8),
+                        "length": (header.tag_start - 8) as u64,
+                        "field": "RECT and frame header",
+                    },
+                    {
+                        "offset": hex(header.tag_start as u64),
+                        "length": (document.end - header.tag_start) as u64,
+                        "field": "tag stream",
+                    },
+                ],
+                "unknown_regions": [],
+                "diagnostics": [],
+                "limitations": [
+                    "versions other than 42 are recognised but not parsed",
+                    "tag bodies other than the nested record stream of tag 39 are opaque",
+                    "no tag body, ActionScript, rendering or playback is interpreted",
+                    "the RECT coordinates and the frames per second are not decoded",
+                ],
+            });
+            let summary = Summary::Gfx {
+                version: header.version,
+                declared_len: header.declared_len,
+                rect_len: header.rect_len,
+                frame_rate: header.frame_rate,
+                frame_count: header.frame_count,
+                tags: document.tags.len(),
+                max_depth: document.max_depth,
+            };
+            (structure, Some(summary), None)
+        }
+        Err(err) => {
+            let stage = match err.kind {
+                gfx::ErrorKind::NotGfx
+                | gfx::ErrorKind::TooShort
+                | gfx::ErrorKind::UnsupportedVersion
+                | gfx::ErrorKind::Length => "header",
+                _ => "structure",
+            };
+            let message = err.to_string();
+            (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure { stage, message }),
+            )
+        }
+    }
+}
+
 fn psin_structure() -> Value {
     json!({
         "valid": true,
@@ -833,5 +976,47 @@ mod tests {
             limitations.contains("magic") || limitations.contains("recognition"),
             "{limitations}"
         );
+    }
+
+    #[test]
+    fn recognises_the_gfx_identifier_with_its_version_byte() {
+        assert_eq!(recognise(b"GFX\x2A\x08\x00\x00\x00"), Some(GFX));
+        // The identifier alone is the family; the version is a separate byte.
+        assert_eq!(recognise(b"GFX\x2B"), Some(GFX));
+        assert_eq!(recognise(b"GF"), None);
+    }
+
+    #[test]
+    fn reports_a_version_42_gfx_payload() {
+        let mut bytes = b"GFX\x2A".to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x1E00u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&0x0040u16.to_le_bytes());
+        body.extend_from_slice(&0x0000u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        // nbits 0 leaves a one-byte RECT.
+        bytes.push(0);
+        bytes.extend_from_slice(&body);
+        let len = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&len.to_le_bytes());
+        let total = bytes.len() as u64;
+        let mut cursor = std::io::Cursor::new(bytes);
+        let report = inspect(
+            &mut cursor,
+            total,
+            &Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.format.map(|format| format.id), Some("gfx"));
+        let structure = &report.structure;
+        assert_eq!(structure["valid"], true);
+        assert_eq!(structure["header"]["version"], 42);
+        assert_eq!(structure["header"]["rect_len"], 1);
+        assert_eq!(structure["header"]["frame_rate_8_8"], 0x1E00);
+        assert_eq!(structure["tags"]["top_level"], 2);
+        assert_eq!(structure["tags"]["items"][0]["code"], 1);
+        assert_eq!(structure["tags"]["items"][1]["code"], 0);
     }
 }

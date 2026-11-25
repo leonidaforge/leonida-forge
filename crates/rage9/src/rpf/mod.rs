@@ -205,6 +205,8 @@ pub enum Kind {
     Psin,
     /// Starts with `RBF0`.
     Rbf,
+    /// Starts with `GFX` and the supported version byte.
+    Gfx,
     Png,
     Dds,
     /// The start of RAGE resource system data, after 16 zero bytes; see
@@ -216,7 +218,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [
+    pub const ALL: [Kind; 9] = [
         Kind::Xml,
         Kind::Psin,
         Kind::Rbf,
@@ -225,6 +227,7 @@ impl Kind {
         Kind::Resource,
         Kind::Text,
         Kind::Binary,
+        Kind::Gfx,
     ];
 
     pub fn name(self) -> &'static str {
@@ -232,6 +235,7 @@ impl Kind {
             Kind::Xml => "xml",
             Kind::Psin => "psin",
             Kind::Rbf => "rbf",
+            Kind::Gfx => "gfx",
             Kind::Png => "png",
             Kind::Dds => "dds",
             Kind::Resource => "resource",
@@ -247,6 +251,7 @@ impl Kind {
             Kind::Xml => "xml",
             Kind::Psin => "bin",
             Kind::Rbf => "rbf",
+            Kind::Gfx => "bin",
             Kind::Png => "png",
             Kind::Dds => "dds",
             Kind::Text => "txt",
@@ -258,7 +263,7 @@ impl Kind {
     /// an established extension for the format. A PSIN payload is named `.bin`
     /// because nothing establishes its real extension.
     pub fn extension_is_synthetic(self) -> bool {
-        matches!(self, Kind::Psin | Kind::Resource | Kind::Binary)
+        matches!(self, Kind::Psin | Kind::Resource | Kind::Binary | Kind::Gfx)
     }
 
     /// Whether data of this kind is only expected at the start of a file.
