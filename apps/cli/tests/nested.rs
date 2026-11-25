@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Output;
 
-use common::{assemble, deflate, lforge, spec, stderr, write_archive};
+use common::{assemble, deflate, lforge, spec, stderr, write_archive, zip_entries};
 use serde_json::Value;
 use zip::write::SimpleFileOptions;
 
@@ -439,4 +439,77 @@ fn ls_descends_into_a_nested_archive() {
     assert_eq!(document["total"], 2);
     assert_eq!(document["rows"][0]["row"], 0);
     assert_eq!(document["rows"][1]["row"], 1);
+}
+
+#[test]
+fn duplicate_full_zip_names_are_distinct_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip = zip_entries(&[("same.bin", &rbf0(21)), ("same.bin", &rbf0(22))]);
+    let path = write(temp.path(), "duplicates.zip", &zip);
+
+    let first = inspect(&path, &["--zip", "0"]);
+    let second = inspect(&path, &["--zip", "1"]);
+    assert_eq!(first["structure"]["prefix"]["flags"], 21);
+    assert_eq!(second["structure"]["prefix"]["flags"], 22);
+    assert_eq!(first["source"]["zip"], 0);
+    assert_eq!(second["source"]["zip"], 1);
+}
+
+#[test]
+fn duplicate_zip_names_stay_selectable_as_nested_archives() {
+    let temp = tempfile::tempdir().unwrap();
+    let inner = rpf9(&[rbf0(23)]);
+    let outer = zip_entries(&[("same.bin", &rbf0(24)), ("same.bin", &inner)]);
+    let path = write(temp.path(), "outer.zip", &outer);
+
+    let document = inspect(&path, &["--enter", "zip:1", "--row", "0"]);
+    assert_eq!(document["structure"]["prefix"]["flags"], 23);
+    assert_eq!(document["provenance"]["chain"][0]["selector"], "zip:1");
+
+    let refused = lforge(&[
+        "archive",
+        "inspect",
+        path.to_str().unwrap(),
+        "--enter",
+        "zip:0",
+        "--row",
+        "0",
+    ]);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("not an archive"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
+fn raw_inspection_of_duplicate_entries_reads_each_stored_range() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip = zip_entries(&[("same.bin", b"first-range"), ("same.bin", b"second-range")]);
+    let path = write(temp.path(), "raw.zip", &zip);
+
+    let first = inspect(&path, &["--zip", "0", "--raw"]);
+    let second = inspect(&path, &["--zip", "1", "--raw"]);
+    assert_eq!(first["size"], 11);
+    assert_eq!(second["size"], 12);
+    assert_eq!(first["provenance"]["selection"]["index"], 0);
+    assert_eq!(second["provenance"]["selection"]["index"], 1);
+}
+
+#[test]
+fn a_malformed_central_directory_is_reported() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut zip = zip_entries(&[("a.bin", &rbf0(25))]);
+    // Blank the central directory signature the reader would find.
+    let at = zip
+        .windows(4)
+        .position(|window| window == b"PK\x01\x02")
+        .expect("a central header");
+    zip[at] = 0;
+    let path = write(temp.path(), "broken.zip", &zip);
+
+    let output = lforge(&["archive", "inspect", path.to_str().unwrap(), "--zip", "0"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("ZIP"), "{}", stderr(&output));
 }

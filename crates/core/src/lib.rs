@@ -3,6 +3,7 @@
 
 pub mod archive;
 pub mod inspect;
+pub mod zip;
 
 use std::path::PathBuf;
 

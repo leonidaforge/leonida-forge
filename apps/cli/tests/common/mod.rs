@@ -407,3 +407,98 @@ pub fn write_archive(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf
 pub fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
+
+/// One entry of a hand-built ZIP archive.
+///
+/// The records are written directly so two entries can share a full name, as a
+/// real central directory may. The writer crate refuses duplicate names.
+pub struct ZipEntry<'a> {
+    pub name: &'a str,
+    pub data: &'a [u8],
+    pub method: u16,
+}
+
+impl<'a> ZipEntry<'a> {
+    pub fn stored(name: &'a str, data: &'a [u8]) -> Self {
+        Self {
+            name,
+            data,
+            method: 0,
+        }
+    }
+
+    pub fn with_method(name: &'a str, data: &'a [u8], method: u16) -> Self {
+        Self { name, data, method }
+    }
+}
+
+const LOCAL_HEADER: [u8; 4] = *b"PK\x03\x04";
+const CENTRAL_HEADER: [u8; 4] = *b"PK\x01\x02";
+const END_RECORD: [u8; 4] = *b"PK\x05\x06";
+
+/// A ZIP archive whose stored entries may repeat a full name.
+pub fn zip_with_entries(files: &[ZipEntry<'_>]) -> Vec<u8> {
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        crc.sum()
+    }
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for file in files {
+        let crc = crc32(file.data);
+        let offset = out.len() as u32;
+        out.extend_from_slice(&LOCAL_HEADER);
+        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&file.method.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(file.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(file.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(file.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(file.name.as_bytes());
+        out.extend_from_slice(file.data);
+
+        central.extend_from_slice(&CENTRAL_HEADER);
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&file.method.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(file.data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(file.data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(file.name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(file.name.as_bytes());
+    }
+    let directory_offset = out.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&END_RECORD);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    out.extend_from_slice(&directory_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// [`zip_with_entries`] for stored entries.
+pub fn zip_entries(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let entries: Vec<ZipEntry<'_>> = files
+        .iter()
+        .map(|(name, data)| ZipEntry::stored(name, data))
+        .collect();
+    zip_with_entries(&entries)
+}

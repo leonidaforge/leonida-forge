@@ -12,15 +12,15 @@
 //! opened through the same metadata verification pipeline as a top-level one.
 
 use std::fmt;
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_binary::Source;
 use lforge_core::archive::{self, Format, Identified};
+use lforge_core::zip as zip_archive;
 use lforge_rage9::rpf::metadata::Payload;
 use serde_json::{Value, json};
-use zip::ZipArchive;
 
 use crate::native::{self, Alternates, Authentication};
 
@@ -85,6 +85,16 @@ impl Selector {
             Selector::Row(row) => u64::from(row),
             Selector::Zip(index) => index as u64,
         }
+    }
+
+    /// `row` or `zip`, the selector's kind.
+    pub fn selector_kind(&self) -> &'static str {
+        self.kind()
+    }
+
+    /// The row or central-directory index the selector names.
+    pub fn selector_index(&self) -> u64 {
+        self.index()
     }
 }
 
@@ -396,34 +406,30 @@ fn enter_zip(
     used: u64,
     limits: &Limits,
 ) -> Result<Step, String> {
-    let source = Source::open(&current.path)
+    let mut source = Source::open(&current.path)
         .map_err(|err| format!("cannot open {}: {err}", current.path.display()))?;
-    let mut zip = ZipArchive::new(BufReader::new(source))
-        .map_err(|err| format!("cannot read the ZIP archive: {err}"))?;
-    if zip.len() as u64 > limits.max_entries {
-        return Err(format!(
-            "the ZIP archive has {} entries, more than the {} entry limit",
-            zip.len(),
-            limits.max_entries
-        ));
-    }
-    if index >= zip.len() {
-        return Err(format!(
-            "ZIP entry {index} is out of range: the entries are 0 to {}",
-            zip.len().saturating_sub(1)
-        ));
-    }
-    let file = zip
-        .by_index(index)
-        .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
-    if file.is_dir() {
+    let len = source.len();
+    // The central directory keeps every record, so `index` is the record's
+    // position even when several records share a name.
+    let zip = zip_archive::Archive::read(
+        &mut source,
+        &zip_archive::Limits {
+            max_entries: limits.max_entries,
+            ..zip_archive::Limits::default()
+        },
+        cancel,
+    )
+    .map_err(|err| format!("cannot read the ZIP archive: {err}"))?;
+    let entry = zip.entry(index).map_err(|err| err.to_string())?;
+    if entry.is_dir() {
         return Err(format!("ZIP entry {index} is a directory, not a file"));
     }
-    let name = file
-        .name()
-        .map(|name| name.into_owned())
-        .unwrap_or_default();
-    let size = file.size();
+    if entry.is_encrypted() {
+        return Err(format!(
+            "ZIP entry {index} is encrypted; its payload cannot be decoded"
+        ));
+    }
+    let size = entry.uncompressed_size;
     if size > limits.max_archive_bytes {
         return Err(format!(
             "ZIP entry {index} decodes to {size} bytes, more than the {} byte limit",
@@ -437,7 +443,7 @@ fn enter_zip(
             limits.max_chain_bytes
         ));
     }
-    let (source, temp) = spool_reader(file, size, cancel)?;
+    let (source, temp) = spool_entry(&zip, &mut source, len, entry, size, cancel)?;
     let (temp, format) = identify_temp(source, temp, "zip entry")?;
     let path = temp.to_path_buf();
     Ok(Step {
@@ -445,7 +451,7 @@ fn enter_zip(
             selector: Selector::Zip(index),
             format,
             size,
-            name: Some(name),
+            name: Some(entry.name.clone()),
             authentication: None,
         },
         path,
@@ -514,39 +520,18 @@ fn spool_payload(
     Ok((source, path))
 }
 
-fn spool_reader(
-    mut reader: impl Read,
+fn spool_entry(
+    zip: &zip_archive::Archive,
+    reader: &mut Source,
+    len: u64,
+    entry: &zip_archive::Entry,
     size: u64,
     cancel: &AtomicBool,
 ) -> Result<(Source, tempfile::TempPath), String> {
     let mut file = tempfile::NamedTempFile::new()
         .map_err(|err| format!("cannot create a temporary file: {err}"))?;
-    let mut buf = vec![0; COPY_LEN];
-    let mut written = 0u64;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".to_string());
-        }
-        let n = reader
-            .read(&mut buf)
-            .map_err(|err| format!("cannot decode the ZIP entry: {err}"))?;
-        if n == 0 {
-            break;
-        }
-        written = written
-            .checked_add(n as u64)
-            .ok_or_else(|| "the decoded size overflowed".to_string())?;
-        if written > size {
-            return Err("the ZIP entry is larger than its declared size".to_string());
-        }
-        file.write_all(&buf[..n])
-            .map_err(|err| format!("cannot write the temporary file: {err}"))?;
-    }
-    if written != size {
-        return Err(format!(
-            "the ZIP entry holds {written} bytes, not its declared {size}"
-        ));
-    }
+    zip.decode_entry(reader, len, entry, cancel, size, &mut file)
+        .map_err(|err| format!("the ZIP entry cannot be decoded: {err}"))?;
     let (file, path) = file.into_parts();
     let source = Source::from_file(file)
         .map_err(|err| format!("cannot reopen the temporary file: {err}"))?;
@@ -600,20 +585,6 @@ mod tests {
         assert_eq!(add_budget(1, 2, 3), Ok(3));
         assert!(add_budget(2, 2, 3).is_err());
         assert!(add_budget(u64::MAX, 1, u64::MAX).is_err());
-    }
-
-    #[test]
-    fn refuses_an_entry_that_grows_past_its_declared_size() {
-        let cancel = AtomicBool::new(false);
-        let err = spool_reader(std::io::Cursor::new(vec![0u8; 100]), 10, &cancel).unwrap_err();
-        assert!(err.contains("larger than its declared size"), "{err}");
-    }
-
-    #[test]
-    fn stops_copying_once_cancelled() {
-        let cancel = AtomicBool::new(true);
-        let err = spool_reader(std::io::Cursor::new(vec![0u8; 10]), 10, &cancel).unwrap_err();
-        assert_eq!(err, "cancelled");
     }
 
     #[test]

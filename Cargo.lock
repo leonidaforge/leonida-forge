@@ -2603,6 +2603,7 @@ dependencies = [
 name = "lforge-core"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "lforge-binary",
  "lforge-rage9",
  "serde",

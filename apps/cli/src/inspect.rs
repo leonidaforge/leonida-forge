@@ -12,16 +12,16 @@
 //! bytes as they are stored instead, and fails explicitly when a transform or
 //! codec is not supported. The document separates the two.
 
-use std::io::{BufReader, Read, Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
 use lforge_core::archive::Format;
 use lforge_core::inspect as recognition;
+use lforge_core::zip as zip_archive;
 use lforge_rage9::rpf::metadata::{Entry, Payload};
 use serde_json::{Map, Value, json};
-use zip::ZipArchive;
 
 use crate::native::{self, Alternates};
 use crate::nested::{self, Selector};
@@ -367,39 +367,29 @@ fn inspect_zip(
     representation: impl Fn(&'static str, bool, &str, Option<String>) -> Value,
     options: &Options,
 ) -> Result<(), String> {
-    let archive = Source::open(&resolved.path)
+    let cancel = AtomicBool::new(false);
+    let mut archive = Source::open(&resolved.path)
         .map_err(|err| format!("cannot open the nested archive: {err}"))?;
-    let mut zip = ZipArchive::new(BufReader::new(archive))
+    let len = archive.len();
+    let zip = zip_archive::Archive::read(&mut archive, &zip_archive::Limits::default(), &cancel)
         .map_err(|err| format!("cannot read the ZIP archive: {err}"))?;
-    if index >= zip.len() {
-        return Err(format!(
-            "ZIP entry {index} is out of range: the entries are 0 to {}",
-            zip.len().saturating_sub(1)
-        ));
+    let entry = zip.entry(index).map_err(|err| err.to_string())?;
+    if entry.is_dir() {
+        return Err(format!("ZIP entry {index} is a directory, not a file"));
     }
     let selection = json!({ "kind": "zip", "index": index, "raw": raw });
 
     if raw {
-        let file = zip
-            .by_index_raw(index)
-            .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
-        if file.is_dir() {
-            return Err(format!("ZIP entry {index} is a directory, not a file"));
-        }
-        if file.encrypted() {
+        if entry.is_encrypted() {
             return Err(format!(
                 "ZIP entry {index} is encrypted; its stored bytes cannot be read"
             ));
         }
-        let Some(start) = file.data_start() else {
-            return Err(format!(
-                "ZIP entry {index} has no stored range; it cannot be read as stored"
-            ));
-        };
-        let compressed = file.compressed_size();
-        drop(file);
-        let mut stored = Source::open(&resolved.path)
-            .map_err(|err| format!("cannot open the nested archive: {err}"))?
+        let start = zip
+            .data_start(&mut archive, len, entry)
+            .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
+        let compressed = entry.compressed_size;
+        let mut stored = archive
             .slice(start, compressed)
             .map_err(|err| format!("ZIP entry {index} is out of range: {err}"))?;
         let len = stored.len();
@@ -408,13 +398,7 @@ fn inspect_zip(
             resolved.provenance_json(selection, representation("stored", false, note, None));
         emit(&mut stored, len, Context { source, provenance }, options)
     } else {
-        let mut file = zip
-            .by_index(index)
-            .map_err(|err| format!("ZIP entry {index} cannot be read: {err}"))?;
-        if file.is_dir() {
-            return Err(format!("ZIP entry {index} is a directory, not a file"));
-        }
-        let len = file.size();
+        let len = entry.uncompressed_size;
         if len > nested::MAX_ARCHIVE_BYTES {
             return Err(format!(
                 "ZIP entry {index} decodes to {len} bytes, more than the {} byte limit",
@@ -423,21 +407,19 @@ fn inspect_zip(
         }
         let mut temp = tempfile::NamedTempFile::new()
             .map_err(|err| format!("cannot create a temporary file: {err}"))?;
-        std::io::copy(&mut file.by_ref().take(len.saturating_add(1)), &mut temp)
-            .map_err(|err| format!("ZIP entry {index} cannot be decoded: {err}"))?;
+        let archive_len = archive.len();
+        zip.decode_entry(
+            &mut archive,
+            archive_len,
+            entry,
+            &cancel,
+            nested::MAX_ARCHIVE_BYTES,
+            &mut temp,
+        )
+        .map_err(|err| format!("ZIP entry {index} cannot be decoded: {err}"))?;
         temp.as_file_mut()
             .flush()
             .map_err(|err| format!("cannot write the temporary file: {err}"))?;
-        let written = temp
-            .as_file()
-            .metadata()
-            .map_err(|err| err.to_string())?
-            .len();
-        if written != len {
-            return Err(format!(
-                "ZIP entry {index} decoded to {written} bytes, not its declared {len}"
-            ));
-        }
         let (file, temp_path) = temp.into_parts();
         let mut stored = Source::from_file(file)
             .map_err(|err| format!("cannot reopen the temporary file: {err}"))?;

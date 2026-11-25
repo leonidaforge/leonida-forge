@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+flate2.workspace = true
 lforge-binary.workspace = true
 lforge-rage9.workspace = true
 serde.workspace = true
