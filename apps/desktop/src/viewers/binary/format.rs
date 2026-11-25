@@ -84,11 +84,25 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             word,
             flags,
             root_name_len,
-        }) => vec![
-            ("Version word", format!("0x{word:04X}")),
-            ("Flags", flags.to_string()),
-            ("Root name", format!("{root_name_len} bytes")),
-        ],
+            body,
+        }) => {
+            let mut fields = vec![
+                ("Version word", format!("0x{word:04X}")),
+                ("Flags", flags.to_string()),
+                ("Root name", format!("{root_name_len} bytes")),
+            ];
+            if let Some(body) = body {
+                fields.push((
+                    "Objects",
+                    format!("{} (depth {})", body.objects, body.depth),
+                ));
+                fields.push(("Fields", body.fields.to_string()));
+                fields.push(("Definitions", body.definitions.to_string()));
+                fields.push(("Attributes", body.attributes.to_string()));
+                fields.push(("String values", body.string_values.to_string()));
+            }
+            fields
+        }
         Some(Summary::Psin) | Some(Summary::Rpf9) | None => Vec::new(),
     }
 }
@@ -109,6 +123,61 @@ mod tests {
         assert_eq!(report.support, "recognition");
         assert!(report.fields.is_empty());
         assert!(report.error.is_none());
+    }
+
+    /// A minimal RBF0 document: header, root name and an empty root object.
+    fn rbf0_document() -> Vec<u8> {
+        let mut bytes = b"RBF0".to_vec();
+        bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes());
+        bytes.extend_from_slice(b"doc");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn reports_the_parsed_rbf0_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.bin");
+        std::fs::write(&path, rbf0_document()).unwrap();
+        let mut source = Source::open(&path).unwrap();
+
+        let report = detect(&mut source).expect("recognised");
+        assert_eq!(report.name, "RBF0");
+        assert_eq!(report.support, "structural");
+        assert!(report.error.is_none());
+        let fields = report
+            .fields
+            .iter()
+            .map(|(label, value)| (*label, value.as_str()))
+            .collect::<Vec<_>>();
+        assert!(fields.contains(&("Objects", "1 (depth 0)")), "{fields:?}");
+        assert!(fields.contains(&("Fields", "0")), "{fields:?}");
+        assert!(fields.contains(&("Definitions", "0")), "{fields:?}");
+        assert!(fields.contains(&("Attributes", "0")), "{fields:?}");
+        assert!(fields.contains(&("String values", "0")), "{fields:?}");
+    }
+
+    #[test]
+    fn reports_an_rbf0_body_failure_with_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.bin");
+        let mut bytes = rbf0_document();
+        bytes[4..6].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let mut source = Source::open(&path).unwrap();
+
+        let report = detect(&mut source).expect("recognised");
+        assert_eq!(report.name, "RBF0");
+        assert!(report.error.is_some());
+        assert!(
+            report
+                .fields
+                .contains(&("Root name", "3 bytes".to_string()))
+        );
     }
 
     #[test]

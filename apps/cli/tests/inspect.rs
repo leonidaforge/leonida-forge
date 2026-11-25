@@ -191,27 +191,167 @@ fn binary_inspect_reports_an_unrecognised_file() {
     assert!(text.contains("unrecognised"), "{text}");
 }
 
-#[test]
-fn binary_inspect_reports_an_rbf0_prefix() {
-    let temp = tempfile::tempdir().unwrap();
+/// A synthetic RBF0 document: header, root name, one object value, one
+/// string value and one attribute.
+fn rbf0() -> Vec<u8> {
+    fn name(bytes: &[u8]) -> Vec<u8> {
+        let mut out = (bytes.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out
+    }
+    fn object(attributes: &[u8], fields: &[u8]) -> Vec<u8> {
+        let mut out = 0u32.to_le_bytes().to_vec();
+        out.extend_from_slice(&((!attributes.is_empty()) as u16).to_le_bytes());
+        out.extend_from_slice(attributes);
+        out.extend_from_slice(fields);
+        out.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        out
+    }
+    let inner = object(&[], &[]);
+    let mut attribute = 0x6003u16.to_le_bytes().to_vec();
+    attribute.extend_from_slice(&name(b"SYNTHETIC-ATTRIBUTE-NAME"));
+    attribute.extend_from_slice(&4u16.to_le_bytes());
+    attribute.extend_from_slice(b"kind");
+    let mut fields = 0x0001u16.to_le_bytes().to_vec();
+    fields.extend_from_slice(&name(b"SYNTHETIC-OBJECT-NAME"));
+    fields.extend_from_slice(&inner);
+    fields.extend_from_slice(&0x0004u16.to_le_bytes());
+    fields.extend_from_slice(&name(b"SYNTHETIC-STRING-NAME"));
+    fields.extend_from_slice(&0u32.to_le_bytes());
+    fields.extend_from_slice(&0u16.to_le_bytes());
+    fields.extend_from_slice(&0xFFFDu16.to_le_bytes());
+    let value = b"SYNTHETIC-TEXT-VALUE\0";
+    fields.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    fields.extend_from_slice(value);
+    fields.extend_from_slice(&0xFFFFu16.to_le_bytes());
+    let root = object(&attribute, &fields);
+
     let mut bytes = b"RBF0".to_vec();
     bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&17u16.to_le_bytes());
-    bytes.extend_from_slice(b"SYNTHETIC-ROOT-NAME");
-    bytes.extend_from_slice(&[0xFF; 8]);
-    let path = write(temp.path(), "doc.bin", &bytes);
+    bytes.extend_from_slice(&name(b"SYNTHETIC-ROOT-NAME"));
+    bytes.extend_from_slice(&root);
+    bytes
+}
+
+#[test]
+fn binary_inspect_parses_an_rbf0_document() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "doc.bin", &rbf0());
 
     let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
-    assert!(output.status.success());
+    assert!(output.status.success(), "{}", common::stderr(&output));
     let document = json(&output);
     assert_eq!(document["format"]["id"], "rbf0");
-    assert_eq!(document["format"]["support"], "header");
-    assert_eq!(document["structure"]["prefix"]["root_name_len"], 17);
-    assert_eq!(document["structure"]["prefix"]["word"], "0xFFFB");
-    // The root name itself is payload text and is never printed.
+    assert_eq!(document["format"]["support"], "structural");
+    let structure = &document["structure"];
+    assert_eq!(structure["valid"], true);
+    assert_eq!(structure["header"]["marker"], "0xFFFB");
+    assert_eq!(structure["header"]["value"], 1);
+    assert_eq!(structure["header"]["root_name_len"], 19);
+    let body = &structure["body"];
+    assert_eq!(body["objects"], 2);
+    assert_eq!(body["depth"], 1);
+    assert_eq!(body["fields"], 2);
+    assert_eq!(body["object_fields"], 1);
+    assert_eq!(body["string_fields"], 1);
+    assert_eq!(body["attributes"], 1);
+    assert_eq!(body["definitions"]["count"], 3);
+    assert_eq!(body["strings"]["count"], 1);
+    assert_eq!(body["attribute_values"]["count"], 1);
+    assert_eq!(body["attribute_values"]["bytes"], 4);
+    let ranges = structure["parsed_ranges"].as_array().unwrap();
+    assert!(ranges.iter().any(|range| range["field"] == "root name"));
+    assert!(ranges.iter().any(|range| range["field"] == "body"));
+    // Names and text values are payload text and never part of the document.
     let text = serde_json::to_string(&document).unwrap();
-    assert!(!text.contains("SYNTHETIC-ROOT-NAME"));
+    for banned in [
+        "SYNTHETIC-ROOT-NAME",
+        "SYNTHETIC-OBJECT-NAME",
+        "SYNTHETIC-STRING-NAME",
+        "SYNTHETIC-ATTRIBUTE-NAME",
+        "SYNTHETIC-TEXT-VALUE",
+    ] {
+        assert!(!text.contains(banned), "{banned} was printed");
+    }
+}
+
+#[test]
+fn binary_inspect_limits_the_definition_sample() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "doc.bin", &rbf0());
+    let output = lforge(&[
+        "binary",
+        "inspect",
+        path.to_str().unwrap(),
+        "--json",
+        "--sample",
+        "2",
+    ]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    let definitions = &document["structure"]["body"]["definitions"];
+    assert_eq!(definitions["count"], 3);
+    assert_eq!(definitions["shown"], 2);
+    assert_eq!(definitions["items"].as_array().unwrap().len(), 2);
+    // The attribute is defined before the root object's fields.
+    assert_eq!(definitions["items"][0]["field_id"], "0x6003");
+    assert_eq!(definitions["items"][0]["class"], "attribute");
+    assert_eq!(definitions["items"][1]["field_id"], "0x0001");
+    assert_eq!(definitions["items"][1]["class"], "object");
+}
+
+#[test]
+fn binary_inspect_is_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "doc.bin", &rbf0());
+    let first = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    let second = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(first.status.success());
+    assert_eq!(first.stdout, second.stdout);
+}
+
+#[test]
+fn binary_inspect_reports_an_unsupported_rbf0_header() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bytes = rbf0();
+    bytes[4..6].copy_from_slice(&0xFFF0u16.to_le_bytes());
+    let path = write(temp.path(), "doc.bin", &bytes);
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(!output.status.success());
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "rbf0");
+    assert_eq!(document["failure_stage"], "header");
+    assert_eq!(document["structure"]["valid"], false);
+    assert!(
+        document["structure"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("0xFFF0")
+    );
+}
+
+#[test]
+fn binary_inspect_reports_an_rbf0_body_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bytes = rbf0();
+    // The first field identifier after the root object header is unsupported.
+    let at = 12 + 19 + 6;
+    bytes[at..at + 2].copy_from_slice(&0x0003u16.to_le_bytes());
+    let path = write(temp.path(), "doc.bin", &bytes);
+    let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
+    assert!(!output.status.success());
+    let document = json(&output);
+    assert_eq!(document["format"]["id"], "rbf0");
+    assert_eq!(document["failure_stage"], "structure");
+    assert_eq!(document["structure"]["valid"], false);
+    assert_eq!(document["structure"]["header"]["marker"], "0xFFFB");
+    assert!(
+        document["structure"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("outside the observed identifier sets")
+    );
 }
 
 #[test]

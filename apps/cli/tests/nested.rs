@@ -12,13 +12,16 @@ use common::{assemble, deflate, lforge, spec, stderr, write_archive, zip_entries
 use serde_json::Value;
 use zip::write::SimpleFileOptions;
 
-/// An RBF0 prefix with a distinct flag value, so a leaf can be identified.
+/// A minimal RBF0 document with a distinct header value, so a leaf can be
+/// identified.
 fn rbf0(flags: u32) -> Vec<u8> {
     let mut bytes = b"RBF0".to_vec();
     bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
     bytes.extend_from_slice(&flags.to_le_bytes());
     bytes.extend_from_slice(&0u16.to_le_bytes());
-    bytes.extend_from_slice(&[0xFF; 8]);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
     bytes
 }
 
@@ -64,7 +67,7 @@ fn an_rpf9_inside_an_rpf9_is_traversed_by_row_index() {
 
     let document = inspect(&path, &["--enter", "row:0", "--row", "0"]);
     assert_eq!(document["format"]["id"], "rbf0");
-    assert_eq!(document["structure"]["prefix"]["flags"], 1);
+    assert_eq!(document["structure"]["header"]["value"], 1);
     assert_eq!(document["provenance"]["depth"], 1);
     assert_eq!(document["provenance"]["root"]["format"], "RPF9");
     let chain = document["provenance"]["chain"].as_array().unwrap();
@@ -86,7 +89,7 @@ fn a_zip_inside_an_rpf9_is_traversed_by_entry_index() {
 
     let document = inspect(&path, &["--enter", "row:0", "--zip", "0"]);
     assert_eq!(document["format"]["id"], "rbf0");
-    assert_eq!(document["structure"]["prefix"]["flags"], 2);
+    assert_eq!(document["structure"]["header"]["value"], 2);
     assert_eq!(document["provenance"]["chain"][0]["format"], "ZIP");
     assert_eq!(document["provenance"]["selection"]["kind"], "zip");
     assert_eq!(document["provenance"]["selection"]["index"], 0);
@@ -102,7 +105,7 @@ fn an_rpf9_inside_a_zip_is_traversed_by_row_index() {
 
     let document = inspect(&path, &["--enter", "zip:0", "--row", "0"]);
     assert_eq!(document["format"]["id"], "rbf0");
-    assert_eq!(document["structure"]["prefix"]["flags"], 3);
+    assert_eq!(document["structure"]["header"]["value"], 3);
     assert_eq!(document["provenance"]["root"]["format"], "ZIP");
     assert_eq!(document["provenance"]["chain"][0]["selector"], "zip:0");
     assert_eq!(document["provenance"]["chain"][0]["format"], "RPF9");
@@ -118,7 +121,7 @@ fn a_zip_inside_a_zip_is_traversed_by_entry_index() {
 
     let document = inspect(&path, &["--enter", "zip:0", "--zip", "0"]);
     assert_eq!(document["format"]["id"], "rbf0");
-    assert_eq!(document["structure"]["prefix"]["flags"], 4);
+    assert_eq!(document["structure"]["header"]["value"], 4);
     assert_eq!(document["provenance"]["chain"][0]["format"], "ZIP");
     assert_eq!(document["provenance"]["selection"]["kind"], "zip");
 }
@@ -133,8 +136,8 @@ fn entries_with_the_same_name_keep_their_identity() {
 
     let first = inspect(&path, &["--zip", "0"]);
     let second = inspect(&path, &["--zip", "1"]);
-    assert_eq!(first["structure"]["prefix"]["flags"], 5);
-    assert_eq!(second["structure"]["prefix"]["flags"], 6);
+    assert_eq!(first["structure"]["header"]["value"], 5);
+    assert_eq!(second["structure"]["header"]["value"], 6);
     assert!(first["provenance"]["chain"].as_array().unwrap().is_empty());
     assert_eq!(first["provenance"]["selection"]["index"], 0);
     assert_eq!(second["provenance"]["selection"]["index"], 1);
@@ -149,7 +152,7 @@ fn a_nested_archive_is_selected_by_index_not_by_name() {
     let path = write(temp.path(), "outer.zip", &outer);
 
     let document = inspect(&path, &["--enter", "zip:1", "--row", "0"]);
-    assert_eq!(document["structure"]["prefix"]["flags"], 8);
+    assert_eq!(document["structure"]["header"]["value"], 8);
     assert_eq!(document["provenance"]["chain"][0]["selector_index"], 1);
 }
 
@@ -173,7 +176,7 @@ fn an_encoding_2_chunked_nested_archive_is_decoded() {
     let path = write(temp.path(), "outer.rpf", &outer);
 
     let document = inspect(&path, &["--enter", "row:0", "--row", "0"]);
-    assert_eq!(document["structure"]["prefix"]["flags"], 9);
+    assert_eq!(document["structure"]["header"]["value"], 9);
 }
 
 #[test]
@@ -449,8 +452,8 @@ fn duplicate_full_zip_names_are_distinct_entries() {
 
     let first = inspect(&path, &["--zip", "0"]);
     let second = inspect(&path, &["--zip", "1"]);
-    assert_eq!(first["structure"]["prefix"]["flags"], 21);
-    assert_eq!(second["structure"]["prefix"]["flags"], 22);
+    assert_eq!(first["structure"]["header"]["value"], 21);
+    assert_eq!(second["structure"]["header"]["value"], 22);
     assert_eq!(first["source"]["zip"], 0);
     assert_eq!(second["source"]["zip"], 1);
 }
@@ -463,7 +466,7 @@ fn duplicate_zip_names_stay_selectable_as_nested_archives() {
     let path = write(temp.path(), "outer.zip", &outer);
 
     let document = inspect(&path, &["--enter", "zip:1", "--row", "0"]);
-    assert_eq!(document["structure"]["prefix"]["flags"], 23);
+    assert_eq!(document["structure"]["header"]["value"], 23);
     assert_eq!(document["provenance"]["chain"][0]["selector"], "zip:1");
 
     let refused = lforge(&[

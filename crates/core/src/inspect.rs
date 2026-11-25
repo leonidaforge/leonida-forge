@@ -10,8 +10,8 @@
 //! `PSIN` is reported as a recognised magic only. Nothing relates it to a
 //! confirmed PSO format, and this module does not claim otherwise.
 
-use std::io::{Read, Seek};
-use std::sync::atomic::AtomicBool;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_rage9::rbf0;
 use lforge_rage9::rds5::{self, Container, Storage};
@@ -30,6 +30,8 @@ pub const DEFAULT_SAMPLE: usize = 8;
 pub const MAX_SAMPLE: usize = 256;
 /// Block failures listed by `--verify`; the count is always complete.
 const MAX_FAILURES: usize = 20;
+/// Bytes of an RBF0 payload read for structural parsing.
+const MAX_RBF0_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A recognised format and how much of it is parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +53,8 @@ pub const RDS5: FormatInfo = FormatInfo {
 pub const RBF0: FormatInfo = FormatInfo {
     id: "rbf0",
     name: "RBF0",
-    support: "header",
-    detail: "the fixed prefix and the root name length; the body grammar is unknown",
+    support: "structural",
+    detail: "the header, the object tree, the local field dictionary and the string and attribute values",
 };
 
 pub const PSIN: FormatInfo = FormatInfo {
@@ -127,9 +129,22 @@ pub enum Summary {
         word: u16,
         flags: u32,
         root_name_len: u16,
+        /// Counts from the parsed body; `None` when the body did not parse.
+        body: Option<Rbf0Body>,
     },
     Psin,
     Rpf9,
+}
+
+/// Counts the grounded RBF0 body fields a display can show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rbf0Body {
+    pub objects: usize,
+    pub depth: usize,
+    pub fields: usize,
+    pub attributes: usize,
+    pub string_values: usize,
+    pub definitions: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -172,7 +187,7 @@ pub fn inspect<R: Read + Seek>(
     let format = recognise(&signature);
     let (structure, summary, failure) = match format {
         Some(format) if format == RDS5 => rds5_structure(source, len, options, cancel),
-        Some(format) if format == RBF0 => rbf0_structure(&signature),
+        Some(format) if format == RBF0 => rbf0_structure(source, len, options, cancel),
         Some(format) if format == PSIN => (psin_structure(), Some(Summary::Psin), None),
         Some(format) if format == RPF9 => (rpf9_structure(), Some(Summary::Rpf9), None),
         _ => (Value::Null, None, None),
@@ -499,54 +514,212 @@ fn rds5_structure<R: Read + Seek>(
     (structure, Some(summary), failure)
 }
 
-fn rbf0_structure(head: &[u8]) -> (Value, Option<Summary>, Option<Failure>) {
-    match rbf0::Header::parse(head) {
-        Ok(header) => (
-            json!({
-                "valid": true,
-                "prefix": {
-                    "len": rbf0::PREFIX_LEN,
-                    "word": format!("0x{:04X}", header.word),
-                    "flags": header.flags,
-                    "root_name_len": header.root_name_len,
-                },
-                "parsed_ranges": [
-                    { "offset": hex(0), "length": rbf0::PREFIX_LEN, "field": "prefix" },
-                ],
-                "unknown_regions": [
-                    {
-                        "offset": hex(rbf0::PREFIX_LEN as u64 + u64::from(header.root_name_len)),
-                        "length": Value::Null,
-                        "field": "body",
-                        "reason": "the tag grammar and type system are not decoded",
-                    },
-                ],
-                "diagnostics": [],
-                "limitations": [
-                    "the `u16` at +0x04 and the `u32` at +0x06 have no established meaning",
-                    "the root name is payload text and is not printed",
-                    "the body is not parsed; field names and values are not reported",
-                ],
+fn rbf0_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    if len > MAX_RBF0_BYTES {
+        let message =
+            format!("the payload is {len} bytes, more than the {MAX_RBF0_BYTES} byte parse limit");
+        return (
+            json!({ "valid": false, "error": message.clone() }),
+            None,
+            Some(Failure {
+                stage: "structure",
+                message,
             }),
-            Some(Summary::Rbf0 {
-                word: header.word,
-                flags: header.flags,
-                root_name_len: header.root_name_len,
-            }),
+        );
+    }
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match rbf0::parse(&bytes, &rbf0::Limits::default(), cancel) {
+        Ok(document) => (
+            rbf0_document(&document, options),
+            Some(rbf0_summary(&document)),
             None,
         ),
         Err(err) => {
-            let message = err.describe().to_string();
-            (
-                json!({ "valid": false, "error": message }),
-                None,
-                Some(Failure {
-                    stage: "header",
-                    message,
+            let header = rbf0::Header::parse(&bytes).ok();
+            let stage = match err.kind {
+                rbf0::ErrorKind::NotRbf0
+                | rbf0::ErrorKind::TooShort
+                | rbf0::ErrorKind::UnsupportedVersion => "header",
+                _ => "structure",
+            };
+            let message = err.to_string();
+            let structure = match header {
+                Some(header) => json!({
+                    "valid": false,
+                    "header": rbf0_header(&header, None),
+                    "error": message.clone(),
                 }),
-            )
+                None => json!({ "valid": false, "error": message.clone() }),
+            };
+            let summary = header.map(|header| Summary::Rbf0 {
+                word: header.word,
+                flags: header.flags,
+                root_name_len: header.root_name_len,
+                body: None,
+            });
+            (structure, summary, Some(Failure { stage, message }))
         }
     }
+}
+
+/// Reads at most the whole subject from its start, in bounded steps.
+fn read_bounded<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| err.to_string())?;
+    let mut bytes = Vec::with_capacity(usize::try_from(len.min(1 << 20)).unwrap_or(0));
+    let mut reader = source.take(len);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(bytes)
+}
+
+fn rbf0_header(header: &rbf0::Header, digest: Option<&[u8; 32]>) -> Value {
+    let mut value = json!({
+        "len": rbf0::PREFIX_LEN,
+        "marker": format!("0x{:04X}", header.word),
+        "value": header.flags,
+        "root_name_len": header.root_name_len,
+    });
+    if let Some(digest) = digest {
+        value["root_name_sha256"] = json!(lforge_binary::hex_bytes(digest));
+    }
+    value
+}
+
+fn rbf0_summary(document: &rbf0::Document) -> Summary {
+    Summary::Rbf0 {
+        word: document.header.word,
+        flags: document.header.flags,
+        root_name_len: document.header.root_name_len,
+        body: Some(Rbf0Body {
+            objects: document.objects,
+            depth: document.depth,
+            fields: document.fields,
+            attributes: document.attributes,
+            string_values: document.strings.count,
+            definitions: document.definitions.len(),
+        }),
+    }
+}
+
+fn text_stats(stats: rbf0::TextStats) -> Value {
+    if stats.count == 0 {
+        json!({ "count": 0, "bytes": 0 })
+    } else {
+        json!({
+            "count": stats.count,
+            "bytes": stats.bytes,
+            "min_len": stats.min_len,
+            "max_len": stats.max_len,
+        })
+    }
+}
+
+fn rbf0_document(document: &rbf0::Document, options: &Options) -> Value {
+    let sample = options.sample.clamp(1, MAX_SAMPLE);
+    let definitions: Vec<Value> = document
+        .definitions
+        .iter()
+        .take(sample)
+        .map(|definition| {
+            json!({
+                "field_id": format!("0x{:04X}", definition.field_id),
+                "class": rbf0::FieldClass::of(definition.field_id)
+                    .map_or("unknown", |class| class.name()),
+                "slot": definition.field_id & 0x0FFF,
+                "offset": hex(definition.offset as u64),
+                "name_len": definition.name_len,
+                "name_sha256": lforge_binary::hex_bytes(&definition.name_digest),
+            })
+        })
+        .collect();
+    let diagnostics: Vec<Value> = document
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            json!({
+                "severity": "note",
+                "offset": hex(diagnostic.offset as u64),
+                "message": diagnostic.message,
+            })
+        })
+        .collect();
+    let body_len = (document.end - document.body_offset) as u64;
+    json!({
+        "valid": true,
+        "header": rbf0_header(&document.header, Some(&document.root_name_digest)),
+        "body": {
+            "offset": hex(document.body_offset as u64),
+            "length": body_len,
+            "objects": document.objects,
+            "depth": document.depth,
+            "fields": document.fields,
+            "object_fields": document.object_fields,
+            "string_fields": document.string_fields,
+            "fixed8_fields": document.fixed8_fields,
+            "attributes": document.attributes,
+            "definitions": {
+                "count": document.definitions.len(),
+                "shown": definitions.len(),
+                "items": definitions,
+            },
+            "strings": text_stats(document.strings),
+            "attribute_values": text_stats(document.attribute_values),
+        },
+        "parsed_ranges": [
+            { "offset": hex(0), "length": rbf0::PREFIX_LEN, "field": "header" },
+            {
+                "offset": hex(rbf0::PREFIX_LEN as u64),
+                "length": u64::from(document.header.root_name_len),
+                "field": "root name",
+            },
+            {
+                "offset": hex(document.body_offset as u64),
+                "length": body_len,
+                "field": "body",
+            },
+        ],
+        "unknown_regions": [],
+        "diagnostics": diagnostics,
+        "limitations": [
+            "the meaning of the header marker, the header value and every field identifier is unknown",
+            "field names and text values are payload text; only their lengths and digests are reported",
+            "only identifiers 0x0001, 0x0002, 0x0004 to 0x000A, 0x1006 and 0x6003/0x6004 are parsed; another identifier stops the parse",
+            "attribute position is unresolved: the counted attributes precede the fields",
+        ],
+    })
 }
 
 fn psin_structure() -> Value {

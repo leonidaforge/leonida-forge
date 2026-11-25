@@ -1719,17 +1719,21 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// A minimal RBF0 document: header, empty root name and an empty root
+    /// object. `flags` is the unknown header value.
     fn rbf0(flags: u32) -> Vec<u8> {
         let mut bytes = b"RBF0".to_vec();
         bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
         bytes.extend_from_slice(&flags.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&[0xFF; 8]);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
         bytes
     }
 
     #[test]
-    fn classify_reports_an_rbf0_prefix() {
+    fn classify_parses_a_minimal_rbf0_document() {
         let bytes = rbf0(3);
         let len = bytes.len() as u64;
         let mut reader = Cursor::new(bytes);
