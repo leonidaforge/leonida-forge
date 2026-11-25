@@ -62,7 +62,10 @@ This is not full native GTA VI RPF9 support.
 ## Features
 
 - Browse folders, ZIP archives and RPF9 archives as one tree, including
-  folders reconstructed from verified RPF9 relative paths.
+  folders reconstructed from verified RPF9 relative paths, or switch a native
+  archive to one flat list of all its rows.
+- Filter the current listing by visible label, stored name hash or key, and
+  type.
 - List an RPF9 archive's own entries after authenticating its table of contents
   against a local game executable.
 - Recover entries from encrypted RPF9 archives and group them by detected kind.
@@ -72,6 +75,9 @@ This is not full native GTA VI RPF9 support.
 - List and export recovery candidates from the CLI.
 - Index native hashes, harvest candidate names from readable payloads and the
   local executable, and export validated LUT files with `lforge names`.
+- List, search and export deterministic manifests of authenticated native rows
+  with `lforge archive ls`, `search` and `manifest`, and audit the LUTs with
+  `lforge names audit`.
 
 ## Known limitations
 
@@ -82,9 +88,10 @@ This is not full native GTA VI RPF9 support.
   `<archive>.names.txt` table supplies one, otherwise by the stored key in
   canonical hexadecimal form. A verified relative path is shown as folders; rows
   without one are grouped last in `Unnamed Entries`. Row numbers remain the entry
-  paths. Only `rpf` to type 0 is a confirmed extension. Many rows remain
-  unresolved, and a hash match is a candidate, not proof of the original
-  developer filename.
+  paths. Only `rpf` to type 0 is a confirmed extension. Types 11, 14 and 255
+  use the 32-bit key class; types 11 and 14 still have no confirmed extension.
+  Many rows remain unresolved, and a hash match is a candidate, not proof of the
+  original developer filename.
 - Recovered entries have no original names or paths.
 - A recovered entry can be partial or unverified. The UI reports its status,
   and an export keeps that caveat in the result message.

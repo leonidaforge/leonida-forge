@@ -41,9 +41,16 @@ pushed.
 - File a row under the folders its verified relative path describes, without
   changing its row number or path identity. Unsafe components (absolute paths,
   `.`, `..`, empty, drive letters, refused characters) never create folders.
-  Rows without a usable path are listed last in `Unnamed Entries`.
+  Rows without a usable path are listed last in `Unnamed Entries`. A native
+  archive can also be listed as one flat list of all its rows; the choice is
+  stored in settings and re-lists from the in-memory table of contents.
+- Filter the current listing by visible label, stored name hash or key, and
+  type, without indexing the archive.
 - Index native hashes, harvest candidate strings from readable payloads and the
   local executable, and export validated LUT files with `lforge names`.
+- List, search and export deterministic manifests of authenticated native rows
+  with `lforge archive ls`, `search` and `manifest`. Revalidate the bundled LUTs
+  and compare them with a Research checkout with `lforge names audit`.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
 - Export one entry to a chosen path, from the entry context menu and the File
