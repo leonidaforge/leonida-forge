@@ -1490,6 +1490,40 @@ mod pipeline {
         Source::from_file(file).unwrap()
     }
 
+    #[test]
+    fn a_declared_trailer_bounds_payload_reads() {
+        let mut bytes = archive(&[spec(RecordLayout::A, vec![7u8; 32], RPF_TYPE)]);
+        // Declare the last 16 payload bytes as a trailing region.
+        bytes[0x0C..0x10].copy_from_slice(&16u32.to_le_bytes());
+        let source = file(&bytes);
+        let stored = Stored::read(&mut source.clone(), 1 << 20).unwrap();
+        assert_eq!(stored.payload_end(), Some(bytes.len() as u64 - 16));
+        let metadata = stored.decode().unwrap();
+        let entry = metadata.entry(0).unwrap();
+        let reason = entry.raw_source(&source, &[]).unwrap_err().to_string();
+        assert!(reason.contains("trailing region"), "{reason}");
+    }
+
+    #[test]
+    fn an_unaligned_trailer_start_is_rejected() {
+        let mut bytes = archive(&[spec(RecordLayout::A, vec![7u8; 32], RPF_TYPE)]);
+        bytes[0x0C..0x10].copy_from_slice(&15u32.to_le_bytes());
+        let mut source = file(&bytes);
+        let reason = invalid_reason(Stored::read(&mut source, 1 << 20));
+        assert!(reason.contains("16-byte boundary"), "{reason}");
+    }
+
+    #[test]
+    fn a_trailer_that_starts_inside_the_metadata_is_rejected() {
+        let mut bytes = archive(&[spec(RecordLayout::A, vec![7u8; 32], RPF_TYPE)]);
+        let metadata_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let trailer = u32::try_from(bytes.len() as u64 - u64::from(metadata_len) + 0x20).unwrap();
+        bytes[0x0C..0x10].copy_from_slice(&trailer.to_le_bytes());
+        let mut source = file(&bytes);
+        let reason = invalid_reason(Stored::read(&mut source, 1 << 20));
+        assert!(reason.contains("metadata end"), "{reason}");
+    }
+
     fn nested() -> Vec<u8> {
         Build::default().build(&[Column::new(KEY_X, 4, &[&[9, 8, 7, 6]], &[Some(0)])])
     }

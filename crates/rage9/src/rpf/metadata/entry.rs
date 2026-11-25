@@ -29,6 +29,9 @@ pub struct Entry {
     /// The alternate source the payload is read through. `None` for the main
     /// source.
     pub read_source: Field<u32>,
+    /// Where the stored payload data ends, from the archive header's declared
+    /// trailing region. `None` when the metadata was built from decoded bytes.
+    pub payload_end: Option<u64>,
 }
 
 fn reason(err: Error) -> String {
@@ -49,6 +52,7 @@ impl Entry {
             payload_transform: metadata.payload_transform(row).map_err(reason),
             payload_cipher: metadata.payload_cipher(row).map_err(reason),
             read_source: metadata.read_source(row).map_err(reason),
+            payload_end: metadata.payload_end(),
         }
     }
 
@@ -137,6 +141,7 @@ impl Entry {
     ) -> Result<Source, Error> {
         let row = self.row;
         let range = self.raw_range()?;
+        self.check_payload_end(row, range.end)?;
         let source = self.read_through(main, alternates)?;
         if range.end > source.len() {
             return Err(invalid(format!(
@@ -146,6 +151,17 @@ impl Entry {
             )));
         }
         Ok(source.slice(range.start, range.end - range.start)?)
+    }
+
+    /// Rejects a payload range that crosses the start of the trailing region
+    /// the archive header declares.
+    fn check_payload_end(&self, row: u32, end: u64) -> Result<(), Error> {
+        match self.payload_end {
+            Some(tail) if end > tail => Err(invalid(format!(
+                "entry {row} ends at {end:#x}, after the start of the trailing region ({tail:#x})"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// The contents of the entry, decoded where that is supported.
@@ -200,6 +216,7 @@ impl Entry {
             .payload_offset
             .checked_add(location.stored_len)
             .ok_or_else(|| invalid(format!("the range of entry {row} overflows")))?;
+        self.check_payload_end(row, end)?;
         if end > source.len() {
             return Err(invalid(format!(
                 "the stored bytes of entry {row} end at {end:#x}, after the end of the archive \

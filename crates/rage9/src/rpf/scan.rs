@@ -180,9 +180,13 @@ pub(crate) fn scan_from<S: Read + Seek + Clone + Send>(
     progress: &Progress,
     cancel: &AtomicBool,
 ) -> Result<Index, Error> {
-    progress.total.store(len - start, Ordering::Relaxed);
+    // Stored payload data ends where the declared trailing region starts; a
+    // stream that would cross that boundary is not read.
+    let end = header.payload_end(len)?;
+    let start = start.min(end);
+    progress.total.store(end - start, Ordering::Relaxed);
     progress.done.store(0, Ordering::Relaxed);
-    let count = usize::try_from((len - start).div_ceil(segment_len))
+    let count = usize::try_from((end - start).div_ceil(segment_len))
         .map_err(|_| Error::InvalidHeader("the archive is too large".into()))?;
     let threads = thread::available_parallelism()
         .map_or(1, NonZero::get)
@@ -204,12 +208,12 @@ pub(crate) fn scan_from<S: Read + Seek + Clone + Send>(
                         break;
                     }
                     let seg_start = start + ix as u64 * segment_len;
-                    let seg_end = seg_start.saturating_add(segment_len).min(len);
+                    let seg_end = seg_start.saturating_add(segment_len).min(end);
                     let result = scan_segment(
                         source.clone(),
                         seg_start,
                         seg_end,
-                        len,
+                        end,
                         progress,
                         cancel,
                         stop,

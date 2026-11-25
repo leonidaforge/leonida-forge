@@ -177,6 +177,9 @@ pub struct Prefix {
     pub selector: u8,
     /// `u32@0x30`, the length of the `B` trailer.
     pub b_trailer_len: u32,
+    /// `u32@0x0C`, the byte length of the trailing region after the stored
+    /// payload data. Zero when the archive declares none.
+    pub trailer_len: u32,
 }
 
 impl Prefix {
@@ -202,6 +205,7 @@ impl Prefix {
             flags: byte(0x2D),
             selector: byte(0x2E),
             b_trailer_len: field(0x30),
+            trailer_len: field(0x0C),
         };
         if (prefix.primary_len as usize) < HEADER_LEN {
             return Err(invalid("the primary area ends inside the header"));
@@ -304,6 +308,36 @@ fn store_len(columns: u16, rows: u32, cell_width: u8) -> Result<u64, Error> {
         .ok_or_else(|| invalid("the index store size overflows 32 bits"))
 }
 
+/// The end of the stored payload data, `archive_len - hdr[0x0C]`.
+///
+/// A zero length declares no trailing region and leaves the whole file
+/// available. A declared boundary must be a multiple of 16, lie above the
+/// metadata end and below the end of the file: the bounds the measured
+/// archive population holds. The trailing bytes themselves are not read.
+fn payload_end(prefix: &Prefix, archive_len: u64) -> Result<u64, Error> {
+    let trailer = u64::from(prefix.trailer_len);
+    if trailer == 0 {
+        return Ok(archive_len);
+    }
+    let end = archive_len.checked_sub(trailer).ok_or_else(|| {
+        invalid(format!(
+            "the {trailer}-byte trailing region is longer than the {archive_len}-byte archive"
+        ))
+    })?;
+    if end % 16 != 0 {
+        return Err(invalid(format!(
+            "the trailing region starts at {end:#x}, not on a 16-byte boundary"
+        )));
+    }
+    if end <= u64::from(prefix.metadata_len) {
+        return Err(invalid(format!(
+            "the trailing region starts at {end:#x}, at or before the metadata end ({:#x})",
+            prefix.metadata_len
+        )));
+    }
+    Ok(end)
+}
+
 /// The in-place passes the engine's validation chain runs over stored
 /// metadata. A pass that runs may still leave the bytes unchanged, for
 /// example with a no-op cipher type; that depends on descriptor contents and
@@ -348,6 +382,8 @@ pub struct Probe {
     /// `None` if it is absent, lies inside the static pass or is not inside
     /// the metadata area.
     pub archive_descriptor: Option<CipherDescriptor>,
+    /// The end of the stored payload data, from the declared trailing region.
+    pub payload_end: u64,
 }
 
 impl Probe {
@@ -435,6 +471,9 @@ pub struct Stored {
     bytes: Vec<u8>,
     prefix: Prefix,
     layout: Layout,
+    /// Where the stored payload data ends, from the declared trailing region.
+    /// `None` when the metadata was built from decoded bytes.
+    payload_end: Option<u64>,
 }
 
 impl Stored {
@@ -443,7 +482,7 @@ impl Stored {
     /// [`lforge_binary::Source::slice`] of it, which keeps all offsets
     /// archive-relative.
     pub fn read(source: &mut (impl Read + Seek), limit: u64) -> Result<Self, Error> {
-        let prefix = Self::read_prefix(source)?;
+        let (prefix, _, payload_end) = Self::read_prefix(source)?;
         let len = u64::from(prefix.metadata_len);
         if len > limit {
             return Err(Error::TooLarge { len, limit });
@@ -451,11 +490,13 @@ impl Stored {
         source.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::with_capacity(to_usize(len)?);
         source.take(len).read_to_end(&mut bytes)?;
-        Self::from_bytes(bytes)
+        Self::finish(bytes, payload_end)
     }
 
-    /// The prefix of a metadata area that lies inside `source`.
-    fn read_prefix(source: &mut (impl Read + Seek)) -> Result<Prefix, Error> {
+    /// The prefix of a metadata area that lies inside `source`, the archive
+    /// length, and the end of the stored payload data when the header
+    /// declares a trailing region.
+    fn read_prefix(source: &mut (impl Read + Seek)) -> Result<(Prefix, u64, Option<u64>), Error> {
         let archive_len = source.seek(SeekFrom::End(0))?;
         source.seek(SeekFrom::Start(0))?;
         let mut header = [0; HEADER_LEN];
@@ -464,7 +505,9 @@ impl Stored {
         if u64::from(prefix.metadata_len) > archive_len {
             return Err(invalid("the metadata area ends after the end of the file"));
         }
-        Ok(prefix)
+        let end = payload_end(&prefix, archive_len)?;
+        let declared = (prefix.trailer_len != 0).then_some(end);
+        Ok((prefix, archive_len, declared))
     }
 
     /// Which processing passes apply, without reading the whole metadata
@@ -473,7 +516,7 @@ impl Stored {
     /// checks are those of [`Stored::read`], except for its size limit, as
     /// nothing else is read.
     pub fn probe(source: &mut (impl Read + Seek)) -> Result<Probe, Error> {
-        let prefix = Self::read_prefix(source)?;
+        let (prefix, archive_len, payload_end) = Self::read_prefix(source)?;
         let layout = Layout::new(&prefix)?;
         let mut probe = Probe {
             prefix,
@@ -483,6 +526,7 @@ impl Stored {
             },
             layout,
             archive_descriptor: None,
+            payload_end: payload_end.unwrap_or(archive_len),
         };
         if probe.processing.static_pass {
             return Ok(probe);
@@ -502,6 +546,10 @@ impl Stored {
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, Error> {
+        Self::finish(bytes, None)
+    }
+
+    fn finish(bytes: Vec<u8>, payload_end: Option<u64>) -> Result<Self, Error> {
         let prefix = Prefix::parse(&bytes)?;
         if bytes.len() as u64 != u64::from(prefix.metadata_len) {
             return Err(invalid(format!(
@@ -515,7 +563,13 @@ impl Stored {
             bytes,
             prefix,
             layout,
+            payload_end,
         })
+    }
+
+    /// Where the stored payload data ends, when the archive declared it.
+    pub fn payload_end(&self) -> Option<u64> {
+        self.payload_end
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -610,6 +664,7 @@ impl Stored {
             bytes,
             prefix: self.prefix,
             layout: self.layout.clone(),
+            payload_end: self.payload_end,
             key_lookup_skipped,
         })
     }
@@ -685,6 +740,7 @@ impl Stored {
             bytes: self.bytes,
             prefix: self.prefix,
             layout: self.layout,
+            payload_end: self.payload_end,
         })
     }
 }
@@ -698,6 +754,7 @@ pub struct Transformed {
     bytes: Vec<u8>,
     prefix: Prefix,
     layout: Layout,
+    payload_end: Option<u64>,
     key_lookup_skipped: bool,
 }
 
@@ -720,6 +777,7 @@ impl Transformed {
             bytes: self.bytes,
             prefix: self.prefix,
             layout: self.layout,
+            payload_end: self.payload_end,
         }
     }
 }
@@ -929,6 +987,8 @@ pub struct Metadata {
     bytes: Vec<u8>,
     prefix: Prefix,
     layout: Layout,
+    /// Where the stored payload data ends, when the archive declared it.
+    payload_end: Option<u64>,
 }
 
 impl Metadata {
@@ -942,7 +1002,13 @@ impl Metadata {
             bytes: stored.bytes,
             prefix: stored.prefix,
             layout: stored.layout,
+            payload_end: None,
         })
+    }
+
+    /// Where the stored payload data ends, when the archive declared it.
+    pub fn payload_end(&self) -> Option<u64> {
+        self.payload_end
     }
 
     pub fn prefix(&self) -> &Prefix {

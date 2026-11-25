@@ -121,6 +121,7 @@ impl Header {
                 "the table of contents ends at {toc_end:#x}, after the end of the file ({archive_len:#x})"
             )));
         }
+        header.payload_end(archive_len)?;
         Ok(header)
     }
 
@@ -137,6 +138,42 @@ impl Header {
     /// The end of the encrypted table of contents, which starts after the header.
     pub fn toc_end(&self) -> u64 {
         self.u32_at(0x04).into()
+    }
+
+    /// The byte length of the trailing region, the `u32` at `0x0C`. Its
+    /// contents are not interpreted.
+    pub fn trailer_len(&self) -> u32 {
+        self.u32_at(0x0C)
+    }
+
+    /// The end of the stored payload data: `archive_len - hdr[0x0C]`.
+    ///
+    /// A zero length declares no trailing region and leaves the whole file
+    /// available; every archive of the measured population declares one. A
+    /// declared boundary must be a multiple of [`ALIGN`], lie above the end
+    /// of the table of contents and below the end of the file.
+    pub fn payload_end(&self, archive_len: u64) -> Result<u64, Error> {
+        let trailer = u64::from(self.trailer_len());
+        if trailer == 0 {
+            return Ok(archive_len);
+        }
+        let end = archive_len.checked_sub(trailer).ok_or_else(|| {
+            Error::InvalidHeader(format!(
+                "the {trailer}-byte trailing region is longer than the {archive_len}-byte file"
+            ))
+        })?;
+        if end % ALIGN != 0 {
+            return Err(Error::InvalidHeader(format!(
+                "the trailing region starts at {end:#x}, not on a {ALIGN}-byte boundary"
+            )));
+        }
+        if end <= self.toc_end() {
+            return Err(Error::InvalidHeader(format!(
+                "the trailing region starts at {end:#x}, at or before the end of the table of contents ({:#x})",
+                self.toc_end()
+            )));
+        }
+        Ok(end)
     }
 
     /// Where the scan for data streams starts.

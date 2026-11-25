@@ -853,3 +853,68 @@ fn a_page_that_starts_like_a_resource_still_belongs_to_its_resource() {
     assert_eq!(resource.layout.pages.len(), 2);
     assert_eq!(index.streams[1].kind, Kind::Binary);
 }
+
+#[test]
+fn a_declared_trailer_bounds_the_scanned_payload_area() {
+    let mut bytes = header(0x40);
+    bytes.resize(0x800, 0);
+    let stream = zlib(b"payload before the trailing region");
+    bytes.extend_from_slice(&stream);
+    pad(&mut bytes);
+    let payload_end = bytes.len() as u64;
+    let trailer_start = bytes.len();
+    let trailer = zlib(b"a stream inside the undecoded trailer");
+    bytes.extend_from_slice(&trailer);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let trailer_len = (bytes.len() - trailer_start) as u32;
+    bytes[0x0C..0x10].copy_from_slice(&trailer_len.to_le_bytes());
+
+    let header = Header::parse(&bytes, bytes.len() as u64).unwrap();
+    assert_eq!(header.trailer_len(), trailer_len);
+    assert_eq!(header.payload_end(bytes.len() as u64).unwrap(), payload_end);
+
+    let index = scan_bytes(bytes);
+    assert_eq!(index.entries.len(), 1, "{:?}", index.streams);
+    assert_eq!(index.entries[0].offset, 0x800);
+    assert_eq!(index.unrecovered_len(), 0);
+}
+
+#[test]
+fn rejects_a_trailer_that_starts_at_the_table_of_contents_end() {
+    let mut bytes = header(0x100);
+    bytes.resize(0x400, 0);
+    bytes[0x0C..0x10].copy_from_slice(&0x300u32.to_le_bytes());
+    assert!(matches!(
+        Header::parse(&bytes, 0x400),
+        Err(Error::InvalidHeader(_))
+    ));
+}
+
+#[test]
+fn rejects_an_unaligned_trailer_start() {
+    let mut bytes = header(0x100);
+    bytes.resize(0x401, 0);
+    bytes[0x0C..0x10].copy_from_slice(&0x301u32.to_le_bytes());
+    assert!(matches!(
+        Header::parse(&bytes, 0x401),
+        Err(Error::InvalidHeader(_))
+    ));
+}
+
+#[test]
+fn rejects_a_trailer_longer_than_the_file() {
+    let mut bytes = header(0x100);
+    bytes.resize(0x400, 0);
+    bytes[0x0C..0x10].copy_from_slice(&0x1000u32.to_le_bytes());
+    assert!(matches!(
+        Header::parse(&bytes, 0x400),
+        Err(Error::InvalidHeader(_))
+    ));
+}
+
+#[test]
+fn a_zero_trailer_length_leaves_the_whole_file_available() {
+    let bytes = header(0x100);
+    let header = Header::parse(&bytes, 0x400).unwrap();
+    assert_eq!(header.payload_end(0x400).unwrap(), 0x400);
+}

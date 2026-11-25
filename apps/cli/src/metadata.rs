@@ -190,6 +190,40 @@ fn prefix_json(prefix: &Prefix) -> Value {
         "cell_width": prefix.cell_width,
         "flags": prefix.flags,
         "selector": prefix.selector,
+        "trailer_length": prefix.trailer_len,
+    })
+}
+
+/// The two competing secondary-area size models, reported as necessary
+/// conditions. Header sizes alone do not select one.
+fn secondary_models_json(prefix: &Prefix) -> Value {
+    let cell = u64::from(prefix.cell_width);
+    let d = u64::from(prefix.secondary_columns);
+    let rows = u64::from(prefix.rows);
+    let metadata_len = u64::from(prefix.metadata_len);
+    let store_start = (u64::from(prefix.primary_len) + cell - 1) & !(cell - 1);
+    let index_store = d
+        .checked_mul(rows)
+        .and_then(|l| l.checked_mul(cell))
+        .and_then(|l| store_start.checked_add(l))
+        .map(|end| (end + 7) & !7);
+    let index_fits = index_store.is_some_and(|end| end <= metadata_len);
+    let area = metadata_len.saturating_sub(store_start);
+    let direct_cells = d.checked_mul(rows);
+    let direct_fits = direct_cells.is_some_and(|cells| cells > 0 && area % cells == 0);
+    json!({
+        "columns_in_secondary_area": prefix.secondary_columns,
+        "store_start": store_start,
+        "index_store_model": {
+            "fits": index_fits,
+            "store_end": index_store.map(|end| json!(end)).unwrap_or(Value::Null),
+        },
+        "direct_value_model": {
+            "fits": direct_fits,
+            "area_bytes": area,
+            "record_bytes": direct_cells.map(|cells| area / cells.max(1)),
+        },
+        "selected": "none: header sizes alone satisfy or fail both models without deciding between them",
     })
 }
 
@@ -232,6 +266,7 @@ fn passes_json(prefix: &Prefix, processing: Processing) -> Value {
         "static_pass": static_pass,
         "archive_pass": archive_pass,
         "secondary_area": if secondary { "non-empty, processed if the archive pass runs" } else { "empty" },
+        "secondary_models": secondary_models_json(prefix),
         "signature": "not checked",
     })
 }
@@ -371,6 +406,11 @@ fn report(path: &Path, options: &Options, naming: &Naming) -> Value {
     let mut report = json!({
         "format": "RPF9",
         "prefix": prefix_json(&prefix),
+        "trailer": {
+            "length": prefix.trailer_len,
+            "payload_end": probe.payload_end,
+            "contents": "undecoded",
+        },
         "regions": layout_json(&probe.layout),
         "passes": passes_json(&prefix, probe.processing),
         "transformed": false,

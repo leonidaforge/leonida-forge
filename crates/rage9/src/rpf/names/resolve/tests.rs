@@ -19,6 +19,7 @@ fn entry(row: u32, type_id: Option<u8>, hash: Option<u64>, key: Option<u32>) -> 
         payload_transform: Ok(false),
         payload_cipher: Ok(None),
         read_source: Ok(None),
+        payload_end: None,
     }
 }
 
