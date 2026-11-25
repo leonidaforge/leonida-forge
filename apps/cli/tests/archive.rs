@@ -501,6 +501,7 @@ fn metadata_reports_declared_and_unconfirmed_name_mappings() {
     assert_eq!(listed[0]["name_hash"], format!("0x{hash:016X}"));
     let resolution = &listed[0]["name_resolution"];
     assert_eq!(resolution["status"], "resolved");
+    assert_eq!(resolution["ambiguous"], false);
     assert_eq!(resolution["namespace"], "hash64");
     assert_eq!(resolution["candidates"][0]["name"], "Item.ydr");
     assert_eq!(resolution["candidates"][0]["provenance"], "user_mapping");

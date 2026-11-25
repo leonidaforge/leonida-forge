@@ -358,6 +358,7 @@ fn resolution_json(row: &RowNames) -> Value {
     };
     json!({
         "status": status,
+        "ambiguous": row.resolution.is_ambiguous(),
         "namespace": namespace,
         "candidates": row
             .resolution
