@@ -2596,14 +2596,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
 name = "lforge-core"
 version = "0.1.0"
 dependencies = [
+ "lforge-binary",
  "lforge-rage9",
  "serde",
+ "serde_json",
  "zip",
 ]
 
