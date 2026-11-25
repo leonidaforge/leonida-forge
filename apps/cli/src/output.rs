@@ -72,3 +72,33 @@ fn already_exists(output: &Path) -> String {
         output.display()
     )
 }
+
+/// Refuses an output that names one of the inputs, also when the two paths
+/// differ but resolve to the same file. Symlinks and junctions are resolved
+/// by canonicalizing the parent of an output that does not exist yet.
+pub fn ensure_not_input(output: &Path, inputs: &[&Path]) -> Result<(), String> {
+    let resolved = |path: &Path| -> Option<std::path::PathBuf> {
+        if let Ok(canonical) = path.canonicalize() {
+            return Some(canonical);
+        }
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let name = path.file_name()?;
+        let parent = match parent {
+            Some(parent) => parent.canonicalize().ok()?,
+            None => std::env::current_dir().ok()?,
+        };
+        Some(parent.join(name))
+    };
+    let Some(target) = resolved(output) else {
+        return Ok(());
+    };
+    for input in inputs {
+        if resolved(input).is_some_and(|input| input == target) {
+            return Err(format!(
+                "{} is one of the inputs; the output must be a different file",
+                output.display()
+            ));
+        }
+    }
+    Ok(())
+}

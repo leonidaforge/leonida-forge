@@ -38,6 +38,7 @@ pub fn run(
         });
     }
     let entry = metadata.entry(row).map_err(|err| err.to_string())?;
+    output::ensure_not_input(output, &[file])?;
     let alternates = Alternates::resolve(file, &metadata);
     let mut payload = entry
         .payload(&source, alternates.sources())

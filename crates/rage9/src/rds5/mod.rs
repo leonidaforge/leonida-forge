@@ -14,14 +14,22 @@
 //!       data blocks, each starting on a 0x100 boundary
 //! ```
 //!
-//! Block records carry a storage selector. Only one value is identified, and
-//! it selects zlib in all but 82 of the observed blocks. A block with another
-//! selector, or with the zlib selector and no zlib header, is reported as an
-//! unidentified codec and is never decoded by guesswork.
+//! Block records carry a storage class in bits 24..29 of their first word.
+//! Two classes are decoded: `0x20` is one complete zlib stream and `0x00` is
+//! stored content of the block's virtual length. The other six observed
+//! classes are reported with their id and refused; no codec name is assigned
+//! to them.
 //!
-//! Entry fields carry no established meaning, so they are exposed as words.
-//! Block payload bytes are never part of a report; [`decode_block`] hands
-//! them to a caller that asks for them.
+//! Two readings of the first word fit the observed population: a six-bit
+//! class in bits 24..29 with a 24-bit offset, or a four-bit class in bits
+//! 26..29 with a 26-bit offset. Bits 24 and 25 are zero in every sampled
+//! record, so dispatch masks them off. A record that sets either bit is
+//! reported as ambiguous with both candidate offsets.
+//!
+//! Entry fields carry no established meaning, so they are exposed as words
+//! and as the bit fields the research defines. Block payload bytes are never
+//! part of a report; [`decode_block`] hands them to a caller that asks for
+//! them.
 
 #[cfg(test)]
 mod tests;
@@ -112,6 +120,8 @@ pub struct Limits {
     pub max_block_stored: u64,
     /// One block's decoded size.
     pub max_block_len: u64,
+    /// Decoded bytes across every block decoded from one container.
+    pub max_total_len: u64,
 }
 
 impl Default for Limits {
@@ -124,6 +134,7 @@ impl Default for Limits {
             max_entries: 2_000_000,
             max_block_stored: 256 << 20,
             max_block_len: 64 << 20,
+            max_total_len: 1 << 30,
         }
     }
 }
@@ -138,45 +149,81 @@ pub fn is_rds5(head: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record {
     pub index: u32,
+    /// Absolute block position, from the 24-bit offset reading.
     pub offset: u64,
-    /// Bits 24..31 of the record's first word. Selects the block codec on
-    /// block records; 0 on every observed record 0.
+    /// Bits 24..31 of the record's first word. Bits 24..29 hold the storage
+    /// class; bits 30..31 hold the low bits of the virtual page position.
     pub high_byte: u8,
     /// The record's second word.
     pub second_word: u32,
 }
 
+/// `lo[24:30]`: the six-bit storage class.
+const CLASS_MASK: u8 = 0x3F;
+/// Bits 24 and 25 of `lo`, which differ between the class readings.
+const CLASS_AMBIGUOUS: u8 = 0x03;
+
 impl Record {
-    /// Bits 0..15 of the second word: on block records a 16-bit wrapping
-    /// counter of the uncompressed position in units of 0x4000 bytes.
-    pub fn counter(&self) -> u16 {
-        (self.second_word & 0xFFFF) as u16
+    /// The six-bit class value of bits 24..29.
+    pub fn class_id(&self) -> u8 {
+        self.high_byte & CLASS_MASK
     }
 
-    /// Bits 16..31 of the second word. Meaning unknown.
-    pub fn upper(&self) -> u16 {
-        (self.second_word >> 16) as u16
+    /// The class used for dispatch, `id & 0x3C`. Bits 24 and 25 never change
+    /// it, so the six-bit and four-bit readings dispatch alike.
+    pub fn dispatch_class(&self) -> u8 {
+        self.class_id() & 0x3C
     }
 
-    /// Bits 2..3 of the high byte: the 2-bit storage selector of a block.
-    pub fn selector(&self) -> u8 {
-        (self.high_byte >> 2) & 0x03
+    /// Whether bit 24 or 25 is set. The six-bit class reading then overlaps
+    /// the offset field the four-bit reading implies.
+    pub fn is_ambiguous(&self) -> bool {
+        self.class_id() & CLASS_AMBIGUOUS != 0
+    }
+
+    /// The offset the 26-bit reading implies: bits `0..25` in units of 0x100.
+    pub fn offset26(&self) -> u64 {
+        let low = self.offset >> 8;
+        let bits = u64::from(self.high_byte & CLASS_AMBIGUOUS) << 24 | low;
+        bits * OFFSET_UNIT
+    }
+
+    /// Bits 0..19 of the second word: the virtual counter in units of
+    /// 0x4000 bytes.
+    pub fn counter(&self) -> u32 {
+        self.second_word & 0x000F_FFFF
+    }
+
+    /// Bits 30..31 of the first word: the low two bits of the virtual page
+    /// position.
+    pub fn page_term(&self) -> u8 {
+        self.high_byte >> 6
+    }
+
+    /// Bits 20..31 of the second word: trailing padding of the stored span.
+    pub fn padding(&self) -> u32 {
+        self.second_word >> 20
+    }
+
+    /// `counter * 0x4000 + page_term * 0x1000`. There is no additional
+    /// constant term.
+    pub fn virtual_position(&self) -> u64 {
+        u64::from(self.counter()) * 0x4000 + u64::from(self.page_term()) * 0x1000
     }
 }
 
-/// How a block's bytes are stored, as far as the record and the stream header
-/// establish.
+/// How a block's bytes are stored, as far as the record establishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Storage {
-    /// The selector names zlib and the bytes start with a zlib header. The
-    /// stream itself is only checked when it is decoded.
+    /// Class `0x20`: one complete zlib stream.
     Zlib,
-    /// The selector names zlib but the bytes do not start with a zlib
-    /// header. 82 observed blocks are like this; their codec is unknown.
-    NotZlib,
-    /// The selector names a codec that was not identified. Carries the
-    /// selector value.
-    Unidentified(u8),
+    /// Class `0x00`: stored content of the block's virtual length.
+    Stored,
+    /// Class `0x20` without a zlib header. This contradicts the class, so
+    /// the block is reported and never decoded.
+    ZlibHeaderMissing,
+    /// A class whose payload is not decoded. Carries the six-bit class id.
+    Undecoded(u8),
     /// Not read.
     Unread,
 }
@@ -185,15 +232,41 @@ impl Storage {
     pub fn name(self) -> &'static str {
         match self {
             Storage::Zlib => "zlib",
-            Storage::NotZlib => "not_zlib",
-            Storage::Unidentified(_) => "unidentified",
+            Storage::Stored => "stored",
+            Storage::ZlibHeaderMissing => "zlib_header_missing",
+            Storage::Undecoded(_) => "undecoded",
             Storage::Unread => "unread",
         }
     }
 
-    /// Whether [`decode_block`] will try to inflate the block.
+    /// Whether [`decode_block`] will inflate the block.
     pub fn is_zlib(self) -> bool {
         self == Storage::Zlib
+    }
+
+    /// The six-bit class id, when one was classified.
+    pub fn class_id(self) -> Option<u8> {
+        match self {
+            Storage::Zlib => Some(0x20),
+            Storage::Stored => Some(0x00),
+            Storage::ZlibHeaderMissing => Some(0x20),
+            Storage::Undecoded(id) => Some(id),
+            Storage::Unread => None,
+        }
+    }
+
+    fn of(class: u8, head: &[u8]) -> Self {
+        match class & 0x3C {
+            0x00 => Storage::Stored,
+            0x20 => {
+                if is_zlib_header(head) {
+                    Storage::Zlib
+                } else {
+                    Storage::ZlibHeaderMissing
+                }
+            }
+            id => Storage::Undecoded(id),
+        }
     }
 }
 
@@ -205,22 +278,27 @@ pub struct Block {
     /// The record that holds the block, starting at 1.
     pub record: u32,
     pub offset: u64,
+    /// The stored span: the next record's offset minus this one's.
     pub stored_len: u64,
-    pub high_byte: u8,
-    pub counter: u16,
-    /// The second word's upper half. Meaning unknown.
-    pub upper: u16,
+    /// The trailing zero bytes of the span.
+    pub padding: u32,
+    /// `stored_len - padding`: the bytes the stream or content occupies.
+    pub content_len: u64,
+    /// `virtual_position` of the next record minus this one's.
+    pub virtual_len: u64,
+    /// Bits 24..29 of the record's first word.
+    pub class_id: u8,
+    /// Whether bit 24 or 25 is set, so the offset width is undecided.
+    pub ambiguous: bool,
+    /// The offset the 26-bit reading implies, when it differs.
+    pub offset26: Option<u64>,
+    pub virtual_position: u64,
     pub storage: Storage,
 }
 
-impl Block {
-    pub fn selector(&self) -> u8 {
-        (self.high_byte >> 2) & 0x03
-    }
-}
-
-/// One 16-byte ETPF entry. No field meaning is established, so the four words
-/// are exposed as they are stored.
+/// One 16-byte ETPF entry, parsed as the descriptor model the research
+/// establishes. Fields whose meaning is unknown keep neutral names; no value
+/// is given a codec or pixel meaning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entry {
     pub index: u32,
@@ -228,10 +306,65 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// Low 16 bits of the third word: a wrapping counter in units of 0x1000
-    /// bytes. The rest of the entry has no established meaning.
-    pub fn page(&self) -> u16 {
-        (self.words[2] & 0xFFFF) as u16
+    /// `w0[0:13] + 1`.
+    pub fn width(&self) -> u32 {
+        (self.words[0] & 0x3FFF) + 1
+    }
+
+    /// `w0[14:27] + 1`.
+    pub fn height(&self) -> u32 {
+        ((self.words[0] >> 14) & 0x3FFF) + 1
+    }
+
+    /// `w0[28:31`. Up to 9 observed. The meaning of a multi-level value is
+    /// not established.
+    pub fn mip(&self) -> u8 {
+        (self.words[0] >> 28) as u8
+    }
+
+    /// `w1[0:2`.
+    pub fn flags(&self) -> u8 {
+        (self.words[1] & 0x7) as u8
+    }
+
+    /// `w1[3:9]`. A format identifier, not a decoded pixel format.
+    pub fn format_id(&self) -> u8 {
+        ((self.words[1] >> 3) & 0x3F) as u8
+    }
+
+    /// `w1[10:19] + 1`.
+    pub fn array_size(&self) -> u32 {
+        ((self.words[1] >> 10) & 0x3FF) + 1
+    }
+
+    /// `w1[20:23]`. Values 2, 4, 6 and 10 were observed.
+    pub fn kind(&self) -> u8 {
+        ((self.words[1] >> 20) & 0xF) as u8
+    }
+
+    /// `w1[24:27]`. Its meaning is not established.
+    pub fn tile_mode(&self) -> u8 {
+        ((self.words[1] >> 24) & 0xF) as u8
+    }
+
+    /// `w1[28:31]`. Meaning unknown.
+    pub fn unknown_high_nibble(&self) -> u8 {
+        ((self.words[1] >> 28) & 0xF) as u8
+    }
+
+    /// The 64-bit locator.
+    pub fn locator(&self) -> u64 {
+        u64::from(self.words[2]) | u64::from(self.words[3]) << 32
+    }
+
+    /// `locator[0:20]`: the first 4 KiB page of the referenced range.
+    pub fn locator_page(&self) -> u32 {
+        (self.locator() & 0x001F_FFFF) as u32
+    }
+
+    /// `locator[21:63]`. Meaning unknown; nonzero in most descriptors.
+    pub fn locator_high(&self) -> u64 {
+        self.locator() >> 21
     }
 }
 
@@ -256,6 +389,8 @@ pub struct Container {
     /// The first block, which is record 1's offset.
     pub first_block: u64,
     pub blocks: Vec<Block>,
+    /// Decoded bytes produced by [`decode_block`] so far.
+    pub decoded_total: u64,
     /// Observations that do not break the contract but differ from every
     /// sample the documentation covers.
     pub warnings: Vec<String>,
@@ -442,15 +577,31 @@ impl Container {
         let blocks = records[1..record_count as usize - 1]
             .iter()
             .enumerate()
-            .map(|(index, record)| Block {
-                index: index as u32,
-                record: record.index,
-                offset: record.offset,
-                stored_len: records[record.index as usize + 1].offset - record.offset,
-                high_byte: record.high_byte,
-                counter: record.counter(),
-                upper: record.upper(),
-                storage: Storage::Unread,
+            .map(|(index, record)| {
+                let next = &records[record.index as usize + 1];
+                let stored_len = next.offset - record.offset;
+                let padding = record.padding();
+                let content_len = stored_len.saturating_sub(u64::from(padding));
+                let virtual_position = record.virtual_position();
+                let virtual_len = next.virtual_position().saturating_sub(virtual_position);
+                let offset26 = record
+                    .is_ambiguous()
+                    .then(|| record.offset26())
+                    .filter(|&offset| offset != record.offset);
+                Block {
+                    index: index as u32,
+                    record: record.index,
+                    offset: record.offset,
+                    stored_len,
+                    padding,
+                    content_len,
+                    virtual_len,
+                    class_id: record.class_id(),
+                    ambiguous: record.is_ambiguous(),
+                    offset26,
+                    virtual_position,
+                    storage: Storage::Unread,
+                }
             })
             .collect();
 
@@ -465,6 +616,7 @@ impl Container {
             content_end,
             first_block,
             blocks,
+            decoded_total: 0,
             warnings,
         })
     }
@@ -543,65 +695,96 @@ impl Container {
         let mut done = 0;
         for index in 0..self.blocks.len().min(max) {
             check(cancel)?;
-            let (offset, stored_len) = {
+            let (offset, stored_len, class) = {
                 let block = &self.blocks[index];
-                (block.offset, block.stored_len)
+                (block.offset, block.stored_len, block.class_id)
             };
             let len = stored_len.min(2) as usize;
             let head = read_at(source, offset, len, self.len)?;
             let block = &mut self.blocks[index];
-            block.storage = storage_of(block.high_byte, &head);
+            block.storage = Storage::of(class, &head);
             done += 1;
         }
         Ok(done)
     }
+
+    /// The `descriptor_count` 8-byte keys after the descriptor table, in
+    /// table order. Their values are texture keys and are never published.
+    pub fn keys<R: Read + Seek>(&self, source: &mut R) -> Result<Vec<u64>, Error> {
+        let at = self
+            .entry_table_offset()
+            .checked_add(self.entry_table_len())
+            .ok_or_else(|| invalid("the key table offset overflows"))?;
+        let len = self.entry_table_len() / 2;
+        if at.checked_add(len).is_none_or(|end| end > self.content_end) {
+            return Err(invalid(format!(
+                "the key table ends at {:#x}, after the ETPF content ({:#x})",
+                at + len,
+                self.content_end
+            )));
+        }
+        let raw = read_at(source, at, len as usize, self.len)?;
+        Ok(raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|key| u64::from_le_bytes(*key))
+            .collect())
+    }
+
+    /// Whether `keys` is strictly increasing, the property every sampled
+    /// store holds.
+    pub fn keys_sorted(keys: &[u64]) -> bool {
+        keys.windows(2).all(|pair| pair[0] < pair[1])
+    }
 }
 
-/// Decoded bytes of one block, with the stored bytes left after the stream
-/// inside the block's range.
+/// Decoded bytes of one block, with the trailing bytes left after the stream
+/// or content inside the block's range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decoded {
     pub len: u64,
     pub stored_len: u64,
-    /// Bytes after the end of the stream. A block's range is rounded up to
-    /// [`BLOCK_ALIGN`], so up to 0xFF padding bytes can trail a stream.
+    /// Bytes after the end of the stream or content: the declared padding.
     pub trailing: u64,
 }
 
-/// Inflates one block, passing the decoded bytes to `sink`. The stored range
-/// and the decoded size are both capped, and the stream must reach its end.
+/// Decodes one block, passing the decoded bytes to `sink`. Zlib blocks are
+/// inflated completely and must consume exactly `content_len` bytes; stored
+/// blocks are copied verbatim and must match the virtual length. Any other
+/// class is refused with its id.
 ///
-/// A block whose storage is not zlib is refused with the reason, including the
-/// blocks that carry the zlib selector value and are not zlib.
+/// `container.decoded_total` carries the cumulative decoded size so a chain
+/// of blocks stays within [`Limits::max_total_len`].
 pub fn decode_block<R: Read + Seek>(
     source: &mut R,
-    container: &Container,
+    container: &mut Container,
     index: u32,
     limits: &Limits,
     cancel: &AtomicBool,
     mut sink: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> Result<Decoded, Error> {
-    let block = container.blocks.get(index as usize).ok_or_else(|| {
+    let block = *container.blocks.get(index as usize).ok_or_else(|| {
         invalid(format!(
             "block {index} does not exist; the container holds {}",
             container.blocks.len()
         ))
     })?;
     match block.storage {
-        Storage::Zlib => {}
+        Storage::Zlib | Storage::Stored => {}
         Storage::Unread => {
             return Err(invalid(format!(
                 "block {index} was not classified; classify the blocks first"
             )));
         }
-        Storage::NotZlib => {
+        Storage::ZlibHeaderMissing => {
             return Err(invalid(format!(
-                "block {index} carries the zlib selector value but does not start with a zlib header; its codec is unknown"
+                "block {index} carries zlib class 0x20 but does not start with a zlib header"
             )));
         }
-        Storage::Unidentified(selector) => {
+        Storage::Undecoded(class) => {
             return Err(invalid(format!(
-                "block {index} uses compressor selector {selector}, which has not been identified"
+                "block {index} uses storage class {class:#04x}, whose payload is not decoded"
             )));
         }
     }
@@ -611,7 +794,60 @@ pub fn decode_block<R: Read + Seek>(
             block.stored_len, limits.max_block_stored
         )));
     }
-    let end = block.offset + block.stored_len;
+    if u64::from(block.padding) > block.stored_len {
+        return Err(invalid(format!(
+            "block {index} declares {} padding bytes, more than its {} stored bytes",
+            block.padding, block.stored_len
+        )));
+    }
+    let len = match block.storage {
+        Storage::Stored => {
+            if block.content_len != block.virtual_len {
+                return Err(invalid(format!(
+                    "stored block {index} holds {} bytes, but its virtual length is {}",
+                    block.content_len, block.virtual_len
+                )));
+            }
+            block.content_len
+        }
+        // The virtual length is the inflated length of a zlib block. The
+        // stream must consume `content_len` stored bytes and produce it.
+        _ => block.virtual_len,
+    };
+    if len > limits.max_block_len {
+        return Err(invalid(format!(
+            "block {index} decodes to {len} bytes, more than the {} byte limit",
+            limits.max_block_len
+        )));
+    }
+    if container.decoded_total.saturating_add(len) > limits.max_total_len {
+        return Err(invalid(format!(
+            "decoding block {index} would reach {} bytes, more than the {} byte cumulative limit",
+            container.decoded_total.saturating_add(len),
+            limits.max_total_len
+        )));
+    }
+    check_padding(source, &block, container.len)?;
+    if block.storage == Storage::Stored {
+        copy_range(
+            source,
+            block.offset,
+            block.content_len,
+            container.len,
+            cancel,
+            &mut sink,
+        )?;
+        container.decoded_total += len;
+        return Ok(Decoded {
+            len,
+            stored_len: block.stored_len,
+            trailing: u64::from(block.padding),
+        });
+    }
+    let end = block
+        .offset
+        .checked_add(block.content_len)
+        .ok_or_else(|| invalid(format!("the range of block {index} overflows")))?;
     let mut zlib = Decompress::new(true);
     let mut input = vec![0u8; DECODE_INPUT];
     let mut output = vec![0u8; DECODE_OUTPUT];
@@ -646,15 +882,23 @@ pub fn decode_block<R: Read + Seek>(
                 sink(&output[..produced]).map_err(Error::Io)?;
             }
             if status == ZlibStatus::StreamEnd {
+                if zlib.total_out() != len {
+                    return Err(invalid(format!(
+                        "the zlib stream of block {index} produced {} bytes, not the {} it declares",
+                        zlib.total_out(),
+                        len
+                    )));
+                }
+                container.decoded_total += len;
                 return Ok(Decoded {
-                    len: zlib.total_out(),
+                    len,
                     stored_len: block.stored_len,
-                    trailing: 0,
+                    trailing: u64::from(block.padding),
                 });
             }
             return Err(invalid(format!(
                 "the zlib stream of block {index} ends before its {} stored bytes do",
-                block.stored_len
+                block.content_len
             )));
         }
         let take = remaining.min(DECODE_INPUT as u64) as usize;
@@ -691,10 +935,25 @@ pub fn decode_block<R: Read + Seek>(
                 sink(&output[..produced]).map_err(Error::Io)?;
             }
             if status == ZlibStatus::StreamEnd {
+                if pos != end {
+                    return Err(invalid(format!(
+                        "the zlib stream of block {index} ends after {} of its {} content bytes",
+                        pos - block.offset,
+                        block.content_len
+                    )));
+                }
+                if zlib.total_out() != len {
+                    return Err(invalid(format!(
+                        "the zlib stream of block {index} produced {} bytes, not the {} it declares",
+                        zlib.total_out(),
+                        len
+                    )));
+                }
+                container.decoded_total += len;
                 return Ok(Decoded {
-                    len: zlib.total_out(),
+                    len,
                     stored_len: block.stored_len,
-                    trailing: end - pos,
+                    trailing: u64::from(block.padding),
                 });
             }
             if consumed == 0 && produced == 0 {
@@ -706,17 +965,51 @@ pub fn decode_block<R: Read + Seek>(
     }
 }
 
-fn storage_of(high_byte: u8, head: &[u8]) -> Storage {
-    match (high_byte >> 2) & 0x03 {
-        0 => {
-            if is_zlib_header(head) {
-                Storage::Zlib
-            } else {
-                Storage::NotZlib
-            }
-        }
-        selector => Storage::Unidentified(selector),
+/// Checks that the declared padding of `block` is present and zero.
+fn check_padding<R: Read + Seek>(source: &mut R, block: &Block, len: u64) -> Result<(), Error> {
+    if block.padding == 0 {
+        return Ok(());
     }
+    let at = block
+        .offset
+        .checked_add(block.content_len)
+        .ok_or_else(|| invalid("the padding offset overflows"))?;
+    let padding = read_at(source, at, block.padding as usize, len)?;
+    if padding.iter().any(|&byte| byte != 0) {
+        return Err(invalid(format!(
+            "block {} declares {} padding bytes that are not zero",
+            block.index, block.padding
+        )));
+    }
+    Ok(())
+}
+
+/// Copies `len` stored bytes from `at` to `sink`.
+fn copy_range<R: Read + Seek>(
+    source: &mut R,
+    at: u64,
+    len: u64,
+    file_len: u64,
+    cancel: &AtomicBool,
+    sink: &mut impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<(), Error> {
+    if at.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(invalid(format!(
+            "the range of {len} bytes at 0x{at:X} ends after the container (0x{file_len:X})"
+        )));
+    }
+    source.seek(SeekFrom::Start(at))?;
+    let mut reader = source.take(len);
+    let mut buf = vec![0u8; DECODE_INPUT];
+    loop {
+        check(cancel)?;
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        sink(&buf[..read]).map_err(Error::Io)?;
+    }
+    Ok(())
 }
 
 /// A zlib header: DEFLATE, a window of at most 32 KiB, no preset dictionary,

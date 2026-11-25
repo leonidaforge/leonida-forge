@@ -53,11 +53,21 @@ fn rds5(blocks: &[Vec<u8>]) -> Vec<u8> {
     );
     set_u32(&mut bytes, 0x0C, 0x1600_0000);
     for (index, offset) in offsets.iter().enumerate() {
-        set_u32(
-            &mut bytes,
-            0x10 + 8 * index,
-            (*offset as u32 / 0x100) & MASK,
-        );
+        // Record 0 is the chunk record. Block 0 starts at virtual 0, and
+        // each block inflates to one 0x1000 unit.
+        let (class, page_term) = if index == 0 {
+            (0u32, 0u32)
+        } else {
+            (0x20u32, ((index - 1) % 4) as u32)
+        };
+        let lo = ((*offset as u32 / 0x100) & MASK) | (class << 24) | (page_term << 30);
+        set_u32(&mut bytes, 0x10 + 8 * index, lo);
+        if index > 0 && index <= blocks.len() {
+            let block = &blocks[index - 1];
+            let padding = (up(block.len(), 0x100) - block.len()) as u32;
+            let counter = ((index - 1) / 4) as u32;
+            set_u32(&mut bytes, 0x14 + 8 * index, (padding << 20) | counter);
+        }
     }
     bytes[record_end..record_end + 4].copy_from_slice(b"ETPF");
     set_u32(&mut bytes, record_end + 4, 0x27A);
@@ -79,7 +89,10 @@ fn rds5(blocks: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn block() -> Vec<u8> {
-    zlib(b"SYNTHETIC-BLOCK-".repeat(40).as_slice())
+    // Inflated blocks are page multiples in every measured case.
+    let mut data = b"SYNTHETIC-BLOCK-".repeat(40);
+    data.resize(0x1000, b'A');
+    zlib(&data)
 }
 
 fn write(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -165,7 +178,7 @@ fn binary_inspect_verifies_every_block() {
     let document = json(&output);
     assert_eq!(document["structure"]["valid"], true);
     let verified = &document["structure"]["verified"];
-    assert_eq!(verified["zlib_blocks"], 2);
+    assert_eq!(verified["decodable_blocks"], 2);
     assert_eq!(verified["failures"], 1);
     assert!(
         verified["failure_sample"][0]["error"]
@@ -436,7 +449,7 @@ fn archive_inspect_seeks_through_a_chunked_row() {
     assert_eq!(structure["header"]["record_count"], 4);
     assert_eq!(structure["blocks"]["count"], 2);
     assert_eq!(structure["verified"]["failures"], 0);
-    assert_eq!(structure["verified"]["zlib_blocks"], 2);
+    assert_eq!(structure["verified"]["decodable_blocks"], 2);
 }
 
 #[test]

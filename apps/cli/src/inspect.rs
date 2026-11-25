@@ -37,9 +37,9 @@ pub const DEFAULT_SAMPLE: usize = recognition::DEFAULT_SAMPLE;
 pub struct Options {
     /// How many records and entries are included.
     pub sample: usize,
-    /// Read every block's storage selector instead of the first `sample`.
+    /// Read every block's storage class instead of the first `sample`.
     pub blocks: bool,
-    /// Inflate every zlib block and report what failed.
+    /// Decode every decodable block and report what failed.
     pub verify: bool,
     pub json: bool,
 }

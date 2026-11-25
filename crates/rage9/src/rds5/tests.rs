@@ -1,6 +1,6 @@
 //! Synthetic RDS5 containers. No game data is used.
 
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::sync::atomic::AtomicBool;
 
 use flate2::Compression;
@@ -12,16 +12,22 @@ use super::*;
 /// of content after the entry table.
 struct Build {
     version: u32,
-    /// Selector written into each block record's high byte, shifted into bits
-    /// 2..3.
-    selectors: Vec<u8>,
+    /// Six-bit storage class per block, written into bits 24..29. Defaults to
+    /// `0x20`, zlib.
+    classes: Vec<u8>,
+    /// Set bit 24 of a block record, which makes the class reading ambiguous.
+    ambiguous: Vec<bool>,
+    /// Second word per block: counter, page term and padding.
+    second_words: Vec<u32>,
 }
 
 impl Default for Build {
     fn default() -> Self {
         Self {
             version: 0x1600_0000,
-            selectors: Vec::new(),
+            classes: Vec::new(),
+            ambiguous: Vec::new(),
+            second_words: Vec::new(),
         }
     }
 }
@@ -38,6 +44,19 @@ fn set_u32(bytes: &mut [u8], at: usize, value: u32) {
 
 fn up(value: usize, to: usize) -> usize {
     value.next_multiple_of(to)
+}
+
+/// The virtual length of a synthetic block: its inflated length for the zlib
+/// class, its stored length otherwise.
+fn inflated_len(block: &[u8], class: u8) -> u64 {
+    if class & 0x3C != 0x20 {
+        return block.len() as u64;
+    }
+    let mut decoded = Vec::new();
+    match flate2::read::ZlibDecoder::new(block).read_to_end(&mut decoded) {
+        Ok(_) => decoded.len() as u64,
+        Err(_) => block.len() as u64,
+    }
 }
 
 impl Build {
@@ -61,6 +80,18 @@ impl Build {
         }
         let size = pos;
 
+        // Virtual positions advance by each block's inflated length, in
+        // units of 0x4000 (counter) and 0x1000 (page term). Record 0 is the
+        // chunk record, so record `k + 1` starts block `k`.
+        let mut virtual_positions = vec![0u64; record_count];
+        let mut acc = 0u64;
+        for (k, block) in blocks.iter().enumerate() {
+            let class = self.classes.get(k).copied().unwrap_or(0x20);
+            virtual_positions[k + 1] = acc;
+            acc += inflated_len(block, class);
+        }
+        virtual_positions[blocks.len() + 1] = acc;
+
         let mut bytes = vec![0u8; size];
         bytes[..4].copy_from_slice(&MAGIC);
         set_u32(&mut bytes, 4, record_count as u32);
@@ -72,14 +103,30 @@ impl Build {
         set_u32(&mut bytes, 0x0C, self.version);
         for (index, offset) in offsets.iter().enumerate() {
             let at = HEADER_LEN as usize + RECORD_LEN as usize * index;
-            let high = if index == 0 {
+            let class = if index == 0 {
                 0
             } else {
-                self.selectors.get(index - 1).copied().unwrap_or(0) << 2
+                self.classes.get(index - 1).copied().unwrap_or(0x20)
             };
-            let lo = ((*offset / 0x100) as u32 & OFFSET_MASK) | (u32::from(high) << 24);
+            let ambiguous = index > 0 && self.ambiguous.get(index - 1).copied().unwrap_or(false);
+            let mut lo = ((*offset / 0x100) as u32 & OFFSET_MASK) | (u32::from(class) << 24);
+            if ambiguous {
+                lo |= 1 << 24;
+            }
+            let virtual_at = virtual_positions[index];
+            lo |= (((virtual_at % 0x4000) / 0x1000) as u32 & 3) << 30;
             set_u32(&mut bytes, at, lo);
-            set_u32(&mut bytes, at + 4, 0);
+            // Every block is padded to the next 0x100 boundary, and the
+            // record declares that padding in bits 20..31 of its second word.
+            let padding = blocks
+                .get(index.saturating_sub(1))
+                .map_or(0, |block| up(block.len(), 0x100) - block.len());
+            let second = self.second_words.get(index.saturating_sub(1)).copied();
+            set_u32(
+                &mut bytes,
+                at + 4,
+                second.unwrap_or((((padding as u32) & 0xFFF) << 20) | (virtual_at / 0x4000) as u32),
+            );
         }
         bytes[record_end..record_end + 4].copy_from_slice(&ETPF_MAGIC);
         set_u32(&mut bytes, record_end + 4, ETPF_TYPE);
@@ -363,13 +410,13 @@ fn reports_a_first_block_off_the_observed_relation() {
 }
 
 #[test]
-fn classifies_blocks_by_selector_and_header() {
+fn classifies_blocks_by_class_id_and_header() {
     let mut bytes = Build {
-        selectors: vec![0, 0, 1],
+        classes: vec![0x20, 0x20, 0x04],
         ..Build::default()
     }
     .build(&[zlib_block(), zlib_block(), zlib_block()], 0);
-    // Make the second block carry the zlib selector without a zlib header.
+    // Make the second block carry the zlib class without a zlib header.
     let container = read(&bytes).unwrap();
     let second = container.blocks[1].offset as usize;
     bytes[second] = 0x30;
@@ -385,8 +432,9 @@ fn classifies_blocks_by_selector_and_header() {
         .unwrap();
     assert_eq!(done, 3);
     assert_eq!(container.blocks[0].storage, Storage::Zlib);
-    assert_eq!(container.blocks[1].storage, Storage::NotZlib);
-    assert_eq!(container.blocks[2].storage, Storage::Unidentified(1));
+    assert_eq!(container.blocks[1].storage, Storage::ZlibHeaderMissing);
+    assert_eq!(container.blocks[2].storage, Storage::Undecoded(0x04));
+    assert_eq!(container.blocks[2].class_id, 0x04);
     assert_eq!(container.blocks_zlib(), 1);
 
     // Sampling stops early and leaves the rest unread.
@@ -402,7 +450,8 @@ fn classifies_blocks_by_selector_and_header() {
 
 #[test]
 fn decodes_a_zlib_block_and_reports_padding() {
-    let data: Vec<u8> = (0..0x1234u32).map(|value| value as u8).collect();
+    // Inflated lengths are multiples of 0x1000, as every measured case.
+    let data: Vec<u8> = (0..0x2000u32).map(|value| value as u8).collect();
     let bytes = Build::default().build(&[zlib(&data)], 0);
     let mut container = read(&bytes).unwrap();
     let mut source = Cursor::new(&bytes);
@@ -412,7 +461,7 @@ fn decodes_a_zlib_block_and_reports_padding() {
     let mut decoded = Vec::new();
     let report = decode_block(
         &mut source,
-        &container,
+        &mut container,
         0,
         &Limits::default(),
         &AtomicBool::new(false),
@@ -425,14 +474,14 @@ fn decodes_a_zlib_block_and_reports_padding() {
     assert_eq!(decoded, data);
     assert_eq!(report.len, data.len() as u64);
     assert_eq!(report.stored_len, container.blocks[0].stored_len);
-    // The block range is rounded up to 0x100, so padding may trail.
-    assert!(report.trailing < 0x100);
+    // The declared padding trails the stream and is reported, not counted.
+    assert_eq!(report.trailing, u64::from(container.blocks[0].padding));
 }
 
 #[test]
 fn refuses_blocks_it_cannot_decode() {
     let bytes = Build {
-        selectors: vec![1],
+        classes: vec![0x04],
         ..Build::default()
     }
     .build(&[zlib_block()], 0);
@@ -440,7 +489,7 @@ fn refuses_blocks_it_cannot_decode() {
     let mut source = Cursor::new(&bytes);
     let err = decode_block(
         &mut source,
-        &container,
+        &mut container,
         0,
         &Limits::default(),
         &AtomicBool::new(false),
@@ -455,7 +504,7 @@ fn refuses_blocks_it_cannot_decode() {
         .unwrap();
     let err = decode_block(
         &mut source,
-        &container,
+        &mut container,
         0,
         &Limits::default(),
         &AtomicBool::new(false),
@@ -464,12 +513,12 @@ fn refuses_blocks_it_cannot_decode() {
     .unwrap_err()
     .to_string();
     assert!(
-        err.contains("compressor selector 1") || err.contains("has not been identified"),
+        err.contains("storage class 0x04") || err.contains("is not decoded"),
         "{err}"
     );
     let err = decode_block(
         &mut source,
-        &container,
+        &mut container,
         7,
         &Limits::default(),
         &AtomicBool::new(false),
@@ -493,7 +542,7 @@ fn rejects_a_truncated_zlib_stream() {
         .unwrap();
     let err = decode_block(
         &mut source,
-        &container,
+        &mut container,
         0,
         &Limits::default(),
         &AtomicBool::new(false),
@@ -522,7 +571,7 @@ fn caps_the_decoded_size() {
     };
     let err = decode_block(
         &mut source,
-        &container,
+        &mut container,
         0,
         &limits,
         &AtomicBool::new(false),
@@ -530,7 +579,7 @@ fn caps_the_decoded_size() {
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("decodes to more than"), "{err}");
+    assert!(err.contains("more than the 256 byte limit"), "{err}");
 }
 
 #[test]
@@ -544,7 +593,7 @@ fn samples_entries() {
     assert_eq!(entries[0].index, 0);
     assert_eq!(entries[1].index, 1);
     assert_eq!(entries[0].words[0], 0xC001);
-    assert_eq!(entries[1].page(), 2);
+    assert_eq!(entries[1].locator_page(), 2);
     let tail = container.entries(&mut source, 1, 8).unwrap();
     assert_eq!(tail.len(), 1);
     assert!(container.entries(&mut source, 9, 1).is_err());
@@ -606,7 +655,7 @@ fn decodes_blocks_that_fill_the_output_buffer_exactly() {
         let mut decoded = Vec::new();
         let report = decode_block(
             &mut source,
-            &container,
+            &mut container,
             0,
             &Limits::default(),
             &AtomicBool::new(false),
@@ -632,4 +681,269 @@ fn stops_when_cancelled() {
     )
     .unwrap_err();
     assert!(matches!(err, Error::Cancelled));
+}
+
+#[test]
+fn classifies_every_observed_class() {
+    let classes = [0x00u8, 0x04, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20];
+    let blocks: Vec<Vec<u8>> = classes
+        .iter()
+        .map(|class| {
+            if *class == 0x20 {
+                zlib(&vec![0xAB; 0x1000])
+            } else if *class == 0x00 {
+                vec![0xCD; 0x1000]
+            } else {
+                vec![0xEF; 0x1000]
+            }
+        })
+        .collect();
+    let bytes = Build {
+        classes: classes.to_vec(),
+        ..Build::default()
+    }
+    .build(&blocks, 0);
+    let mut container = read(&bytes).unwrap();
+    container
+        .classify(
+            &mut Cursor::new(&bytes),
+            usize::MAX,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let expected = [
+        Storage::Stored,
+        Storage::Undecoded(0x04),
+        Storage::Undecoded(0x0C),
+        Storage::Undecoded(0x10),
+        Storage::Undecoded(0x14),
+        Storage::Undecoded(0x18),
+        Storage::Undecoded(0x1C),
+        Storage::Zlib,
+    ];
+    let actual: Vec<Storage> = container.blocks.iter().map(|block| block.storage).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(container.blocks_zlib(), 1);
+}
+
+#[test]
+fn decodes_a_stored_block_verbatim() {
+    let data: Vec<u8> = (0..0x1000u32).map(|value| value as u8).collect();
+    let bytes = Build {
+        classes: vec![0x00],
+        ..Build::default()
+    }
+    .build(&[data.clone()], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    container
+        .classify(&mut source, usize::MAX, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(container.blocks[0].content_len, 0x1000);
+    assert_eq!(container.blocks[0].virtual_len, 0x1000);
+    let mut decoded = Vec::new();
+    let report = decode_block(
+        &mut source,
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |chunk| {
+            decoded.extend_from_slice(chunk);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(decoded, data);
+    assert_eq!(report.len, 0x1000);
+}
+
+#[test]
+fn reports_a_stored_block_whose_length_disagrees_with_the_virtual_length() {
+    let bytes = Build {
+        classes: vec![0x00],
+        // Counter 10 puts the next record far ahead of the stored content.
+        second_words: vec![10],
+        ..Build::default()
+    }
+    .build(&[vec![0x11; 0x1000]], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    container
+        .classify(&mut source, usize::MAX, &AtomicBool::new(false))
+        .unwrap();
+    let err = decode_block(
+        &mut source,
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("virtual length"), "{err}");
+}
+
+#[test]
+fn accepts_an_ambiguous_class_record_and_reports_both_offsets() {
+    let bytes = Build {
+        classes: vec![0x04],
+        ambiguous: vec![true],
+        ..Build::default()
+    }
+    .build(&[vec![0x22; 0x100]], 0);
+    let container = read(&bytes).unwrap();
+    let block = &container.blocks[0];
+    assert!(block.ambiguous);
+    assert_eq!(block.class_id, 0x05);
+    assert_eq!(block.offset26, Some(block.offset + 0x1_0000_0000));
+    let record = container.records[1];
+    assert_eq!(record.dispatch_class(), 0x04);
+    assert_eq!(record.offset26(), block.offset + 0x1_0000_0000);
+}
+
+#[test]
+fn virtual_position_has_no_extra_constant() {
+    let record = Record {
+        index: 1,
+        offset: 0,
+        high_byte: 0x20 | (1 << 6),
+        second_word: 3,
+    };
+    assert_eq!(record.counter(), 3);
+    assert_eq!(record.page_term(), 1);
+    assert_eq!(record.virtual_position(), 3 * 0x4000 + 0x1000);
+    let sub_page = Record {
+        index: 2,
+        offset: 0,
+        high_byte: 0x20 | (2 << 6),
+        second_word: 0,
+    };
+    assert_eq!(sub_page.virtual_position(), 0x2000);
+}
+
+#[test]
+fn reports_non_zero_padding_and_accepts_zero_padding() {
+    // The builder declares the alignment padding, which is zero.
+    let data = vec![0x33; 0x1000];
+    let bytes = Build::default().build(&[zlib(&data)], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    container
+        .classify(&mut source, usize::MAX, &AtomicBool::new(false))
+        .unwrap();
+    assert!(container.blocks[0].padding > 0);
+    decode_block(
+        &mut source,
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap();
+
+    let mut damaged = bytes;
+    let padding_at = container.blocks[0].offset as usize + container.blocks[0].content_len as usize;
+    damaged[padding_at] = 0x7F;
+    let mut container = read(&damaged).unwrap();
+    container
+        .classify(
+            &mut Cursor::new(&damaged),
+            usize::MAX,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let err = decode_block(
+        &mut Cursor::new(&damaged),
+        &mut container,
+        0,
+        &Limits::default(),
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("padding bytes that are not zero"), "{err}");
+}
+
+#[test]
+fn reads_and_checks_the_key_table() {
+    let bytes = Build::default().build(&[zlib_block(), zlib_block()], 0);
+    let container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    let keys = container.keys(&mut source).unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(!Container::keys_sorted(&keys));
+
+    let mut sorted = bytes;
+    let at = container.entry_table_offset() as usize + container.entry_table_len() as usize;
+    set_u32(&mut sorted, at, 1);
+    set_u32(&mut sorted, at + 8, 2);
+    let container = read(&sorted).unwrap();
+    let keys = container.keys(&mut Cursor::new(&sorted)).unwrap();
+    assert_eq!(keys, vec![1, 2]);
+    assert!(Container::keys_sorted(&keys));
+}
+
+#[test]
+fn caps_the_cumulative_decoded_size() {
+    let page = vec![0x11; 0x1000];
+    let bytes = Build::default().build(&[zlib(&page), zlib(&page)], 0);
+    let mut container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    container
+        .classify(&mut source, usize::MAX, &AtomicBool::new(false))
+        .unwrap();
+    let limits = Limits {
+        max_total_len: 0x1000,
+        ..Limits::default()
+    };
+    decode_block(
+        &mut source,
+        &mut container,
+        0,
+        &limits,
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let err = decode_block(
+        &mut source,
+        &mut container,
+        1,
+        &limits,
+        &AtomicBool::new(false),
+        |_| Ok(()),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("cumulative limit"), "{err}");
+}
+
+#[test]
+fn rejects_an_index_that_cannot_exist() {
+    let bytes = Build::default().build(&[zlib_block(), zlib_block()], 0);
+    let mut container = read(&bytes).unwrap();
+    container
+        .classify(
+            &mut Cursor::new(&bytes),
+            usize::MAX,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    for index in [7, u32::MAX] {
+        let err = decode_block(
+            &mut Cursor::new(&bytes),
+            &mut container,
+            index,
+            &Limits::default(),
+            &AtomicBool::new(false),
+            |_| Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
 }

@@ -13,7 +13,7 @@ use lforge_binary::Source;
 use lforge_core::inspect as recognition;
 use lforge_core::inspect::Summary;
 
-/// Blocks whose storage selector is read for a report.
+/// Blocks whose storage class is read for a report.
 const SAMPLE_BLOCKS: usize = 8;
 
 pub(super) struct Report {

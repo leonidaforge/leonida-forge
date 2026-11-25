@@ -253,15 +253,25 @@ fn rds5_structure<R: Read + Seek>(
         let mut decoded = 0u64;
         let mut failures: Vec<Value> = Vec::new();
         let mut failed = 0u64;
-        for block in &container.blocks {
-            if !block.storage.is_zlib() {
+        let indices: Vec<u32> = container.blocks.iter().map(|block| block.index).collect();
+        for index in indices {
+            let decodable = matches!(
+                container.blocks[index as usize].storage,
+                Storage::Zlib | Storage::Stored
+            );
+            if !decodable {
                 continue;
             }
             checked += 1;
             let mut len = 0u64;
-            let result = rds5::decode_block(source, &container, block.index, &limits, cancel, |_| {
-                Ok(())
-            })
+            let result = rds5::decode_block(
+                source,
+                &mut container,
+                index,
+                &limits,
+                cancel,
+                |_| Ok(()),
+            )
             .map(|report| {
                 len = report.len;
             });
@@ -270,8 +280,9 @@ fn rds5_structure<R: Read + Seek>(
                 Err(err) => {
                     failed += 1;
                     if failures.len() < MAX_FAILURES {
+                        let block = &container.blocks[index as usize];
                         failures.push(json!({
-                            "block": block.index,
+                            "block": index,
                             "offset": hex(block.offset),
                             "error": err.to_string(),
                         }));
@@ -292,11 +303,11 @@ fn rds5_structure<R: Read + Seek>(
         if failed > 0 {
             failure = Some(Failure {
                 stage: "decode",
-                message: format!("{failed} zlib blocks did not decode"),
+                message: format!("{failed} blocks did not decode"),
             });
         }
         json!({
-            "zlib_blocks": checked,
+            "decodable_blocks": checked,
             "decoded_bytes": decoded,
             "failures": failed,
             "failure_sample": failures,
@@ -321,8 +332,10 @@ fn rds5_structure<R: Read + Seek>(
             "length": block.stored_len,
             "field": format!("block {}", block.index),
             "reason": match block.storage {
-                Storage::NotZlib => "carries the zlib selector value but is not zlib",
-                Storage::Unidentified(_) => "compressor selector not identified",
+                Storage::Stored => "stored content of the block's virtual length",
+                Storage::ZlibHeaderMissing =>
+                    "carries zlib class 0x20 but does not start with a zlib header",
+                Storage::Undecoded(_) => "storage class whose payload is not decoded",
                 _ => "",
             },
         }));
@@ -344,13 +357,19 @@ fn rds5_structure<R: Read + Seek>(
                 "index": record.index,
                 "role": role,
                 "offset": hex(record.offset),
-                "high_byte": format!("0x{:02X}", record.high_byte),
-                "selector": record.selector(),
+                "class_id": record.class_id(),
+                "class_dispatch": record.dispatch_class(),
+                "ambiguous_offset": record.is_ambiguous(),
                 "second_word": hex(u64::from(record.second_word)),
             });
             if role == "block" {
                 value["counter"] = json!(record.counter());
-                value["unknown"] = json!(record.upper());
+                value["page_term"] = json!(record.page_term());
+                value["padding"] = json!(record.padding());
+                value["virtual_position"] = json!(record.virtual_position());
+                if record.is_ambiguous() {
+                    value["offset26"] = json!(hex(record.offset26()));
+                }
             } else if role == "chunk" {
                 value["layout_flag"] = json!(record.second_word >> 28);
             }
@@ -365,47 +384,50 @@ fn rds5_structure<R: Read + Seek>(
             json!({
                 "index": entry.index,
                 "words": entry.words.iter().map(|word| format!("0x{word:08X}")).collect::<Vec<_>>(),
-                "page": entry.page(),
+                "width": entry.width(),
+                "height": entry.height(),
+                "mip": entry.mip(),
+                "flags": entry.flags(),
+                "format_id": entry.format_id(),
+                "array_size": entry.array_size(),
+                "kind": entry.kind(),
+                "tile_mode": entry.tile_mode(),
+                "unknown_high_nibble": entry.unknown_high_nibble(),
+                "locator_page": entry.locator_page(),
+                "locator_high": hex(entry.locator_high()),
             })
         })
         .collect();
 
-    // The selector value is reported per group: the research identifies only
-    // selector 0, and selectors 1, 2 and 3 each select an unknown codec.
+    // Storage is reported per class id. Only `0x20` and `0x00` are decoded;
+    // the other observed ids keep their number and get no codec name.
     let mut by_storage = Map::new();
-    let mut counts: Vec<(String, usize)> = vec![
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for (name, storage) in [
+        ("zlib".to_string(), Storage::Zlib),
+        ("stored".to_string(), Storage::Stored),
         (
-            "zlib".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::Zlib)
-                .count(),
+            "zlib_header_missing".to_string(),
+            Storage::ZlibHeaderMissing,
         ),
-        (
-            "not_zlib".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::NotZlib)
-                .count(),
-        ),
-        (
-            "unread".to_string(),
-            container
-                .blocks
-                .iter()
-                .filter(|block| block.storage == Storage::Unread)
-                .count(),
-        ),
-    ];
-    for selector in 1..=3u8 {
+        ("unread".to_string(), Storage::Unread),
+    ] {
         counts.push((
-            format!("selector_{selector}"),
+            name,
             container
                 .blocks
                 .iter()
-                .filter(|block| block.storage == Storage::Unidentified(selector))
+                .filter(|block| block.storage == storage)
+                .count(),
+        ));
+    }
+    for id in [0x04u8, 0x0C, 0x10, 0x14, 0x18, 0x1C] {
+        counts.push((
+            format!("class_{id:02X}"),
+            container
+                .blocks
+                .iter()
+                .filter(|block| block.storage == Storage::Undecoded(id))
                 .count(),
         ));
     }
@@ -420,15 +442,23 @@ fn rds5_structure<R: Read + Seek>(
         .iter()
         .take(sample)
         .map(|block| {
-            json!({
+            let mut value = json!({
                 "index": block.index,
                 "record": block.record,
                 "offset": hex(block.offset),
                 "stored_len": block.stored_len,
-                "selector": block.selector(),
+                "padding": block.padding,
+                "content_len": block.content_len,
+                "virtual_len": block.virtual_len,
+                "virtual_position": hex(block.virtual_position),
+                "class_id": block.class_id,
+                "ambiguous_offset": block.ambiguous,
                 "storage": block.storage.name(),
-                "counter": block.counter,
-            })
+            });
+            if let Some(offset26) = block.offset26 {
+                value["offset26"] = json!(hex(offset26));
+            }
+            value
         })
         .collect();
 
@@ -459,6 +489,7 @@ fn rds5_structure<R: Read + Seek>(
         }));
     }
 
+    let keys = container.keys(source).ok();
     let structure = json!({
         "valid": true,
         "header": {
@@ -480,6 +511,11 @@ fn rds5_structure<R: Read + Seek>(
             "content_end": hex(container.content_end),
             "shown": entries.len(),
             "entry_sample": entries,
+            "keys": keys.as_ref().map(|keys| json!({
+                "count": keys.len(),
+                "strictly_increasing": rds5::Container::keys_sorted(keys),
+                "values": "not published",
+            })),
         },
         "blocks": {
             "count": container.blocks.len(),
@@ -495,10 +531,10 @@ fn rds5_structure<R: Read + Seek>(
         "verified": verified.unwrap_or(Value::Null),
         "diagnostics": diagnostics,
         "limitations": [
-            "entry fields and the block record's upper second word have no established meaning",
-            "the ETPF content after the entry table is not interpreted",
+            "the meaning of the descriptor fields beyond their widths, the block record's layout flag and the locator high bits is unknown",
+            "the ETPF content after the key table is not interpreted",
             "page sizes and pixel formats are not part of this container",
-            "a block whose compressor selector is not identified is not decoded",
+            "only storage classes 0x20 and 0x00 are decoded; the other ids are reported and refused",
         ],
     });
     let summary = Summary::Rds5 {

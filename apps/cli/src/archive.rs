@@ -160,10 +160,10 @@ pub enum Command {
         /// Records and entries included in the report
         #[arg(long, default_value_t = crate::inspect::DEFAULT_SAMPLE)]
         sample: usize,
-        /// Read every block's storage selector instead of the first sample
+        /// Read every block's storage class instead of the first sample
         #[arg(long)]
         blocks: bool,
-        /// Inflate every zlib block and report what fails
+        /// Decode every decodable block and report what fails
         #[arg(long)]
         verify: bool,
         /// Print as JSON

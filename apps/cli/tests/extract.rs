@@ -323,3 +323,16 @@ fn does_not_overwrite_without_the_flag() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(std::fs::read(&out).unwrap(), b"fresh bytes");
 }
+
+#[test]
+fn refuses_an_output_that_is_the_input_archive() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = assemble(&[spec(b"stored contents, verbatim")], &[]);
+    let archive = write_archive(temp.path(), "self.rpf", &bytes);
+    let output = extract(&archive, 0, &archive, &["--overwrite"]);
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(message.contains("one of the inputs"), "{message}");
+    // The archive is untouched.
+    assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+}
