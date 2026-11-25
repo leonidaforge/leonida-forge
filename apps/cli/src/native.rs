@@ -6,8 +6,10 @@
 //! sub-block 3 and [`Companions::open`] opens each record in the archive's
 //! directory with its path-traversal, symlink and header checks.
 
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_binary::Source;
 use lforge_binary::pe::ExecutableView;
@@ -15,7 +17,8 @@ use lforge_rage9::rpf;
 use lforge_rage9::rpf::metadata::verify::{
     OpenReport, VerifyOutcome, VerifyReport, open_authenticated,
 };
-use lforge_rage9::rpf::metadata::{Companion, CompanionStatus, Metadata, Stored};
+use lforge_rage9::rpf::metadata::{Companion, CompanionStatus, Entry, Error, Metadata, Stored};
+use lforge_rage9::rpf::names::{Builtin, Lut, StringTable};
 
 /// How the native table of contents was obtained.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +51,268 @@ pub struct Opened {
     pub source: Source,
     pub metadata: Metadata,
     pub authentication: Authentication,
+}
+
+/// One name table that was read, and what became of it.
+#[derive(Debug, Clone)]
+pub struct NameTableSource {
+    pub path: PathBuf,
+    pub kind: &'static str,
+    pub namespace: Option<&'static str>,
+    pub entries: usize,
+    pub verified: usize,
+    pub added: usize,
+}
+
+/// The local name tables of one archive and the built-in ones. A local table
+/// is an explicit `--name-file`, or `<archive>.names.txt` next to the archive
+/// when none is given.
+#[derive(Debug, Clone)]
+pub struct NameTables {
+    /// Local entries first, then the built-in ones.
+    pub table: StringTable,
+    /// Entries `table` holds from the local files.
+    pub local: usize,
+    pub sources: Vec<NameTableSource>,
+    pub sidecar: bool,
+    pub builtin: Builtin,
+}
+
+fn sidecar_path(archive: &Path) -> PathBuf {
+    let mut name = archive.file_name().unwrap_or_default().to_os_string();
+    name.push(".names.txt");
+    archive.with_file_name(name)
+}
+
+fn is_lut(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes)
+        .trim_start()
+        .starts_with("# leonida-forge-lut:")
+}
+
+fn read_bounded(path: &Path) -> Result<(Vec<u8>, bool), String> {
+    let limit =
+        lforge_rage9::rpf::names::table::MAX_BYTES.max(lforge_rage9::rpf::names::lut::MAX_BYTES);
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let truncated = bytes.len() as u64 > limit;
+    if truncated {
+        bytes.truncate(limit as usize);
+    }
+    Ok((bytes, truncated))
+}
+
+/// Reads the local tables, then merges the built-in LUTs. The table next to
+/// an archive is a `.names.txt` candidate table; a LUT there is refused.
+pub fn load_name_tables(archive: &Path, files: &[PathBuf]) -> Result<NameTables, String> {
+    let (paths, sidecar) = if files.is_empty() {
+        let path = sidecar_path(archive);
+        if path.is_file() {
+            (vec![path], true)
+        } else {
+            (Vec::new(), false)
+        }
+    } else {
+        (files.to_vec(), false)
+    };
+    let mut table = StringTable::default();
+    let mut sources = Vec::new();
+    for path in paths {
+        let (bytes, truncated) = read_bounded(&path)?;
+        if is_lut(&bytes) {
+            if sidecar {
+                return Err(format!(
+                    "{} is a LUT; a LUT is only read from the built-in tables and from beside \
+                     the executable, and the table next to an archive is a .names.txt name table",
+                    path.display()
+                ));
+            }
+            if truncated {
+                return Err(format!(
+                    "{} is larger than the LUT size limit",
+                    path.display()
+                ));
+            }
+            let lut = Lut::parse(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+            let entries = lut.entries().len();
+            let verified = lut.verified();
+            let namespace = Some(lut.namespace().namespace());
+            let added = table.merge_lut(&lut);
+            sources.push(NameTableSource {
+                path,
+                kind: "lut",
+                namespace,
+                entries,
+                verified,
+                added,
+            });
+        } else {
+            let part = StringTable::parse(&bytes, truncated);
+            let entries = part.entries().len();
+            let added = table.merge(part);
+            sources.push(NameTableSource {
+                path,
+                kind: "names_txt",
+                namespace: None,
+                entries,
+                verified: 0,
+                added,
+            });
+        }
+    }
+    let local = table.entries().len();
+    let builtin = Builtin::beside_executable();
+    table.merge(builtin.table().clone());
+    Ok(NameTables {
+        table,
+        local,
+        sources,
+        sidecar,
+        builtin,
+    })
+}
+
+/// How an entry's contents can be read: one of the readability states. This
+/// reports actual payload readability, not only raw-byte availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentsState {
+    pub readable: bool,
+    /// `stored`, `decoded`, `unsupported_transform`, `unsupported_compression`,
+    /// `alternate_source` or `malformed`.
+    pub state: &'static str,
+    pub reason: Option<String>,
+}
+
+/// Computes the readability state of `entry` against its read sources.
+pub fn contents_state(
+    entry: &Entry,
+    source: &Source,
+    alternates: &[Option<Source>],
+) -> ContentsState {
+    let state = |readable: bool, state: &'static str, reason: Option<String>| ContentsState {
+        readable,
+        state,
+        reason,
+    };
+    // A field that did not parse takes precedence: nothing downstream is trustworthy.
+    let malformed = [
+        entry.location.as_ref().err(),
+        entry.chunks.as_ref().err(),
+        entry.payload_transform.as_ref().err(),
+        entry.read_source.as_ref().err(),
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    if let Some(reason) = malformed {
+        return state(false, "malformed", Some(reason.clone()));
+    }
+    match entry.payload(source, alternates) {
+        Ok(_) if entry.raw_source(source, alternates).is_ok() => state(true, "stored", None),
+        Ok(_) => state(true, "decoded", None),
+        Err(Error::Encoded { encoding, .. }) => state(
+            false,
+            "unsupported_transform",
+            Some(format!("stored {encoding}")),
+        ),
+        Err(Error::Undecodable { reason, .. }) => {
+            state(false, "unsupported_compression", Some(reason))
+        }
+        Err(Error::ReadSource { index, .. }) => state(
+            false,
+            "alternate_source",
+            Some(format!("alternate read source {index} is not available")),
+        ),
+        Err(err) => state(false, "malformed", Some(err.to_string())),
+    }
+}
+
+/// Whether the entry's stored bytes can be read as they are, and why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawState {
+    Available { size: u64 },
+    Unavailable { reason: String },
+}
+
+pub fn raw_state(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> RawState {
+    match entry.raw_source(source, alternates) {
+        Ok(view) => RawState::Available { size: view.len() },
+        Err(Error::Encoded { encoding, .. }) => RawState::Unavailable {
+            reason: format!("stored {encoding}"),
+        },
+        Err(Error::ReadSource { index, .. }) => RawState::Unavailable {
+            reason: format!("alternate read source {index} is not available"),
+        },
+        Err(err) => RawState::Unavailable {
+            reason: err.to_string(),
+        },
+    }
+}
+
+/// Archive discovery limits for directory searches.
+#[derive(Debug, Clone, Copy)]
+pub struct ScanLimits {
+    pub max_depth: usize,
+    pub max_archives: usize,
+}
+
+/// Every `.rpf` file under `root`, sorted, with whether a limit cut the walk
+/// short. A file root is returned as it is. Symbolic links are skipped.
+pub fn collect_archives(
+    root: &Path,
+    limits: ScanLimits,
+    cancel: &AtomicBool,
+) -> Result<(Vec<PathBuf>, bool), String> {
+    if root.is_file() {
+        return Ok((vec![root.to_path_buf()], false));
+    }
+    let mut files = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut truncated = false;
+    while let Some((directory, depth)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        if depth > limits.max_depth {
+            truncated = true;
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut children: Vec<_> = entries.filter_map(Result::ok).collect();
+        children.sort_by_key(|entry| entry.path());
+        for entry in children {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push((path, depth + 1));
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
+            {
+                files.push(path);
+                if files.len() >= limits.max_archives {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        if files.len() >= limits.max_archives {
+            break;
+        }
+    }
+    files.sort();
+    Ok((files, truncated))
 }
 
 /// Opens `path`, reads the RPF9 header and decodes the native table of

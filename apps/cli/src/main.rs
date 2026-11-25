@@ -7,6 +7,7 @@ mod native;
 mod output;
 mod probe;
 mod recover;
+mod rows;
 
 use std::process::ExitCode;
 

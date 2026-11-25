@@ -1,8 +1,7 @@
 //! `lforge archive metadata`: the RPF9 table of contents as stored, and its
 //! entries where it can be read without decryption.
 
-use std::fs;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -13,8 +12,8 @@ use lforge_rage9::rpf::metadata::{
     CompanionStatus, Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, Builtin, CandidateOutcome, Class, Lut, MountPrefix, Namespace, Provenance, Resolver,
-    RowNames, StringTable, Types,
+    self, Builtin, CandidateOutcome, Class, MountPrefix, Namespace, Provenance, Resolver, RowNames,
+    StringTable, Types,
 };
 use serde_json::{Value, json};
 
@@ -90,75 +89,17 @@ struct NameSource {
 
 impl Naming {
     fn read(options: &Options, archive: &Path) -> Result<Self, String> {
-        let (paths, sidecar) = if options.candidates.is_empty() {
-            let path = sidecar_path(archive);
-            if path.is_file() {
-                (vec![path], true)
-            } else {
-                let addressing = options.archive_path.is_some()
-                    || options.mount_prefix.is_some()
-                    || !options.extensions.is_empty();
-                if addressing {
-                    return Err(format!(
-                        "--archive-path, --mount-prefix and --extension need a name table; \
-                         pass --name-file or place one at {}",
-                        path.display()
-                    ));
-                }
-                (Vec::new(), false)
-            }
-        } else {
-            (options.candidates.clone(), false)
-        };
-        let mut table = StringTable::default();
-        let mut sources = Vec::new();
-        for path in paths {
-            let (bytes, truncated) = read_bounded(&path)?;
-            if is_lut(&bytes) {
-                if sidecar {
-                    return Err(format!(
-                        "{} is a LUT; a LUT is only read from the built-in tables and from \
-                         beside the executable, and the table next to an archive is a .names.txt \
-                         name table",
-                        path.display()
-                    ));
-                }
-                if truncated {
-                    return Err(format!(
-                        "{} is larger than the LUT size limit",
-                        path.display()
-                    ));
-                }
-                let lut = Lut::parse(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
-                let entries = lut.entries().len();
-                let verified = lut.verified();
-                let namespace = Some(lut.namespace().namespace());
-                let added = table.merge_lut(&lut);
-                sources.push(NameSource {
-                    path,
-                    kind: "lut",
-                    namespace,
-                    entries,
-                    verified,
-                    added,
-                });
-            } else {
-                let part = StringTable::parse(&bytes, truncated);
-                let entries = part.entries().len();
-                let added = table.merge(part);
-                sources.push(NameSource {
-                    path,
-                    kind: "names_txt",
-                    namespace: None,
-                    entries,
-                    verified: 0,
-                    added,
-                });
-            }
+        let tables = native::load_name_tables(archive, &options.candidates)?;
+        let addressing = options.archive_path.is_some()
+            || options.mount_prefix.is_some()
+            || !options.extensions.is_empty();
+        if tables.sources.is_empty() && addressing {
+            return Err(format!(
+                "--archive-path, --mount-prefix and --extension need a name table; \
+                 pass --name-file or place one at {}",
+                sidecar_path(archive).display()
+            ));
         }
-        let local = table.entries().len();
-        let builtin = Builtin::beside_executable();
-        table.merge(builtin.table().clone());
         let prefix = match (&options.mount_prefix, &options.archive_path) {
             (Some(mount), _) => MountPrefix::mounted(mount.as_bytes()).ok_or_else(|| {
                 format!(
@@ -177,35 +118,28 @@ impl Naming {
                 types.insert_class(extension.type_id, class);
             }
         }
+        let sources = tables
+            .sources
+            .iter()
+            .map(|source| NameSource {
+                path: source.path.clone(),
+                kind: source.kind,
+                namespace: source.namespace,
+                entries: source.entries,
+                verified: source.verified,
+                added: source.added,
+            })
+            .collect();
         Ok(Self {
             sources,
-            sidecar,
-            table,
-            local,
-            builtin,
+            sidecar: tables.sidecar,
+            local: tables.local,
+            table: tables.table,
+            builtin: tables.builtin,
             prefix,
             types,
         })
     }
-}
-
-fn read_bounded(path: &Path) -> Result<(Vec<u8>, bool), String> {
-    let limit = names::table::MAX_BYTES.max(names::lut::MAX_BYTES);
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    let truncated = bytes.len() as u64 > limit;
-    if truncated {
-        bytes.truncate(limit as usize);
-    }
-    Ok((bytes, truncated))
-}
-
-fn is_lut(bytes: &[u8]) -> bool {
-    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let text = String::from_utf8_lossy(bytes);
-    text.trim_start().starts_with("# leonida-forge-lut:")
 }
 
 fn sidecar_path(archive: &Path) -> PathBuf {
@@ -316,67 +250,23 @@ fn hex<T: std::fmt::UpperHex>(value: T, digits: usize) -> String {
 
 /// Whether the entry's stored bytes can be read as they are, and why not.
 fn raw_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
-    match entry.raw_source(source, alternates) {
-        Ok(view) => json!({ "available": true, "size": view.len() }),
-        Err(Error::Encoded { encoding, .. }) => {
-            json!({ "available": false, "reason": format!("stored {encoding}") })
+    match native::raw_state(entry, source, alternates) {
+        native::RawState::Available { size } => json!({ "available": true, "size": size }),
+        native::RawState::Unavailable { reason } => {
+            json!({ "available": false, "reason": reason })
         }
-        Err(Error::ReadSource { index, .. }) => json!({
-            "available": false,
-            "reason": format!("alternate read source {index} is not available"),
-        }),
-        Err(err) => json!({ "available": false, "reason": err.to_string() }),
     }
 }
 
 /// How the entry's contents can be obtained: one of the readability states.
 /// This reports actual payload readability, not only raw-byte availability.
-///
-/// - `stored`: readable as the stored bytes are.
-/// - `decoded`: readable after supported decoding (raw DEFLATE or chunks).
-/// - `unsupported_transform`: behind the unsupported payload transform.
-/// - `unsupported_compression`: an unsupported compression mode.
-/// - `alternate_source`: read through a companion that is not available.
-/// - `malformed`: the payload metadata did not parse or is inconsistent.
 fn contents_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
-    let state = |readable: bool, state: &str, reason: Option<String>| {
-        let mut value = json!({ "readable": readable, "state": state });
-        if let Some(reason) = reason {
-            value["reason"] = json!(reason);
-        }
-        value
-    };
-    // A field that did not parse takes precedence: nothing downstream is trustworthy.
-    let malformed = [
-        entry.location.as_ref().err(),
-        entry.chunks.as_ref().err(),
-        entry.payload_transform.as_ref().err(),
-        entry.read_source.as_ref().err(),
-    ]
-    .into_iter()
-    .flatten()
-    .next();
-    if let Some(reason) = malformed {
-        return state(false, "malformed", Some(reason.clone()));
+    let state = native::contents_state(entry, source, alternates);
+    let mut value = json!({ "readable": state.readable, "state": state.state });
+    if let Some(reason) = state.reason {
+        value["reason"] = json!(reason);
     }
-    match entry.payload(source, alternates) {
-        Ok(_) if entry.raw_source(source, alternates).is_ok() => state(true, "stored", None),
-        Ok(_) => state(true, "decoded", None),
-        Err(Error::Encoded { encoding, .. }) => state(
-            false,
-            "unsupported_transform",
-            Some(format!("stored {encoding}")),
-        ),
-        Err(Error::Undecodable { reason, .. }) => {
-            state(false, "unsupported_compression", Some(reason))
-        }
-        Err(Error::ReadSource { index, .. }) => state(
-            false,
-            "alternate_source",
-            Some(format!("alternate read source {index} is not available")),
-        ),
-        Err(err) => state(false, "malformed", Some(err.to_string())),
-    }
+    value
 }
 
 fn entry_json(
@@ -420,7 +310,7 @@ fn entry_json(
     value
 }
 
-fn resolution_json(row: &RowNames) -> Value {
+pub(crate) fn resolution_json(row: &RowNames) -> Value {
     let status = if row.resolution.is_ambiguous() {
         "ambiguous"
     } else if row.resolution.is_resolved() {

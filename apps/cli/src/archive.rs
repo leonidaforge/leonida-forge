@@ -12,7 +12,7 @@ use lforge_rage9::resource::Segment;
 use lforge_rage9::rpf::{self, Index, Origin, Progress, Resource};
 use serde_json::{Value, json};
 
-use crate::{extract, metadata, recover};
+use crate::{extract, metadata, recover, rows};
 
 /// How the contents of an RPF9 archive are obtained, for users who expect a
 /// file listing.
@@ -122,6 +122,93 @@ pub enum Command {
         #[arg(long)]
         executable: Option<PathBuf>,
     },
+    /// List the authenticated native rows of one archive as stable records,
+    /// with resolved names, type, extension and readability
+    Ls {
+        file: PathBuf,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// A local name table, or a `.lut` file. Defaults to
+        /// `<archive>.names.txt` when it exists. The built-in LUTs always apply
+        #[arg(long = "name-file", visible_alias = "candidates")]
+        candidates: Vec<PathBuf>,
+        /// The first row to list
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// The most rows to list
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search authenticated native rows by name, key, type, extension,
+    /// readability or archive, in one archive or a directory of archives
+    Search {
+        /// An .rpf file or a directory searched recursively for .rpf files
+        path: PathBuf,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// A local name table, or a `.lut` file. Defaults to
+        /// `<archive>.names.txt` when it exists. The built-in LUTs always apply
+        #[arg(long = "name-file", visible_alias = "candidates")]
+        candidates: Vec<PathBuf>,
+        /// A case-insensitive substring of a resolved name
+        #[arg(long)]
+        name: Option<String>,
+        /// A stored hash64 (16 hexadecimal digits) or key32 (8 digits)
+        #[arg(long, value_parser = rows::parse_hash)]
+        hash: Option<lforge_rage9::rpf::names::Key>,
+        /// A type ID
+        #[arg(long = "type", value_name = "TYPE")]
+        type_id: Option<u8>,
+        /// A confirmed extension, without the dot
+        #[arg(long)]
+        extension: Option<String>,
+        /// Whether the payload is readable: true or false
+        #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
+        readable: Option<bool>,
+        /// A case-insensitive substring of an archive's path under the search
+        /// root
+        #[arg(long)]
+        archive: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 32)]
+        max_depth: usize,
+        #[arg(long, default_value_t = 64)]
+        max_archives: usize,
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a deterministic manifest of the native rows of one archive
+    Manifest {
+        file: PathBuf,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// A local name table, or a `.lut` file. Defaults to
+        /// `<archive>.names.txt` when it exists. The built-in LUTs always apply
+        #[arg(long = "name-file", visible_alias = "candidates")]
+        candidates: Vec<PathBuf>,
+        /// json (one document) or jsonl (a header, then one row per line)
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Where to write the manifest. Defaults to standard output
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
     #[command(group(
@@ -199,6 +286,67 @@ pub fn run(command: Command) -> Result<(), String> {
             overwrite,
             executable,
         } => extract::run(&file, row, &output, overwrite, executable.as_deref()),
+        Command::Ls {
+            file,
+            executable,
+            candidates,
+            offset,
+            limit,
+            json,
+        } => rows::run_ls(rows::LsOptions {
+            file,
+            executable,
+            candidates,
+            offset,
+            limit,
+            json,
+        }),
+        Command::Search {
+            path,
+            executable,
+            candidates,
+            name,
+            hash,
+            type_id,
+            extension,
+            readable,
+            archive,
+            offset,
+            limit,
+            max_depth,
+            max_archives,
+            json,
+        } => rows::run_search(rows::SearchOptions {
+            path,
+            executable,
+            candidates,
+            name,
+            hash,
+            type_id,
+            extension,
+            readable,
+            archive,
+            offset,
+            limit,
+            max_depth,
+            max_archives,
+            json,
+        }),
+        Command::Manifest {
+            file,
+            executable,
+            candidates,
+            format,
+            output,
+            overwrite,
+        } => rows::run_manifest(rows::ManifestOptions {
+            file,
+            executable,
+            candidates,
+            format,
+            output,
+            overwrite,
+        }),
         Command::Probe {
             file,
             executable,
