@@ -40,6 +40,10 @@ pub const RPF_TYPE: u8 = 0;
 /// The type the resolver uses when the extension maps to no type, or the
 /// path has no extension.
 pub const NO_TYPE: u8 = 0xFF;
+/// The observed types whose key class the executable's per-type tables
+/// establish as the 32-bit class. The class decides which stored column the
+/// engine reads; it does not establish an extension or a readable name.
+pub const KEY32_TYPES: [u8; 2] = [11, 14];
 /// The limit of a prefix derived from an archive path.
 pub const MAX_PREFIX_LEN: usize = 255;
 /// The limit of an explicit mount prefix.
@@ -134,6 +138,29 @@ pub fn joaat(text: &[u8]) -> u32 {
     h = h.wrapping_add(h << 3);
     h ^= h >> 11;
     h.wrapping_add(h << 15)
+}
+
+/// The components of a relative path that cannot escape an archive. Names
+/// are untrusted: absolute paths, `.` and `..`, empty components, drive
+/// letters and characters Windows does not allow in a name are refused.
+pub fn relative_path(name: &str) -> Option<Vec<&str>> {
+    if name.is_empty() || name.starts_with(['/', '\\']) {
+        return None;
+    }
+    let parts: Vec<&str> = name.split(['/', '\\']).collect();
+    parts
+        .iter()
+        .all(|part| safe_component(part))
+        .then_some(parts)
+}
+
+/// One component of a relative path: non-empty, not `.` or `..`, and free of
+/// characters Windows does not allow in a file name.
+pub fn safe_component(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && !part.contains([':', '<', '>', '"', '|', '?', '*'])
 }
 
 /// The part of a request path the engine compares as a whole, by its folded
@@ -239,10 +266,14 @@ pub struct Types {
 }
 
 impl Default for Types {
-    /// Only `rpf` to type 0, of the 64-bit class.
+    /// `rpf` to type 0, of the 64-bit class, and the observed types whose
+    /// class is established as the 32-bit class. Other types keep no class.
     fn default() -> Self {
         let mut classes = [None; 256];
         classes[usize::from(RPF_TYPE)] = Some(Class::Hash64);
+        for type_id in KEY32_TYPES {
+            classes[usize::from(type_id)] = Some(Class::Key32);
+        }
         Self {
             extensions: vec![(b"rpf".to_vec(), RPF_TYPE)],
             classes,
@@ -271,6 +302,15 @@ impl Types {
             .iter()
             .find(|(e, _)| e == extension)
             .map(|&(_, type_id)| type_id)
+    }
+
+    /// The confirmed extension of `type_id`, without the dot. Only mappings
+    /// established by evidence are returned.
+    pub fn extension(&self, type_id: u8) -> Option<&[u8]> {
+        self.extensions
+            .iter()
+            .find(|(_, id)| *id == type_id)
+            .map(|(extension, _)| extension.as_slice())
     }
 
     pub fn class(&self, type_id: u8) -> Option<Class> {
@@ -335,7 +375,7 @@ pub enum Candidate<'a> {
     Stem { stem: &'a [u8], type_id: u8 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Key {
     Hash64(u64),
     Key32(u32),

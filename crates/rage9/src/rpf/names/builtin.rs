@@ -22,6 +22,12 @@ const EMBEDDED: [(&str, &[u8]); 2] = [
     (KEY32_FILE, include_bytes!("../../../data/rpf9-key32.lut")),
 ];
 
+/// The LUTs embedded in the binary, with their file names and bytes. No file
+/// beside the executable is read.
+pub fn embedded() -> impl Iterator<Item = (&'static str, &'static [u8])> {
+    EMBEDDED.into_iter()
+}
+
 /// One LUT and what became of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {

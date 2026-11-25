@@ -35,13 +35,18 @@ fn reports_unresolved_rows_with_their_namespace() {
         entry(0, Some(0), Some(0x1234), None),
         entry(1, Some(255), None, Some(0x5678)),
         entry(2, Some(11), Some(1), Some(2)),
+        entry(3, Some(13), Some(3), Some(4)),
     ];
     let resolved = resolve(&StringTable::default(), &entries);
     assert_eq!(resolved.unusable_rows, 0);
-    assert_eq!(resolved.rows.len(), 3);
+    assert_eq!(resolved.rows.len(), 4);
     assert_eq!(resolved.rows[0].namespace, Namespace::Hash64);
     assert_eq!(resolved.rows[1].namespace, Namespace::Key32);
-    assert_eq!(resolved.rows[2].namespace, Namespace::Unknown);
+    // Type 11 uses the 32-bit class, established from the executable's
+    // per-type tables.
+    assert_eq!(resolved.rows[2].namespace, Namespace::Key32);
+    // A type with no established class and both keys stays unknown.
+    assert_eq!(resolved.rows[3].namespace, Namespace::Unknown);
     for row in &resolved.rows {
         assert_eq!(row.resolution, Resolution::Unresolved);
     }

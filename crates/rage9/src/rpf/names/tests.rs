@@ -223,6 +223,51 @@ fn untyped_paths_hash_the_whole_rest() {
 }
 
 #[test]
+fn established_types_keep_their_class_and_confirmed_extension() {
+    let types = Types::default();
+    assert_eq!(types.class(RPF_TYPE), Some(Class::Hash64));
+    for type_id in KEY32_TYPES {
+        assert_eq!(types.class(type_id), Some(Class::Key32), "type {type_id}");
+    }
+    // The class is established for these observed types; their extensions are
+    // not, so none is invented.
+    assert_eq!(types.extension(RPF_TYPE), Some(&b"rpf"[..]));
+    for type_id in KEY32_TYPES {
+        assert_eq!(types.extension(type_id), None);
+    }
+    assert_eq!(types.class(NO_TYPE), Some(Class::Key32));
+    assert_eq!(types.extension(NO_TYPE), None);
+}
+
+#[test]
+fn relative_paths_are_checked_component_by_component() {
+    assert_eq!(
+        relative_path("packs/props/crate.ydr"),
+        Some(vec!["packs", "props", "crate.ydr"])
+    );
+    assert_eq!(
+        relative_path(r"packs\props\crate.ydr"),
+        Some(vec!["packs", "props", "crate.ydr"])
+    );
+    for path in [
+        "",
+        "/absolute",
+        "\\absolute",
+        "a//b",
+        "a/./b",
+        "a/../b",
+        "a\\..\\b",
+        "c:drive",
+        "a/<b>",
+        "a/|b",
+        "a/?b",
+        "a/*b",
+    ] {
+        assert_eq!(relative_path(path), None, "{path}");
+    }
+}
+
+#[test]
 fn rejects_paths_outside_the_prefix() {
     let types = Types::default();
     for path in [

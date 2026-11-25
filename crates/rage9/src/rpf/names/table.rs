@@ -253,7 +253,7 @@ pub(crate) fn checked_name(name: &str) -> Option<String> {
 }
 
 /// The normalized bytes two spellings are compared by.
-pub(crate) fn normalized(name: &str) -> Vec<u8> {
+pub fn normalized(name: &str) -> Vec<u8> {
     name.as_bytes().iter().copied().map(fold).collect()
 }
 
