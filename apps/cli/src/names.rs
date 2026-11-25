@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::Subcommand;
 use lforge_binary::pe::ExecutableView;
+use lforge_rage9::rbf0::{self, TextKind};
 use lforge_rage9::rpf::metadata::{Entry, Error as MetadataError};
 #[cfg(test)]
 use lforge_rage9::rpf::names::VariantKind;
@@ -556,6 +557,46 @@ struct HarvestLimits {
     matches: usize,
 }
 
+/// The verified text of one payload: a candidate that matches exactly is a
+/// field of the parsed RBF0 document, not an arbitrary binary string. A
+/// payload in another format, or one that does not parse, contributes
+/// nothing, so every candidate stays unlabelled.
+#[derive(Default)]
+struct VerifiedText {
+    names: HashSet<String>,
+    strings: HashSet<String>,
+    attributes: HashSet<String>,
+}
+
+impl VerifiedText {
+    fn of(bytes: &[u8], cancel: &AtomicBool) -> Self {
+        let mut verified = Self::default();
+        if !rbf0::is_rbf0(bytes) {
+            return verified;
+        }
+        let Ok(document) = rbf0::parse(bytes, &rbf0::Limits::default(), cancel) else {
+            return verified;
+        };
+        verified.names.extend(document.field_names);
+        verified.strings.extend(document.string_texts);
+        verified.attributes.extend(document.attribute_texts);
+        verified
+    }
+
+    /// Which verified use the candidate is, by the field it came from.
+    fn label(&self, candidate: &str) -> Option<&'static str> {
+        if self.names.contains(candidate) {
+            Some(TextKind::FieldName.name())
+        } else if self.strings.contains(candidate) {
+            Some(TextKind::StringValue.name())
+        } else if self.attributes.contains(candidate) {
+            Some(TextKind::AttributeValue.name())
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SourceRecord {
     kind: String,
@@ -587,6 +628,10 @@ struct MatchRecord {
     namespace: String,
     hash: String,
     source: SourceRecord,
+    /// The RBF0 field the candidate is, when a parsed document defines it.
+    /// Absent for an arbitrary string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_as: Option<String>,
     rows: Vec<MatchRow>,
     verified: bool,
     ambiguous: bool,
@@ -723,6 +768,7 @@ impl<'a> Harvester<'a> {
                     section: None,
                     authentication: Some(archive.opened.authentication.status().to_string()),
                 };
+                let verified = VerifiedText::of(&bytes, self.cancel);
                 let strings = extract_strings(
                     &bytes,
                     StringLimits {
@@ -741,7 +787,7 @@ impl<'a> Harvester<'a> {
                         self.sensitive += 1;
                         continue;
                     }
-                    self.process_candidate(&candidate, &source);
+                    self.process_candidate(&candidate, &source, verified.label(&candidate));
                 }
             }
         }
@@ -811,13 +857,18 @@ impl<'a> Harvester<'a> {
                     self.sensitive += 1;
                     continue;
                 }
-                self.process_candidate(&candidate, &source);
+                self.process_candidate(&candidate, &source, None);
             }
         }
         Ok(())
     }
 
-    fn process_candidate(&mut self, candidate: &str, source: &SourceRecord) {
+    fn process_candidate(
+        &mut self,
+        candidate: &str,
+        source: &SourceRecord,
+        verified_as: Option<&'static str>,
+    ) {
         if self.records.len() >= self.limits.matches {
             self.truncated = true;
             return;
@@ -899,6 +950,7 @@ impl<'a> Harvester<'a> {
                     namespace,
                     hash,
                     source: source.clone(),
+                    verified_as: verified_as.map(str::to_string),
                     rows,
                     verified: true,
                     ambiguous,
@@ -981,6 +1033,11 @@ impl<'a> Harvester<'a> {
                 "records": self.records.len(),
                 "unique_keys": self.matched_keys.len(),
                 "rows": self.matched_rows.len(),
+                "verified_fields": self
+                    .records
+                    .iter()
+                    .filter(|record| record.verified_as.is_some())
+                    .count(),
                 "ambiguous": self.records.iter().filter(|record| record.ambiguous).count(),
                 "ambiguous_keys": ambiguous_keys,
                 "by_namespace": by_namespace,
@@ -1603,6 +1660,38 @@ mod tests {
         assert!(sensitive_candidate("password=synthetic"));
         assert!(sensitive_candidate(&"A".repeat(200)));
         assert!(!sensitive_candidate("synthetic/path/file.bin"));
+    }
+
+    /// A minimal RBF0 document with one named string field.
+    fn rbf0_document() -> Vec<u8> {
+        let mut bytes = b"RBF0".to_vec();
+        bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0x0004u16.to_le_bytes());
+        bytes.extend_from_slice(&5u16.to_le_bytes());
+        bytes.extend_from_slice(b"field");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFDu16.to_le_bytes());
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(b"value\0");
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn labels_verified_rbf0_text_and_leaves_other_strings_alone() {
+        let verified = VerifiedText::of(&rbf0_document(), &AtomicBool::new(false));
+        assert_eq!(verified.label("field"), Some(TextKind::FieldName.name()));
+        assert_eq!(verified.label("value"), Some(TextKind::StringValue.name()));
+        assert_eq!(verified.label("unrelated"), None);
+
+        let other = VerifiedText::of(b"nothing to parse here", &AtomicBool::new(false));
+        assert_eq!(other.label("field"), None);
     }
 
     #[test]
