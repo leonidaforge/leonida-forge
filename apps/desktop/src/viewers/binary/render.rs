@@ -934,6 +934,38 @@ impl BinaryInspector {
                     }),
                 )
             }))
+            .children(file.and_then(|file| file.format.as_ref()).map(|report| {
+                let mut block = div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .py_0p5()
+                    .child(muted("Format"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(format!("{} ({})", report.name, report.support)),
+                    );
+                for (label, value) in &report.fields {
+                    block = block.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_xs()
+                            .child(muted(*label).flex_none().w(px(LABEL_WIDTH)))
+                            .child(div().flex_1().min_w_0().truncate().child(value.clone())),
+                    );
+                }
+                if let Some(error) = &report.error {
+                    block = block.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::ERROR))
+                            .child(error.clone()),
+                    );
+                }
+                block
+            }))
             .child(info_block("SHA-256", hash))
     }
 

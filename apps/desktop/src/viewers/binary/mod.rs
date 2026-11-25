@@ -4,6 +4,7 @@
 //! searches and hashing run on background threads against clones of one
 //! [`Source`], so files of any size open without loading them.
 
+mod format;
 mod render;
 
 use std::io;
@@ -60,6 +61,8 @@ struct OpenFile {
     source: Source,
     modified: Option<SystemTime>,
     signature: Vec<u8>,
+    /// The recognised format, if any.
+    format: Option<format::Report>,
 }
 
 enum State {
@@ -186,10 +189,12 @@ impl BinaryInspector {
             async move {
                 let mut file = files::open_binary_with(&path, &access)?;
                 let signature = lforge_binary::read_at(&mut file.source, 0, SIGNATURE_LEN)?;
+                let format = format::detect(&mut file.source);
                 io::Result::Ok(OpenFile {
                     source: file.source,
                     modified: file.modified,
                     signature,
+                    format,
                 })
             }
         });
