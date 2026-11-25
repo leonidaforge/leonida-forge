@@ -46,13 +46,14 @@ lforge binary search example.bin --hex "52 50 46 37"
 lforge binary search example.bin --text example --json
 lforge binary interpret example.bin --offset 0x10 --endian big --json
 lforge binary inspect example.bin --json       # recognised format and its structure
+lforge binary inspect texture.rds --texture 3 --output texture.bin
 ```
 
 Offsets accept decimal or `0x` hexadecimal. Exit codes: 0 on success, 1 when a command fails, 2 for invalid usage.
 
 A format is recognised from the file's first bytes, never from its extension, and the inspector shows what was recognised next to the signature. The CLI and the desktop Binary Inspector use the same recogniser and parser in `lforge-core`, so a format means the same thing in both. `binary inspect` reports the recognised format, its parsed structure, the byte ranges it read and the ranges it left uninterpreted. `--sample` bounds how many records and entries are listed, `--blocks` reads every block's storage selector instead of the first few, and `--verify` inflates every zlib block and reports what failed.
 
-Known formats are the RDS5 container, whose header, record array, ETPF chunk extent and block catalogue are parsed; the RBF0 document, whose header, object tree, local field dictionary and string and attribute values are parsed within the field identifiers the research established; PSIN, by its four-byte magic only; and RPF9, which the archive commands read. PSIN is reported as recognition only: nothing relates it to a confirmed PSO format, and a PSIN payload gets no `.pso` extension. No payload bytes are printed: RBF0 field names and text values are reported as lengths and SHA-256 digests only, and a field identifier outside the established sets stops the parse with its offset. A structure that breaks the documented contract is reported and exits with code 1; a file that matches no format is reported as unrecognised and still exits with code 0.
+Known formats are the RDS5 container, whose header, record array, ETPF chunk extent, block catalogue, block storage classes and per-element descriptors are parsed; the RBF0 document, whose header, object tree, name dictionary, field names, attributes and text nodes are parsed from its token stream; the GFx version-42 container, whose header, extent, frame fields and tag walk are parsed while tag bodies stay opaque; PSIN, by its four-byte magic only; and RPF9, which the archive commands read. PSIN is reported as recognition only: nothing relates it to a confirmed PSO format, and a PSIN payload gets no `.pso` extension. No payload bytes are printed: RBF0 names and text values are reported as lengths and SHA-256 digests only. A token stream or tag walk that breaks its grammar stops the parse and reports the offset where it stopped. A structure that breaks the documented contract is reported and exits with code 1; a file that matches no format is reported as unrecognised and still exits with code 0.
 
 ## RPF9 archives
 
@@ -92,6 +93,8 @@ Inside an archive:
 An entry is complete when it starts with a known file signature and ends with a chunk shorter than 64 KiB.
 Entries without a known signature are unverified and may be parts of larger files.
 
+`--texture N` reconstructs the bytes of one RDS5 element through every block its descriptor names, in the order the descriptor declares, and reports the chain: descriptor fields, virtual range, block and class counts, the reconstructed length and whether the chain is complete. `--output FILE` writes those bytes; `--overwrite` replaces an existing file. The bytes are the element's stored representation, not a decoded image: no pixel format is established, so nothing is interpreted as texels.
+
 A RAGE resource is stored as one zlib stream per page, system pages first.
 Leonida Forge reads the page counts from the resource's page map and takes the pages from the streams that follow.
 A resource file holds its system pages, then its graphics pages.
@@ -100,10 +103,15 @@ It is partial when pages are missing, and unverified when its page map fails val
 These rules come from observed data, not from game code.
 
 ```sh
-lforge archive info data.rpf --json            # header fields and a recovery summary
-lforge archive list data.rpf --json            # entries, resource pages and unrecovered regions
-lforge archive resource data.rpf 0x2010 --json # pages and checks of one resource
+lforge archive info data.rpf --json             # header fields and a recovery summary
+lforge archive list data.rpf --json             # entries, resource pages and unrecovered regions
+lforge archive resource data.rpf 0x2010 --json  # pages and checks of one resource
+lforge archive resource data.rpf 0x2010 --drawable --json # its drawable structure
 ```
+
+When the archive header declares a trailing region, every stored payload ends where that region begins, and the region's own contents are reported as undecoded. An archive whose header declares no trailing region keeps the whole file.
+
+`--drawable` reconstructs a resource and walks the drawable structure in it: the header fields, the four LOD slots, each model's geometry array, each vertex buffer's element and layout arithmetic, index descriptor ranges and the shader group with its per-shader parameter and bound-slot counts. A resource counts as a drawable when its header and chain have that shape, not from a local type ID. Every pointer either resolves inside a reconstructed segment or is reported as an issue, an array is clamped to the entries that fit, and the report is partial until every record resolves. The graphics segment base is not stored; it is reported only when two distinct graphics pointers support one candidate, and otherwise as undecided. Vertex positions, triangles, materials and texture references are not reconstructed.
 
 `--no-cache` neither reads nor writes the index cache.
 
@@ -150,7 +158,7 @@ lforge archive inspect outer.rpf --row 42 --raw --json
 
 `--enter SEL` is repeatable and descends into an archive stored in the current one. `row:N` selects a native RPF9 row; `zip:N` selects a ZIP entry by central-directory index. The entered payload must be a valid archive recognised from its contents, never from its name. `--row N` and `--zip N` select the final entry in the last archive; without either, `archive inspect FILE` keeps reading row 0, and with `--enter` it inspects the entered archive itself. Entries are identified by index at every level, so two entries with the same visible name are never confused. The ZIP reader keeps one entry per central-directory record: records that share a full name stay distinct entries with their original indices, and `zip:N` always names the record at position N. The same `--enter` selectors work with `archive extract` and `archive ls`.
 
-An RDS5 row is reported field by field: header values, the record array, the ETPF chunk position and extent, the entry table, and one catalogue entry per data block with its stored range and storage selector. Only zlib is identified as a block codec; a block with another selector, or with the zlib selector and no zlib header, is reported as unidentified and is never decoded by guesswork. `--verify` inflates each zlib block, reports the blocks that fail and compares the decoded total with the declared uncompressed total. An RBF0 row is reported as its parsed object tree: the header, the object, field and attribute counts, the deepest nesting, the field dictionary with each identifier's class and name digest, and the string and attribute value counts and lengths. Rows in the PSIN and RPF9 formats are reported by signature only. In every case the row is decoded in memory; nothing is extracted and nothing is written.
+An RDS5 row is reported field by field: header values, the record array, the ETPF chunk position and extent, the entry table, and one catalogue entry per data block with its stored range and storage class. Class `0x20` is a zlib stream and class `0x00` is stored bytes; the six other classes observed in data are reported by value and never decoded, and a block of the zlib class without a zlib header is reported as unidentified instead of being decoded by guesswork. `--verify` inflates each zlib block, reports the blocks that fail and compares the decoded total with the declared uncompressed total. Each element's descriptor fields are reported as the values they store, and the texture key table is reported as a count and an increasing order, never as key values. An RBF0 row is reported as its parsed token stream: the header variant and number width, the body offset and length, the name, object, field, attribute and text-node counts, the deepest nesting, one record per name definition with its length and digest, and the string and length-prefixed values as totals, lengths and digests. A GFx row is reported as its version-42 header, declared length, RECT extent, 8.8 frame rate, frame count and tag walk with each tag's code, length and depth. Rows in the PSIN and RPF9 formats are reported by signature only. In every case the row is decoded in memory; nothing is extracted and nothing is written.
 
 Structured inspection reads the decoded logical payload: an entry stored as raw DEFLATE or in chunks is decoded first, and an unsupported transform or codec is reported as a decoding failure instead of being passed to a parser. `--raw` asks for the bytes as they are stored instead. For a row stored compressed, in chunks or behind a transform, that is the stored representation before decoding, which may include alignment padding; it is never presented as the row's decoded contents.
 

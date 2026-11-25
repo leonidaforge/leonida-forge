@@ -56,11 +56,17 @@ pushed.
 - Inspect a recognised file format from its contents, in the Binary Inspector and
   with `lforge binary inspect` and `lforge archive inspect`. Both front ends use
   the same recogniser in `lforge-core`. The RDS5 container reports its header,
-  record array, ETPF chunk extent and block catalogue; an RBF0 document reports
-  its header, object tree, local field dictionary and string and attribute value
-  counts and lengths; PSIN and RPF9 are recognised by signature only.
+  record array, ETPF chunk extent, block catalogue, block storage classes and
+  per-element descriptor values, and `binary inspect --texture` reconstructs one
+  element's bytes; an RBF0 document reports its token stream, object tree, name
+  dictionary and string and attribute value counts and lengths; a GFx
+  version-42 container reports its header, extent, frame fields and tag walk;
+  PSIN and RPF9 are recognised by signature only.
   `archive inspect --enter` follows mixed ZIP/RPF9 nesting, and a row or ZIP
   entry is decoded in memory, so nothing is extracted to inspect it.
+  `archive resource --drawable` walks the drawable structure of a reconstructed
+  resource: header fields, LOD slots, models, geometries, vertex-buffer layout
+  arithmetic, index ranges and the shader group.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
@@ -76,12 +82,16 @@ pushed.
   signature does not verify, an encrypted archive falls back to scan recovery.
 - Original names and folder structure for recovered entries. Names are archive
   offsets; grouping is by detected kind.
-- Any format whose structure is not documented. RDS5 blocks whose compressor
-  selector is not the identified zlib value are reported and never decoded; the
-  RBF0 body is parsed only for the field identifiers the research established,
-  and the meaning of those identifiers, the header words and the attribute
-  position is unknown; the ETPF entry fields, the ETPF region after the entry
-  table and the upper half of the RDS5 block counter are not interpreted.
+- Any format whose structure is not documented. RDS5 blocks of the six storage
+  classes that are not `0x20` zlib or `0x00` stored are reported and never
+  decoded; the RBF0 token classes that were not observed stop the parse, and the
+  meaning of every name, the header words and the attribute position is unknown;
+  GFx tag bodies are opaque; the ETPF entry fields, the ETPF region after the
+  entry table and the upper half of the RDS5 block counter are not interpreted.
+- Vertex semantics. A drawable's bounds, layout codes, index descriptor fields
+  and material parameter values are reported as stored values. No vertex
+  position, triangle, mesh or texture reference is reconstructed, and the
+  graphics base is reported only when two distinct pointers support it.
 - Virtual folder grouping from resolved native paths. The native list is flat;
   path-like candidate names are display data and do not become directories.
 - Payload transforms and compression modes beyond stored, raw DEFLATE and
