@@ -262,6 +262,44 @@ fn archive_inspect_reads_a_row_without_extracting_it() {
 }
 
 #[test]
+fn archive_inspect_seeks_through_a_chunked_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let payload = rds5(&[block(), block()]);
+    let split = payload.len() / 2;
+    let split = split - split % 16;
+    let (first, entry_a) = common::zlib_chunk2(&payload[..split]);
+    let (second, entry_b) = common::zlib_chunk2(&payload[split..]);
+    // Encoding-2 rows keep 16 bytes ahead of the first chunk.
+    let mut stored = vec![0u8; 16];
+    stored.extend_from_slice(&first);
+    stored.extend_from_slice(&second);
+    let row = common::Spec {
+        chunks: Some(common::chunk_value(2, 2, &[entry_a, entry_b])),
+        logical: Some(payload.len() as u64),
+        ..common::spec(&stored)
+    };
+    let path = write_archive(temp.path(), "chunked.rpf", &assemble(&[row], &[]));
+
+    let output = lforge(&[
+        "archive",
+        "inspect",
+        path.to_str().unwrap(),
+        "--row",
+        "0",
+        "--verify",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", common::stderr(&output));
+    let document = json(&output);
+    let structure = &document["structure"];
+    assert_eq!(structure["valid"], true);
+    assert_eq!(structure["header"]["record_count"], 4);
+    assert_eq!(structure["blocks"]["count"], 2);
+    assert_eq!(structure["verified"]["failures"], 0);
+    assert_eq!(structure["verified"]["zlib_blocks"], 2);
+}
+
+#[test]
 fn archive_inspect_rejects_an_out_of_range_row() {
     let temp = tempfile::tempdir().unwrap();
     let path = write_archive(
