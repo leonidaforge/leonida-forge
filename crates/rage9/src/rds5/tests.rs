@@ -1044,6 +1044,25 @@ fn reconstructs_a_single_block_texture() {
     assert_eq!(report.virtual_end, 0x1000 + u64::from(texels));
     assert_eq!(report.bytes_per_texel, Some(1));
     assert!(report.complete, "{report:?}");
+    assert!(report.stored_len > 0);
+    assert!(report.padding <= report.stored_len, "{report:?}");
+    assert_eq!(report.components.len(), 8);
+    let supported = report
+        .components
+        .iter()
+        .filter(|component| component.status == "supported")
+        .count();
+    assert_eq!(supported, 5, "{:?}", report.components);
+    assert_eq!(
+        report
+            .components
+            .iter()
+            .filter(|component| component.status == "not established")
+            .count(),
+        3
+    );
+    assert_eq!(report.components[5].name, "pixel_format");
+    assert_eq!(report.components[7].name, "mip_selection");
 }
 
 #[test]

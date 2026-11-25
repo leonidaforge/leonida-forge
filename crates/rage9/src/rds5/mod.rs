@@ -1013,6 +1013,16 @@ fn copy_range<R: Read + Seek>(
     Ok(())
 }
 
+/// One component of the byte chain, reported separately so one success does
+/// not imply another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Component {
+    pub name: &'static str,
+    /// `supported`, `unsupported` or `not established`.
+    pub status: &'static str,
+    pub note: &'static str,
+}
+
 /// The byte-level chain from one descriptor to its reconstructed bytes.
 ///
 /// Only the relations the research established are reported: the descriptor
@@ -1033,6 +1043,10 @@ pub struct TextureReport {
     pub block_count: u32,
     pub virtual_start: u64,
     pub virtual_end: u64,
+    /// Stored bytes the selected blocks occupy, padding excluded.
+    pub stored_len: u64,
+    /// Trailing zero bytes of the selected blocks' stored spans.
+    pub padding: u64,
     pub decoded_len: u64,
     pub classes: Vec<u8>,
     /// `decoded_len / (width * height)` when it divides evenly. A size
@@ -1040,6 +1054,7 @@ pub struct TextureReport {
     pub bytes_per_texel: Option<u32>,
     /// Whether the decoded bytes and the virtual range agree.
     pub complete: bool,
+    pub components: Vec<Component>,
     pub notes: Vec<String>,
 }
 
@@ -1117,13 +1132,18 @@ pub fn reconstruct_texture<R: Read + Seek>(
     // Classify every block once; decode_block refuses an unclassified one.
     container.classify(source, usize::MAX, cancel)?;
     let mut decoded_len = 0u64;
+    let mut stored_len = 0u64;
+    let mut padding = 0u64;
     let mut classes = Vec::with_capacity(block_count as usize);
     for offset in 0..block_count {
         let index = first_block as u32 + offset;
         let before = container.decoded_total;
         decode_block(source, container, index, limits, cancel, &mut sink)?;
         decoded_len += container.decoded_total - before;
-        classes.push(container.blocks[index as usize].class_id);
+        let block = &container.blocks[index as usize];
+        stored_len += block.content_len;
+        padding += u64::from(block.padding);
+        classes.push(block.class_id);
     }
 
     let virtual_start = container.blocks[first_block].virtual_position;
@@ -1170,12 +1190,67 @@ pub fn reconstruct_texture<R: Read + Seek>(
         block_count,
         virtual_start,
         virtual_end,
+        stored_len,
+        padding,
         decoded_len,
         classes,
         bytes_per_texel,
         complete,
+        components: components(entry.mip()),
         notes,
     })
+}
+
+/// The component table the research reports: the first five components have
+/// a supported byte-level path, the last three are not established.
+fn components(mip: u8) -> Vec<Component> {
+    let mip_note = if mip == 0 {
+        "one level; no mip comparison covers this sample"
+    } else {
+        "mip selection is not implemented"
+    };
+    vec![
+        Component {
+            name: "descriptor",
+            status: "supported",
+            note: "fields read at confirmed positions",
+        },
+        Component {
+            name: "block_selection",
+            status: "supported",
+            note: "the range runs to the next descriptor's first page",
+        },
+        Component {
+            name: "storage_class",
+            status: "supported",
+            note: "only 0x20 and 0x00 are decoded; the other classes are refused",
+        },
+        Component {
+            name: "decompression",
+            status: "supported",
+            note: "zlib or stored bytes, with the content length checked",
+        },
+        Component {
+            name: "virtual_reconstruction",
+            status: "supported",
+            note: "virtual positions come from the record counter and page term",
+        },
+        Component {
+            name: "pixel_format",
+            status: "not established",
+            note: "no format id has a validated pixel interpretation",
+        },
+        Component {
+            name: "element_order",
+            status: "not established",
+            note: "linear layout is rejected only for format 98 at tile mode 3",
+        },
+        Component {
+            name: "mip_selection",
+            status: "not established",
+            note: mip_note,
+        },
+    ]
 }
 
 /// A zlib header: DEFLATE, a window of at most 32 KiB, no preset dictionary,

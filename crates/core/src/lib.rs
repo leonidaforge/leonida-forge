@@ -2,6 +2,7 @@
 //! by the desktop application and the CLI.
 
 pub mod archive;
+pub mod dictionary;
 pub mod inspect;
 pub mod zip;
 

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lforge_rage9::gfx;
 use lforge_rage9::rbf0;
 use lforge_rage9::rds5::{self, Container, Storage};
+use lforge_rage9::{adat, edup, kb2, psin};
 use serde_json::{Map, Value, json};
 
 /// The schema of an inspection document. Version 2 adds `provenance`,
@@ -61,8 +62,29 @@ pub const RBF0: FormatInfo = FormatInfo {
 pub const PSIN: FormatInfo = FormatInfo {
     id: "psin",
     name: "PSIN",
-    support: "recognition",
-    detail: "the magic only; no header field, record structure or purpose is established",
+    support: "structural",
+    detail: "the section walk, the LSCH and PMAP families, the block and section tables and the CHKS checksum; no field meaning",
+};
+
+pub const EDUP: FormatInfo = FormatInfo {
+    id: "edup",
+    name: "EDUP",
+    support: "structural",
+    detail: "the entry count, the two 8-byte fields without their values and the opaque trailing blob",
+};
+
+pub const ADAT: FormatInfo = FormatInfo {
+    id: "adat",
+    name: "ADAT",
+    support: "structural",
+    detail: "the header, the per-stream tables, the chunk records and the 2,048-byte packet framing of the 0x0B streams",
+};
+
+pub const KB2: FormatInfo = FormatInfo {
+    id: "kb2",
+    name: "KB2",
+    support: "structural",
+    detail: "the header, the frame index and the per-frame audio record framing; no frame is decoded",
 };
 
 pub const GFX: FormatInfo = FormatInfo {
@@ -147,7 +169,36 @@ pub enum Summary {
         /// Counts from the parsed body; `None` when the body did not parse.
         body: Option<Rbf0Body>,
     },
-    Psin,
+    Psin {
+        /// `LSCH`, `PMAP` or `other`.
+        family: &'static str,
+        sections: usize,
+        /// `verified`, `mismatched` or `unsupported`.
+        checksum: &'static str,
+    },
+    Edup {
+        count: u32,
+        first_distinct: usize,
+        second_distinct: usize,
+        blob_len: u32,
+    },
+    Adat {
+        variant: u16,
+        streams: u32,
+        records: u32,
+        packets: u64,
+        blocks: u64,
+        violations: u64,
+        framing_checked: bool,
+    },
+    Kb2 {
+        variant: &'static str,
+        frames: u32,
+        width: u32,
+        height: u32,
+        tracks: u32,
+        issues: usize,
+    },
     Gfx {
         version: u8,
         declared_len: u32,
@@ -191,8 +242,14 @@ pub fn recognise(head: &[u8]) -> Option<FormatInfo> {
         Some(RBF0)
     } else if gfx::is_gfx(head) {
         Some(GFX)
-    } else if head.starts_with(b"PSIN") {
+    } else if psin::is_psin(head) {
         Some(PSIN)
+    } else if edup::is_edup(head) {
+        Some(EDUP)
+    } else if adat::is_adat(head) {
+        Some(ADAT)
+    } else if kb2::is_kb2(head) {
+        Some(KB2)
     } else if lforge_rage9::rpf::is_rpf9(head) {
         Some(RPF9)
     } else {
@@ -216,7 +273,10 @@ pub fn inspect<R: Read + Seek>(
         Some(format) if format == RDS5 => rds5_structure(source, len, options, cancel),
         Some(format) if format == RBF0 => rbf0_structure(source, len, options, cancel),
         Some(format) if format == GFX => gfx_structure(source, len, options, cancel),
-        Some(format) if format == PSIN => (psin_structure(), Some(Summary::Psin), None),
+        Some(format) if format == PSIN => psin_structure(source, len, options, cancel),
+        Some(format) if format == EDUP => edup_structure(source, len, options, cancel),
+        Some(format) if format == ADAT => adat_structure(source, len, options, cancel),
+        Some(format) if format == KB2 => kb2_structure(source, len, options, cancel),
         Some(format) if format == RPF9 => (rpf9_structure(), Some(Summary::Rpf9), None),
         _ => (Value::Null, None, None),
     };
@@ -961,24 +1021,493 @@ fn gfx_structure<R: Read + Seek>(
     }
 }
 
-fn psin_structure() -> Value {
-    json!({
-        "valid": true,
-        "unknown_regions": [
-            {
-                "offset": hex(4),
-                "length": Value::Null,
-                "field": "payload",
-                "reason": "no field or record meaning is established",
-            },
-        ],
-        "diagnostics": [],
-        "limitations": [
-            "only the four-byte magic is established",
-            "nothing relates PSIN to a confirmed PSO format",
-            "no checked field in the first 32 bytes equals the payload size",
-        ],
-    })
+fn psin_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match psin::parse(&bytes) {
+        Ok(report) => {
+            let sample = options.sample.clamp(1, MAX_SAMPLE);
+            let sections: Vec<Value> = report
+                .sections
+                .iter()
+                .take(sample)
+                .map(|section| {
+                    json!({
+                        "tag": section.tag_text(),
+                        "offset": hex(u64::from(section.offset)),
+                        "length": section.len,
+                        "body_length": section.body_len(),
+                    })
+                })
+                .collect();
+            let structure = json!({
+                "valid": true,
+                "size": bytes.len(),
+                "first_section": hex(u64::from(report.first_offset)),
+                "first_tag": String::from_utf8_lossy(&report.first_tag),
+                "family": report.family.name(),
+                "sections": {
+                    "count": report.sections.len(),
+                    "shown": sections.len(),
+                    "items": sections,
+                },
+                "descriptors": report.descriptors.as_ref().map(|table| json!({
+                    "count": table.count,
+                    "candidates": table.candidates,
+                    "blocks": table.descriptors.iter().map(|descriptor| json!({
+                        "word": hex_u32(descriptor.word),
+                        "length": descriptor.len,
+                    })).collect::<Vec<Value>>(),
+                })),
+                "blocks": report.blocks.as_ref().map(|table| json!({
+                    "mode": table.mode,
+                    "second": table.second,
+                    "count": table.blocks.len(),
+                    "predicted_first_offset": table.predicted_first_offset,
+                    "offset_matches": table.offset_matches,
+                    "padding_ok": table.padding_ok,
+                    "items": table.blocks.iter().map(|block| json!({
+                        "id": block.id,
+                        "offset": block.offset,
+                        "zero": block.zero,
+                        "length": block.len,
+                    })).collect::<Vec<Value>>(),
+                })),
+                "section_table": report.section_table.as_ref().map(|table| json!({
+                    "count": table.count,
+                    "tiling_ok": table.tiling_ok,
+                    "tiling_error": table.tiling_error,
+                    "values": table.values.iter().take(sample).map(|value| json!({
+                        "id": value.id,
+                        "offset": value.offset,
+                        "length": value.len,
+                    })).collect::<Vec<Value>>(),
+                })),
+                "lsch_body": report.lsch.as_ref().map(|body| json!({
+                    "length": body.len,
+                    "header_word": body.header_word,
+                    "header_zero": body.header_zero,
+                    "marker_records": body.marker_records,
+                    "tail_length": body.tail_len,
+                    "aligned": body.aligned,
+                })),
+                "lenm_body": report.lenm.as_ref().map(|body| json!({
+                    "length": body.len,
+                    "count": body.count,
+                    "chain_length": body.chain_len,
+                    "extra_length": body.extra,
+                    "count_delimits_body": body.count_delimits_body,
+                })),
+                "id1_block": report.id1_block.map(|block| json!({
+                    "offset": block.offset,
+                    "length": block.len,
+                    "nul_terminated": block.nul_terminated,
+                })),
+                "checksum": match report.checksum {
+                    psin::Checksum::Verified => json!({ "status": "verified" }),
+                    psin::Checksum::Mismatch { stored, computed } => json!({
+                        "status": "mismatched",
+                        "stored": hex_u32(stored),
+                        "computed": hex_u32(computed),
+                    }),
+                    psin::Checksum::Unsupported => json!({ "status": "unsupported" }),
+                },
+                "issues": report.issues,
+                "unknown_regions": [
+                    { "field": "PSCH value contents", "reason": "bounded by offsets, not decoded" },
+                    { "field": "LSCH marker fields and tail", "reason": "no field meaning is established" },
+                    { "field": "LENM chain and extra region", "reason": "not decoded" },
+                    { "field": "STDN, STFN, STNS, PSIG bodies", "reason": "no field meaning is established" },
+                ],
+                "limitations": [
+                    "the two families share a tag vocabulary, not a grammar; every result names its family",
+                    "no tag, field, block or value is assigned a semantic meaning",
+                    "the checksum is reported separately from the structural parse",
+                    "the trailing NUL of the id-1 block is an observation, not a requirement",
+                ],
+            });
+            let summary = Summary::Psin {
+                family: report.family.name(),
+                sections: report.sections.len(),
+                checksum: report.checksum.name(),
+            };
+            (structure, Some(summary), None)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            )
+        }
+    }
+}
+
+fn hex_u32(value: u32) -> String {
+    format!("0x{value:08X}")
+}
+
+fn edup_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match edup::parse(&bytes, 1 << 22) {
+        Ok(report) => {
+            let sample = options.sample.clamp(1, MAX_SAMPLE);
+            let entries: Vec<Value> = report
+                .entries
+                .iter()
+                .take(sample)
+                .map(|entry| {
+                    json!({
+                        "first": hex(entry.first),
+                        "second": hex(entry.second),
+                    })
+                })
+                .collect();
+            let structure = json!({
+                "valid": true,
+                "size": report.size,
+                "count": report.count,
+                "first_distinct": report.first_distinct,
+                "second_distinct": report.second_distinct,
+                "first_unique": report.first_unique,
+                "fields_disjoint": report.fields_disjoint,
+                "entries": {
+                    "count": report.entries.len(),
+                    "shown": entries.len(),
+                    "items": entries,
+                },
+                "trailing_blob": {
+                    "offset": hex(report.blob.offset),
+                    "length": report.blob.len,
+                },
+                "key_direction": {
+                    "status": "not evaluated",
+                    "reason": "no texture store set was supplied, so no key was compared",
+                },
+                "unknown_regions": [
+                    { "field": "trailing blob", "reason": "length-delimited and opaque" },
+                    { "field": "entry field meaning", "reason": "the key direction is established for one table only" },
+                ],
+                "limitations": [
+                    "a matching stored key does not establish the purpose of an entry",
+                    "the direction is confirmed for the large table only; the smaller tables remain unresolved",
+                    "no store is scanned when a payload is inspected",
+                ],
+            });
+            let summary = Summary::Edup {
+                count: report.count,
+                first_distinct: report.first_distinct,
+                second_distinct: report.second_distinct,
+                blob_len: report.blob.len,
+            };
+            (structure, Some(summary), None)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            )
+        }
+    }
+}
+
+fn adat_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match adat::parse(&bytes, &adat::Limits::default()) {
+        Ok(report) => {
+            let sample = options.sample.clamp(1, MAX_SAMPLE);
+            let records: Vec<Value> = report
+                .records
+                .iter()
+                .take(sample)
+                .map(|record| {
+                    json!({
+                        "index": record.index,
+                        "type": format!("{:#04x}", record.kind),
+                        "offset": hex(u64::from(record.offset)),
+                        "length": record.size,
+                    })
+                })
+                .collect();
+            let structure = json!({
+                "valid": true,
+                "size": report.stored_len,
+                "version": report.version,
+                "variant": hex_u32(u32::from(report.variant)),
+                "streams": report.streams,
+                "data_offset": hex(u64::from(report.data_offset)),
+                "chunk_records": {
+                    "count": report.record_count,
+                    "shown": records.len(),
+                    "items": records,
+                    "by_type": report.type_counts.iter().map(|(kind, count)| json!({
+                        "type": format!("{kind:#04x}"),
+                        "count": count,
+                    })).collect::<Vec<Value>>(),
+                },
+                "phrases": report.phrases.iter().map(|phrase| json!({
+                    "offset": hex(u64::from(phrase.offset)),
+                    "declared": phrase.declared,
+                    "rate": phrase.rate,
+                    "rate_flags": phrase.rate_flags,
+                    "codec": phrase.codec,
+                })).collect::<Vec<Value>>(),
+                "pages": report.pages.iter().map(|page| json!({
+                    "offset": hex(u64::from(page.offset)),
+                    "pages": page.pages,
+                    "stride": page.stride,
+                    "entries": page.entries.iter().map(|entry| json!({
+                        "decoded": entry.decoded,
+                        "rate": entry.rate,
+                        "rate_flags": entry.rate_flags,
+                        "codec": entry.codec,
+                    })).collect::<Vec<Value>>(),
+                })).collect::<Vec<Value>>(),
+                "codecs": report.codecs.iter().map(|codec| json!({
+                    "codec": codec.codec,
+                    "streams": codec.streams,
+                    "support": codec.support,
+                })).collect::<Vec<Value>>(),
+                "blocks": {
+                    "data": report.blocks.data,
+                    "sentinel": report.blocks.sentinel,
+                    "metadata": report.blocks.metadata,
+                    "zero": report.blocks.zero,
+                },
+                "packets": report.packets,
+                "packet_bytes": report.packet_bytes,
+                "padding_bytes": report.padding,
+                "framing_violations": report.framing_violations,
+                "failure_sample": report.failures,
+                "positions": report.positions.map(|table| json!({
+                    "tables": table.tables,
+                    "entries": table.entries,
+                    "starts_at_zero": table.starts_at_zero,
+                    "non_decreasing": table.non_decreasing,
+                    "interpretation": "probable position table; the unit is unknown",
+                })),
+                "page_summary": report.page_summary.map(|summary| json!({
+                    "declared_pages": summary.declared_pages,
+                    "stride": summary.stride,
+                    "sentinel_pages": summary.sentinel_pages,
+                    "pages_with_metadata": summary.pages_with_metadata,
+                    "page_count_matches": summary.page_count_matches,
+                })),
+                "rates": report.rates.iter().map(|(rate, count)| json!({
+                    "rate": rate,
+                    "records": count,
+                })).collect::<Vec<Value>>(),
+                "issues": report.issues,
+                "unknown_regions": [
+                    { "field": "codec identity", "reason": "no decoder was run" },
+                    { "field": "packet contents", "reason": "no audio is decoded" },
+                ],
+                "limitations": [
+                    "no codec is named and no decoder is run",
+                    "only the 0x0B and 0x02 stream classes receive a check",
+                    "the page classifier would absorb a corrupted first data block as metadata",
+                    "packets are counted, never materialised",
+                ],
+            });
+            let summary = Summary::Adat {
+                variant: report.variant,
+                streams: report.streams,
+                records: report.record_count,
+                packets: report.packets,
+                blocks: report.blocks.data,
+                violations: report.framing_violations,
+                framing_checked: report.framing_checked,
+            };
+            (structure, Some(summary), None)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            )
+        }
+    }
+}
+
+fn kb2_structure<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    let bytes = match read_bounded(source, len, cancel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            );
+        }
+    };
+    match kb2::parse(&bytes, &kb2::Limits::default()) {
+        Ok(report) => {
+            let sample = options.sample.clamp(1, MAX_SAMPLE);
+            let frames: Vec<Value> = report
+                .frames
+                .iter()
+                .take(sample)
+                .map(|frame| {
+                    json!({
+                        "index": frame.index,
+                        "raw": hex_u32(frame.raw),
+                        "flag": frame.flag,
+                        "offset": frame.offset,
+                    })
+                })
+                .collect();
+            let structure = json!({
+                "valid": true,
+                "size": report.size,
+                "variant": report.variant.name(),
+                "header": {
+                    "declared_length": report.declared_len,
+                    "frame_count": report.frame_count,
+                    "largest_frame": report.largest_frame,
+                    "duplicate_count": report.duplicate_count,
+                    "width": report.width,
+                    "height": report.height,
+                    "rate_numerator": report.rate_num,
+                    "rate_denominator": report.rate_den,
+                    "flags": report.flags,
+                    "tracks": report.tracks,
+                    "variant_word": report.variant_word,
+                },
+                "frame_index": {
+                    "offset": hex(u64::from(report.table_offset)),
+                    "end": hex(u64::from(report.table_end)),
+                    "entries": report.frame_count_checked,
+                    "shown": frames.len(),
+                    "items": frames,
+                    "checks": {
+                        "monotone": report.checks.monotone,
+                        "intervals_within_largest": report.checks.intervals_within_largest,
+                        "last_offset_matches": report.checks.last_offset_matches,
+                        "first_is_keyframe": report.checks.first_is_keyframe,
+                        "frames_within_table": report.checks.frames_within_table,
+                    },
+                },
+                "audio": {
+                    "tracks": report.audio.iter().map(|track| json!({
+                        "decoded_max": track.decoded_max,
+                        "rate": track.rate,
+                        "rate_flags": track.rate_flags,
+                        "id": track.id,
+                    })).collect::<Vec<Value>>(),
+                    "track_ids_permutation": report.track_ids_permutation,
+                    "frames": report.audio_records.frames,
+                    "non_empty_records": report.audio_records.non_empty,
+                    "zero_records": report.audio_records.zero_records,
+                    "record_bytes": report.audio_records.bytes,
+                    "violations": report.audio_records.violations,
+                },
+                "issues": report.issues,
+                "failure_sample": report.failures,
+                "unknown_regions": [
+                    { "field": "frame payloads", "reason": "no frame is decoded" },
+                    { "field": "flags word", "reason": "the bits are reported, not named" },
+                    { "field": "variant word at +0x2C", "reason": "no meaning is established" },
+                ],
+                "limitations": [
+                    "no video or audio codec is claimed and nothing is decoded",
+                    "the 0x100000 flag bit is not established as an alpha flag",
+                    "the low bit of an entry is reported as a flag, not as a confirmed keyframe",
+                ],
+            });
+            let summary = Summary::Kb2 {
+                variant: report.variant.name(),
+                frames: report.frame_count,
+                width: report.width,
+                height: report.height,
+                tracks: report.tracks,
+                issues: report.issues.len() + report.failures.len(),
+            };
+            (structure, Some(summary), None)
+        }
+        Err(err) => {
+            let message = err.to_string();
+            (
+                json!({ "valid": false, "error": message.clone() }),
+                None,
+                Some(Failure {
+                    stage: "structure",
+                    message,
+                }),
+            )
+        }
+    }
 }
 
 fn rpf9_structure() -> Value {
@@ -1001,39 +1530,176 @@ mod tests {
         assert_eq!(recognise(b"RDS5\0\0\0\0"), Some(RDS5));
         assert_eq!(recognise(b"RBF0\0\0"), Some(RBF0));
         assert_eq!(recognise(b"PSIN\0\0\0\0"), Some(PSIN));
+        assert_eq!(recognise(b"EDUP\0\0\0\0"), Some(EDUP));
+        assert_eq!(recognise(b"ADAT\x01\x00"), Some(ADAT));
+        assert_eq!(recognise(b"KB2n\0\0\0\0"), Some(KB2));
+        assert_eq!(recognise(b"KB2j\0\0\0\0"), Some(KB2));
         assert_eq!(recognise(b"9FPR\0\0\0\0"), Some(RPF9));
         assert_eq!(recognise(b"\x89PNG\r\n\x1a\n"), None);
         assert_eq!(recognise(b""), None);
     }
 
     #[test]
-    fn psin_is_described_as_recognition_only() {
-        let bytes = b"PSIN\0\0\0\0";
+    fn psin_is_structural_and_names_its_family() {
+        // An unknown first tag still walks the framing and the checksum.
+        let mut bytes = b"PSIN".to_vec();
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"ZZZZ");
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        let total = bytes.len() as u64;
         let report = inspect(
             &mut std::io::Cursor::new(bytes),
-            bytes.len() as u64,
+            total,
             &Options::default(),
             &AtomicBool::new(false),
         )
         .unwrap();
         let format = report.format.unwrap();
         assert_eq!(format.id, "psin");
-        assert_eq!(format.name, "PSIN");
-        assert_eq!(format.support, "recognition");
-        assert_eq!(report.summary, Some(Summary::Psin));
-        let limitations = report.structure["limitations"]
-            .as_array()
+        assert_eq!(format.support, "structural");
+        assert!(matches!(
+            report.summary,
+            Some(Summary::Psin {
+                family: "other",
+                sections: 1,
+                ..
+            })
+        ));
+        assert_eq!(report.structure["valid"], true);
+        assert_eq!(report.structure["family"], "other");
+        assert_eq!(report.structure["checksum"]["status"], "unsupported");
+        let text = serde_json::to_string(&report.structure)
             .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" ")
             .to_lowercase();
-        // The only mention of PSO is the disclaimer that no relation exists.
-        assert!(limitations.contains("nothing relates"), "{limitations}");
-        assert!(
-            limitations.contains("magic") || limitations.contains("recognition"),
-            "{limitations}"
+        assert!(!text.contains("\"pso\""));
+    }
+
+    #[test]
+    fn psin_reports_a_structural_failure() {
+        let bytes = b"PSIN\0\0\0\0";
+        let total = bytes.len() as u64;
+        let report = inspect(
+            &mut std::io::Cursor::new(bytes.to_vec()),
+            total,
+            &Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.structure["valid"], false);
+        assert!(report.failure.is_some());
+    }
+
+    #[test]
+    fn reports_an_edup_table_without_key_values() {
+        let mut bytes = b"EDUP".to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 16]);
+        let total = bytes.len() as u64;
+        let report = inspect(
+            &mut std::io::Cursor::new(bytes),
+            total,
+            &Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.format.map(|format| format.id), Some("edup"));
+        assert!(matches!(
+            report.summary,
+            Some(Summary::Edup {
+                count: 1,
+                blob_len: 16,
+                ..
+            })
+        ));
+        assert_eq!(
+            report.structure["entries"]["items"][0]["first"],
+            "0x0000000000000007"
+        );
+        assert_eq!(report.structure["key_direction"]["status"], "not evaluated");
+        assert_eq!(report.structure["trailing_blob"]["length"], 16);
+    }
+
+    #[test]
+    fn reports_an_adat_header_and_its_refusals() {
+        // Version 1, variant 0xFF21, one stream, no records: the record run
+        // starts at 0x1E and the data offset is 0x1E.
+        let mut bytes = vec![0u8; 0x1E];
+        bytes[..4].copy_from_slice(b"ADAT");
+        bytes[4..8].copy_from_slice(&0xFF21_0001u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x0C..0x10].copy_from_slice(&0x1Eu32.to_le_bytes());
+        let total = bytes.len() as u64;
+        let report = inspect(
+            &mut std::io::Cursor::new(bytes),
+            total,
+            &Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.format.map(|format| format.id), Some("adat"));
+        assert_eq!(report.structure["valid"], true);
+        assert_eq!(report.structure["variant"], "0x0000FF21");
+        assert_eq!(report.structure["streams"], 1);
+        assert_eq!(report.structure["chunk_records"]["count"], 0);
+        let text = serde_json::to_string(&report.structure).unwrap();
+        assert!(!text.to_lowercase().contains("opus"));
+    }
+
+    #[test]
+    fn reports_a_kb2_header_and_frame_table() {
+        // Two frames of 4 bytes with no audio track.
+        let entries = 3usize;
+        let table = 0x30 + 4 * entries;
+        let size = table + 8;
+        let mut bytes = vec![0u8; size];
+        bytes[..4].copy_from_slice(b"KB2n");
+        bytes[4..8].copy_from_slice(&((size - 8) as u32).to_le_bytes());
+        bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+        bytes[0x0C..0x10].copy_from_slice(&4u32.to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(&2u32.to_le_bytes());
+        bytes[0x14..0x18].copy_from_slice(&320u32.to_le_bytes());
+        bytes[0x18..0x1C].copy_from_slice(&240u32.to_le_bytes());
+        bytes[0x1C..0x20].copy_from_slice(&30u32.to_le_bytes());
+        bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0x24..0x28].copy_from_slice(&0x0004_0013u32.to_le_bytes());
+        for (index, value) in [table as u32 | 1, table as u32 + 4, size as u32]
+            .into_iter()
+            .enumerate()
+        {
+            let at = 0x30 + 4 * index;
+            bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let total = bytes.len() as u64;
+        let report = inspect(
+            &mut std::io::Cursor::new(bytes),
+            total,
+            &Options::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.format.map(|format| format.id), Some("kb2"));
+        assert!(matches!(
+            report.summary,
+            Some(Summary::Kb2 {
+                variant: "KB2n",
+                frames: 2,
+                width: 320,
+                height: 240,
+                tracks: 0,
+                ..
+            })
+        ));
+        assert_eq!(report.structure["frame_index"]["checks"]["monotone"], true);
+        assert_eq!(
+            report.structure["audio"]["tracks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
     }
 

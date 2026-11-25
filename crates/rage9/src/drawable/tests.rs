@@ -36,6 +36,18 @@ fn layout(system: &mut [u8], at: u64, vertex_count: u32, attributes: &[(usize, u
     put_u32(system, at as usize + 0x138, (vertex_count << 10) | 0x51);
 }
 
+/// A bounds record: `min.xyz`, `min.x`, `max.xyz`, `max.x`.
+fn bounds_record(system: &mut [u8], at: usize, min: [f32; 3], max: [f32; 3]) {
+    for (ix, value) in [
+        min[0], min[1], min[2], min[0], max[0], max[1], max[2], max[0],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put_f32(system, at + 4 * ix, value);
+    }
+}
+
 /// A drawable with one populated LOD slot, one model, two geometries and one
 /// shader.
 fn drawable() -> (Vec<u8>, Vec<u8>) {
@@ -44,8 +56,12 @@ fn drawable() -> (Vec<u8>, Vec<u8>) {
     put_u64(&mut system, 0x08, system_ptr(0x1000));
     put_u64(&mut system, 0x10, system_ptr(0x980));
     put_f32(&mut system, 0x2C, 1.5);
-    put_f32(&mut system, 0x30, -1.0);
-    put_f32(&mut system, 0x40, 1.0);
+    for (ix, value) in [-1.0f32, -1.0, -1.0].into_iter().enumerate() {
+        put_f32(&mut system, 0x30 + 4 * ix, value);
+    }
+    for (ix, value) in [1.0f32, 1.0, 1.0].into_iter().enumerate() {
+        put_f32(&mut system, 0x40 + 4 * ix, value);
+    }
     put_u64(&mut system, 0x50, system_ptr(0x200));
     for slot in 0..LOD_SLOTS {
         put_f32(&mut system, 0x70 + 4 * slot, 9998.0);
@@ -64,16 +80,21 @@ fn drawable() -> (Vec<u8>, Vec<u8>) {
     put_u16(&mut system, 0x222, 1);
     put_u64(&mut system, 0x240, system_ptr(0x300));
 
-    // Model.
+    // Model, its geometry array and its bounds array.
     put_u64(&mut system, 0x308, system_ptr(0x340));
     put_u16(&mut system, 0x310, 2);
     put_u16(&mut system, 0x312, 2);
     put_u32(&mut system, 0x314, 0x0002_0000);
-    put_u64(&mut system, 0x318, system_ptr(0x1100));
+    put_u64(&mut system, 0x318, system_ptr(0x1140));
     put_u64(&mut system, 0x320, system_ptr(0x220));
     put_u64(&mut system, 0x330, 0x11);
     put_u64(&mut system, 0x340, system_ptr(0x380));
     put_u64(&mut system, 0x348, system_ptr(0x440));
+
+    // Aggregate, then one record per geometry.
+    bounds_record(&mut system, 0x1140, [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+    bounds_record(&mut system, 0x1160, [-1.0, -1.0, -1.0], [1.0, 1.0, 0.0]);
+    bounds_record(&mut system, 0x1180, [-1.0, -1.0, 0.0], [1.0, 1.0, 1.0]);
 
     // Geometries.
     for (at, buffer, index) in [(0x380, 0x500, 0x600), (0x440, 0x540, 0x680)] {
@@ -99,13 +120,19 @@ fn drawable() -> (Vec<u8>, Vec<u8>) {
     put_u64(&mut system, 0x568, system_ptr(0x6A0));
     put_u64(&mut system, 0x580, system_ptr(0x840));
 
-    // Index descriptors and records.
-    for (descriptor, record, buffer, elements, graphics) in [
-        (0x600u64, 0x620u64, 0x660u64, 40u32, 0x300u64),
-        (0x680, 0x6A0, 0x6E0, 12, 0x500),
+    // Index descriptors and records: cluster count, count A and count B.
+    for (descriptor, record, buffer, elements, graphics, count_a, count_b) in [
+        (0x600u64, 0x620u64, 0x660u64, 40u32, 0x300u64, 5u16, 7u16),
+        (0x680, 0x6A0, 0x6E0, 12, 0x500, 3, 4),
     ] {
         put_u64(&mut system, descriptor as usize, system_ptr(buffer));
         put_u16(&mut system, descriptor as usize + 8, 1);
+        put_u16(&mut system, descriptor as usize + 0x0A, count_a);
+        put_u32(
+            &mut system,
+            descriptor as usize + 0x0C,
+            u32::from(count_b) << 8,
+        );
         put_u64(&mut system, record as usize + 0x10, INDEX_CONSTANT);
         put_u32(&mut system, buffer as usize + 0x08, elements);
         put_u16(&mut system, buffer as usize + 0x0C, 4);
@@ -123,7 +150,8 @@ fn drawable() -> (Vec<u8>, Vec<u8>) {
     );
     layout(&mut system, 0x840, 4, &[(0, 0x80, 8, 0x10)]);
 
-    // Shader group, one shader, two texture parameters with one bound slot.
+    // Shader group, one shader, two texture parameters with one bound slot
+    // and one non-texture parameter.
     put_u64(&mut system, 0x990, system_ptr(0x9C0));
     put_u16(&mut system, 0x998, 1);
     put_u16(&mut system, 0x99A, 1);
@@ -141,11 +169,27 @@ fn drawable() -> (Vec<u8>, Vec<u8>) {
     system[0xBA1] = 2;
     put_u16(&mut system, 0xBA4, 3);
     put_u16(&mut system, 0xBA6, 0x0800);
+    // `{u32 name hash, u32 packed}` pairs: two texture entries and one other.
+    put_u32(&mut system, 0xBA8, 0xC8E8_C282);
+    put_u32(&mut system, 0xBAC, 0);
+    put_u32(&mut system, 0xBB0, 0xC8E8_C282);
+    put_u32(&mut system, 0xBB4, 4);
+    put_u32(&mut system, 0xBB8, 0x0CD2_7763);
+    put_u32(&mut system, 0xBBC, 0x100);
     system[0x1100..0x1112].copy_from_slice(b"SYNTHETIC-DRAWABLE");
 
     let mut graphics = vec![0u8; 0x600];
+    // Declaration tables at both graphics targets.
     graphics[0x100..0x104].copy_from_slice(&MARKER);
+    put_u32(&mut graphics, 0x104, (0x180 / 2) << 8 | 0x21);
     graphics[0x400..0x404].copy_from_slice(&MARKER);
+    // Index headers matching both descriptors.
+    put_u32(&mut graphics, 0x300, 0x8000_0001);
+    put_u32(&mut graphics, 0x304, 5);
+    put_u32(&mut graphics, 0x308, 7);
+    put_u32(&mut graphics, 0x500, 0x8000_0001);
+    put_u32(&mut graphics, 0x504, 3);
+    put_u32(&mut graphics, 0x508, 4);
     (system, graphics)
 }
 
@@ -206,6 +250,12 @@ fn walks_the_verified_drawable_chain() {
     );
     let index = first.index.as_ref().unwrap();
     assert_eq!(index.clusters, 1);
+    assert_eq!(index.count_a, 5);
+    assert_eq!(index.count_b, 7);
+    assert_eq!(index.count_word, 7 << 8);
+    assert_eq!(index.low_byte, 0);
+    assert_eq!(index.header, Some([0x8000_0001, 5, 7]));
+    assert_eq!(index.header_matches, Some(true));
     assert_eq!(index.elements, 40);
     assert_eq!(
         index.range,
@@ -231,10 +281,52 @@ fn walks_the_verified_drawable_chain() {
     assert_eq!(group.shaders.len(), 1);
     let shader = &group.shaders[0];
     assert_eq!(shader.marker, 0x6D65_7461);
+    assert_eq!(shader.shader_hash, 0x0000_1234);
     assert_eq!(shader.texture_parameters, 2);
     assert_eq!(shader.total_parameters, 3);
     assert_eq!(shader.slots, 2);
     assert_eq!(shader.bound_slots, 1);
+    assert_eq!(shader.parameters.len(), 3);
+    assert!(shader.parameters[0].texture);
+    assert_eq!(shader.parameters[0].name_hash, 0xC8E8_C282);
+    assert_eq!(shader.parameters[1].slot, 1);
+    assert!(!shader.parameters[2].texture);
+    assert_eq!(shader.slot_states.len(), 2);
+    assert_eq!(
+        shader.slot_states[0].state,
+        crate::dictionary::SlotState::Bound
+    );
+    assert_eq!(shader.slot_states[0].key, Some(0x1122_3344_5566_7788));
+    assert_eq!(
+        shader.slot_states[1].state,
+        crate::dictionary::SlotState::Unbound
+    );
+    assert_eq!(report.materials.declared_slots, 2);
+    assert_eq!(report.materials.bound, 1);
+    assert_eq!(report.materials.unbound, 1);
+    assert_eq!(report.materials.invalid, 0);
+    assert_eq!(report.materials.distinct_keys, 1);
+    assert_eq!(report.model_union.models, 1);
+    assert!(report.model_union.matches);
+    assert_eq!(report.model_union.trivial, 0);
+    let header_union = report.header_union.expect("a header union check");
+    assert!(header_union.matches, "{header_union:?}");
+    assert!(header_union.finite);
+    let bounds = model.bounds.as_ref().expect("a bounds array");
+    assert_eq!(bounds.records, 3);
+    assert_eq!(bounds.per_geometry.len(), 2);
+    assert_eq!(bounds.union_matches, Some(true));
+    assert!(bounds.extra_min_equal);
+    assert!(bounds.extra_max_equal);
+
+    // The declaration tables match the present layout offsets.
+    assert_eq!(buffer.declarations.len(), 2);
+    assert_eq!(buffer.declarations[0].format, 0x42);
+    assert_eq!(buffer.declarations[0].offset, 0x80);
+    assert_eq!(buffer.declarations[1].format, 0x21);
+    assert_eq!(buffer.declarations[1].offset, 0x180);
+    assert!(buffer.declarations.iter().all(|entry| entry.matches_layout));
+    assert_eq!(buffer.packed_flags, 0x51);
 }
 
 #[test]
@@ -331,4 +423,220 @@ fn reports_a_layout_whose_arithmetic_disagrees() {
             ..
         }
     )));
+}
+
+#[test]
+fn a_single_geometry_model_needs_only_the_aggregate_record() {
+    let (mut system, graphics) = drawable();
+    put_u16(&mut system, 0x310, 1);
+    put_u16(&mut system, 0x312, 1);
+    let report = inspect(&system, &graphics).unwrap();
+    assert_eq!(report.status, "complete", "{:?}", report.issues);
+    let model = &report.lod[0].models[0];
+    assert_eq!(model.geometry_count, 1);
+    let bounds = model.bounds.as_ref().expect("a bounds array");
+    assert_eq!(bounds.records, 1);
+    assert!(bounds.per_geometry.is_empty());
+    assert_eq!(bounds.union_matches, None);
+    assert_eq!(report.model_union.trivial, 1);
+    assert_eq!(report.model_union.models, 0);
+    assert!(report.model_union.matches);
+}
+
+#[test]
+fn a_multi_geometry_aggregate_beyond_the_tolerance_fails() {
+    let (mut system, graphics) = drawable();
+    // The aggregate's maximum stays at 1.0; the second geometry reaches 1.1.
+    bounds_record(&mut system, 0x1180, [-1.0, -1.0, 0.0], [1.0, 1.0, 1.1]);
+    let report = inspect(&system, &graphics).unwrap();
+    assert_eq!(report.status, "partial");
+    assert!(!report.model_union.matches);
+    assert!(report.model_union.delta > AABB_TOLERANCE);
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Arithmetic {
+            field: "model bounds aggregate",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_header_union_exception_keeps_the_drawable_complete() {
+    let (mut system, graphics) = drawable();
+    // The header maximum is larger than every model aggregate.
+    put_f32(&mut system, 0x48, 50.0);
+    let report = inspect(&system, &graphics).unwrap();
+    assert_eq!(report.status, "complete", "{:?}", report.issues);
+    assert!(report.model_union.matches);
+    let header_union = report.header_union.expect("a header union check");
+    assert!(!header_union.matches);
+    assert!(header_union.delta >= 49.0);
+}
+
+#[test]
+fn non_finite_bounds_are_reported() {
+    let (mut system, graphics) = drawable();
+    put_f32(&mut system, 0x1140, f32::NAN);
+    let report = inspect(&system, &graphics).unwrap();
+    assert!(report.header_union.is_some_and(|check| !check.finite));
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Arithmetic {
+            field: "model bounds array",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn index_count_b_is_masked_out_of_the_word() {
+    let (mut system, graphics) = drawable();
+    // The low byte is not count B and the high byte is not either.
+    put_u32(&mut system, 0x600 + 0x0C, (0xAB << 8) | 0x5A);
+    let report = inspect(&system, &graphics).unwrap();
+    let index = report.lod[0].models[0].geometries[0]
+        .index
+        .as_ref()
+        .expect("an index descriptor");
+    assert_eq!(index.count_b, 0xAB);
+    assert_eq!(index.low_byte, 0x5A);
+    assert_eq!(index.high_byte, 0);
+}
+
+#[test]
+fn a_descriptor_and_header_count_disagreement_is_reported() {
+    let (system, mut graphics) = drawable();
+    // The index bytes claim a different count B.
+    put_u32(&mut graphics, 0x308, 9);
+    let report = inspect(&system, &graphics).unwrap();
+    let index = report.lod[0].models[0].geometries[0]
+        .index
+        .as_ref()
+        .expect("an index descriptor");
+    assert_eq!(index.header_matches, Some(false));
+    let message = report
+        .issues
+        .iter()
+        .find_map(|issue| match issue {
+            Issue::Arithmetic {
+                field: "index header",
+                message,
+            } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("an index header issue");
+    assert!(message.contains("0x00000009"), "{message}");
+    assert!(message.contains("7"), "{message}");
+}
+
+#[test]
+fn packed_counts_with_0x61_flags_decode_the_same_count() {
+    let (mut system, graphics) = drawable();
+    put_u32(&mut system, 0x700 + 0x138, (32 << 10) | 0x61);
+    let report = inspect(&system, &graphics).unwrap();
+    let buffer = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    assert_eq!(buffer.vertex_count, 32);
+    assert_eq!(buffer.packed_flags, 0x61);
+    assert_eq!(buffer.layout_end, buffer.declared_bytes);
+}
+
+#[test]
+fn a_vertex_buffer_size_disagreement_is_reported() {
+    let (mut system, graphics) = drawable();
+    // 129 elements of 4 bytes is 516 bytes; the layout still ends at 512.
+    put_u32(&mut system, 0x508, 129);
+    let report = inspect(&system, &graphics).unwrap();
+    assert_eq!(report.status, "partial");
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Arithmetic {
+            field: "vertex layout",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_declaration_offset_that_no_layout_entry_uses_is_reported() {
+    let (system, mut graphics) = drawable();
+    put_u32(&mut graphics, 0x108, (0x200 / 2) << 8 | 0x28);
+    let report = inspect(&system, &graphics).unwrap();
+    let first = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    assert_eq!(first.declarations.len(), 3);
+    assert_eq!(first.declarations[2].offset, 0x200);
+    assert!(!first.declarations[2].matches_layout);
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Arithmetic {
+            field: "declaration table",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_missing_declaration_terminator_is_reported() {
+    let (system, mut graphics) = drawable();
+    // Every word of the table is non-zero for the whole window.
+    for ix in 0..MAX_DECLARATIONS {
+        put_u32(&mut graphics, 0x100 + 4 * ix, (0x80 / 2) << 8 | 0x42);
+    }
+    let report = inspect(&system, &graphics).unwrap();
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Missing {
+            field: "the declaration-table terminator"
+        }
+    )));
+}
+
+#[test]
+fn a_texture_slot_outside_the_declared_count_is_invalid() {
+    let (mut system, graphics) = drawable();
+    // The second texture parameter selects slot 9 with only two declared.
+    put_u32(&mut system, 0xBB4, 9 << 2);
+    let report = inspect(&system, &graphics).unwrap();
+    let shader = &report.shader_group.as_ref().unwrap().shaders[0];
+    assert_eq!(
+        shader.slot_states[1].state,
+        crate::dictionary::SlotState::Invalid
+    );
+    assert_eq!(report.materials.invalid, 1);
+    assert_eq!(report.materials.unbound, 0);
+}
+
+#[test]
+fn a_non_texture_parameter_class_has_no_slot() {
+    let (mut system, graphics) = drawable();
+    // The second texture parameter declares class 1.
+    put_u32(&mut system, 0xBB4, (1 << 2) | 1);
+    let report = inspect(&system, &graphics).unwrap();
+    let shader = &report.shader_group.as_ref().unwrap().shaders[0];
+    assert_eq!(shader.slot_states.len(), 1);
+    assert_eq!(report.materials.declared_slots, 2);
+    assert_eq!(report.materials.bound, 1);
+}
+
+#[test]
+fn an_overflowing_bounds_extent_is_clamped() {
+    let (mut system, graphics) = drawable();
+    put_u16(&mut system, 0x310, 0xFF00);
+    put_u16(&mut system, 0x312, 0xFFFF);
+    let report = inspect(&system, &graphics).unwrap();
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Clamped {
+            field: "model bounds array",
+            ..
+        }
+    )));
+    let bounds = report.lod[0].models[0].bounds.as_ref().unwrap();
+    assert!(bounds.records < 0xFF01);
 }

@@ -37,6 +37,13 @@ pub const LOD_SLOTS: usize = 4;
 /// Largest element, geometry or shader array accepted.
 pub const MAX_ARRAY: usize = 1 << 16;
 
+/// Size of one model bounds record: eight `f32`.
+pub const BOUNDS_RECORD_LEN: u64 = 0x20;
+/// Tolerance the research used for the aggregate-union check.
+pub const AABB_TOLERANCE: f32 = 2e-3;
+/// Longest declaration table accepted.
+pub const MAX_DECLARATIONS: usize = 64;
+
 /// A structural problem. Every pointer that does not resolve produces one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Issue {
@@ -120,6 +127,139 @@ pub struct Bounds {
     pub max: [f32; 3],
 }
 
+/// An axis-aligned box as the bounds records store it: six meaningful
+/// values and two repeats.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Aabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+impl Aabb {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let bytes: [u8; 32] = bytes.get(..32)?.try_into().ok()?;
+        let word = |ix: usize| {
+            f32::from_le_bytes(bytes[ix * 4..ix * 4 + 4].try_into().expect("four bytes"))
+        };
+        Some(Self {
+            min: [word(0), word(1), word(2)],
+            max: [word(4), word(5), word(6)],
+        })
+    }
+
+    /// The largest absolute difference between the six meaningful values.
+    pub fn delta(&self, other: &Aabb) -> f32 {
+        let mut delta = 0f32;
+        for (a, b) in self.min.iter().zip(other.min.iter()) {
+            delta = delta.max((a - b).abs());
+        }
+        for (a, b) in self.max.iter().zip(other.max.iter()) {
+            delta = delta.max((a - b).abs());
+        }
+        if delta.is_nan() { f32::INFINITY } else { delta }
+    }
+
+    fn union(&self, other: &Aabb) -> Aabb {
+        let min = [
+            self.min[0].min(other.min[0]),
+            self.min[1].min(other.min[1]),
+            self.min[2].min(other.min[2]),
+        ];
+        let max = [
+            self.max[0].max(other.max[0]),
+            self.max[1].max(other.max[1]),
+            self.max[2].max(other.max[2]),
+        ];
+        Aabb { min, max }
+    }
+
+    pub fn finite(&self) -> bool {
+        self.min
+            .iter()
+            .chain(self.max.iter())
+            .all(|value| value.is_finite())
+    }
+}
+
+/// The model `+0x18` bounds array: an aggregate record followed by one
+/// record per geometry for a multi-geometry model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundsArray {
+    pub at: u32,
+    pub records: u32,
+    pub aggregate: Aabb,
+    pub per_geometry: Vec<Aabb>,
+    /// The fourth word of each record repeats the first.
+    pub extra_min_equal: bool,
+    pub extra_max_equal: bool,
+    /// `None` for a one-geometry model, whose union check is trivial.
+    pub union_matches: Option<bool>,
+    pub union_delta: f32,
+}
+
+/// One declaration-table entry from the graphics prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Declaration {
+    pub format: u8,
+    pub offset: u32,
+    /// Whether the offset equals a present layout entry's offset.
+    pub matches_layout: bool,
+}
+
+/// One model bounds-array check result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnionCheck {
+    pub matches: bool,
+    pub delta: f32,
+    /// Models whose aggregate was compared.
+    pub models: usize,
+    /// Models skipped because they hold one geometry.
+    pub trivial: usize,
+}
+
+/// The header-union check, which is independent of the model checks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderUnion {
+    pub matches: bool,
+    pub delta: f32,
+    pub finite: bool,
+}
+
+/// One shader parameter entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parameter {
+    pub index: u16,
+    pub name_hash: u32,
+    pub packed: u32,
+    /// Low two bits of `packed`.
+    pub class: u8,
+    /// Bits 2..31 of `packed`.
+    pub slot: u32,
+    /// Class zero, the texture-entry class.
+    pub texture: bool,
+}
+
+/// One texture slot: bound to a record, declared but null, or invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slot {
+    pub index: u16,
+    pub state: crate::dictionary::SlotState,
+    /// The name record's 64-bit key, for a bound slot.
+    pub key: Option<u64>,
+}
+
+/// Counts over the shader group. Keys are hashes: nothing is resolved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterialSummary {
+    pub shaders: usize,
+    pub declared_slots: u32,
+    pub bound: u32,
+    pub unbound: u32,
+    pub invalid: u32,
+    /// Distinct 64-bit keys across bound slots.
+    pub distinct_keys: usize,
+}
+
 /// The header fields whose positions the research confirmed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeaderView {
@@ -156,11 +296,16 @@ pub struct VertexBuffer {
     pub graphics: u32,
     pub layout: Option<u32>,
     pub vertex_count: u32,
+    /// Bits 0..9 of the packed word. Uninterpreted flags.
+    pub packed_flags: u32,
     pub declared_bytes: u64,
     pub attribute_bytes: u64,
     pub layout_end: u64,
     pub prefix_gap: i64,
     pub attributes: Vec<Attribute>,
+    /// Entries of the declaration table at the graphics target.
+    pub declarations: Vec<Declaration>,
+    pub declaration_end: Option<u64>,
 }
 
 /// An index descriptor's verified fields and the range it addresses.
@@ -168,11 +313,22 @@ pub struct VertexBuffer {
 pub struct IndexView {
     pub at: u32,
     pub clusters: u16,
+    pub count_a: u16,
+    /// `(value >> 8) & 0xFFFF` from `+0x0C`.
+    pub count_b: u16,
+    /// The whole `+0x0C` word.
+    pub count_word: u32,
+    pub low_byte: u8,
+    pub high_byte: u8,
     pub elements: u32,
     pub unit: u16,
     pub graphics: u32,
     pub range: Option<Region>,
     pub in_bounds: bool,
+    /// The first three words of the index bytes, when they are in range.
+    pub header: Option<[u32; 3]>,
+    /// Whether the header agrees with the descriptor.
+    pub header_matches: Option<bool>,
     pub constant: Option<u64>,
 }
 
@@ -184,7 +340,7 @@ pub struct Geometry {
     pub word_30: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub at: u32,
     pub geometry_count: u16,
@@ -193,9 +349,10 @@ pub struct Model {
     pub shader_indices: Option<u32>,
     pub flags: u64,
     pub geometries: Vec<Geometry>,
+    pub bounds: Option<BoundsArray>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LodSlot {
     pub slot: usize,
     /// The header pointer, as stored.
@@ -220,6 +377,8 @@ pub enum GraphicsBase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shader {
     pub at: u32,
+    /// `+0x00`, stable per parameter schema. A hash, not a name.
+    pub shader_hash: u32,
     /// `+0x04`, the constant `0x6D657461` in every sample.
     pub marker: u32,
     pub texture_parameters: u8,
@@ -227,6 +386,8 @@ pub struct Shader {
     pub word_06: u16,
     pub slots: u32,
     pub bound_slots: u32,
+    pub parameters: Vec<Parameter>,
+    pub slot_states: Vec<Slot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +406,12 @@ pub struct Report {
     pub empty_slots: Vec<usize>,
     pub graphics_base: GraphicsBase,
     pub shader_group: Option<ShaderGroup>,
+    pub materials: MaterialSummary,
+    /// The model-union check over the walked bounds arrays.
+    pub model_union: UnionCheck,
+    /// The header-union check, reported independently of the model checks.
+    /// `None` when no model aggregate was walked.
+    pub header_union: Option<HeaderUnion>,
     pub issues: Vec<Issue>,
     /// `complete` only when no issue was produced.
     pub status: &'static str,
@@ -496,6 +663,9 @@ impl<'a> Walk<'a> {
             .into_iter()
             .filter_map(|at| self.geometry(at))
             .collect();
+        let bounds = self
+            .pointer(base + 0x18, "model bounds array", Segment::System)
+            .and_then(|at| self.bounds(at, geometry_count));
         Some(Model {
             at,
             geometry_count,
@@ -504,6 +674,115 @@ impl<'a> Walk<'a> {
             shader_indices,
             flags,
             geometries,
+            bounds,
+        })
+    }
+
+    /// Reads the bounds array and checks the aggregate against the union of
+    /// the per-geometry records.
+    fn bounds(&mut self, at: u32, geometry_count: u16) -> Option<BoundsArray> {
+        let expected = if geometry_count <= 1 {
+            1
+        } else {
+            u32::from(geometry_count) + 1
+        };
+        let base = u64::from(at);
+        let size = self.system.len() as u64;
+        let available = if base >= size {
+            0
+        } else {
+            (size - base) / BOUNDS_RECORD_LEN
+        };
+        let records = u64::from(expected).min(available) as u32;
+        if records == 0 {
+            self.issues.push(Issue::Bounds {
+                field: "model bounds array",
+                at: at as usize,
+                segment: Segment::System,
+                offset: base,
+                len: BOUNDS_RECORD_LEN,
+                size,
+            });
+            return None;
+        }
+        if records < expected {
+            self.issues.push(Issue::Clamped {
+                field: "model bounds array",
+                declared: u64::from(expected),
+                used: u64::from(records),
+            });
+        }
+        let mut values = Vec::with_capacity(records as usize);
+        for ix in 0..records as usize {
+            let start = base as usize + ix * BOUNDS_RECORD_LEN as usize;
+            let bytes = &self.system[start..start + BOUNDS_RECORD_LEN as usize];
+            values.push(Aabb::parse(bytes)?);
+        }
+        let aggregate = values[0];
+        let per_geometry = values[1..].to_vec();
+        let extra_min_equal = (0..records as usize).all(|ix| {
+            let start = base as usize + ix * BOUNDS_RECORD_LEN as usize;
+            let words: [f32; 8] = std::array::from_fn(|word| {
+                f32::from_le_bytes(
+                    self.system[start + word * 4..start + word * 4 + 4]
+                        .try_into()
+                        .expect("four bytes"),
+                )
+            });
+            words[3] == words[0]
+        });
+        let extra_max_equal = (0..records as usize).all(|ix| {
+            let start = base as usize + ix * BOUNDS_RECORD_LEN as usize;
+            let words: [f32; 8] = std::array::from_fn(|word| {
+                f32::from_le_bytes(
+                    self.system[start + word * 4..start + word * 4 + 4]
+                        .try_into()
+                        .expect("four bytes"),
+                )
+            });
+            words[7] == words[4]
+        });
+        let finite = values.iter().all(Aabb::finite);
+        if !finite {
+            self.issues.push(Issue::Arithmetic {
+                field: "model bounds array",
+                message: "a bounds record holds a non-finite value".to_string(),
+            });
+        }
+        let (union_matches, union_delta) = if geometry_count <= 1 {
+            (None, 0.0)
+        } else {
+            let mut union = per_geometry.first().copied();
+            for aabb in per_geometry.iter().skip(1) {
+                if let Some(current) = union {
+                    union = Some(current.union(aabb));
+                }
+            }
+            match union {
+                Some(union) if finite => {
+                    let delta = aggregate.delta(&union);
+                    if delta > AABB_TOLERANCE {
+                        self.issues.push(Issue::Arithmetic {
+                            field: "model bounds aggregate",
+                            message: format!(
+                                "the aggregate differs from the union of the per-geometry records by {delta}"
+                            ),
+                        });
+                    }
+                    (Some(delta <= AABB_TOLERANCE), delta)
+                }
+                _ => (Some(false), f32::INFINITY),
+            }
+        };
+        Some(BoundsArray {
+            at,
+            records,
+            aggregate,
+            per_geometry,
+            extra_min_equal,
+            extra_max_equal,
+            union_matches,
+            union_delta,
         })
     }
 
@@ -547,16 +826,70 @@ impl<'a> Walk<'a> {
             graphics,
             layout,
             vertex_count: 0,
+            packed_flags: 0,
             declared_bytes: u64::from(elements) * u64::from(unit),
             attribute_bytes: 0,
             layout_end: 0,
             prefix_gap: 0,
             attributes: Vec::new(),
+            declarations: Vec::new(),
+            declaration_end: None,
         };
         if let Some(layout) = layout {
             let _ = self.layout(layout, &mut buffer);
         }
+        self.declarations(graphics, &mut buffer);
         Some(buffer)
+    }
+
+    /// Reads the declaration table at the graphics target. Each word is a
+    /// `u8` format and an offset in units of two, and a zero word ends it.
+    fn declarations(&mut self, graphics: u32, buffer: &mut VertexBuffer) {
+        let mut pos = u64::from(graphics);
+        let size = self.graphics.len() as u64;
+        let mut ended = false;
+        for _ in 0..MAX_DECLARATIONS {
+            let word = self
+                .graphics
+                .get(pos as usize..pos as usize + 4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")));
+            let Some(word) = word else {
+                self.issues.push(Issue::Arithmetic {
+                    field: "declaration table",
+                    message: format!(
+                        "the table at graphics +{graphics:#x} runs past the {size} byte graphics segment"
+                    ),
+                });
+                return;
+            };
+            if word == 0 {
+                ended = true;
+                buffer.declaration_end = Some(pos + 4);
+                break;
+            }
+            let format = (word & 0xFF) as u8;
+            let offset = (word >> 8) * 2;
+            let matches_layout = buffer.attributes.iter().any(|entry| entry.offset == offset);
+            if !matches_layout {
+                self.issues.push(Issue::Arithmetic {
+                    field: "declaration table",
+                    message: format!(
+                        "an entry declares format {format:#04x} at offset {offset:#x}, which no present layout entry uses"
+                    ),
+                });
+            }
+            buffer.declarations.push(Declaration {
+                format,
+                offset,
+                matches_layout,
+            });
+            pos += 4;
+        }
+        if !ended {
+            self.issues.push(Issue::Missing {
+                field: "the declaration-table terminator",
+            });
+        }
     }
 
     /// Reads the 52-entry layout and checks the documented arithmetic.
@@ -585,6 +918,7 @@ impl<'a> Walk<'a> {
             });
         }
         buffer.vertex_count = vertex_count;
+        buffer.packed_flags = packed & 0x3FF;
         buffer.attribute_bytes = sum;
         buffer.layout_end = end;
         buffer.prefix_gap = buffer.declared_bytes as i64 - sum as i64;
@@ -593,6 +927,18 @@ impl<'a> Walk<'a> {
                 field: "vertex layout",
                 message: format!(
                     "the entries end at {end}, but the buffer declares {} bytes",
+                    buffer.declared_bytes
+                ),
+            });
+        }
+        // `vertex_count × sum(size)` must be the declared size less the
+        // 0x80-byte prefix. The declared size is never rescaled to fit.
+        let expected = buffer.declared_bytes.checked_sub(VERTEX_PREFIX);
+        if expected != Some(sum) {
+            self.issues.push(Issue::Arithmetic {
+                field: "vertex layout",
+                message: format!(
+                    "{vertex_count} vertices of {sum} attribute bytes do not reproduce the declared {} bytes minus the {VERTEX_PREFIX}-byte prefix",
                     buffer.declared_bytes
                 ),
             });
@@ -609,6 +955,13 @@ impl<'a> Walk<'a> {
                 .try_into()
                 .expect("two bytes"),
         );
+        let count_a = u16::from_le_bytes(
+            self.bytes(Segment::System, base + 0x0A, 2, "index count A")?
+                .try_into()
+                .expect("two bytes"),
+        );
+        let count_word = self.u32(base + 0x0C, "index count word")?;
+        let count_b = ((count_word >> 8) & 0xFFFF) as u16;
         // The record at +0x20 carries a constant word at its +0x10.
         let constant = self
             .bytes(Segment::System, base + 0x20, 0x20, "index record")
@@ -639,9 +992,41 @@ impl<'a> Walk<'a> {
                 size: self.graphics.len() as u64,
             });
         }
+        // The index bytes begin with the cluster word, count A and count B.
+        let header = self
+            .graphics
+            .get(graphics as usize..graphics as usize + 12)
+            .map(|bytes| {
+                [
+                    u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")),
+                    u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes")),
+                    u32::from_le_bytes(bytes[8..12].try_into().expect("four bytes")),
+                ]
+            });
+        let header_matches = header.map(|words| {
+            let expected = 0x8000_0000u32 | u32::from(clusters);
+            let matches = words[0] == expected
+                && words[1] == u32::from(count_a)
+                && words[2] == u32::from(count_b);
+            if !matches {
+                self.issues.push(Issue::Arithmetic {
+                    field: "index header",
+                    message: format!(
+                        "the index bytes begin {:#010X} {:#010X} {:#010X}; the descriptor declares {expected:#010X} {} {}",
+                        words[0], words[1], words[2], count_a, count_b
+                    ),
+                });
+            }
+            matches
+        });
         Some(IndexView {
             at,
             clusters,
+            count_a,
+            count_b,
+            count_word,
+            low_byte: (count_word & 0xFF) as u8,
+            high_byte: (count_word >> 24) as u8,
             elements,
             unit,
             graphics,
@@ -651,6 +1036,8 @@ impl<'a> Walk<'a> {
                 len,
             }),
             in_bounds,
+            header,
+            header_matches,
             constant,
         })
     }
@@ -685,20 +1072,102 @@ impl<'a> Walk<'a> {
     fn shader(&mut self, at: u32) -> Option<Shader> {
         let base = u64::from(at);
         self.bytes(Segment::System, base, 0x40, "shader record")?;
+        let shader_hash = self.u32(base, "shader hash")?;
         let marker = self.u32(base + 0x04, "shader marker")?;
         let slots_at = self.pointer(base + 0x10, "texture slot table", Segment::System)?;
         let parameters_at = self.pointer(base + 0x20, "parameter table", Segment::System)?;
         let (texture_parameters, total_parameters, word_06) = self.parameter_counts(parameters_at);
+        let parameters = self.parameters(parameters_at, total_parameters, texture_parameters);
         let (slots, bound_slots) = self.slot_counts(slots_at, texture_parameters);
+        let slot_states = self.slot_states(slots_at, &parameters, texture_parameters);
         Some(Shader {
             at,
+            shader_hash,
             marker,
             texture_parameters,
             total_parameters,
             word_06,
             slots,
             bound_slots,
+            parameters,
+            slot_states,
         })
+    }
+
+    /// Reads the parameter pairs. `total` bounds the walk; the first
+    /// `textures` entries are the texture parameters.
+    fn parameters(&mut self, at: u32, total: u16, textures: u8) -> Vec<Parameter> {
+        let base = u64::from(at) + 8;
+        let mut parameters = Vec::new();
+        for index in 0..u32::from(total) {
+            if parameters.len() >= MAX_ARRAY {
+                break;
+            }
+            let start = base as usize + index as usize * 8;
+            let Some(bytes) = self.system.get(start..start + 8) else {
+                self.issues.push(Issue::Clamped {
+                    field: "parameter table",
+                    declared: u64::from(total),
+                    used: parameters.len() as u64,
+                });
+                break;
+            };
+            let name_hash = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes"));
+            let packed_value = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
+            let texture = index < u32::from(textures);
+            parameters.push(Parameter {
+                index: index as u16,
+                name_hash,
+                packed: packed_value,
+                class: (packed_value & 0x3) as u8,
+                slot: packed_value >> 2,
+                texture,
+            });
+        }
+        parameters
+    }
+
+    fn slot_states(
+        &mut self,
+        at: u32,
+        parameters: &[Parameter],
+        texture_parameters: u8,
+    ) -> Vec<Slot> {
+        let mut slots = Vec::with_capacity(usize::from(texture_parameters));
+        for parameter in parameters.iter().filter(|parameter| parameter.texture) {
+            let start = at as usize + parameter.index as usize * 8;
+            let pointer = u64_at(self.system, start).unwrap_or(0);
+            let bound = pointer != 0;
+            let texture = crate::dictionary::TextureParameter {
+                class: parameter.class,
+                slot: parameter.slot,
+            };
+            let Some(state) =
+                crate::dictionary::slot_state(texture, u32::from(texture_parameters), bound)
+            else {
+                continue;
+            };
+            let key = if state == crate::dictionary::SlotState::Bound {
+                self.record_key(pointer)
+            } else {
+                None
+            };
+            slots.push(Slot {
+                index: parameter.index,
+                state,
+                key,
+            });
+        }
+        slots
+    }
+
+    /// Follows a texture record to its name record's 64-bit key. The key is a
+    /// hash: it is not resolved to a dictionary record.
+    fn record_key(&mut self, pointer: u64) -> Option<u64> {
+        let record = system_pointer(pointer)?;
+        let name = u64_at(self.system, record as usize + 0x30)?;
+        let name = system_pointer(name)?;
+        u64_at(self.system, name as usize + 8)
     }
 
     fn parameter_counts(&mut self, at: u32) -> (u8, u16, u16) {
@@ -775,6 +1244,69 @@ pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
         .map(|buffer| buffer.graphics)
         .collect::<Vec<_>>();
     let graphics_base = graphics_base(graphics, &graphics_offsets);
+
+    let mut materials = MaterialSummary::default();
+    let mut keys: Vec<u64> = Vec::new();
+    if let Some(group) = &shader_group {
+        materials.shaders = group.shaders.len();
+        for shader in &group.shaders {
+            materials.declared_slots += u32::from(shader.texture_parameters);
+            for slot in &shader.slot_states {
+                match slot.state {
+                    crate::dictionary::SlotState::Bound => {
+                        materials.bound += 1;
+                        if let Some(key) = slot.key {
+                            keys.push(key);
+                        }
+                    }
+                    crate::dictionary::SlotState::Unbound => materials.unbound += 1,
+                    crate::dictionary::SlotState::Invalid => materials.invalid += 1,
+                }
+            }
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    materials.distinct_keys = keys.len();
+
+    let mut model_union = UnionCheck {
+        matches: true,
+        delta: 0.0,
+        models: 0,
+        trivial: 0,
+    };
+    let mut union: Option<Aabb> = None;
+    for model in lod.iter().flat_map(|slot| slot.models.iter()) {
+        let Some(bounds) = &model.bounds else {
+            continue;
+        };
+        union = Some(match union {
+            Some(current) => current.union(&bounds.aggregate),
+            None => bounds.aggregate,
+        });
+        match bounds.union_matches {
+            Some(true) => model_union.models += 1,
+            Some(false) => {
+                model_union.models += 1;
+                model_union.matches = false;
+                model_union.delta = model_union.delta.max(bounds.union_delta);
+            }
+            None => model_union.trivial += 1,
+        }
+    }
+    let header_box = Aabb {
+        min: header.bounds.min,
+        max: header.bounds.max,
+    };
+    let header_union = union.map(|union| {
+        let delta = union.delta(&header_box);
+        HeaderUnion {
+            matches: delta <= AABB_TOLERANCE && union.finite() && header_box.finite(),
+            delta,
+            finite: union.finite() && header_box.finite(),
+        }
+    });
+
     let status = if walk.issues.is_empty() {
         "complete"
     } else {
@@ -786,6 +1318,9 @@ pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
         empty_slots,
         graphics_base,
         shader_group,
+        materials,
+        model_union,
+        header_union,
         issues: walk.issues,
         status,
     })
