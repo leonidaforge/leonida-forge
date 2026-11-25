@@ -328,22 +328,48 @@ fn rds5_structure<R: Read + Seek>(source: &mut R, len: u64, options: &Options) -
         })
         .collect();
 
+    // The selector value is reported per group: the research identifies only
+    // selector 0, and selectors 1, 2 and 3 each select an unknown codec.
     let mut by_storage = Map::new();
-    for storage in [
-        Storage::Zlib,
-        Storage::NotZlib,
-        Storage::Unidentified(0),
-        Storage::Unread,
-    ] {
-        let count = container
-            .blocks
-            .iter()
-            .filter(|block| {
-                std::mem::discriminant(&block.storage) == std::mem::discriminant(&storage)
-            })
-            .count();
+    let mut counts: Vec<(String, usize)> = vec![
+        (
+            "zlib".to_string(),
+            container
+                .blocks
+                .iter()
+                .filter(|block| block.storage == Storage::Zlib)
+                .count(),
+        ),
+        (
+            "not_zlib".to_string(),
+            container
+                .blocks
+                .iter()
+                .filter(|block| block.storage == Storage::NotZlib)
+                .count(),
+        ),
+        (
+            "unread".to_string(),
+            container
+                .blocks
+                .iter()
+                .filter(|block| block.storage == Storage::Unread)
+                .count(),
+        ),
+    ];
+    for selector in 1..=3u8 {
+        counts.push((
+            format!("selector_{selector}"),
+            container
+                .blocks
+                .iter()
+                .filter(|block| block.storage == Storage::Unidentified(selector))
+                .count(),
+        ));
+    }
+    for (name, count) in counts {
         if count > 0 {
-            by_storage.insert(storage.name().into(), json!(count));
+            by_storage.insert(name, json!(count));
         }
     }
     let stored_bytes: u64 = container.blocks.iter().map(|block| block.stored_len).sum();
