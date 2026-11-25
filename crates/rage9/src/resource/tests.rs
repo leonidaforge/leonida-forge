@@ -262,14 +262,14 @@ fn feeding_in_pieces_gives_the_same_layout() {
     let whole = {
         let mut builder = Builder::new(&sys).unwrap();
         builder.feed(&sys);
-        builder.finish(&pages)
+        builder.finish(&pages, None)
     };
     for piece in [1, 3, 7, 9, 0x1D5] {
         let mut builder = Builder::new(&sys).unwrap();
         for chunk in sys.chunks(piece) {
             builder.feed(chunk);
         }
-        assert_eq!(builder.finish(&pages), whole, "pieces of {piece}");
+        assert_eq!(builder.finish(&pages, None), whole, "pieces of {piece}");
     }
     assert_eq!(whole.status(), Status::Complete);
     assert_eq!(whole.pointers.graphics, 27);
@@ -281,7 +281,7 @@ fn split_graphics_pages_count_as_one_page() {
     let mut builder = Builder::new(&sys).unwrap();
     builder.feed(&sys);
     let pages = group_pages(&[0x80, SPLIT_LEN, 0x60_0000]);
-    let layout = builder.finish(&pages);
+    let layout = builder.finish(&pages, None);
     assert_eq!(layout.status(), Status::Complete);
     assert_eq!(layout.stream_count(), 3);
     assert_eq!(layout.segment_len(Segment::Graphics), SPLIT_LEN + 0x60_0000);

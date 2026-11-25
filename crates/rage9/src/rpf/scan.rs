@@ -109,7 +109,7 @@ pub(crate) fn inflate<S: Read + Seek>(
     }
 }
 
-fn is_zlib_header(bytes: &[u8]) -> bool {
+pub(crate) fn is_zlib_header(bytes: &[u8]) -> bool {
     let [cmf, flg, ..] = *bytes else {
         return false;
     };
@@ -244,7 +244,9 @@ pub(crate) fn scan_from<S: Read + Seek + Clone + Send>(
         return Err(Error::Cancelled);
     }
     let (mut streams, regions) = merge(start, segments);
-    let resources = reconstruct::resolve(source, len, &mut streams, cancel)?;
+    // Resources are reconstructed inside the stored payload area, so a raw
+    // page never extends into the trailing region.
+    let resources = reconstruct::resolve(source, end, &mut streams, cancel)?;
     Ok(Index::new(len, header, streams, resources, regions))
 }
 

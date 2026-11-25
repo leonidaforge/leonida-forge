@@ -25,7 +25,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use crate::Status;
-use crate::resource::{Layout, Page, Segment};
+use crate::resource::{Layout, Page, Segment, Storage};
 pub use cache::{CacheKey, Origin, file_location, file_version, load, open, store};
 pub use scan::scan;
 
@@ -366,6 +366,7 @@ impl Index {
         regions: Vec<Region>,
     ) -> Self {
         let entries = group(&streams, &resources);
+        let regions = subtract_raw_pages(regions, &resources);
         Self {
             archive_len,
             header,
@@ -454,6 +455,54 @@ impl Index {
     }
 }
 
+/// Removes the raw resource pages from the unrecovered regions: they are
+/// recovered data, even though no zlib stream holds them.
+fn subtract_raw_pages(regions: Vec<Region>, resources: &[Resource]) -> Vec<Region> {
+    let mut ranges: Vec<(u64, u64)> = resources
+        .iter()
+        .flat_map(|resource| resource.layout.pages.iter())
+        .filter_map(|page| match page.storage {
+            Storage::Raw { offset } => Some((offset, offset.checked_add(page.len)?)),
+            Storage::Streams => None,
+        })
+        .collect();
+    if ranges.is_empty() {
+        return regions;
+    }
+    ranges.sort_unstable();
+    let mut out = Vec::with_capacity(regions.len());
+    for region in regions {
+        let mut pieces = vec![(region.offset, region.offset + region.len)];
+        for &(from, to) in &ranges {
+            let mut kept = Vec::with_capacity(pieces.len());
+            for (start, end) in pieces {
+                if to <= start || from >= end {
+                    kept.push((start, end));
+                    continue;
+                }
+                if start < from {
+                    kept.push((start, from));
+                }
+                if to < end {
+                    kept.push((to, end));
+                }
+            }
+            pieces = kept;
+        }
+        out.extend(
+            pieces
+                .into_iter()
+                .filter(|(start, end)| end > start)
+                .map(|(start, end)| Region {
+                    offset: start,
+                    len: end - start,
+                }),
+        );
+    }
+    out.sort_unstable_by_key(|region| region.offset);
+    out
+}
+
 /// One entry per resource for the streams it claims. Other streams join the
 /// previous entry when they directly follow a full 64 KiB chunk and do not
 /// themselves look like the start of a file.
@@ -473,7 +522,8 @@ fn group(streams: &[Stream], resources: &[Resource]) -> Vec<Entry> {
                 stream_count: count,
                 kind: Kind::Resource,
                 status: resource.status(),
-                len: claimed.iter().map(|s| u64::from(s.len)).sum(),
+                len: resource.layout.segment_len(Segment::System)
+                    + resource.layout.segment_len(Segment::Graphics),
                 stored_len: claimed.iter().map(|s| u64::from(s.stored_len)).sum(),
             });
             open = false;
@@ -555,11 +605,22 @@ pub fn read_streams<S: Read + Seek>(
     out: &mut dyn Write,
     cancel: &AtomicBool,
 ) -> Result<u64, Error> {
+    read_streams_mut(&mut source, index, streams, limit, out, cancel)
+}
+
+fn read_streams_mut<S: Read + Seek>(
+    source: &mut S,
+    index: &Index,
+    streams: &[Stream],
+    limit: u64,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> Result<u64, Error> {
     let len: u64 = streams.iter().map(|s| u64::from(s.len)).sum();
     if len > limit {
         return Err(Error::TooLarge { len, limit });
     }
-    check_len(&mut source, index)?;
+    check_len(source, index)?;
     let mut window = scan::Window::new(source, index.archive_len);
     let mut scratch = vec![0; scan::SCRATCH_LEN];
     for stream in streams {
@@ -588,25 +649,151 @@ pub fn read_streams<S: Read + Seek>(
     Ok(len)
 }
 
+/// Copies the stored bytes of one raw resource page into `out`.
+fn read_raw_page<S: Read + Seek>(
+    source: &mut S,
+    index: &Index,
+    offset: u64,
+    len: u64,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> Result<u64, Error> {
+    if offset
+        .checked_add(len)
+        .is_none_or(|end| end > index.archive_len)
+    {
+        return Err(Error::Changed(
+            "the raw page lies outside the indexed archive".into(),
+        ));
+    }
+    source.seek(SeekFrom::Start(offset))?;
+    let mut reader = source.take(len);
+    let mut buf = vec![0u8; scan::SCRATCH_LEN];
+    let mut copied = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&buf[..read])?;
+        copied += read as u64;
+    }
+    if copied != len {
+        return Err(Error::Changed(
+            "the archive is shorter than its index".into(),
+        ));
+    }
+    Ok(copied)
+}
+
+/// Writes one page of `resource`: the streams of a stream page are inflated,
+/// a raw page is copied as stored. Returns the number of bytes written.
+pub fn read_page<S: Read + Seek>(
+    mut source: S,
+    index: &Index,
+    resource: &Resource,
+    position: usize,
+    limit: u64,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> Result<u64, Error> {
+    let page = resource
+        .layout
+        .pages
+        .get(position)
+        .ok_or_else(|| Error::Changed(format!("the resource has no page {position}")))?;
+    if page.len > limit {
+        return Err(Error::TooLarge {
+            len: page.len,
+            limit,
+        });
+    }
+    let skip: usize = resource
+        .layout
+        .pages
+        .iter()
+        .take(position)
+        .map(|page| page.stream_count as usize)
+        .sum();
+    let next = resource.first_stream as usize + skip;
+    match page.storage {
+        Storage::Streams => {
+            let count = page.stream_count as usize;
+            let streams = index
+                .streams
+                .get(next..next + count)
+                .ok_or_else(|| Error::Changed("a page has too few streams".into()))?;
+            read_streams_mut(&mut source, index, streams, page.len, out, cancel)
+        }
+        Storage::Raw { offset } => read_raw_page(&mut source, index, offset, page.len, out, cancel),
+    }
+}
+
 /// Inflates one entry into `out` and checks it against the index. Returns the
 /// number of bytes written. A resource is written as its system pages
-/// followed by its graphics pages, the layout its pointers refer to.
+/// followed by its graphics pages, the layout its pointers refer to; a raw
+/// page is copied as it is stored.
 pub fn read_entry<S: Read + Seek>(
-    source: S,
+    mut source: S,
     index: &Index,
     entry: &Entry,
     limit: u64,
     out: &mut dyn Write,
     cancel: &AtomicBool,
 ) -> Result<u64, Error> {
-    read_streams(
-        source,
+    if entry.kind == Kind::Resource
+        && let Some(resource) = index.resource_at(entry.offset)
+    {
+        return read_resource(&mut source, index, resource, limit, out, cancel);
+    }
+    read_streams_mut(
+        &mut source,
         index,
         index.entry_streams(entry),
         limit,
         out,
         cancel,
     )
+}
+
+/// Writes every page of `resource` in order: streams are inflated and a raw
+/// page is copied.
+fn read_resource<S: Read + Seek>(
+    source: &mut S,
+    index: &Index,
+    resource: &Resource,
+    limit: u64,
+    out: &mut dyn Write,
+    cancel: &AtomicBool,
+) -> Result<u64, Error> {
+    let total = resource.layout.segment_len(Segment::System)
+        + resource.layout.segment_len(Segment::Graphics);
+    if total > limit {
+        return Err(Error::TooLarge { len: total, limit });
+    }
+    let mut next = resource.first_stream as usize;
+    let mut written = 0u64;
+    for page in &resource.layout.pages {
+        match page.storage {
+            Storage::Streams => {
+                let count = page.stream_count as usize;
+                let streams = index
+                    .streams
+                    .get(next..next + count)
+                    .ok_or_else(|| Error::Changed("a page has too few streams".into()))?;
+                read_streams_mut(source, index, streams, limit, out, cancel)?;
+                next += count;
+            }
+            Storage::Raw { offset } => {
+                read_raw_page(source, index, offset, page.len, out, cancel)?;
+            }
+        }
+        written += page.len;
+    }
+    Ok(written)
 }
 
 fn check_len(source: &mut impl Seek, index: &Index) -> Result<(), Error> {

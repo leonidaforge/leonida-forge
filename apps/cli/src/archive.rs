@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Subcommand};
 use lforge_rage9::Status;
-use lforge_rage9::resource::Segment;
+use lforge_rage9::resource::{Segment, Storage};
 use lforge_rage9::rpf::{self, Index, Origin, Progress, Resource};
 use serde_json::{Value, json};
 
@@ -796,12 +796,21 @@ fn resource_json(index: &Index, resource: &Resource) -> Value {
     let pages: Vec<Value> = index
         .resource_pages(resource)
         .map(|(page, streams)| {
+            let offset = match page.storage {
+                Storage::Raw { offset } => offset,
+                Storage::Streams => streams.first().map_or(resource.offset, |s| s.offset),
+            };
+            let stored: u64 = match page.storage {
+                Storage::Raw { .. } => page.len,
+                Storage::Streams => streams.iter().map(|s| u64::from(s.stored_len)).sum(),
+            };
             json!({
-                "id": id(streams[0].offset),
-                "offset": streams[0].offset,
+                "id": id(offset),
+                "offset": offset,
                 "segment": page.segment.name(),
                 "size": page.len,
-                "compressed_size": streams.iter().map(|s| u64::from(s.stored_len)).sum::<u64>(),
+                "storage": page.storage.name(),
+                "compressed_size": stored,
                 "streams": page.stream_count,
             })
         })
@@ -983,15 +992,25 @@ fn resource(path: &Path, offset: u64, no_cache: bool, json: bool) -> Result<(), 
         "page", "segment", "size", "compressed", "streams"
     );
     for (page, streams) in index.resource_pages(resource) {
-        let stored: u64 = streams.iter().map(|s| u64::from(s.stored_len)).sum();
+        let (offset, stored) = match page.storage {
+            Storage::Raw { offset } => (offset, page.len),
+            Storage::Streams => (
+                streams.first().map_or(resource.offset, |s| s.offset),
+                streams.iter().map(|s| u64::from(s.stored_len)).sum(),
+            ),
+        };
         println!(
             "{:<12} {:<9} {:>12} {:>12} {:>7}",
-            id(streams[0].offset),
+            id(offset),
             page.segment.name(),
             page.len,
             stored,
             page.stream_count
         );
+    }
+    if let Some(tail) = layout.tail {
+        println!();
+        println!("warning: {}", tail.describe());
     }
     let issues = layout.issues();
     if !issues.is_empty() {

@@ -12,9 +12,9 @@ use std::num::NonZero;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use super::scan::{SCRATCH_LEN, Window, inflate};
-use super::{Error, Kind, Resource, Stream};
-use crate::resource::{Builder, group_pages};
+use super::scan::{SCRATCH_LEN, Window, inflate, is_zlib_header};
+use super::{ALIGN, Error, Kind, Resource, Stream};
+use crate::resource::{Builder, Issue, PAGE_UNIT, RawPage, group_pages};
 
 /// The zeroed bytes in front of the first system stream.
 const PREFIX_LEN: usize = 16;
@@ -74,7 +74,7 @@ pub(crate) fn resolve<S: Read + Seek + Clone + Send>(
                             if cancel.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                                 return Err(Error::Cancelled);
                             }
-                            resolve_one(&mut window, shared, ix, &mut scratch)
+                            resolve_one(&mut window, shared, ix, len, &mut scratch)
                         })
                         .collect();
                     if result.is_err() {
@@ -168,6 +168,7 @@ fn resolve_one<S: Read + Seek>(
     window: &mut Window<S>,
     streams: &[Stream],
     first: usize,
+    limit: u64,
     scratch: &mut [u8],
 ) -> Result<Option<Resource>, Error> {
     let head = &streams[first];
@@ -219,9 +220,123 @@ fn resolve_one<S: Read + Seek>(
     let Some(builder) = feed.builder else {
         return Ok(None);
     };
+
+    // A declared page that no zlib stream holds may be one raw stored range
+    // after the streams. Only the last declared page is considered, and only
+    // when exactly one page is missing.
+    let attributed = builder
+        .page_map()
+        .and_then(Result::ok)
+        .map(|map| usize::from(map.system_pages) + usize::from(map.graphics_pages));
+    let mut raw = None;
+    let mut tail = None;
+    if attributed.is_some_and(|total| pages.len() + 1 == total) {
+        match find_tail(window, run, last, limit)? {
+            Tail::None => {}
+            Tail::Page(page) => raw = Some(page),
+            Tail::TooLong { offset, len } | Tail::AllZero { offset, len } => {
+                tail = Some(Issue::UnclassifiableTail { offset, len });
+            }
+            Tail::LooksCompressed { offset } => {
+                tail = Some(Issue::DamagedStream { offset });
+            }
+        }
+    }
+    let mut layout = builder.finish(&pages, raw);
+    if layout.tail.is_none() {
+        layout.tail = tail;
+    }
     Ok(Some(Resource {
         offset: head.offset,
         first_stream: first as u32,
-        layout: builder.finish(&pages),
+        layout,
     }))
+}
+
+/// What a range after the last stream of a resource run looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Nothing after the streams, or nothing that could be a page.
+    None,
+    /// A stored range that fits one last page.
+    Page(RawPage),
+    /// Non-zero bytes longer than one page.
+    TooLong { offset: u64, len: u64 },
+    /// A range that is entirely zero, so its length cannot be established.
+    AllZero { offset: u64, len: u64 },
+    /// A range that starts with a zlib header but did not inflate.
+    LooksCompressed { offset: u64 },
+}
+
+/// The range a raw page could occupy: from the aligned end of the last
+/// stream to the next stream or the end of the payload area.
+fn tail_bounds(streams: &[Stream], last: usize, limit: u64) -> Option<(u64, u64)> {
+    let start = streams[last].aligned_end()?;
+    if start > limit {
+        return None;
+    }
+    let stop = streams
+        .get(last + 1)
+        .map_or(limit, |next| next.offset.min(limit));
+    (stop > start).then_some((start, stop))
+}
+
+/// Classifies the range a raw page could occupy. A page of at most
+/// [`PAGE_UNIT`] bytes is `Page`; the bytes after it to the next stream must
+/// be zero fill.
+fn find_tail<S: Read + Seek>(
+    window: &mut Window<S>,
+    streams: &[Stream],
+    last: usize,
+    limit: u64,
+) -> Result<Tail, Error> {
+    let Some((start, stop)) = tail_bounds(streams, last, limit) else {
+        return Ok(Tail::None);
+    };
+    // A range that starts like a zlib stream is a stream that failed to
+    // inflate, not a stored page: every observed raw page starts without a
+    // zlib header. The chunk counts then stay short and the page is reported
+    // missing instead of being invented from a damaged stream.
+    let head = window.at(start, 2)?;
+    if is_zlib_header(&head[..head.len().min(2)]) {
+        return Ok(Tail::LooksCompressed { offset: start });
+    }
+    // One page plus one block of margin, so an oversized range is detected
+    // without walking a whole gap.
+    let scan_end = stop.min(start.saturating_add(2 * PAGE_UNIT));
+    let mut end = start;
+    let mut pos = start;
+    while pos < scan_end {
+        let bytes = window.at(pos, ALIGN as usize)?;
+        let Some(block) = bytes
+            .get(..bytes.len().min(ALIGN as usize))
+            .filter(|b| !b.is_empty())
+        else {
+            break;
+        };
+        if block.iter().any(|&byte| byte != 0) {
+            end = pos + block.len() as u64;
+        }
+        pos += block.len() as u64;
+    }
+    let len = end.saturating_sub(start);
+    if len > PAGE_UNIT {
+        return Ok(Tail::TooLong {
+            offset: start,
+            len: stop - start,
+        });
+    }
+    if len == 0 {
+        return Ok(Tail::AllZero {
+            offset: start,
+            len: stop - start,
+        });
+    }
+    if len % ALIGN != 0 {
+        return Ok(Tail::TooLong {
+            offset: start,
+            len: stop - start,
+        });
+    }
+    Ok(Tail::Page(RawPage { offset: start, len }))
 }

@@ -164,12 +164,42 @@ impl Segment {
     }
 }
 
-/// One page as stored: consecutive streams.
+/// How a page is stored in the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Storage {
+    /// [`Page::stream_count`] consecutive zlib streams, each of the lengths
+    /// the index recorded.
+    Streams,
+    /// One stored range that is not a zlib stream. Its length is the page
+    /// length; the bytes are used as they are stored.
+    Raw { offset: u64 },
+}
+
+impl Storage {
+    pub fn name(self) -> &'static str {
+        match self {
+            Storage::Streams => "streams",
+            Storage::Raw { .. } => "raw",
+        }
+    }
+}
+
+/// One page as stored: consecutive streams, or one raw range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Page {
     pub segment: Segment,
     pub stream_count: u32,
-    /// Inflated length.
+    /// Inflated length for streams, stored length for a raw page.
+    pub len: u64,
+    pub storage: Storage,
+}
+
+/// A stored range after the streams, offered to [`Builder::finish`] as the
+/// last declared page when the page counts require one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawPage {
+    pub offset: u64,
+    /// Stored length, which equals the page length.
     pub len: u64,
 }
 
@@ -226,6 +256,24 @@ pub enum Issue {
         system: u32,
         graphics: u32,
     },
+    /// Bytes follow the declared pages without being one. They are reported
+    /// as trailing data, not as a page.
+    TrailingData {
+        offset: u64,
+        len: u64,
+    },
+    /// A range follows the streams and is not a zlib stream, but its extent
+    /// cannot be established: it is all zero, or it does not fit the last
+    /// page. It is not counted as a page.
+    UnclassifiableTail {
+        offset: u64,
+        len: u64,
+    },
+    /// A range starts like a zlib stream but does not inflate. It is not
+    /// counted as a raw page.
+    DamagedStream {
+        offset: u64,
+    },
 }
 
 impl Issue {
@@ -245,6 +293,15 @@ impl Issue {
             Issue::PointersOutside { system, graphics } => format!(
                 "{system} system and {graphics} graphics pointer-like values point past the reconstructed data"
             ),
+            Issue::TrailingData { offset, len } => {
+                format!("{len} bytes at {offset:#x} follow the declared pages and are not a page")
+            }
+            Issue::UnclassifiableTail { offset, len } => format!(
+                "the {len} bytes at {offset:#x} after the streams are not a zlib stream and their page extent cannot be established"
+            ),
+            Issue::DamagedStream { offset } => format!(
+                "the bytes at {offset:#x} start like a zlib stream and do not inflate, so they are not counted as a page"
+            ),
         }
     }
 }
@@ -258,6 +315,8 @@ pub struct Layout {
     pub pages: Vec<Page>,
     pub pointers: Pointers,
     pub tag: Option<u8>,
+    /// A stored range after the declared pages that was not counted as one.
+    pub tail: Option<Issue>,
 }
 
 impl Layout {
@@ -281,6 +340,9 @@ impl Layout {
             Err(err) => return vec![Issue::PageMap(err)],
         };
         let mut issues = Vec::new();
+        if let Some(tail) = self.tail {
+            issues.push(tail);
+        }
         for segment in [Segment::System, Segment::Graphics] {
             let pages: Vec<&Page> = self.segment_pages(segment).collect();
             let declared = map.pages(segment);
@@ -333,7 +395,15 @@ impl Layout {
         let issues: Vec<Issue> = self
             .issues()
             .into_iter()
-            .filter(|issue| !matches!(issue, Issue::PointersOutside { .. }))
+            .filter(|issue| {
+                !matches!(
+                    issue,
+                    Issue::PointersOutside { .. }
+                        | Issue::TrailingData { .. }
+                        | Issue::UnclassifiableTail { .. }
+                        | Issue::DamagedStream { .. }
+                )
+            })
             .collect();
         if issues.is_empty() {
             Status::Complete
@@ -444,7 +514,11 @@ impl Builder {
     /// the first system page, to segments. The data fed must be the system
     /// pages up to where [`Builder::has_system`] became true, or all pages
     /// if it never did.
-    pub fn finish(self, pages: &[(u32, u64)]) -> Layout {
+    ///
+    /// `raw` is a stored range after the streams that may be the last
+    /// declared page. It is used as a page only when exactly one declared
+    /// page is still missing; otherwise it is reported, not counted.
+    pub fn finish(self, pages: &[(u32, u64)], raw: Option<RawPage>) -> Layout {
         let first = |page_map| Layout {
             page_map,
             pages: pages
@@ -453,11 +527,13 @@ impl Builder {
                     segment: Segment::System,
                     stream_count,
                     len,
+                    storage: Storage::Streams,
                 })
                 .into_iter()
                 .collect(),
             pointers: Pointers::default(),
             tag: self.tag,
+            tail: None,
         };
         let map = match self.page_map() {
             Some(Ok(map)) => map,
@@ -466,7 +542,7 @@ impl Builder {
         };
         let system = usize::from(map.system_pages);
         let graphics = usize::from(map.graphics_pages);
-        let found: Vec<Page> = pages
+        let mut found: Vec<Page> = pages
             .iter()
             .take(system + graphics)
             .enumerate()
@@ -478,8 +554,34 @@ impl Builder {
                 },
                 stream_count,
                 len,
+                storage: Storage::Streams,
             })
             .collect();
+        let mut tail = None;
+        if let Some(raw) = raw {
+            if found.len() + 1 == system + graphics {
+                found.push(Page {
+                    segment: if found.len() < system {
+                        Segment::System
+                    } else {
+                        Segment::Graphics
+                    },
+                    stream_count: 0,
+                    len: raw.len,
+                    storage: Storage::Raw { offset: raw.offset },
+                });
+            } else if found.len() >= system + graphics {
+                tail = Some(Issue::TrailingData {
+                    offset: raw.offset,
+                    len: raw.len,
+                });
+            } else {
+                tail = Some(Issue::UnclassifiableTail {
+                    offset: raw.offset,
+                    len: raw.len,
+                });
+            }
+        }
         let system_len: u64 = found.iter().take(system).map(|page| page.len).sum();
         if u64::from(map.offset) + u64::from(map.byte_len()) > system_len {
             return first(Err(PageMapError::Outside));
@@ -505,6 +607,7 @@ impl Builder {
             pages: found,
             pointers,
             tag: self.tag,
+            tail,
         }
     }
 }
@@ -526,5 +629,5 @@ pub fn analyze(streams: &[&[u8]]) -> Option<Layout> {
         }
         next += count as usize;
     }
-    Some(builder.finish(&pages))
+    Some(builder.finish(&pages, None))
 }

@@ -718,6 +718,7 @@ mod tests {
             payload_transform: Ok(false),
             payload_cipher: Ok(None),
             read_source: Ok(None),
+            payload_end: None,
         }
     }
 

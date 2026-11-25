@@ -26,7 +26,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use lforge_rage9::resource::{Page, Segment};
+use lforge_rage9::resource::{Page, Segment, Storage};
 use lforge_rage9::rpf::metadata::verify;
 use lforge_rage9::rpf::{self, CacheKey, Index, Kind, Progress, Region, Resource, Status, Stream};
 
@@ -496,7 +496,15 @@ fn resource_details(index: &Index, resource: &Resource) -> Vec<(&'static str, St
             index
                 .resource_pages(resource)
                 .map(|(page, streams)| {
-                    format!("{:#x} ({})", streams[0].offset, page.segment.name())
+                    let offset = match page.storage {
+                        Storage::Raw { offset } => offset,
+                        Storage::Streams => streams.first().map_or(resource.offset, |s| s.offset),
+                    };
+                    if page.storage == Storage::Streams {
+                        format!("{offset:#x} ({})", page.segment.name())
+                    } else {
+                        format!("{offset:#x} ({}, stored)", page.segment.name())
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -569,7 +577,10 @@ fn page_file(
     page: &Page,
     streams: &[Stream],
 ) -> Entry {
-    let offset = streams[0].offset;
+    let offset = match page.storage {
+        Storage::Raw { offset } => offset,
+        Storage::Streams => streams.first().map_or(resource.offset, |s| s.offset),
+    };
     let name = file_name(offset, "bin");
     let mut file = Entry::new(
         name.clone(),
@@ -586,7 +597,10 @@ fn page_file(
     }
     .to_string();
     file.order = Some(offset);
-    let stored: u64 = streams.iter().map(|s| u64::from(s.stored_len)).sum();
+    let stored: u64 = match page.storage {
+        Storage::Raw { .. } => page.len,
+        Storage::Streams => streams.iter().map(|s| u64::from(s.stored_len)).sum(),
+    };
     file.details = vec![
         (
             "Resource",
@@ -598,6 +612,7 @@ fn page_file(
         ),
         ("Page", format!("{} page {number} of {of}", segment.name())),
         ("Offset", format!("{offset:#x}")),
+        ("Storage", page.storage.name().to_string()),
         ("Compressed", compressed(stored)),
         ("Streams", page.stream_count.to_string()),
     ];
@@ -708,12 +723,13 @@ pub fn copy(
             rpf::read_entry(source, &index, entry, limit, out, cancel)?;
         }
         Node::Page(resource, position) => {
-            let (page, streams) = index
+            let page = index
                 .resource_pages(resource)
                 .nth(position)
+                .map(|(page, _)| page)
                 .ok_or_else(not_found)?;
             check_size(page.len, limit)?;
-            rpf::read_streams(source, &index, streams, limit, out, cancel)?;
+            rpf::read_page(source, &index, resource, position, limit, out, cancel)?;
         }
         Node::Region(region) => {
             check_size(region.len, limit)?;

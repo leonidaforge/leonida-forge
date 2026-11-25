@@ -13,12 +13,14 @@ use std::time::UNIX_EPOCH;
 use sha2::{Digest, Sha256};
 
 use super::{Error, HEADER_LEN, Header, Index, Kind, Progress, Region, Resource, Stream, scan};
-use crate::resource::{Layout, Page, PageMap, PageMapError, Pointers, Segment};
+use crate::resource::{Issue, Layout, Page, PageMap, PageMapError, Pointers, Segment, Storage};
 
 const MAGIC: &[u8; 8] = b"LFRPFIDX";
 /// Version 1 indexes did not reconstruct resources. Version 2 indexes were
 /// stamped with a file size and modification time instead of a [`CacheKey`].
-const VERSION: u32 = 3;
+/// Version 4 records the storage and length of every page, including raw
+/// pages, and the reported tail.
+const VERSION: u32 = 4;
 const STREAM_LEN: usize = 8 + 4 + 4 + 1;
 const REGION_LEN: usize = 8 + 8;
 /// A resource record with no pages.
@@ -205,6 +207,34 @@ fn encode_resource(resource: &Resource, out: &mut Vec<u8>) {
             Segment::Graphics => 1,
         });
         out.extend_from_slice(&page.stream_count.to_le_bytes());
+        out.extend_from_slice(&page.len.to_le_bytes());
+        match page.storage {
+            Storage::Streams => {
+                out.push(0);
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+            Storage::Raw { offset } => {
+                out.push(1);
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+    }
+    match layout.tail {
+        Some(Issue::TrailingData { offset, len }) => {
+            out.push(1);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        Some(Issue::UnclassifiableTail { offset, len }) => {
+            out.push(2);
+            out.extend_from_slice(&offset.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        _ => {
+            out.push(0);
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
     }
 }
 
@@ -255,27 +285,66 @@ fn decode_resource(reader: &mut Reader, streams: &[Stream], cut: usize) -> Optio
             _ => return None,
         };
         let stream_count = reader.u32()?;
+        let len = reader.u64()?;
+        let tag = reader.u8()?;
+        let raw_offset = reader.u64()?;
+        let storage = match tag {
+            0 => Storage::Streams,
+            1 => Storage::Raw { offset: raw_offset },
+            _ => return None,
+        };
         let end = next.checked_add(usize::try_from(stream_count).ok()?)?;
-        let claimed = streams.get(next..end).filter(|s| !s.is_empty())?;
-        if next > first && !streams[next - 1].is_followed_by(&claimed[0]) {
-            return None;
-        }
-        if claimed
-            .windows(2)
-            .any(|pair| !pair[0].is_followed_by(&pair[1]))
-            || claimed[usize::from(next == first)..]
-                .iter()
-                .any(|stream| stream.kind.is_file_start())
-        {
-            return None;
+        let claimed = streams.get(next..end)?;
+        match storage {
+            Storage::Streams => {
+                if claimed.is_empty() {
+                    return None;
+                }
+                let claimed_len: u64 = claimed.iter().map(|s| u64::from(s.len)).sum();
+                if claimed_len != len
+                    || next > first && !streams[next - 1].is_followed_by(&claimed[0])
+                {
+                    return None;
+                }
+                if claimed
+                    .windows(2)
+                    .any(|pair| !pair[0].is_followed_by(&pair[1]))
+                    || claimed[usize::from(next == first)..]
+                        .iter()
+                        .any(|stream| stream.kind.is_file_start())
+                {
+                    return None;
+                }
+            }
+            Storage::Raw { offset } => {
+                if stream_count != 0 || offset % super::ALIGN != 0 || len == 0 {
+                    return None;
+                }
+            }
         }
         pages.push(Page {
             segment,
             stream_count,
-            len: claimed.iter().map(|s| u64::from(s.len)).sum(),
+            len,
+            storage,
         });
         next = end;
     }
+    let tail_tag = reader.u8()?;
+    let tail_offset = reader.u64()?;
+    let tail_len = reader.u64()?;
+    let tail = match tail_tag {
+        0 => None,
+        1 => Some(Issue::TrailingData {
+            offset: tail_offset,
+            len: tail_len,
+        }),
+        2 => Some(Issue::UnclassifiableTail {
+            offset: tail_offset,
+            len: tail_len,
+        }),
+        _ => return None,
+    };
     let system = pages
         .iter()
         .take_while(|page| page.segment == Segment::System)
@@ -299,6 +368,7 @@ fn decode_resource(reader: &mut Reader, streams: &[Stream], cut: usize) -> Optio
             pages,
             pointers,
             tag,
+            tail,
         },
     })
 }
@@ -467,7 +537,7 @@ mod tests {
         let key = CacheKey::for_file(&path).unwrap();
         let len = index.archive_len;
         let encoded = encode(&index, &key);
-        assert_eq!(decode(&encoded, &key, len), Some(index));
+        assert_eq!(decode(&encoded, &key, len), Some(index.clone()));
 
         // Indexes from earlier formats are not current.
         for version in [1u32, 2] {
@@ -476,18 +546,28 @@ mod tests {
             assert_eq!(decode(&old, &key, len), None);
         }
 
-        // The last page record: a segment byte and a stream count.
-        let last = encoded.len() - 5;
+        // The last page record: a segment byte, a stream count, a length,
+        // a storage tag and the raw offset.
+        const PAGE_LEN: usize = 1 + 4 + 8 + 1 + 8;
+        let record = prefix(&key)
+            + HEADER_LEN
+            + 8
+            + index.streams.len() * STREAM_LEN
+            + 8
+            + index.regions.len() * REGION_LEN
+            + 8;
+        // The resource header before the pages, and the tail after them.
+        let pages = record + 4 + 1 + 4 + 1 + 1 + 1 + 1 + 16 + 1 + 2;
+        let last = pages + 2 * PAGE_LEN;
         let mut past_end = encoded.clone();
-        past_end[last + 1..].copy_from_slice(&2u32.to_le_bytes());
+        past_end[last + 1..last + 5].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(decode(&past_end, &key, len), None);
         let mut bad_segment = encoded.clone();
         bad_segment[last] = 2;
         assert_eq!(decode(&bad_segment, &key, len), None);
-        // A third system page, although the page map declares one.
+        // A second system page, although the page map declares one.
         let mut too_many = encoded;
-        too_many[last - 5] = 0;
-        too_many[last] = 0;
+        too_many[pages + PAGE_LEN] = 0;
         assert_eq!(decode(&too_many, &key, len), None);
     }
 

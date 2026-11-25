@@ -918,3 +918,106 @@ fn a_zero_trailer_length_leaves_the_whole_file_available() {
     let header = Header::parse(&bytes, 0x400).unwrap();
     assert_eq!(header.payload_end(0x400).unwrap(), 0x400);
 }
+
+#[test]
+fn a_raw_last_page_completes_a_resource() {
+    // Two system pages: the first is exactly one 64 KiB page unit, the
+    // second is stored raw, as in the type 6 terrain rows.
+    let system = system_data(0x1_0000, 0x100, 2, 0);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &[system]);
+    let raw_at = bytes.len().next_multiple_of(ALIGN as usize);
+    bytes.resize(raw_at, 0);
+    let raw = noise(0x600, 11);
+    assert_ne!(raw.last(), Some(&0));
+    bytes.extend_from_slice(&raw);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let index = scan_bytes(bytes.clone());
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(
+        resource.status(),
+        Status::Complete,
+        "{:?}",
+        resource.layout.issues()
+    );
+    assert_eq!(resource.layout.pages.len(), 2);
+    assert_eq!(resource.layout.segment_len(Segment::System), 0x1_0600);
+    assert_eq!(
+        resource.layout.pages[1].storage,
+        crate::resource::Storage::Raw {
+            offset: raw_at as u64
+        }
+    );
+    // The raw page is recovered data, not an unrecovered region.
+    assert_eq!(index.unrecovered_len(), 0);
+    let entry = index.entry_at(offsets[0]).unwrap();
+    assert_eq!(entry.len, 0x1_0600);
+    let out = read(&bytes, &index, entry);
+    assert_eq!(out.len(), 0x1_0600);
+    assert_eq!(&out[0x1_0000..], &raw[..]);
+}
+
+#[test]
+fn an_all_zero_tail_is_not_invented_as_a_page() {
+    let system = system_data(0x1_0000, 0x100, 2, 0);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &[system]);
+    bytes.resize(bytes.len() + 0x600, 0);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 1);
+    assert!(matches!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::UnclassifiableTail { .. })
+    ));
+}
+
+#[test]
+fn a_damaged_stream_is_not_reclassified_as_a_raw_page() {
+    let system = system_data(0x100, 0xC0, 1, 2);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &[system, graphics(0x2_0000, 3)]);
+    // A second graphics stream whose bytes are damaged, but which still
+    // starts with a zlib header.
+    pad(&mut bytes);
+    let damaged_at = bytes.len();
+    let mut damaged = zlib(&graphics(0x800, 4));
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xFF;
+    bytes.extend_from_slice(&damaged);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Partial, "{:?}", resource.layout);
+    assert_eq!(resource.layout.pages.len(), 2);
+    assert_eq!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::DamagedStream {
+            offset: damaged_at as u64
+        })
+    );
+}
+
+#[test]
+fn trailing_bytes_after_all_pages_are_not_a_page() {
+    let system = system_data(0x100, 0xC0, 1, 1);
+    let mut bytes = empty_archive();
+    let offsets = add_resource(&mut bytes, &[system, graphics(0x7000, 5)]);
+    // Extra non-zero bytes after every declared page.
+    let extra_at = bytes.len().next_multiple_of(ALIGN as usize);
+    bytes.resize(extra_at, 0);
+    bytes.extend_from_slice(&noise(0x180, 6));
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_eq!(resource.status(), Status::Complete);
+    assert_eq!(resource.layout.pages.len(), 2);
+    assert!(resource.layout.tail.is_none());
+    assert!(index.unrecovered_len() >= 0x180);
+}
