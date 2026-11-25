@@ -438,7 +438,11 @@ impl Index {
         let resource = &self.resources[ix];
         self.resource_pages(resource)
             .enumerate()
-            .find(|(_, (_, streams))| streams[0].offset == offset)
+            .find(|(_, (_, streams))| {
+                streams
+                    .first()
+                    .is_some_and(|stream| stream.offset == offset)
+            })
             .map(|(position, (page, streams))| (resource, position, page, streams))
     }
 

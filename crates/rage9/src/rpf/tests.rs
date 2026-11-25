@@ -1021,3 +1021,205 @@ fn trailing_bytes_after_all_pages_are_not_a_page() {
     assert!(resource.layout.tail.is_none());
     assert!(index.unrecovered_len() >= 0x180);
 }
+
+/// A one-page system resource, used to push the first stream of the resource
+/// under test away from archive stream index zero.
+fn leading_resource() -> Vec<Vec<u8>> {
+    vec![system_data(0x100, 0xC0, 1, 0)]
+}
+
+/// Two declared system pages, no graphics pages, one compressed page of
+/// exactly one page unit, one stored raw page, and a first stream index that
+/// is not zero. This is the shape the raw/missing-tail classifier used to
+/// index with an archive-global stream index.
+fn raw_continuation_archive(tail: &[u8]) -> (Vec<u8>, u64, u64) {
+    let mut bytes = empty_archive();
+    add_resource(&mut bytes, &leading_resource());
+    let system = system_data(0x1_0000, 0x100, 2, 0);
+    let offsets = add_resource(&mut bytes, &[system]);
+    let raw_at = bytes.len().next_multiple_of(ALIGN as usize);
+    bytes.resize(raw_at, 0);
+    bytes.extend_from_slice(tail);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    (bytes, offsets[0], raw_at as u64)
+}
+
+#[test]
+fn a_raw_continuation_page_after_another_resource_completes() {
+    let raw = noise(0x600, 11);
+    assert_ne!(raw.last(), Some(&0));
+    let (bytes, offset, raw_at) = raw_continuation_archive(&raw);
+    let index = scan_bytes(bytes.clone());
+
+    assert_eq!(index.resources.len(), 2);
+    let resource = index.resource_at(offset).unwrap();
+    // The defect: this resource's first stream is not stream zero.
+    assert_ne!(resource.first_stream, 0);
+    assert_eq!(
+        resource.status(),
+        Status::Complete,
+        "{:?}",
+        resource.layout.issues()
+    );
+    let system: Vec<_> = resource.layout.segment_pages(Segment::System).collect();
+    assert_eq!(system.len(), 2);
+    assert_eq!(system[0].storage, crate::resource::Storage::Streams);
+    assert_eq!(
+        system[1].storage,
+        crate::resource::Storage::Raw { offset: raw_at }
+    );
+    assert_eq!(resource.layout.segment_len(Segment::System), 0x1_0600);
+    assert_eq!(resource.layout.segment_pages(Segment::Graphics).count(), 0);
+    assert!(resource.layout.tail.is_none());
+
+    let entry = index.entry_at(offset).unwrap();
+    assert_eq!(entry.len, 0x1_0600);
+    let out = read(&bytes, &index, entry);
+    assert_eq!(out.len(), 0x1_0600);
+    assert_eq!(&out[0x1_0000..], &raw[..]);
+    assert_eq!(index.unrecovered_len(), 0);
+}
+
+#[test]
+fn a_missing_page_after_another_resource_is_not_invented() {
+    let (bytes, offset, _) = raw_continuation_archive(&[0u8; 0x600]);
+    let index = scan_bytes(bytes.clone());
+
+    let resource = index.resource_at(offset).unwrap();
+    assert_ne!(resource.first_stream, 0);
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 1);
+    assert_eq!(resource.layout.segment_len(Segment::System), 0x1_0000);
+    assert_eq!(resource.layout.segment_pages(Segment::Graphics).count(), 0);
+    assert!(
+        resource
+            .layout
+            .issues()
+            .contains(&crate::resource::Issue::MissingPages {
+                segment: Segment::System,
+                declared: 2,
+                found: 1,
+            })
+    );
+    assert!(matches!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::UnclassifiableTail { .. })
+    ));
+}
+
+#[test]
+fn a_damaged_tail_after_another_resource_is_not_a_page() {
+    // A damaged zlib stream keeps its two-byte header, so the classifier must
+    // report it as damaged rather than adopting its bytes as a raw page.
+    let mut damaged = zlib(&noise(0x800, 4));
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xFF;
+    let (bytes, offset, tail_at) = raw_continuation_archive(&damaged);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offset).unwrap();
+    assert_ne!(resource.first_stream, 0);
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 1);
+    assert_eq!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::DamagedStream { offset: tail_at })
+    );
+}
+
+#[test]
+fn an_oversized_tail_after_another_resource_is_not_a_page() {
+    let (bytes, offset, _) = raw_continuation_archive(&noise(0x2_0000, 5));
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offset).unwrap();
+    assert_ne!(resource.first_stream, 0);
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 1);
+    assert!(matches!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::UnclassifiableTail { .. })
+    ));
+}
+
+#[test]
+fn a_truncated_tail_after_another_resource_is_not_a_page() {
+    // The file ends inside an alignment block, so the stored range has no
+    // established extent and is reported rather than counted as a page.
+    let mut bytes = empty_archive();
+    add_resource(&mut bytes, &leading_resource());
+    let system = system_data(0x1_0000, 0x100, 2, 0);
+    let offsets = add_resource(&mut bytes, &[system]);
+    let raw_at = bytes.len().next_multiple_of(ALIGN as usize);
+    bytes.resize(raw_at, 0);
+    let tail = noise(0x606, 6);
+    bytes.extend_from_slice(&tail);
+    let index = scan_bytes(bytes);
+
+    let resource = index.resource_at(offsets[0]).unwrap();
+    assert_ne!(resource.first_stream, 0);
+    assert_eq!(resource.status(), Status::Partial);
+    assert_eq!(resource.layout.pages.len(), 1);
+    assert_eq!(
+        resource.layout.tail,
+        Some(crate::resource::Issue::UnclassifiableTail {
+            offset: raw_at as u64,
+            len: 0x606,
+        })
+    );
+}
+
+#[test]
+fn several_resources_are_each_reconstructed_from_their_own_streams() {
+    let mut bytes = empty_archive();
+    let first = add_resource(
+        &mut bytes,
+        &[system_data(0x100, 0xC0, 1, 1), graphics(0x2_0000, 7)],
+    );
+    let second = add_resource(&mut bytes, &[system_data(0x200, 0x1C0, 1, 0)]);
+    let third = {
+        let mut system = system_data(0x1_0000, 0x100, 2, 0);
+        put_u64(&mut system, 0x20, 0x6000_0000 + 0x10);
+        add_resource(&mut bytes, &[system])
+    };
+    let raw = noise(0x600, 9);
+    let raw_at = bytes.len().next_multiple_of(ALIGN as usize);
+    bytes.resize(raw_at, 0);
+    bytes.extend_from_slice(&raw);
+    bytes.resize(bytes.len().next_multiple_of(ALIGN as usize), 0);
+    let index = scan_bytes(bytes.clone());
+    let _ = raw_at;
+
+    assert_eq!(index.resources.len(), 3);
+    assert_eq!(
+        index.resource_at(first[0]).unwrap().status(),
+        Status::Complete
+    );
+    assert_eq!(
+        index.resource_at(second[0]).unwrap().status(),
+        Status::Complete
+    );
+    let last = index.resource_at(third[0]).unwrap();
+    assert_eq!(last.status(), Status::Complete);
+    assert_eq!(last.layout.pages.len(), 2);
+    assert_eq!(last.layout.segment_len(Segment::System), 0x1_0600);
+
+    // Each entry carries exactly its own pages.
+    assert_eq!(index.entry_at(first[0]).unwrap().len, 0x2_0100);
+    assert_eq!(index.entry_at(second[0]).unwrap().len, 0x200);
+    assert_eq!(index.entry_at(third[0]).unwrap().len, 0x1_0600);
+    let out = read(&bytes, &index, index.entry_at(third[0]).unwrap());
+    assert_eq!(out.len(), 0x1_0600);
+    assert_eq!(&out[0x1_0000..], &raw[..]);
+
+    // Every reconstructed stream page resolves back to its own resource.
+    for resource in &index.resources {
+        for (_, streams) in index.resource_pages(resource) {
+            let Some(first) = streams.first() else {
+                continue;
+            };
+            let (found, _, _, _) = index.page_at(first.offset).unwrap();
+            assert_eq!(found.offset, resource.offset);
+        }
+    }
+}

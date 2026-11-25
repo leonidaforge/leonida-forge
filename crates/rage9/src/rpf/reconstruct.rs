@@ -231,7 +231,10 @@ fn resolve_one<S: Read + Seek>(
     let mut raw = None;
     let mut tail = None;
     if attributed.is_some_and(|total| pages.len() + 1 == total) {
-        match find_tail(window, run, last, limit)? {
+        // `run` is resource-local; the stream after it comes from the
+        // archive-global list. Both are passed as values, so no index from
+        // one domain can address the other.
+        match find_tail(window, run, streams.get(last + 1), limit)? {
             Tail::None => {}
             Tail::Page(page) => raw = Some(page),
             Tail::TooLong { offset, len } | Tail::AllZero { offset, len } => {
@@ -270,14 +273,16 @@ enum Tail {
 
 /// The range a raw page could occupy: from the aligned end of the last
 /// stream to the next stream or the end of the payload area.
-fn tail_bounds(streams: &[Stream], last: usize, limit: u64) -> Option<(u64, u64)> {
-    let start = streams[last].aligned_end()?;
+///
+/// `last` is the last stream of one resource run and `next` is the following
+/// stream of the archive, if any. Neither is an index, so the two stream
+/// domains cannot be confused.
+fn tail_bounds(last: &Stream, next: Option<&Stream>, limit: u64) -> Option<(u64, u64)> {
+    let start = last.aligned_end()?;
     if start > limit {
         return None;
     }
-    let stop = streams
-        .get(last + 1)
-        .map_or(limit, |next| next.offset.min(limit));
+    let stop = next.map_or(limit, |next| next.offset.min(limit));
     (stop > start).then_some((start, stop))
 }
 
@@ -286,11 +291,14 @@ fn tail_bounds(streams: &[Stream], last: usize, limit: u64) -> Option<(u64, u64)
 /// be zero fill.
 fn find_tail<S: Read + Seek>(
     window: &mut Window<S>,
-    streams: &[Stream],
-    last: usize,
+    run: &[Stream],
+    next: Option<&Stream>,
     limit: u64,
 ) -> Result<Tail, Error> {
-    let Some((start, stop)) = tail_bounds(streams, last, limit) else {
+    let Some(last) = run.last() else {
+        return Ok(Tail::None);
+    };
+    let Some((start, stop)) = tail_bounds(last, next, limit) else {
         return Ok(Tail::None);
     };
     // A range that starts like a zlib stream is a stream that failed to
