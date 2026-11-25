@@ -76,12 +76,12 @@ This is not full native GTA VI RPF9 support.
 
 - Encrypted RPF9 table-of-contents metadata needs a compatible local
   executable. Without one, only recovery by scanning is available.
-- Native entries are labelled by a verified unambiguous name when a local
-  `<archive>.names.txt` or `<archive>.lut` table supplies one, otherwise by
-  the stored key in canonical hexadecimal form. Row numbers remain the entry
-  paths. Only `rpf` to type 0 is a confirmed extension. Many rows remain
-  unresolved, and a hash match is a candidate, not proof of the original
-  developer filename.
+- Native entries are labelled by a verified unambiguous name when the embedded
+  LUTs, a `rpf9-hash64.lut` or `rpf9-key32.lut` beside the executable, or a local
+  `<archive>.names.txt` table supplies one, otherwise by the stored key in
+  canonical hexadecimal form. Row numbers remain the entry paths. Only `rpf` to
+  type 0 is a confirmed extension. Many rows remain unresolved, and a hash match
+  is a candidate, not proof of the original developer filename.
 - Recovered entries have no original names or paths.
 - A recovered entry can be partial or unverified. The UI reports its status,
   and an export keeps that caveat in the result message.

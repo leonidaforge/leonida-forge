@@ -2,7 +2,8 @@
 //! [`match_candidates`] finds the rows that candidate paths from outside the
 //! archive address, following the engine's resolver. [`Resolver`] applies a
 //! local [`StringTable`] to rows and reports unresolved, resolved and
-//! ambiguous results with provenance.
+//! ambiguous results with provenance. [`Builtin`] holds the LUT files the
+//! application carries.
 //!
 //! The engine's extension and type class tables are executable data and are
 //! not included. Only `rpf`, type 0 and its 64-bit class are built in; the
@@ -15,12 +16,14 @@ use std::collections::HashMap;
 
 use super::metadata::{Entry, Error, Metadata};
 
+pub mod builtin;
 pub mod harvest;
 pub mod index;
 pub mod lut;
 pub mod resolve;
 pub mod table;
 
+pub use builtin::Builtin;
 pub use harvest::{
     Limits, Variant, VariantKind, candidate_variants, extract_strings, hash_variant,
 };

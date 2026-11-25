@@ -7,15 +7,17 @@
 //! The table holds hashes of entry names, not names. Each entry keeps its row
 //! number as its stable path, `Row 00042`, and is labelled with a verified
 //! unambiguous resolved name, otherwise the stored key in canonical form.
-//! Original names come from the local table `<archive file>.names.txt`, next
-//! to the file on disk. The table holds candidate paths relative to the
-//! archive, or explicit `hash64:HASH<TAB>name` and `key32:HASH<TAB>name`
-//! mappings. Names are display data only: entry paths stay the row names.
+//! Names come from the LUT files embedded in the application and read beside
+//! the executable, and from the local table `<archive file>.names.txt` next to
+//! the file on disk. That table holds candidate paths relative to the archive,
+//! or explicit `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names
+//! are display data only: entry paths stay the row names.
 
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
@@ -24,8 +26,8 @@ use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, CandidateOutcome, Class, Key, Lut, MountPrefix, Provenance, Resolution, ResolutionSet,
-    Resolver, StringTable, Types,
+    self, Builtin, CandidateOutcome, Class, Key, MountPrefix, Provenance, Resolution,
+    ResolutionSet, Resolver, StringTable, Types, builtin,
 };
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
@@ -34,7 +36,6 @@ use super::{Entry, EntryKind, format_bytes_exact, format_size};
 /// Larger tables of contents are not read.
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
 pub const NAMES_SUFFIX: &str = ".names.txt";
-pub const LUT_SUFFIX: &str = ".lut";
 
 const ROW_NOTE: &str = "Listed from the archive's table of contents. The label is a verified \
      unambiguous name, otherwise the stored key; the row number identifies the entry.";
@@ -88,16 +89,21 @@ impl Authentication {
         }
     }
 }
-/// The local name table and what it resolves to.
+/// The names applied to the rows: the built-in LUTs and what resolves to what.
 struct Names {
-    files: Vec<PathBuf>,
-    stamps: Vec<Option<Stamp>>,
-    /// The file named in messages.
-    primary: PathBuf,
+    /// The local table next to the archive, when there is one.
+    file: Option<PathBuf>,
+    /// Of `file`, to notice changes.
+    stamp: Option<Stamp>,
+    /// The local entries first, then the built-in ones.
     table: StringTable,
-    matches: Option<ResolutionSet>,
-    /// Why the table was not used.
+    /// Entries of `table` that the local file contributed.
+    local: usize,
+    matches: ResolutionSet,
+    /// Why the local file was not used.
     problem: Option<String>,
+    /// The built-in LUTs that were found.
+    builtin: Vec<builtin::Source>,
 }
 
 /// The companion files of `B` sub-block 3, opened for an archive that is a
@@ -203,10 +209,10 @@ fn names_file(archive: &Archive) -> PathBuf {
     archive.root.with_file_name(name)
 }
 
-fn lut_file(archive: &Archive) -> PathBuf {
-    let mut name = archive.root.file_name().unwrap_or_default().to_os_string();
-    name.push(LUT_SUFFIX);
-    archive.root.with_file_name(name)
+/// The built-in name tables, read once.
+fn builtin() -> &'static Builtin {
+    static BUILTIN: OnceLock<Builtin> = OnceLock::new();
+    BUILTIN.get_or_init(Builtin::beside_executable)
 }
 
 /// Rows whose names can be matched: with a location record and well-formed
@@ -217,53 +223,51 @@ fn matchable(row: &Row) -> bool {
 
 impl Names {
     fn read(archive: &Archive, rows: &[Row], types: &Types) -> Option<Self> {
-        let files: Vec<PathBuf> = [names_file(archive), lut_file(archive)]
-            .into_iter()
-            .filter(|file| file.is_file())
-            .collect();
-        if files.is_empty() {
-            return None;
-        }
-        let stamps: Vec<Option<Stamp>> = files.iter().map(|file| file_stamp(file)).collect();
-        let primary = files[0].clone();
-        let unused = |problem: String, table: StringTable| Self {
-            files: files.clone(),
-            stamps: stamps.clone(),
-            primary: primary.clone(),
-            table,
-            matches: None,
-            problem: Some(problem),
-        };
+        Self::read_with(archive, rows, types, builtin())
+    }
+
+    /// Reads the local table of `archive` and resolves the rows with it and
+    /// with `builtin`.
+    fn read_with(
+        archive: &Archive,
+        rows: &[Row],
+        types: &Types,
+        builtin: &Builtin,
+    ) -> Option<Self> {
+        let file = names_file(archive);
+        let file = file.is_file().then_some(file);
         let mut table = StringTable::default();
-        for file in &files {
-            let (bytes, truncated) = match read_name_file(file) {
-                Ok(result) => result,
-                Err(err) => return Some(unused(err.to_string(), StringTable::default())),
-            };
-            if is_lut(&bytes) {
-                if truncated {
-                    return Some(unused(
-                        format!("{} is larger than the LUT size limit", file.display()),
-                        StringTable::default(),
-                    ));
+        let mut problem = None;
+        if let Some(file) = &file {
+            match read_name_file(file) {
+                Ok((bytes, truncated)) => {
+                    if is_lut(&bytes) {
+                        problem = Some(
+                            "a LUT is only read from the built-in tables and from beside the \
+                             executable; the table next to an archive is a .names.txt name table"
+                                .to_string(),
+                        );
+                    } else {
+                        table.merge(StringTable::parse(&bytes, truncated));
+                    }
                 }
-                let lut = match Lut::parse(&bytes) {
-                    Ok(lut) => lut,
-                    Err(err) => return Some(unused(err.to_string(), StringTable::default())),
-                };
-                table.merge_lut(&lut);
-            } else {
-                table.merge(StringTable::parse(&bytes, truncated));
+                Err(err) => problem = Some(err.to_string()),
             }
+        }
+        let local = table.entries().len();
+        table.merge(builtin.table().clone());
+        if table.entries().is_empty() {
+            return None;
         }
         let matches = Resolver::new(&table, types, MountPrefix::EMPTY).resolve(rows);
         Some(Self {
-            files,
-            stamps,
-            primary,
+            stamp: file.as_deref().and_then(file_stamp),
+            file,
             table,
-            matches: Some(matches),
-            problem: None,
+            local,
+            matches,
+            problem,
+            builtin: builtin.sources().to_vec(),
         })
     }
 }
@@ -416,22 +420,15 @@ impl Native {
         }
     }
 
-    /// Whether the name files and the companion files are unchanged since the
-    /// table was read.
+    /// Whether the local name table and the companion files are unchanged
+    /// since the table was read.
     pub fn is_current(&self, archive: &Archive) -> bool {
-        let current: Vec<PathBuf> = [names_file(archive), lut_file(archive)]
-            .into_iter()
-            .filter(|file| file.is_file())
-            .collect();
+        let current = names_file(archive);
+        let current = current.is_file().then_some(current);
         let names_current = match &self.names {
-            None => current.is_empty(),
+            None => current.is_none(),
             Some(names) => {
-                names.files == current
-                    && names
-                        .files
-                        .iter()
-                        .zip(&names.stamps)
-                        .all(|(file, stamp)| file_stamp(file) == *stamp)
+                names.file == current && names.file.as_deref().and_then(file_stamp) == names.stamp
             }
         };
         let records = &self.companions.records;
@@ -481,7 +478,6 @@ impl Native {
         self.names
             .as_ref()?
             .matches
-            .as_ref()?
             .row(row)
             .map(|names| &names.resolution)
     }
@@ -490,11 +486,8 @@ impl Native {
         if !matchable(row) {
             return "Unknown: the row is malformed".to_string();
         }
-        let Some(names) = &self.names else {
+        if self.names.is_none() {
             return "Unknown".to_string();
-        };
-        if names.matches.is_none() {
-            return format!("Unknown: {} was not used", names.primary.display());
         }
         match self.resolution(row.row) {
             Some(Resolution::Resolved(list)) => list
@@ -509,11 +502,8 @@ impl Native {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Some(Resolution::Unresolved) | None if names.table.mappings() == 0 => {
-                "Unknown: no candidate path has this entry's hash".to_string()
-            }
             Some(Resolution::Unresolved) | None => {
-                "Unknown: no name in this entry's table has its hash".to_string()
+                "Unknown: no candidate path or declared name has this entry's hash".to_string()
             }
         }
     }
@@ -784,23 +774,25 @@ impl Native {
                 " {malformed} of them have malformed fields, described with each entry."
             ));
         }
-        let file = self
-            .names
-            .as_ref()
-            .map(|names| names.primary.clone())
-            .unwrap_or_else(|| names_file(archive));
+        let file = names_file(archive);
         let file_name = file.file_name().unwrap_or_default().to_string_lossy();
         match &self.names {
             None => note.push_str(&format!(
                 " Original names are unknown. Candidate paths relative to the archive, one per \
                  line, can be listed in {file_name} next to the archive file."
             )),
-            Some(Names {
-                problem: Some(problem),
-                ..
-            }) => note.push_str(&format!(" {file_name} was not used: {problem}.")),
             Some(names) => {
-                let resolved = names.matches.as_ref()?;
+                if let Some(problem) = &names.problem {
+                    note.push_str(&format!(" {file_name} was not used: {problem}."));
+                }
+                for source in names.builtin.iter().filter(|s| s.problem.is_some()) {
+                    note.push_str(&format!(
+                        " The built-in {} could not be used: {}.",
+                        source.file,
+                        source.problem.as_deref().unwrap_or_default()
+                    ));
+                }
+                let resolved = &names.matches;
                 let named = resolved
                     .rows
                     .iter()
@@ -820,17 +812,29 @@ impl Native {
                     })
                     .count();
                 let paths = names.table.candidates();
-                let mappings = names.table.mappings();
-                let source = match (paths, mappings) {
-                    (paths, 0) => format!("{paths} candidate paths"),
-                    (0, mappings) => format!("{mappings} name mappings"),
-                    (paths, mappings) => {
-                        format!("{paths} candidate paths and {mappings} name mappings")
-                    }
-                };
+                let mappings = names.local - paths;
+                let builtin = names
+                    .builtin
+                    .iter()
+                    .map(|source| source.added)
+                    .sum::<usize>();
+                let mut sentence = format!(" {named} of {total} entries are named");
+                if paths > 0 || mappings > 0 {
+                    let source = match (paths, mappings) {
+                        (paths, 0) => format!("{paths} candidate paths"),
+                        (0, mappings) => format!("{mappings} name mappings"),
+                        (paths, mappings) => {
+                            format!("{paths} candidate paths and {mappings} name mappings")
+                        }
+                    };
+                    sentence.push_str(&format!(" by the {source} in {file_name}"));
+                    sentence.push_str(&format!(" and by {builtin} built-in name mappings"));
+                } else {
+                    sentence.push_str(&format!(" by {builtin} built-in name mappings"));
+                }
+                note.push_str(&sentence);
                 note.push_str(&format!(
-                    " {named} of {total} entries are named by the {source} in {file_name}; \
-                     {ambiguous} ambiguously. {unresolved} candidates could not be resolved, for \
+                    "; {ambiguous} ambiguously. {unresolved} candidates could not be resolved, for \
                      example because no type is known for their extension."
                 ));
                 if mappings > 0 {
@@ -838,7 +842,9 @@ impl Native {
                         .candidates
                         .iter()
                         .filter(|candidate| {
-                            candidate.provenance == Provenance::UserMapping && candidate.verified
+                            candidate.index < names.local
+                                && candidate.provenance == Provenance::UserMapping
+                                && candidate.verified
                         })
                         .count();
                     let unconfirmed = mappings - verified;

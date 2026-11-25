@@ -32,11 +32,12 @@ pushed.
 - Read a processed table of contents after authenticating it against a local
   game executable selected in the explorer. Native rows keep their row number
   and name hash, and are never merged with recovered entries.
-- Show a native row's name from a local `<archive>.names.txt` or
-  `<archive>.lut` table next to the archive. A name is marked verified only
-  when hashing reproduces the stored key. Unresolved and ambiguous rows use the
-  stored key in canonical hexadecimal form as the visible label. Names are
-  display data; the row number and stored hash remain authoritative.
+- Show a native row's name from the embedded LUTs, from a `rpf9-hash64.lut` or
+  `rpf9-key32.lut` beside the executable, or from a `<archive>.names.txt` table
+  next to the archive. A name is marked verified only when hashing reproduces
+  the stored key. Unresolved and ambiguous rows use the stored key in canonical
+  hexadecimal form as the visible label. Names are display data; the row number
+  and stored hash remain authoritative.
 - Index native hashes, harvest candidate strings from readable payloads and the
   local executable, and export validated LUT files with `lforge names`.
 - Inspect any file as bytes in the Binary Inspector, including files inside
@@ -271,9 +272,9 @@ C++ Redistributable installed.
    native rows. Place a `<archive>.names.txt` with a known candidate path next
    to the archive, reopen it, and confirm the name appears while the row label
    and stored hash stay. Remove the file and confirm the names return to
-   unknown. Copy an archive and a LUT to a temporary folder, name the LUT
-   `<archive>.lut`, and confirm the resolved name becomes the entry label while
-   `Row NNNNN` remains its path.
+   unknown. Then copy `rpf9-hash64.lut` beside the executable, reopen the
+   archive, and confirm its resolved names become entry labels while
+   `Row NNNNN` remains each path.
 8. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
 9. Open a plain file and an entry inside an archive in the Binary Inspector.

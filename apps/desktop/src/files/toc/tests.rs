@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 use lforge_rage9::rpf::Progress;
 use lforge_rage9::rpf::metadata::keys;
-use lforge_rage9::rpf::names::{NO_TYPE, RPF_TYPE, hash64, joaat};
+use lforge_rage9::rpf::names::{Builtin, NO_TYPE, RPF_TYPE, hash64, joaat};
 
 use super::*;
 use crate::files;
@@ -282,7 +282,10 @@ fn lists_entries_from_the_table_of_contents() {
     assert_eq!(entries[0].type_name, "RPF9 entry, type 0 (rpf)");
     assert_eq!(entries[1].type_name, "RPF9 entry, type 5");
     assert_eq!(entries[1].size, Some(raw.len() as u64));
-    assert_eq!(detail(&entries[1], "Names"), "Unknown");
+    assert_eq!(
+        detail(&entries[1], "Names"),
+        "Unknown: no candidate path or declared name has this entry's hash"
+    );
     assert_eq!(
         detail(&entries[1], "Name hash"),
         format!("0x{:016X}", hash64(b"data"))
@@ -305,7 +308,7 @@ fn lists_entries_from_the_table_of_contents() {
     assert!(note.contains("table of contents"), "{note}");
     assert!(note.contains("5 entries"), "{note}");
     assert!(note.contains("2 of them have malformed fields"), "{note}");
-    assert!(note.contains("native.rpf.names.txt"), "{note}");
+    assert!(note.contains("built-in name mappings"), "{note}");
 
     // Raw entries read and open in the Binary Inspector.
     assert_eq!(files::read(&entries[1].path).unwrap(), raw);
@@ -402,7 +405,7 @@ fn names_come_from_candidate_paths() {
     assert!(detail(&entries[1], "Names").starts_with("Ambiguous: readme, \"readme\"x"));
     assert_eq!(
         detail(&entries[2], "Names"),
-        "Unknown: no candidate path has this entry's hash"
+        "Unknown: no candidate path or declared name has this entry's hash"
     );
     let note = files::describe(&path).unwrap();
     assert!(
@@ -421,11 +424,14 @@ fn names_come_from_candidate_paths() {
     assert_eq!(detail(&entries[2], "Names"), "other.rpf");
     assert!(detail(&entries[0], "Names").starts_with("Unknown"));
     fs::remove_file(&candidates).unwrap();
-    assert_eq!(detail(&files::list(&path).unwrap()[2], "Names"), "Unknown");
+    assert_eq!(
+        detail(&files::list(&path).unwrap()[2], "Names"),
+        "Unknown: no candidate path or declared name has this entry's hash"
+    );
 }
 
 #[test]
-fn names_load_from_a_lut_sidecar() {
+fn names_come_from_a_lut_beside_the_executable() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("lut.rpf");
     let item = hash64(b"props/item");
@@ -444,30 +450,57 @@ fn names_load_from_a_lut_sidecar() {
         ]),
     )
     .unwrap();
-    let lut = temp.path().join("lut.rpf.lut");
+    let directory = temp.path().join("bin");
+    fs::create_dir(&directory).unwrap();
     fs::write(
-        &lut,
+        directory.join("rpf9-hash64.lut"),
         format!("# leonida-forge-lut: 1\n# namespace: hash64\n\n0x{item:016X}\tProps/Item.ydr\n"),
     )
     .unwrap();
-    fs::write(temp.path().join("lut.rpf.names.txt"), "other.rpf\n").unwrap();
 
-    let entries = files::list(&path).unwrap();
-    assert_eq!(names_of(&entries), ["Props/Item.ydr", "other.rpf"]);
+    let archive = opened(&path);
+    let builtin = Builtin::load(Some(&directory));
+    let mut native = Native::read(&archive).unwrap();
+    native.names = Names::read_with(&archive, &native.rows, &native.types, &builtin);
+    let entries = native.list(&archive, Path::new("")).unwrap();
+    let labels: Vec<String> = entries.iter().map(|entry| entry.name.clone()).collect();
+    assert_eq!(
+        labels,
+        ["Props/Item.ydr".to_string(), format!("0x{other:016X}.rpf")]
+    );
     assert_eq!(
         detail(&entries[0], "Name source"),
         "User mapping, verified by hash"
     );
     assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+}
 
-    // A changed LUT invalidates the listing.
+#[test]
+fn lut_content_next_to_the_archive_is_not_used() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("lut.rpf");
+    let item = hash64(b"props/item");
     fs::write(
-        &lut,
-        format!("# leonida-forge-lut: 1\n# namespace: hash64\n\n0x{item:016X}\tRenamed.ydr\n"),
+        &path,
+        native_rpf(&[Spec {
+            hash: Some(item),
+            ..spec(&[1; 16], RPF_TYPE)
+        }]),
     )
     .unwrap();
+    let lut =
+        format!("# leonida-forge-lut: 1\n# namespace: hash64\n\n0x{item:016X}\tProps/Item.ydr\n");
+    // A `.lut` beside an archive is not read at all.
+    fs::write(temp.path().join("lut.rpf.lut"), &lut).unwrap();
+    // LUT content in the name table is refused with a reason.
+    fs::write(temp.path().join("lut.rpf.names.txt"), &lut).unwrap();
+
     let entries = files::list(&path).unwrap();
-    assert_eq!(names_of(&entries), ["Renamed.ydr", "other.rpf"]);
+    assert_eq!(entries[0].name, format!("0x{item:016X}.rpf"));
+    let note = files::describe(&path).unwrap();
+    assert!(note.contains("lut.rpf.names.txt was not used"), "{note}");
+    assert!(note.contains("a LUT is only read from"), "{note}");
+    assert!(note.contains("built-in name mappings"), "{note}");
 }
 
 #[test]

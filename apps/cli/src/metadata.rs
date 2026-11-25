@@ -13,8 +13,8 @@ use lforge_rage9::rpf::metadata::{
     CompanionStatus, Entry, Error, Field, Layout, Metadata, Prefix, Processing, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, CandidateOutcome, Class, Lut, MountPrefix, Namespace, Provenance, Resolver, RowNames,
-    StringTable, Types,
+    self, Builtin, CandidateOutcome, Class, Lut, MountPrefix, Namespace, Provenance, Resolver,
+    RowNames, StringTable, Types,
 };
 use serde_json::{Value, json};
 
@@ -66,11 +66,15 @@ pub fn parse_extension(text: &str) -> Result<Extension, String> {
     })
 }
 
-/// The local name table and the address rules it is applied under.
+/// The name tables and the address rules they are applied under.
 struct Naming {
     sources: Vec<NameSource>,
     sidecar: bool,
+    /// The entries of `sources` first, then the built-in ones.
     table: StringTable,
+    /// Entries of `table` that `sources` contributed.
+    local: usize,
+    builtin: Builtin,
     prefix: MountPrefix,
     types: Types,
 }
@@ -85,7 +89,7 @@ struct NameSource {
 }
 
 impl Naming {
-    fn read(options: &Options, archive: &Path) -> Result<Option<Self>, String> {
+    fn read(options: &Options, archive: &Path) -> Result<Self, String> {
         let (paths, sidecar) = if options.candidates.is_empty() {
             let path = sidecar_path(archive);
             if path.is_file() {
@@ -101,7 +105,7 @@ impl Naming {
                         path.display()
                     ));
                 }
-                return Ok(None);
+                (Vec::new(), false)
             }
         } else {
             (options.candidates.clone(), false)
@@ -111,6 +115,14 @@ impl Naming {
         for path in paths {
             let (bytes, truncated) = read_bounded(&path)?;
             if is_lut(&bytes) {
+                if sidecar {
+                    return Err(format!(
+                        "{} is a LUT; a LUT is only read from the built-in tables and from \
+                         beside the executable, and the table next to an archive is a .names.txt \
+                         name table",
+                        path.display()
+                    ));
+                }
                 if truncated {
                     return Err(format!(
                         "{} is larger than the LUT size limit",
@@ -144,6 +156,9 @@ impl Naming {
                 });
             }
         }
+        let local = table.entries().len();
+        let builtin = Builtin::beside_executable();
+        table.merge(builtin.table().clone());
         let prefix = match (&options.mount_prefix, &options.archive_path) {
             (Some(mount), _) => MountPrefix::mounted(mount.as_bytes()).ok_or_else(|| {
                 format!(
@@ -162,13 +177,15 @@ impl Naming {
                 types.insert_class(extension.type_id, class);
             }
         }
-        Ok(Some(Self {
+        Ok(Self {
             sources,
             sidecar,
             table,
+            local,
+            builtin,
             prefix,
             types,
-        }))
+        })
     }
 }
 
@@ -203,7 +220,7 @@ pub fn run(path: &Path, options: &Options) -> Result<(), String> {
     let mut source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
     rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
-    let report = report(path, options, naming.as_ref());
+    let report = report(path, options, &naming);
     let out = io::stdout().lock();
     let mut out = BufWriter::new(out);
     let result = if options.json {
@@ -367,7 +384,6 @@ fn entry_json(
     source: &Source,
     alternates: &[Option<Source>],
     names: &RowNames,
-    show_names: bool,
 ) -> Value {
     let location = &entry.location;
     let mut value = json!({
@@ -394,15 +410,13 @@ fn entry_json(
         "contents": contents_json(entry, source, alternates),
     });
     value["name_resolution"] = resolution_json(names);
-    if show_names {
-        value["names"] = names
-            .resolution
-            .names()
-            .iter()
-            .map(|name| json!(name.text))
-            .collect();
-        value["ambiguous"] = json!(names.resolution.is_ambiguous());
-    }
+    value["names"] = names
+        .resolution
+        .names()
+        .iter()
+        .map(|name| json!(name.text))
+        .collect();
+    value["ambiguous"] = json!(names.resolution.is_ambiguous());
     value
 }
 
@@ -441,7 +455,7 @@ fn resolution_json(row: &RowNames) -> Value {
     })
 }
 
-fn report(path: &Path, options: &Options, naming: Option<&Naming>) -> Value {
+fn report(path: &Path, options: &Options, naming: &Naming) -> Value {
     let unreadable = |reason: String| {
         json!({
             "format": "RPF9",
@@ -562,7 +576,7 @@ fn entries_json(
     source: &Source,
     alternates: &Alternates,
     options: &Options,
-    naming: Option<&Naming>,
+    naming: &Naming,
 ) -> Value {
     let entries: Vec<Entry> = metadata.entries().collect();
     let mut value = json!({
@@ -573,73 +587,83 @@ fn entries_json(
     if let Some(companions) = companions_json(alternates) {
         value["companions"] = companions;
     }
-    let empty_table = StringTable::default();
-    let default_types = Types::default();
-    let (table, types, prefix) = match naming {
-        Some(naming) => (&naming.table, &naming.types, naming.prefix),
-        None => (&empty_table, &default_types, MountPrefix::EMPTY),
-    };
-    let resolved = Resolver::new(table, types, prefix).resolve(&entries);
-    if let Some(naming) = naming {
-        let count = |provenance: Provenance, outcome: fn(&CandidateOutcome) -> bool| {
-            resolved
-                .candidates
-                .iter()
-                .filter(|candidate| {
-                    candidate.provenance == provenance && outcome(&candidate.outcome)
-                })
-                .count()
-        };
-        let unresolved = count(Provenance::CandidatePath, |outcome| {
-            matches!(outcome, CandidateOutcome::Unresolved(_))
-        });
-        let unmatched = count(Provenance::CandidatePath, |outcome| {
-            matches!(outcome, CandidateOutcome::NoRow)
-        });
-        let verified = resolved
+    let resolved = Resolver::new(&naming.table, &naming.types, naming.prefix).resolve(&entries);
+    let count = |provenance: Provenance, outcome: fn(&CandidateOutcome) -> bool| {
+        resolved
             .candidates
             .iter()
-            .filter(|candidate| {
-                candidate.provenance == Provenance::UserMapping && candidate.verified
-            })
-            .count();
-        let named = resolved
-            .rows
+            .filter(|candidate| candidate.provenance == provenance && outcome(&candidate.outcome))
+            .count()
+    };
+    let unresolved = count(Provenance::CandidatePath, |outcome| {
+        matches!(outcome, CandidateOutcome::Unresolved(_))
+    });
+    let unmatched = count(Provenance::CandidatePath, |outcome| {
+        matches!(outcome, CandidateOutcome::NoRow)
+    });
+    let verified = resolved
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.index < naming.local
+                && candidate.provenance == Provenance::UserMapping
+                && candidate.verified
+        })
+        .count();
+    let named = resolved
+        .rows
+        .iter()
+        .filter(|row| !row.resolution.names().is_empty())
+        .count();
+    let candidates = naming.table.candidates();
+    let mappings = naming.local - candidates;
+    value["names"] = json!({
+        "source": naming.sources.first().map(|source| source.path.to_string_lossy().into_owned()).unwrap_or_default(),
+        "sources": naming
+            .sources
             .iter()
-            .filter(|row| !row.resolution.names().is_empty())
-            .count();
-        value["names"] = json!({
-            "source": naming.sources.first().map(|source| source.path.to_string_lossy().into_owned()).unwrap_or_default(),
+            .map(|source| json!({
+                "path": source.path.to_string_lossy(),
+                "kind": source.kind,
+                "namespace": source.namespace,
+                "entries": source.entries,
+                "verified": source.verified,
+                "added": source.added,
+            }))
+            .collect::<Vec<_>>(),
+        "sidecar": naming.sidecar,
+        "entries": naming.local,
+        "candidates": candidates,
+        "mappings": mappings,
+        "unresolved_candidates": unresolved,
+        "unmatched_candidates": unmatched,
+        "named_rows": named,
+        "resolved_rows": resolved.rows.iter().filter(|row| row.resolution.is_resolved()).count(),
+        "ambiguous_rows": resolved.rows.iter().filter(|row| row.resolution.is_ambiguous()).count(),
+        "unresolved_rows": resolved.rows.len() - named,
+        "verified_mappings": verified,
+        "unconfirmed_mappings": mappings - verified,
+        "skipped_lines": naming.table.skipped(),
+        "duplicate_lines": naming.table.duplicates(),
+        "truncated": naming.table.truncated(),
+        "unusable_rows": resolved.unusable_rows,
+        "builtin": {
+            "entries": naming.builtin.table().entries().len(),
             "sources": naming
-                .sources
+                .builtin
+                .sources()
                 .iter()
                 .map(|source| json!({
-                    "path": source.path.to_string_lossy(),
-                    "kind": source.kind,
-                    "namespace": source.namespace,
+                    "file": source.file,
+                    "path": source.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
                     "entries": source.entries,
                     "verified": source.verified,
                     "added": source.added,
+                    "problem": source.problem,
                 }))
                 .collect::<Vec<_>>(),
-            "sidecar": naming.sidecar,
-            "entries": naming.table.entries().len(),
-            "candidates": naming.table.candidates(),
-            "mappings": naming.table.mappings(),
-            "unresolved_candidates": unresolved,
-            "unmatched_candidates": unmatched,
-            "named_rows": named,
-            "resolved_rows": resolved.rows.iter().filter(|row| row.resolution.is_resolved()).count(),
-            "ambiguous_rows": resolved.rows.iter().filter(|row| row.resolution.is_ambiguous()).count(),
-            "unresolved_rows": resolved.rows.len() - named,
-            "verified_mappings": verified,
-            "unconfirmed_mappings": naming.table.mappings() - verified,
-            "skipped_lines": naming.table.skipped(),
-            "duplicate_lines": naming.table.duplicates(),
-            "truncated": naming.table.truncated(),
-            "unusable_rows": resolved.unusable_rows,
-        });
-    }
+        },
+    });
     if options.entries {
         value["listed"] = entries
             .iter()
@@ -651,7 +675,6 @@ fn entries_json(
                     source,
                     alternates.sources(),
                     &resolved.rows[position],
-                    naming.is_some(),
                 )
             })
             .collect();
@@ -767,7 +790,8 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
             None => writeln!(
                 out,
                 "names:       {} of {} candidates unresolved, {} rows named, {} ambiguous \
-                 ({} resolved, {} unresolved), {} unverified mappings, {} skipped lines",
+                 ({} resolved, {} unresolved), {} unverified mappings, {} built-in mappings, \
+                 {} skipped lines",
                 names["unresolved_candidates"],
                 names["candidates"],
                 names["named_rows"],
@@ -775,6 +799,7 @@ fn write_text(report: &Value, out: &mut impl Write) -> io::Result<()> {
                 names["resolved_rows"],
                 names["unresolved_rows"],
                 names["unconfirmed_mappings"],
+                names["builtin"]["entries"],
                 names["skipped_lines"]
             )?,
         }

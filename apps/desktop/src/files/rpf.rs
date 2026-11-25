@@ -1406,20 +1406,16 @@ pub(crate) mod tests {
         assert!(detail(row, "Contents").is_some());
     }
 
-    /// Opens a copy of a local archive with a LUT sidecar, read-only. Set
-    /// `LEONIDA_FORGE_EXECUTABLE`, `LEONIDA_FORGE_ARCHIVE` and
-    /// `LEONIDA_FORGE_LUT`.
+    /// Opens a copy of a local archive with the built-in name tables, read-only.
+    /// Set `LEONIDA_FORGE_EXECUTABLE` and `LEONIDA_FORGE_ARCHIVE`.
     #[test]
-    #[ignore = "set the three environment variables to local files to run"]
+    #[ignore = "set the two environment variables to local files to run"]
     fn local_lut_labels_smoke_test() {
         let Some(executable) = std::env::var_os("LEONIDA_FORGE_EXECUTABLE") else {
             panic!("set LEONIDA_FORGE_EXECUTABLE to a local executable");
         };
         let Some(archive) = std::env::var_os("LEONIDA_FORGE_ARCHIVE") else {
             panic!("set LEONIDA_FORGE_ARCHIVE to a local archive");
-        };
-        let Some(lut) = std::env::var_os("LEONIDA_FORGE_LUT") else {
-            panic!("set LEONIDA_FORGE_LUT to a local LUT");
         };
         let executable = Arc::new(Executable::open(Path::new(&executable)).unwrap());
         let access = Access::with(executable);
@@ -1428,9 +1424,6 @@ pub(crate) mod tests {
         let name = source.file_name().unwrap();
         let archive = temp.path().join(name);
         std::fs::copy(&source, &archive).unwrap();
-        let mut sidecar = name.to_os_string();
-        sidecar.push(".lut");
-        std::fs::copy(PathBuf::from(lut), temp.path().join(sidecar)).unwrap();
 
         prepare_with(&archive, &access, false).unwrap();
         let rows = files::list_with(&archive, &access).unwrap();
@@ -1438,7 +1431,7 @@ pub(crate) mod tests {
             .iter()
             .filter(|row| detail(row, "Names").is_some_and(|text| !text.starts_with("Unknown")))
             .count();
-        assert!(named > 0, "the LUT resolved no names");
+        assert!(named > 0, "the built-in tables resolved no names");
         assert!(
             rows.iter()
                 .any(|row| !row.name.starts_with("0x") && !row.name.starts_with("Row "))

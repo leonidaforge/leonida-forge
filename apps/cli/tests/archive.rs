@@ -405,7 +405,13 @@ fn metadata_lists_decoded_entries_with_names() {
         temp.path(),
     ));
     assert_eq!(limited["entries"]["listed"].as_array().unwrap().len(), 1);
-    assert_eq!(limited["entries"]["names"], Value::Null);
+    assert_eq!(limited["entries"]["names"]["entries"], 0);
+    assert!(
+        limited["entries"]["names"]["builtin"]["entries"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     let text = lforge(
         &["archive", "metadata", archive, "--entries", "--limit", "1"],
         temp.path(),
@@ -534,12 +540,16 @@ fn metadata_reports_declared_and_unconfirmed_name_mappings() {
     assert_eq!(candidate["verified"], false);
     assert_eq!(candidate["provenance"], "user_mapping");
 
-    // Without a table the key namespace is still reported, and no name is.
+    // Without a local table only the built-in mappings apply, and none of them
+    // has this key.
     let report = json(&lforge(
         &["archive", "metadata", archive_text, "--entries", "--json"],
         temp.path(),
     ));
-    assert_eq!(report["entries"]["names"], Value::Null);
+    let names = &report["entries"]["names"];
+    assert_eq!(names["entries"], 0);
+    assert_eq!(names["mappings"], 0);
+    assert!(names["builtin"]["entries"].as_u64().unwrap() > 0);
     let resolution = &report["entries"]["listed"][0]["name_resolution"];
     assert_eq!(resolution["status"], "unresolved");
     assert_eq!(resolution["namespace"], "hash64");

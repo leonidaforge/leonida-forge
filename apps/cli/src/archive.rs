@@ -71,7 +71,9 @@ pub enum Command {
         limit: usize,
         /// A local name table: candidate paths, `hash64:HASH<TAB>name` and
         /// `key32:HASH<TAB>name` mappings, or a `.lut` file. Repeatable.
-        /// Defaults to `<archive>.names.txt` next to the archive when it exists
+        /// Defaults to `<archive>.names.txt` next to the archive when it exists.
+        /// The built-in LUTs are always applied, and a `rpf9-hash64.lut` or
+        /// `rpf9-key32.lut` beside the executable is read as well
         #[arg(long = "name-file", visible_alias = "candidates")]
         candidates: Vec<PathBuf>,
         /// The archive's own path, whose directory is the mount prefix
