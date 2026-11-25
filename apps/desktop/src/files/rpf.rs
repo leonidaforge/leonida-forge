@@ -1398,12 +1398,51 @@ pub(crate) mod tests {
         .unwrap();
         let rows = files::list(&path).unwrap();
         let row = &rows[0];
-        assert_eq!(row.name, "Row 00000");
         let hash = format!("0x{:016X}", lforge_rage9::rpf::names::hash64(b"data"));
+        assert_eq!(row.name, hash.as_str());
         assert_eq!(detail(row, "Name hash"), Some(hash.as_str()));
         assert_eq!(detail(row, "Type ID"), Some("11 (meaning not established)"));
         assert!(detail(row, "Metadata").unwrap().starts_with("Unencrypted"));
         assert!(detail(row, "Contents").is_some());
+    }
+
+    /// Opens a copy of a local archive with a LUT sidecar, read-only. Set
+    /// `LEONIDA_FORGE_EXECUTABLE`, `LEONIDA_FORGE_ARCHIVE` and
+    /// `LEONIDA_FORGE_LUT`.
+    #[test]
+    #[ignore = "set the three environment variables to local files to run"]
+    fn local_lut_labels_smoke_test() {
+        let Some(executable) = std::env::var_os("LEONIDA_FORGE_EXECUTABLE") else {
+            panic!("set LEONIDA_FORGE_EXECUTABLE to a local executable");
+        };
+        let Some(archive) = std::env::var_os("LEONIDA_FORGE_ARCHIVE") else {
+            panic!("set LEONIDA_FORGE_ARCHIVE to a local archive");
+        };
+        let Some(lut) = std::env::var_os("LEONIDA_FORGE_LUT") else {
+            panic!("set LEONIDA_FORGE_LUT to a local LUT");
+        };
+        let executable = Arc::new(Executable::open(Path::new(&executable)).unwrap());
+        let access = Access::with(executable);
+        let temp = tempfile::tempdir().unwrap();
+        let source = PathBuf::from(archive);
+        let name = source.file_name().unwrap();
+        let archive = temp.path().join(name);
+        std::fs::copy(&source, &archive).unwrap();
+        let mut sidecar = name.to_os_string();
+        sidecar.push(".lut");
+        std::fs::copy(PathBuf::from(lut), temp.path().join(sidecar)).unwrap();
+
+        prepare_with(&archive, &access, false).unwrap();
+        let rows = files::list_with(&archive, &access).unwrap();
+        let named = rows
+            .iter()
+            .filter(|row| detail(row, "Names").is_some_and(|text| !text.starts_with("Unknown")))
+            .count();
+        assert!(named > 0, "the LUT resolved no names");
+        assert!(
+            rows.iter()
+                .any(|row| !row.name.starts_with("0x") && !row.name.starts_with("Row "))
+        );
     }
 
     /// Reads a real archive through the desktop layer, read-only. Set the

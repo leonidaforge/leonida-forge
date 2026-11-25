@@ -4,15 +4,16 @@
 //! engine processes first is used only after it authenticated against a local
 //! executable (see [`super::rpf`]), or recovered by scanning instead.
 //!
-//! The table holds hashes of entry names, not names. Each entry is a file
-//! named after its row, `Row 00042`, which identifies it within the archive.
-//! Original names are shown only where a name from the local table
-//! `<archive file>.names.txt`, next to the file on disk, has the entry's
-//! hash. The table holds candidate paths relative to the archive, or explicit
-//! `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names are display
-//! data only: entry paths stay the row names.
+//! The table holds hashes of entry names, not names. Each entry keeps its row
+//! number as its stable path, `Row 00042`, and is labelled with a verified
+//! unambiguous resolved name, otherwise the stored key in canonical form.
+//! Original names come from the local table `<archive file>.names.txt`, next
+//! to the file on disk. The table holds candidate paths relative to the
+//! archive, or explicit `hash64:HASH<TAB>name` and `key32:HASH<TAB>name`
+//! mappings. Names are display data only: entry paths stay the row names.
 
-use std::io::{self, Write};
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,8 +24,8 @@ use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, CandidateOutcome, MountPrefix, Provenance, Resolution, ResolutionSet, Resolver,
-    StringTable, Types,
+    self, CandidateOutcome, Class, Key, Lut, MountPrefix, Provenance, Resolution, ResolutionSet,
+    Resolver, StringTable, Types,
 };
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
@@ -33,9 +34,10 @@ use super::{Entry, EntryKind, format_bytes_exact, format_size};
 /// Larger tables of contents are not read.
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
 pub const NAMES_SUFFIX: &str = ".names.txt";
+pub const LUT_SUFFIX: &str = ".lut";
 
-const ROW_NOTE: &str = "Listed from the archive's table of contents. The name is the row \
-     number: the table stores a hash of the original name, not the name.";
+const ROW_NOTE: &str = "Listed from the archive's table of contents. The label is a verified \
+     unambiguous name, otherwise the stored key; the row number identifies the entry.";
 
 /// Why the stored table of contents cannot be read as it is.
 #[derive(Debug, Clone)]
@@ -88,11 +90,13 @@ impl Authentication {
 }
 /// The local name table and what it resolves to.
 struct Names {
-    file: PathBuf,
-    stamp: Stamp,
+    files: Vec<PathBuf>,
+    stamps: Vec<Option<Stamp>>,
+    /// The file named in messages.
+    primary: PathBuf,
     table: StringTable,
     matches: Option<ResolutionSet>,
-    /// Why the file was not used.
+    /// Why the table was not used.
     problem: Option<String>,
 }
 
@@ -190,11 +194,18 @@ pub struct Native {
     names: Option<Names>,
     companions: Companions,
     authentication: Authentication,
+    types: Types,
 }
 
 fn names_file(archive: &Archive) -> PathBuf {
     let mut name = archive.root.file_name().unwrap_or_default().to_os_string();
     name.push(NAMES_SUFFIX);
+    archive.root.with_file_name(name)
+}
+
+fn lut_file(archive: &Archive) -> PathBuf {
+    let mut name = archive.root.file_name().unwrap_or_default().to_os_string();
+    name.push(LUT_SUFFIX);
     archive.root.with_file_name(name)
 }
 
@@ -205,34 +216,76 @@ fn matchable(row: &Row) -> bool {
 }
 
 impl Names {
-    fn read(file: PathBuf, rows: &[Row]) -> Option<Self> {
-        let stamp = file_stamp(&file)?;
+    fn read(archive: &Archive, rows: &[Row], types: &Types) -> Option<Self> {
+        let files: Vec<PathBuf> = [names_file(archive), lut_file(archive)]
+            .into_iter()
+            .filter(|file| file.is_file())
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        let stamps: Vec<Option<Stamp>> = files.iter().map(|file| file_stamp(file)).collect();
+        let primary = files[0].clone();
         let unused = |problem: String, table: StringTable| Self {
-            file: file.clone(),
-            stamp,
+            files: files.clone(),
+            stamps: stamps.clone(),
+            primary: primary.clone(),
             table,
             matches: None,
             problem: Some(problem),
         };
-        if stamp.0 > names::table::MAX_BYTES {
-            return Some(unused(
-                format!("it is larger than {}", format_size(names::table::MAX_BYTES)),
-                StringTable::default(),
-            ));
+        let mut table = StringTable::default();
+        for file in &files {
+            let (bytes, truncated) = match read_name_file(file) {
+                Ok(result) => result,
+                Err(err) => return Some(unused(err.to_string(), StringTable::default())),
+            };
+            if is_lut(&bytes) {
+                if truncated {
+                    return Some(unused(
+                        format!("{} is larger than the LUT size limit", file.display()),
+                        StringTable::default(),
+                    ));
+                }
+                let lut = match Lut::parse(&bytes) {
+                    Ok(lut) => lut,
+                    Err(err) => return Some(unused(err.to_string(), StringTable::default())),
+                };
+                table.merge_lut(&lut);
+            } else {
+                table.merge(StringTable::parse(&bytes, truncated));
+            }
         }
-        let table = match StringTable::read(&file) {
-            Ok(table) => table,
-            Err(err) => return Some(unused(err.to_string(), StringTable::default())),
-        };
-        let matches = Resolver::new(&table, &Types::default(), MountPrefix::EMPTY).resolve(rows);
+        let matches = Resolver::new(&table, types, MountPrefix::EMPTY).resolve(rows);
         Some(Self {
-            file,
-            stamp,
+            files,
+            stamps,
+            primary,
             table,
             matches: Some(matches),
             problem: None,
         })
     }
+}
+
+fn read_name_file(path: &Path) -> io::Result<(Vec<u8>, bool)> {
+    let limit = names::table::MAX_BYTES.max(names::lut::MAX_BYTES);
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() as u64 > limit;
+    if truncated {
+        bytes.truncate(limit as usize);
+    }
+    Ok((bytes, truncated))
+}
+
+fn is_lut(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    String::from_utf8_lossy(bytes)
+        .trim_start()
+        .starts_with("# leonida-forge-lut:")
 }
 
 /// Maps entry errors to I/O errors: unsupported for encoded entries and
@@ -275,6 +328,17 @@ fn not_found() -> io::Error {
         io::ErrorKind::NotFound,
         "the path does not exist in the archive",
     )
+}
+
+fn with_extension(name: &str, type_id: Option<u8>) -> String {
+    if type_id != Some(names::RPF_TYPE) {
+        return name.to_string();
+    }
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if basename.contains('.') {
+        return name.to_string();
+    }
+    format!("{name}.rpf")
 }
 
 fn hex<T: std::fmt::UpperHex>(value: T, digits: usize) -> String {
@@ -340,22 +404,38 @@ impl Native {
         authentication: Authentication,
     ) -> Self {
         let rows: Vec<Row> = metadata.entries().collect();
-        let names = Names::read(names_file(archive), &rows);
+        let types = Types::default();
+        let names = Names::read(archive, &rows, &types);
         let companions = Companions::read(archive, &metadata);
         Self {
             rows,
             names,
             companions,
             authentication,
+            types,
         }
     }
 
-    /// Whether the candidate file and the companion files are unchanged
-    /// since the table was read.
+    /// Whether the name files and the companion files are unchanged since the
+    /// table was read.
     pub fn is_current(&self, archive: &Archive) -> bool {
-        let names = file_stamp(&names_file(archive));
+        let current: Vec<PathBuf> = [names_file(archive), lut_file(archive)]
+            .into_iter()
+            .filter(|file| file.is_file())
+            .collect();
+        let names_current = match &self.names {
+            None => current.is_empty(),
+            Some(names) => {
+                names.files == current
+                    && names
+                        .files
+                        .iter()
+                        .zip(&names.stamps)
+                        .all(|(file, stamp)| file_stamp(file) == *stamp)
+            }
+        };
         let records = &self.companions.records;
-        names == self.names.as_ref().map(|names| names.stamp)
+        names_current
             && companion_stamps(companion_dir(archive).as_deref(), records)
                 == self.companions.stamps
     }
@@ -414,7 +494,7 @@ impl Native {
             return "Unknown".to_string();
         };
         if names.matches.is_none() {
-            return format!("Unknown: {} was not used", names.file.display());
+            return format!("Unknown: {} was not used", names.primary.display());
         }
         match self.resolution(row.row) {
             Some(Resolution::Resolved(list)) => list
@@ -435,6 +515,36 @@ impl Native {
             Some(Resolution::Unresolved) | None => {
                 "Unknown: no name in this entry's table has its hash".to_string()
             }
+        }
+    }
+
+    /// The primary visible name: a verified unambiguous resolved name, else
+    /// the stored key in canonical form, with only a confirmed extension.
+    fn label(&self, row: &Row) -> String {
+        if let Some(name) = self.resolved_name(row.row) {
+            return with_extension(name, row.type_id());
+        }
+        let hash = row.name_hash.as_ref().ok().and_then(|value| *value);
+        let key = row.name_key.as_ref().ok().and_then(|value| *value);
+        let stored = match row.type_id().and_then(|type_id| self.types.class(type_id)) {
+            Some(Class::Hash64) => hash.map(Key::Hash64),
+            Some(Class::Key32) => key.map(Key::Key32),
+            _ => match (hash, key) {
+                (Some(hash), _) => Some(Key::Hash64(hash)),
+                (None, Some(key)) => Some(Key::Key32(key)),
+                _ => None,
+            },
+        };
+        match stored {
+            Some(key) => with_extension(&key.canonical(), row.type_id()),
+            None => row_name(row.row),
+        }
+    }
+
+    fn resolved_name(&self, row: u32) -> Option<&str> {
+        match self.resolution(row)? {
+            Resolution::Resolved(names) => names.first().map(|name| name.text.as_str()),
+            Resolution::Ambiguous(_) | Resolution::Unresolved => None,
         }
     }
 
@@ -468,7 +578,8 @@ impl Native {
     }
 
     fn entry(&self, archive: &Archive, dir: &Path, row: &Row) -> Entry {
-        let name = row_name(row.row);
+        let path_name = row_name(row.row);
+        let label = self.label(row);
         let location = match &row.location {
             Ok(Some(location)) => Some(location),
             _ => None,
@@ -478,8 +589,8 @@ impl Native {
             None => EntryKind::Unavailable,
         };
         let mut entry = Entry::new(
-            name.clone(),
-            dir.join(&name),
+            label,
+            dir.join(&path_name),
             kind,
             location.map(|l| l.logical_len),
             None,
@@ -659,9 +770,9 @@ impl Native {
             ),
         };
         let mut note = format!(
-            "Listed from the archive's table of contents, {}: {} in table order, named after \
-             their row. Names are hashes of the original paths. The signature covers the \
-             metadata, not the payloads.",
+            "Listed from the archive's table of contents, {}: {} in table order, labelled by a \
+             verified name or by the stored key. Row numbers remain the entry paths. The \
+             signature covers the metadata, not the payloads.",
             provenance,
             match total {
                 1 => "1 entry".to_string(),
@@ -673,7 +784,11 @@ impl Native {
                 " {malformed} of them have malformed fields, described with each entry."
             ));
         }
-        let file = names_file(archive);
+        let file = self
+            .names
+            .as_ref()
+            .map(|names| names.primary.clone())
+            .unwrap_or_else(|| names_file(archive));
         let file_name = file.file_name().unwrap_or_default().to_string_lossy();
         match &self.names {
             None => note.push_str(&format!(

@@ -268,16 +268,14 @@ fn lists_entries_from_the_table_of_contents() {
 
     // No scan is needed.
     let entries = files::list(&path).unwrap();
-    assert_eq!(
-        names_of(&entries),
-        [
-            "Row 00000",
-            "Row 00001",
-            "Row 00002",
-            "Row 00003",
-            "Row 00004"
-        ]
-    );
+    let expected = [
+        format!("0x{:016X}.rpf", hash64(b"packs/inner")),
+        format!("0x{:016X}", hash64(b"data")),
+        format!("0x{:016X}.rpf", hash64(b"packed")),
+        "Row 00003".to_string(),
+        "Row 00004".to_string(),
+    ];
+    assert_eq!(names_of(&entries).join("\n"), expected.join("\n"));
     let kinds: Vec<EntryKind> = entries.iter().map(|e| e.kind).collect();
     use EntryKind::{File, Unavailable};
     assert_eq!(kinds, [File, File, File, Unavailable, File]);
@@ -334,6 +332,33 @@ fn lists_entries_from_the_table_of_contents() {
 }
 
 #[test]
+fn duplicate_visible_labels_keep_distinct_entry_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("duplicates.rpf");
+    let hash = hash64(b"shared/name");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(hash),
+                ..spec(b"first payload", RPF_TYPE)
+            },
+            Spec {
+                hash: Some(hash),
+                ..spec(b"second payload", RPF_TYPE)
+            },
+        ]),
+    )
+    .unwrap();
+    let entries = files::list(&path).unwrap();
+    assert_eq!(entries[0].name, entries[1].name);
+    assert_ne!(entries[0].path, entries[1].path);
+    assert_eq!(files::read(&entries[0].path).unwrap(), b"first payload");
+    assert_eq!(files::read(&entries[1].path).unwrap(), b"second payload");
+    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{hash:016X}"));
+}
+
+#[test]
 fn names_come_from_candidate_paths() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("named.rpf");
@@ -363,8 +388,13 @@ fn names_come_from_candidate_paths() {
     .unwrap();
 
     let entries = files::list(&path).unwrap();
-    // The row stays the name; candidates are details.
-    assert_eq!(names_of(&entries), ["Row 00000", "Row 00001", "Row 00002"]);
+    // The row stays the path; candidates are details.
+    let expected = [
+        "packs/inner.rpf".to_string(),
+        format!("0x{:08X}", joaat(b"readme")),
+        format!("0x{:016X}.rpf", hash64(b"other")),
+    ];
+    assert_eq!(names_of(&entries).join("\n"), expected.join("\n"));
     assert_eq!(
         detail(&entries[0], "Names"),
         "packs/inner.rpf, PACKS\\INNER.rpf"
@@ -392,6 +422,52 @@ fn names_come_from_candidate_paths() {
     assert!(detail(&entries[0], "Names").starts_with("Unknown"));
     fs::remove_file(&candidates).unwrap();
     assert_eq!(detail(&files::list(&path).unwrap()[2], "Names"), "Unknown");
+}
+
+#[test]
+fn names_load_from_a_lut_sidecar() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("lut.rpf");
+    let item = hash64(b"props/item");
+    let other = hash64(b"other");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(item),
+                ..spec(&[1; 16], RPF_TYPE)
+            },
+            Spec {
+                hash: Some(other),
+                ..spec(&[2; 16], RPF_TYPE)
+            },
+        ]),
+    )
+    .unwrap();
+    let lut = temp.path().join("lut.rpf.lut");
+    fs::write(
+        &lut,
+        format!("# leonida-forge-lut: 1\n# namespace: hash64\n\n0x{item:016X}\tProps/Item.ydr\n"),
+    )
+    .unwrap();
+    fs::write(temp.path().join("lut.rpf.names.txt"), "other.rpf\n").unwrap();
+
+    let entries = files::list(&path).unwrap();
+    assert_eq!(names_of(&entries), ["Props/Item.ydr", "other.rpf"]);
+    assert_eq!(
+        detail(&entries[0], "Name source"),
+        "User mapping, verified by hash"
+    );
+    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+
+    // A changed LUT invalidates the listing.
+    fs::write(
+        &lut,
+        format!("# leonida-forge-lut: 1\n# namespace: hash64\n\n0x{item:016X}\tRenamed.ydr\n"),
+    )
+    .unwrap();
+    let entries = files::list(&path).unwrap();
+    assert_eq!(names_of(&entries), ["Renamed.ydr", "other.rpf"]);
 }
 
 #[test]
@@ -428,7 +504,7 @@ fn names_can_be_declared_for_stored_keys() {
 
     let entries = files::list(&path).unwrap();
     // The entry remains its row: a name never becomes a path.
-    assert_eq!(names_of(&entries), ["Row 00000", "Row 00001"]);
+    assert_eq!(names_of(&entries), ["Props/Item.ydr", "Readme.txt"]);
     assert_eq!(
         entries[0].path.file_name().unwrap().to_str().unwrap(),
         "Row 00000"
