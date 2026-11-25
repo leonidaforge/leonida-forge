@@ -1,6 +1,7 @@
 //! GTA VI RAGE formats: RPF9 archives, the resources stored in them, and the
 //! sibling containers and payload encodings found in archive rows.
 
+pub mod drawable;
 pub mod gfx;
 pub mod rbf0;
 pub mod rds5;

@@ -62,6 +62,9 @@ pub enum Command {
         /// Neither read nor write the index cache
         #[arg(long)]
         no_cache: bool,
+        /// Walk the drawable structure of the reconstructed segments
+        #[arg(long)]
+        drawable: bool,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -373,8 +376,9 @@ pub fn run(command: Command) -> Result<(), String> {
             file,
             id,
             no_cache,
+            drawable,
             json,
-        } => resource(&file, id, no_cache, json),
+        } => resource(&file, id, no_cache, drawable, json),
         Command::Metadata {
             file,
             entries,
@@ -794,6 +798,169 @@ fn list(path: &Path, no_cache: bool, json: bool) -> Result<(), String> {
         .map_err(|err| format!("cannot write output: {err}"))
 }
 
+/// Bytes reconstructed for a drawable walk.
+const MAX_DRAWABLE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Reconstructs the resource and walks its drawable structure.
+fn inspect_drawable(
+    path: &Path,
+    index: &Index,
+    resource: &Resource,
+) -> Result<lforge_rage9::drawable::Report, String> {
+    let entry = index
+        .entry_at(resource.offset)
+        .ok_or_else(|| "the resource has no entry to reconstruct".to_string())?;
+    let source = lforge_binary::Source::open(path)
+        .map_err(|err| format!("cannot open {}: {err}", path.display()))?;
+    let mut bytes = Vec::new();
+    rpf::read_entry(
+        source,
+        index,
+        entry,
+        MAX_DRAWABLE_BYTES,
+        &mut bytes,
+        &AtomicBool::new(false),
+    )
+    .map_err(|err| format!("the resource cannot be reconstructed: {err}"))?;
+    let system_len = resource.layout.segment_len(Segment::System) as usize;
+    if system_len > bytes.len() {
+        return Err(format!(
+            "the reconstructed resource is {} bytes, shorter than the {system_len} byte system segment",
+            bytes.len()
+        ));
+    }
+    lforge_rage9::drawable::inspect(&bytes[..system_len], &bytes[system_len..])
+        .ok_or_else(|| "the resource does not have the drawable chain shape".to_string())
+}
+
+fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
+    use lforge_rage9::drawable::GraphicsBase;
+    let attributes = |buffer: &lforge_rage9::drawable::VertexBuffer| {
+        buffer
+            .attributes
+            .iter()
+            .map(|attribute| {
+                json!({
+                    "slot": attribute.slot,
+                    "offset": attribute.offset,
+                    "size": attribute.size,
+                    "format": attribute.format,
+                })
+            })
+            .collect::<Vec<Value>>()
+    };
+    let lod: Vec<Value> = report
+        .lod
+        .iter()
+        .map(|slot| {
+            json!({
+                "slot": slot.slot,
+                "model_count": slot.model_count,
+                "capacity": slot.capacity,
+                "shader_indices": slot.shader_indices,
+                "models": slot.models.iter().map(|model| {
+                    json!({
+                        "offset": model.at,
+                        "geometry_count": model.geometry_count,
+                        "capacity": model.capacity,
+                        "word_14": model.word_14,
+                        "flags": model.flags,
+                        "geometries": model.geometries.iter().map(|geometry| {
+                            json!({
+                                "offset": geometry.at,
+                                "word_30": geometry.word_30,
+                                "vertex_buffer": geometry.vertex_buffer.as_ref().map(|buffer| json!({
+                                    "offset": buffer.at,
+                                    "elements": buffer.elements,
+                                    "unit": buffer.unit,
+                                    "word_0e": buffer.word_0e,
+                                    "word_10": buffer.word_10,
+                                    "graphics": buffer.graphics,
+                                    "vertex_count": buffer.vertex_count,
+                                    "declared_bytes": buffer.declared_bytes,
+                                    "attribute_bytes": buffer.attribute_bytes,
+                                    "layout_end": buffer.layout_end,
+                                    "prefix_gap": buffer.prefix_gap,
+                                    "attributes": attributes(buffer),
+                                })),
+                                "index": geometry.index.as_ref().map(|index| json!({
+                                    "offset": index.at,
+                                    "clusters": index.clusters,
+                                    "elements": index.elements,
+                                    "unit": index.unit,
+                                    "graphics": index.graphics,
+                                    "in_bounds": index.in_bounds,
+                                    "range": index.range.map(|range| json!({
+                                        "segment": range.segment.name(),
+                                        "offset": range.offset,
+                                        "length": range.len,
+                                    })),
+                                })),
+                            })
+                        }).collect::<Vec<Value>>(),
+                    })
+                }).collect::<Vec<Value>>(),
+            })
+        })
+        .collect();
+    let graphics_base = match &report.graphics_base {
+        GraphicsBase::Unique { base, supports } => json!({
+            "state": "unique",
+            "base": base,
+            "supports": supports,
+        }),
+        GraphicsBase::Ambiguous { candidates } => json!({
+            "state": "ambiguous",
+            "candidates": candidates,
+        }),
+        GraphicsBase::Unavailable => json!({ "state": "unavailable" }),
+    };
+    json!({
+        "status": report.status,
+        "header": {
+            "page_map": report.header.page_map,
+            "shader_group": report.header.shader_group,
+            "skeleton": report.header.skeleton,
+            "name": report.header.name,
+            "list": report.header.list,
+            "bounds": {
+                "centre": report.header.bounds.centre,
+                "radius": report.header.bounds.radius,
+                "min": report.header.bounds.min,
+                "max": report.header.bounds.max,
+            },
+            "lod_slots": report.header.lod_slots,
+            "distances": report.header.distances,
+            "flags": report.header.flags,
+            "word_b8": report.header.word_a8_hi,
+        },
+        "lod": lod,
+        "empty_slots": report.empty_slots,
+        "graphics_base": graphics_base,
+        "shader_group": report.shader_group.as_ref().map(|group| json!({
+            "offset": group.at,
+            "count": group.count,
+            "capacity": group.capacity,
+            "shaders": group.shaders.iter().map(|shader| json!({
+                "offset": shader.at,
+                "marker": format!("0x{:08X}", shader.marker),
+                "texture_parameters": shader.texture_parameters,
+                "total_parameters": shader.total_parameters,
+                "word_06": shader.word_06,
+                "slots": shader.slots,
+                "bound_slots": shader.bound_slots,
+            })).collect::<Vec<Value>>(),
+        })),
+        "issues": report.issues.iter().map(|issue| issue.to_string()).collect::<Vec<String>>(),
+        "limitations": [
+            "layout slots and format codes are values, not semantics",
+            "the 0x80-byte vertex prefix has no established meaning",
+            "index descriptors are structural; no triangle is formed",
+            "material parameters, texture keys and mesh export are not supported",
+        ],
+    })
+}
+
 fn resource_json(index: &Index, resource: &Resource) -> Value {
     let layout = &resource.layout;
     let pages: Vec<Value> = index
@@ -932,13 +1099,30 @@ fn list_text(index: &Index, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-fn resource(path: &Path, offset: u64, no_cache: bool, json: bool) -> Result<(), String> {
+fn resource(
+    path: &Path,
+    offset: u64,
+    no_cache: bool,
+    drawable: bool,
+    json: bool,
+) -> Result<(), String> {
     let (index, _) = index(path, no_cache)?;
     let resource = index
         .resource_at(offset)
         .or_else(|| index.page_at(offset).map(|(resource, ..)| resource))
         .ok_or_else(|| format!("no resource or resource page has the id {}", id(offset)))?;
-    let report = resource_json(&index, resource);
+    let drawable = if drawable {
+        Some(inspect_drawable(path, &index, resource)?)
+    } else {
+        None
+    };
+    let mut report = resource_json(&index, resource);
+    if let Some(drawable_report) = &drawable {
+        report
+            .as_object_mut()
+            .expect("object")
+            .insert("drawable".into(), drawable_json(drawable_report));
+    }
     if json {
         let mut value = json!({ "id": id(resource.offset), "offset": resource.offset });
         value
@@ -1020,6 +1204,53 @@ fn resource(path: &Path, offset: u64, no_cache: bool, json: bool) -> Result<(), 
         println!();
         for issue in issues {
             println!("warning: {}", issue.describe());
+        }
+    }
+    if let Some(drawable) = &drawable {
+        println!();
+        println!("drawable:    {}", drawable.status);
+        let models: usize = drawable.lod.iter().map(|slot| slot.models.len()).sum();
+        let geometries: usize = drawable
+            .lod
+            .iter()
+            .flat_map(|slot| slot.models.iter())
+            .map(|model| model.geometries.len())
+            .sum();
+        println!(
+            "             {} populated LOD slots, {models} models, {geometries} geometries",
+            drawable.lod.len()
+        );
+        match &drawable.graphics_base {
+            lforge_rage9::drawable::GraphicsBase::Unique { base, supports } => {
+                println!("graphics:    base {base:#x} from {supports} distinct pointers");
+            }
+            lforge_rage9::drawable::GraphicsBase::Ambiguous { candidates } => {
+                println!("graphics:    {candidates} candidate bases; the base is not established");
+            }
+            lforge_rage9::drawable::GraphicsBase::Unavailable => {
+                println!("graphics:    no base is supported by two distinct pointers");
+            }
+        }
+        if let Some(group) = &drawable.shader_group {
+            println!(
+                "shaders:     {} of {} slots",
+                group.shaders.len(),
+                group.count
+            );
+            for shader in &group.shaders {
+                println!(
+                    "             at {:#x}: marker {:#010X}, {} texture of {} parameters, {} of {} slots bound",
+                    shader.at,
+                    shader.marker,
+                    shader.texture_parameters,
+                    shader.total_parameters,
+                    shader.bound_slots,
+                    shader.slots
+                );
+            }
+        }
+        for issue in &drawable.issues {
+            println!("warning: drawable: {issue}");
         }
     }
     Ok(())
