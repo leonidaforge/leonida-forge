@@ -260,24 +260,24 @@ C++ Redistributable installed.
    the metadata status says the signature verified, and one readable row
    exports. Then clear the executable and confirm the archive no longer lists
    native rows.
-7. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
+8. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
-8. Open a plain file and an entry inside an archive in the Binary Inspector.
+9. Open a plain file and an entry inside an archive in the Binary Inspector.
    Check the signature, size and search.
-9. Export through the entry context menu, then through **File > Save Selection
-   As**. Confirm the suggested name, destination folder and result toast.
-10. Save to an existing file. Confirm the save dialog asks before replacing it,
+10. Export through the entry context menu, then through **File > Save Selection
+    As**. Confirm the suggested name, destination folder and result toast.
+11. Save to an existing file. Confirm the save dialog asks before replacing it,
     and that cancelling the overwrite leaves the old file unchanged.
-11. Cancel an export while it runs. Confirm no new or partial file is left.
-12. Start a second export while the first save dialog is open, then while the
+12. Cancel an export while it runs. Confirm no new or partial file is left.
+13. Start a second export while the first save dialog is open, then while the
     first export is running. Confirm Save As is disabled in both cases, that
     cancelling the dialog re-enables it, and that finishing or failing the
     export re-enables it again.
-13. Run `lforge.exe --help`, `lforge.exe info`, and `lforge.exe archive info`
+14. Run `lforge.exe --help`, `lforge.exe info`, and `lforge.exe archive info`
     on an RPF9 archive.
-14. Run `lforge.exe archive recover <archive> --list`, then export one
+15. Run `lforge.exe archive recover <archive> --list`, then export one
     candidate. Confirm overwrite protection and the unverified-bytes note.
-15. Check that `%APPDATA%\Leonida Forge` holds settings and the archive index,
+16. Check that `%APPDATA%\Leonida Forge` holds settings and the archive index,
     and that no game file changed.
 
 Record which steps ran, the Windows build, the GPU and any archive samples used.
