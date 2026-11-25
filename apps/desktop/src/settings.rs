@@ -15,6 +15,10 @@ fn default_details_widths() -> [f32; 3] {
     [130., 80., 120.]
 }
 
+fn default_details_name_width() -> f32 {
+    320.
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ViewMode {
     Icons,
@@ -59,6 +63,9 @@ pub struct Settings {
     /// Widths of the Type, Size and Modified columns in the details view.
     #[serde(default = "default_details_widths")]
     pub details_widths: [f32; 3],
+    /// Width of the Name column in the details view.
+    #[serde(default = "default_details_name_width")]
+    pub details_name_width: f32,
     pub preview_visible: bool,
     pub tree_width: f32,
     pub preview_width: f32,
@@ -78,6 +85,7 @@ impl Default for Settings {
             sort: Sort::default(),
             layout: ListingLayout::default(),
             details_widths: default_details_widths(),
+            details_name_width: default_details_name_width(),
             preview_visible: true,
             tree_width: DEFAULT_TREE_WIDTH,
             preview_width: DEFAULT_PREVIEW_WIDTH,
@@ -152,6 +160,7 @@ mod tests {
             },
             layout: ListingLayout::Flat,
             details_widths: [150., 90., 140.],
+            details_name_width: 280.,
             preview_visible: false,
             tree_width: 300.,
             preview_width: 260.,
@@ -173,6 +182,7 @@ mod tests {
         assert_eq!(settings.executable, None);
         assert_eq!(settings.layout, ListingLayout::Folders);
         assert_eq!(settings.details_widths, default_details_widths());
+        assert_eq!(settings.details_name_width, default_details_name_width());
     }
 
     #[test]

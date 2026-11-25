@@ -643,29 +643,14 @@ impl Explorer {
                     .border_b_1()
                     .border_color(rgb(theme::BORDER))
                     .font_weight(FontWeight::MEDIUM)
-                    .child(
-                        header_cell(SortKey::Name, "Name")
-                            .flex_1()
-                            .min_w(px(DETAILS_NAME_MIN_WIDTH)),
-                    )
-                    .child(
-                        header_cell(SortKey::Type, "Type")
-                            .relative()
-                            .w(px(self.details_widths[0]))
-                            .child(self.column_grip(0, cx)),
-                    )
-                    .child(
-                        header_cell(SortKey::Size, "Size")
-                            .relative()
-                            .w(px(self.details_widths[1]))
-                            .child(self.column_grip(1, cx)),
-                    )
-                    .child(
-                        header_cell(SortKey::Modified, "Modified")
-                            .relative()
-                            .w(px(self.details_widths[2]))
-                            .child(self.column_grip(2, cx)),
-                    ),
+                    .child(header_cell(SortKey::Name, "Name").w(px(self.details_name_width)))
+                    .child(self.column_grip(0, cx))
+                    .child(header_cell(SortKey::Type, "Type").w(px(self.details_widths[0])))
+                    .child(self.column_grip(1, cx))
+                    .child(header_cell(SortKey::Size, "Size").w(px(self.details_widths[1])))
+                    .child(self.column_grip(2, cx))
+                    .child(header_cell(SortKey::Modified, "Modified").w(px(self.details_widths[2])))
+                    .child(self.column_grip(3, cx)),
             )
             .child(
                 uniform_list(
@@ -689,6 +674,7 @@ impl Explorer {
 
     fn render_details_row(&self, ix: usize, entry: &Entry, cx: &Context<Self>) -> impl IntoElement {
         let cell = || div().px_2().truncate();
+        let spacer = || div().flex_none().w(px(6.));
         self.browser_item(ix, entry, cx)
             .flex()
             .items_center()
@@ -699,17 +685,19 @@ impl Explorer {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .flex_1()
+                    .w(px(self.details_name_width))
                     .min_w(px(DETAILS_NAME_MIN_WIDTH))
                     .child(self.entry_icon(entry, px(16.)))
                     .child(div().min_w_0().truncate().child(entry.name.clone())),
             )
+            .child(spacer())
             .child(
                 cell()
                     .w(px(self.details_widths[0]))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(entry.type_name.clone()),
             )
+            .child(spacer())
             .child(
                 cell()
                     .w(px(self.details_widths[1]))
@@ -717,6 +705,7 @@ impl Explorer {
                     .justify_end()
                     .child(entry.size.map(files::format_size).unwrap_or_default()),
             )
+            .child(spacer())
             .child(
                 cell()
                     .w(px(self.details_widths[2]))

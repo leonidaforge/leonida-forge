@@ -21,7 +21,7 @@ use gpui::{
     KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions,
     Pixels, Point, RenderImage, ScrollHandle, Stateful, Subscription, Task, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowHandle, WindowOptions, actions, canvas,
-    div, prelude::*, px, rgb, size,
+    div, fill, prelude::*, px, rgb, size,
 };
 
 use lforge_rage9::rpf::Progress;
@@ -55,6 +55,8 @@ const MAX_PREVIEW_WIDTH: f32 = 560.;
 const MIN_CENTER_WIDTH: f32 = 440.;
 const MIN_DETAILS_COLUMN: f32 = 60.;
 const MAX_DETAILS_COLUMN: f32 = 420.;
+const MIN_DETAILS_NAME: f32 = 120.;
+const MAX_DETAILS_NAME: f32 = 640.;
 const SCROLLBAR_WIDTH: f32 = 10.;
 const MIN_SCROLLBAR_THUMB: f32 = 24.;
 
@@ -148,7 +150,7 @@ struct ColumnDrag {
     start_width: f32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Axis {
     Vertical,
     Horizontal,
@@ -164,6 +166,10 @@ struct ScrollDrag {
 
 fn clamp_details_column(width: f32) -> f32 {
     width.clamp(MIN_DETAILS_COLUMN, MAX_DETAILS_COLUMN)
+}
+
+fn clamp_details_name(width: f32) -> f32 {
+    width.clamp(MIN_DETAILS_NAME, MAX_DETAILS_NAME)
 }
 
 /// The thumb length and its position along the track. `offset` is the
@@ -287,6 +293,7 @@ pub struct Explorer {
     resizing: Option<Divider>,
     column_drag: Option<ColumnDrag>,
     scroll_drag: Option<ScrollDrag>,
+    details_name_width: f32,
     details_widths: [f32; 3],
     export: Option<Export>,
     export_requests: ExportRequests,
@@ -340,6 +347,7 @@ impl Explorer {
             resizing: None,
             column_drag: None,
             scroll_drag: None,
+            details_name_width: clamp_details_name(settings.details_name_width),
             details_widths: settings.details_widths.map(clamp_details_column),
             export: None,
             export_requests: ExportRequests::default(),
@@ -1062,6 +1070,7 @@ impl Explorer {
             sort: self.sort,
             layout: self.layout,
             details_widths: self.details_widths,
+            details_name_width: self.details_name_width,
             preview_visible: self.preview_visible,
             tree_width: self.tree_width,
             preview_width: self.preview_width,
@@ -1487,7 +1496,9 @@ impl Explorer {
 
     /// A visible scrollbar for a scroll handle. `axis` selects a vertical bar
     /// on the right or a horizontal bar at the bottom. The bar occupies its own
-    /// layout space, so it never covers the content.
+    /// layout space, so it never covers the content. The thumb is painted after
+    /// layout, because a scroll handle only knows its range once its content
+    /// has been laid out.
     fn render_scrollbar(
         &self,
         handle: ScrollHandle,
@@ -1495,27 +1506,17 @@ impl Explorer {
         id: &'static str,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let bounds = handle.bounds();
-        let (offset, max, viewport) = match axis {
-            Axis::Vertical => (
-                -f32::from(handle.offset().y),
-                f32::from(handle.max_offset().y),
-                f32::from(bounds.size.height),
-            ),
-            Axis::Horizontal => (
-                -f32::from(handle.offset().x),
-                f32::from(handle.max_offset().x),
-                f32::from(bounds.size.width),
-            ),
-        };
-        let scrollable = max > 0.5 && viewport > 0.;
-        let (thumb, position) = scrollbar_geometry(offset, max, viewport);
         let active = self
             .scroll_drag
             .as_ref()
             .is_some_and(|drag| drag.axis == axis);
-        let thumb_color = if active { theme::ACCENT } else { theme::HOVER };
+        let thumb_color = if active {
+            theme::ACCENT
+        } else {
+            theme::TEXT_DISABLED
+        };
         let click_handle = handle.clone();
+        let paint_handle = handle;
         div()
             .id(id)
             .relative()
@@ -1527,34 +1528,55 @@ impl Explorer {
                 el.h(px(SCROLLBAR_WIDTH)).w_full()
             })
             .bg(rgb(theme::BACKGROUND))
-            .when(scrollable, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .when(axis == Axis::Vertical, |el| {
-                            el.top(px(position))
-                                .left(px(2.))
-                                .w(px(SCROLLBAR_WIDTH - 4.))
-                                .h(px(thumb))
-                        })
-                        .when(axis == Axis::Horizontal, |el| {
-                            el.left(px(position))
-                                .top(px(2.))
-                                .h(px(SCROLLBAR_WIDTH - 4.))
-                                .w(px(thumb))
-                        })
-                        .rounded_sm()
-                        .bg(rgb(thumb_color))
-                        .hover(|s| s.bg(rgb(theme::TEXT_DISABLED))),
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        let (offset, max, viewport) = match axis {
+                            Axis::Vertical => (
+                                -f32::from(paint_handle.offset().y),
+                                f32::from(paint_handle.max_offset().y),
+                                f32::from(bounds.size.height),
+                            ),
+                            Axis::Horizontal => (
+                                -f32::from(paint_handle.offset().x),
+                                f32::from(paint_handle.max_offset().x),
+                                f32::from(bounds.size.width),
+                            ),
+                        };
+                        let (thumb, position) = scrollbar_geometry(offset, max, viewport);
+                        if thumb <= 0. {
+                            return;
+                        }
+                        let thumb_bounds = match axis {
+                            Axis::Vertical => Bounds::new(
+                                Point {
+                                    x: bounds.left() + px(2.),
+                                    y: bounds.top() + px(position),
+                                },
+                                size(px(SCROLLBAR_WIDTH - 4.), px(thumb)),
+                            ),
+                            Axis::Horizontal => Bounds::new(
+                                Point {
+                                    x: bounds.left() + px(position),
+                                    y: bounds.top() + px(2.),
+                                },
+                                size(px(thumb), px(SCROLLBAR_WIDTH - 4.)),
+                            ),
+                        };
+                        window.paint_quad(fill(thumb_bounds, rgb(thumb_color)));
+                    },
                 )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        this.begin_scroll_drag(click_handle.clone(), axis, event.position, cx);
-                        cx.stop_propagation();
-                    }),
-                )
-            })
+                .absolute()
+                .inset_0(),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.begin_scroll_drag(click_handle.clone(), axis, event.position, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .into_any_element()
     }
 
@@ -1636,40 +1658,49 @@ impl Explorer {
         let Some(drag) = self.column_drag else {
             return;
         };
-        let Some(width) = self.details_widths.get_mut(drag.column) else {
-            return;
-        };
-        *width = clamp_details_column(drag.start_width + (x - drag.start_x));
+        let width = drag.start_width + (x - drag.start_x);
+        self.set_column_width(drag.column, width);
         cx.notify();
     }
 
-    /// The draggable right edge of a details header column.
+    fn column_width(&self, column: usize) -> Option<f32> {
+        match column {
+            0 => Some(self.details_name_width),
+            n => self.details_widths.get(n - 1).copied(),
+        }
+    }
+
+    fn set_column_width(&mut self, column: usize, width: f32) {
+        match column {
+            0 => self.details_name_width = clamp_details_name(width),
+            n => {
+                if let Some(slot) = self.details_widths.get_mut(n - 1) {
+                    *slot = clamp_details_column(width);
+                }
+            }
+        }
+    }
+
+    /// The draggable right edge of a details header column. Columns are
+    /// numbered Name, Type, Size, Modified.
     fn column_grip(&self, column: usize, cx: &Context<Self>) -> Stateful<Div> {
         let active = self.column_drag.is_some_and(|drag| drag.column == column);
         div()
             .id(("column-grip", column))
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right(px(-2.5))
-            .w(px(5.))
+            .flex_none()
+            .w(px(6.))
+            .h_full()
             .cursor_col_resize()
-            .child(
-                div()
-                    .absolute()
-                    .left(px(2.))
-                    .w(px(1.))
-                    .h_full()
-                    .bg(rgb(if active {
-                        theme::SELECTION_BORDER
-                    } else {
-                        theme::BORDER
-                    })),
-            )
+            .hover(|s| s.bg(rgb(theme::HOVER)))
+            .child(div().m_auto().w(px(1.)).h_full().bg(rgb(if active {
+                theme::SELECTION_BORDER
+            } else {
+                theme::BORDER
+            })))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    let Some(&width) = this.details_widths.get(column) else {
+                    let Some(width) = this.column_width(column) else {
                         return;
                     };
                     this.column_drag = Some(ColumnDrag {
