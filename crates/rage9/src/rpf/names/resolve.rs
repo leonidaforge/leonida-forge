@@ -350,7 +350,7 @@ fn strength(name: &Name) -> u8 {
 /// Whether the engine's hashes of the name, or of its stem, reproduce the
 /// declared key. This proves the name is a preimage, not that the archive
 /// named the entry.
-fn verifies(name: &str, declared: Key) -> bool {
+pub(crate) fn verifies(name: &str, declared: Key) -> bool {
     let bytes = name.as_bytes();
     let stem = match bytes.iter().rposition(|&byte| byte == b'.') {
         Some(dot) => &bytes[..dot],

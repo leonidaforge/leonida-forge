@@ -21,6 +21,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
+use super::lut::Lut;
 use super::{Key, fold};
 
 /// Larger tables are not read.
@@ -62,6 +63,7 @@ pub struct TableEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StringTable {
     entries: Vec<TableEntry>,
+    seen: HashSet<TableEntry>,
     skipped: usize,
     duplicates: usize,
     truncated: bool,
@@ -91,7 +93,6 @@ impl StringTable {
             truncated,
             ..Self::default()
         };
-        let mut seen: HashSet<TableEntry> = HashSet::new();
         let mut parts: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
         if truncated && parts.last().is_some_and(|line| !line.is_empty()) {
             parts.pop();
@@ -113,17 +114,54 @@ impl StringTable {
                 table.skipped += 1;
                 continue;
             };
-            if !seen.insert(entry.clone()) {
-                table.duplicates += 1;
-                continue;
-            }
-            if table.entries.len() >= MAX_ENTRIES {
-                table.truncated = true;
-                break;
-            }
-            table.entries.push(entry);
+            table.add(entry);
         }
         table
+    }
+
+    /// Adds one entry. Returns `false` when it is an exact duplicate or the
+    /// entry limit is reached. Duplicates and truncation are counted.
+    pub fn add(&mut self, entry: TableEntry) -> bool {
+        if self.entries.len() >= MAX_ENTRIES {
+            self.truncated = true;
+            return false;
+        }
+        if !self.seen.insert(entry.clone()) {
+            self.duplicates += 1;
+            return false;
+        }
+        self.entries.push(entry);
+        true
+    }
+
+    /// Merges another table in its order and returns how many entries were
+    /// added. Statistics are added, not recomputed.
+    pub fn merge(&mut self, other: StringTable) -> usize {
+        let mut added = 0;
+        for entry in other.entries {
+            if self.add(entry) {
+                added += 1;
+            }
+        }
+        self.skipped += other.skipped;
+        self.duplicates += other.duplicates;
+        self.truncated |= other.truncated;
+        added
+    }
+
+    /// Adds every record of a LUT as a declared user mapping.
+    pub fn merge_lut(&mut self, lut: &Lut) -> usize {
+        let mut added = 0;
+        for entry in lut.entries() {
+            if self.add(TableEntry {
+                name: entry.name.clone(),
+                provenance: Provenance::UserMapping,
+                declared: Some(entry.hash),
+            }) {
+                added += 1;
+            }
+        }
+        added
     }
 
     pub fn entries(&self) -> &[TableEntry] {
@@ -200,7 +238,7 @@ fn parse_key(text: &str) -> Option<Key> {
 /// A name is display data: it must be UTF-8 without control characters or
 /// bidi overrides, so it cannot carry terminal escapes, a NUL that the engine
 /// would stop at, or text that displays as a different name.
-fn checked_name(name: &str) -> Option<String> {
+pub(crate) fn checked_name(name: &str) -> Option<String> {
     let bytes = name.as_bytes();
     let invalid = bytes.is_empty()
         || bytes.len() > MAX_LINE

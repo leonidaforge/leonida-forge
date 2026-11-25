@@ -105,6 +105,31 @@ fn cuts_a_truncated_input_at_a_complete_line() {
 }
 
 #[test]
+fn merges_luts_and_tables_without_duplicates() {
+    let hash = crate::rpf::names::hash64(b"synthetic/asset");
+    let lut = crate::rpf::names::Lut::new(
+        crate::rpf::names::Class::Hash64,
+        [(
+            crate::rpf::names::Key::Hash64(hash),
+            "synthetic/asset.bin".to_string(),
+        )],
+    )
+    .unwrap();
+    let mut table = parse("synthetic/asset.bin\n");
+    // A candidate path and a declared mapping are separate entries even when
+    // they name the same string; the resolver merges them by text per row.
+    assert_eq!(table.merge_lut(&lut), 1);
+    assert_eq!(table.duplicates(), 0);
+    assert_eq!(table.candidates(), 1);
+    assert_eq!(table.mappings(), 1);
+
+    let second = parse("other/file.rpf\n");
+    assert_eq!(table.merge(second), 1);
+    assert_eq!(table.entries().len(), 3);
+    assert_eq!(table.entries()[2].name, "other/file.rpf");
+}
+
+#[test]
 fn reads_a_bounded_file() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("names.txt");

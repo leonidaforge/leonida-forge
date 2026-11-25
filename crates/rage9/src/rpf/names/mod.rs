@@ -15,9 +15,17 @@ use std::collections::HashMap;
 
 use super::metadata::{Entry, Error, Metadata};
 
+pub mod harvest;
+pub mod index;
+pub mod lut;
 pub mod resolve;
 pub mod table;
 
+pub use harvest::{
+    Limits, Variant, VariantKind, candidate_variants, extract_strings, hash_variant,
+};
+pub use index::{HashIndex, Occurrence};
+pub use lut::{Lut, LutEntry, LutError};
 pub use resolve::{
     CandidateOutcome, CandidateResult, Name, Namespace, Resolution, ResolutionSet, Resolver,
     RowNames,
@@ -186,12 +194,38 @@ impl MountPrefix {
 }
 
 /// Which row field holds the key of a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     /// [`hash64`] of the stem, in the name hash column.
     Hash64,
     /// [`joaat`] of the stem, in the 32-bit key column.
     Key32,
+}
+
+impl Class {
+    /// The stable identifier used in LUT files and CLI output.
+    pub fn namespace(self) -> &'static str {
+        match self {
+            Class::Hash64 => "hash64",
+            Class::Key32 => "key32",
+        }
+    }
+
+    /// The number of hexadecimal digits of a canonical key.
+    pub fn width(self) -> usize {
+        match self {
+            Class::Hash64 => 16,
+            Class::Key32 => 8,
+        }
+    }
+
+    pub fn parse_namespace(text: &str) -> Option<Self> {
+        match text {
+            "hash64" => Some(Class::Hash64),
+            "key32" => Some(Class::Key32),
+            _ => None,
+        }
+    }
 }
 
 /// Extension to type ID and type ID to class mappings.
@@ -302,6 +336,31 @@ pub enum Candidate<'a> {
 pub enum Key {
     Hash64(u64),
     Key32(u32),
+}
+
+impl Key {
+    pub fn class(self) -> Class {
+        match self {
+            Key::Hash64(_) => Class::Hash64,
+            Key::Key32(_) => Class::Key32,
+        }
+    }
+
+    /// The value as a `u64`, which is exact for both widths.
+    pub fn value(self) -> u64 {
+        match self {
+            Key::Hash64(hash) => hash,
+            Key::Key32(key) => u64::from(key),
+        }
+    }
+
+    /// `0x` followed by the namespace's exact uppercase width.
+    pub fn canonical(self) -> String {
+        match self {
+            Key::Hash64(hash) => format!("0x{hash:016X}"),
+            Key::Key32(key) => format!("0x{key:08X}"),
+        }
+    }
 }
 
 /// What a candidate resolves to.
