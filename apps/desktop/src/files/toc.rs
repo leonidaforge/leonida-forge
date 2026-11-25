@@ -6,12 +6,13 @@
 //!
 //! The table holds hashes of entry names, not names. Each entry is a file
 //! named after its row, `Row 00042`, which identifies it within the archive.
-//! Original names are shown only where a candidate path from
+//! Original names are shown only where a name from the local table
 //! `<archive file>.names.txt`, next to the file on disk, has the entry's
-//! hash. Candidate paths are relative to the archive.
+//! hash. The table holds candidate paths relative to the archive, or explicit
+//! `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names are display
+//! data only: entry paths stay the row names.
 
-use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -21,15 +22,16 @@ use lforge_rage9::rpf::metadata::verify::VerifyReport;
 use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
 };
-use lforge_rage9::rpf::names::{self, Candidate, Matches, MountPrefix, Types};
+use lforge_rage9::rpf::names::{
+    self, CandidateOutcome, MountPrefix, Provenance, Resolution, ResolutionSet, Resolver,
+    StringTable, Types,
+};
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
 use super::{Entry, EntryKind, format_bytes_exact, format_size};
 
 /// Larger tables of contents are not read.
 const MAX_METADATA: u64 = 64 * 1024 * 1024;
-/// Larger candidate files are ignored.
-const MAX_NAMES: u64 = 16 * 1024 * 1024;
 pub const NAMES_SUFFIX: &str = ".names.txt";
 
 const ROW_NOTE: &str = "Listed from the archive's table of contents. The name is the row \
@@ -84,12 +86,12 @@ impl Authentication {
         }
     }
 }
-/// The candidate paths and which rows they name.
+/// The local name table and what it resolves to.
 struct Names {
     file: PathBuf,
     stamp: Stamp,
-    candidates: Vec<Vec<u8>>,
-    matches: Option<Matches>,
+    table: StringTable,
+    matches: Option<ResolutionSet>,
     /// Why the file was not used.
     problem: Option<String>,
 }
@@ -205,41 +207,31 @@ fn matchable(row: &Row) -> bool {
 impl Names {
     fn read(file: PathBuf, rows: &[Row]) -> Option<Self> {
         let stamp = file_stamp(&file)?;
-        let mut names = Self {
+        let unused = |problem: String, table: StringTable| Self {
+            file: file.clone(),
+            stamp,
+            table,
+            matches: None,
+            problem: Some(problem),
+        };
+        if stamp.0 > names::table::MAX_BYTES {
+            return Some(unused(
+                format!("it is larger than {}", format_size(names::table::MAX_BYTES)),
+                StringTable::default(),
+            ));
+        }
+        let table = match StringTable::read(&file) {
+            Ok(table) => table,
+            Err(err) => return Some(unused(err.to_string(), StringTable::default())),
+        };
+        let matches = Resolver::new(&table, &Types::default(), MountPrefix::EMPTY).resolve(rows);
+        Some(Self {
             file,
             stamp,
-            candidates: Vec::new(),
-            matches: None,
+            table,
+            matches: Some(matches),
             problem: None,
-        };
-        if stamp.0 > MAX_NAMES {
-            names.problem = Some(format!("it is larger than {}", format_size(MAX_NAMES)));
-            return Some(names);
-        }
-        let mut text = Vec::new();
-        if let Err(err) =
-            fs::File::open(&names.file).and_then(|file| file.take(MAX_NAMES).read_to_end(&mut text))
-        {
-            names.problem = Some(err.to_string());
-            return Some(names);
-        }
-        names.candidates = text
-            .split(|&b| b == b'\n')
-            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-            .filter(|line| !line.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect();
-        let candidates: Vec<Candidate> = names
-            .candidates
-            .iter()
-            .map(|c| Candidate::Path(c))
-            .collect();
-        let rows: Vec<Row> = rows.iter().filter(|row| matchable(row)).cloned().collect();
-        match names::match_entries(&rows, &MountPrefix::EMPTY, &Types::default(), &candidates) {
-            Ok(matches) => names.matches = Some(matches),
-            Err(err) => names.problem = Some(err.to_string()),
-        }
-        Some(names)
+        })
     }
 }
 
@@ -405,37 +397,73 @@ impl Native {
         self.rows.get(usize::try_from(row).ok()?)
     }
 
-    fn matched_names(&self, row: u32) -> Option<(Vec<String>, bool)> {
-        let names = self.names.as_ref()?;
-        let matched = names.matches.as_ref()?.row(row)?;
-        let list = matched
-            .candidates
-            .iter()
-            .map(|&n| String::from_utf8_lossy(&names.candidates[n]).into_owned())
-            .collect();
-        Some((list, matched.ambiguous))
+    fn resolution(&self, row: u32) -> Option<&Resolution> {
+        self.names
+            .as_ref()?
+            .matches
+            .as_ref()?
+            .row(row)
+            .map(|names| &names.resolution)
     }
 
     fn names_text(&self, row: &Row) -> String {
         if !matchable(row) {
             return "Unknown: the row is malformed".to_string();
         }
-        match &self.names {
-            None => "Unknown".to_string(),
-            Some(names) if names.matches.is_none() => {
-                format!("Unknown: {} was not used", names.file.display())
+        let Some(names) = &self.names else {
+            return "Unknown".to_string();
+        };
+        if names.matches.is_none() {
+            return format!("Unknown: {} was not used", names.file.display());
+        }
+        match self.resolution(row.row) {
+            Some(Resolution::Resolved(list)) => list
+                .iter()
+                .map(|name| name.text.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(Resolution::Ambiguous(list)) => format!(
+                "Ambiguous: {} (each has this entry's hash)",
+                list.iter()
+                    .map(|name| name.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Some(Resolution::Unresolved) | None if names.table.mappings() == 0 => {
+                "Unknown: no candidate path has this entry's hash".to_string()
             }
-            Some(_) => match self.matched_names(row.row) {
-                Some((list, _)) if list.is_empty() => {
-                    "Unknown: no candidate path has this entry's hash".to_string()
-                }
-                Some((list, true)) => format!(
-                    "Ambiguous: {} (each has this entry's hash)",
-                    list.join(", ")
-                ),
-                Some((list, false)) => list.join(", "),
-                None => "Unknown".to_string(),
-            },
+            Some(Resolution::Unresolved) | None => {
+                "Unknown: no name in this entry's table has its hash".to_string()
+            }
+        }
+    }
+
+    /// Where the displayed names came from, and whether their keys were
+    /// verified by hashing.
+    fn names_source_text(&self, row: &Row) -> String {
+        let Some(Resolution::Resolved(names) | Resolution::Ambiguous(names)) =
+            self.resolution(row.row)
+        else {
+            return "None".to_string();
+        };
+        let paths = names
+            .iter()
+            .filter(|name| name.provenance == Provenance::CandidatePath)
+            .count();
+        let verified = names
+            .iter()
+            .filter(|name| name.provenance == Provenance::UserMapping && name.verified)
+            .count();
+        let unconfirmed = names
+            .iter()
+            .filter(|name| name.provenance == Provenance::UserMapping && !name.verified)
+            .count();
+        match (paths > 0, verified > 0, unconfirmed > 0) {
+            (true, false, false) => "Candidate path, verified by hash".to_string(),
+            (false, true, false) => "User mapping, verified by hash".to_string(),
+            (false, false, true) => "User mapping, unconfirmed".to_string(),
+            (false, true, true) => "User mappings, verified and unconfirmed".to_string(),
+            _ => "Candidate paths and user mappings".to_string(),
         }
     }
 
@@ -470,6 +498,7 @@ impl Native {
             ),
             ("Metadata", self.authentication.text()),
             ("Names", self.names_text(row)),
+            ("Name source", self.names_source_text(row)),
         ];
         match &row.name_hash {
             Ok(Some(hash)) => details.push(("Name hash", hex(*hash, 16))),
@@ -656,20 +685,79 @@ impl Native {
                 ..
             }) => note.push_str(&format!(" {file_name} was not used: {problem}.")),
             Some(names) => {
-                let matches = names.matches.as_ref()?;
-                let named = matches
+                let resolved = names.matches.as_ref()?;
+                let named = resolved
                     .rows
                     .iter()
-                    .filter(|r| !r.candidates.is_empty())
+                    .filter(|r| !r.resolution.names().is_empty())
                     .count();
-                let ambiguous = matches.rows.iter().filter(|r| r.ambiguous).count();
-                let unresolved = matches.candidates.iter().filter(|c| c.is_err()).count();
+                let ambiguous = resolved
+                    .rows
+                    .iter()
+                    .filter(|r| r.resolution.is_ambiguous())
+                    .count();
+                let unresolved = resolved
+                    .candidates
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.provenance == Provenance::CandidatePath
+                            && matches!(&candidate.outcome, CandidateOutcome::Unresolved(_))
+                    })
+                    .count();
+                let paths = names.table.candidates();
+                let mappings = names.table.mappings();
+                let source = match (paths, mappings) {
+                    (paths, 0) => format!("{paths} candidate paths"),
+                    (0, mappings) => format!("{mappings} name mappings"),
+                    (paths, mappings) => {
+                        format!("{paths} candidate paths and {mappings} name mappings")
+                    }
+                };
                 note.push_str(&format!(
-                    " {named} of {total} entries are named by the {} candidate paths in \
-                     {file_name}; {ambiguous} ambiguously. {unresolved} candidates could not be \
-                     resolved, for example because no type is known for their extension.",
-                    names.candidates.len()
+                    " {named} of {total} entries are named by the {source} in {file_name}; \
+                     {ambiguous} ambiguously. {unresolved} candidates could not be resolved, for \
+                     example because no type is known for their extension."
                 ));
+                if mappings > 0 {
+                    let verified = resolved
+                        .candidates
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.provenance == Provenance::UserMapping && candidate.verified
+                        })
+                        .count();
+                    let unconfirmed = mappings - verified;
+                    note.push_str(&format!(
+                        " {verified} of {mappings} name mappings are verified by hash; \
+                         {unconfirmed} {} unconfirmed.",
+                        if unconfirmed == 1 { "is" } else { "are" }
+                    ));
+                }
+                if names.table.skipped() > 0 {
+                    let skipped = names.table.skipped();
+                    note.push_str(&format!(
+                        " {skipped} {} not a valid entry.",
+                        if skipped == 1 {
+                            "line was"
+                        } else {
+                            "lines were"
+                        }
+                    ));
+                }
+                if names.table.duplicates() > 0 {
+                    let duplicates = names.table.duplicates();
+                    note.push_str(&format!(
+                        " {duplicates} duplicate {} dropped.",
+                        if duplicates == 1 {
+                            "line was"
+                        } else {
+                            "lines were"
+                        }
+                    ));
+                }
+                if names.table.truncated() {
+                    note.push_str(" The table was cut at its size limit.");
+                }
             }
         }
         let companions = &self.companions;

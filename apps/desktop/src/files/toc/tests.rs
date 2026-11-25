@@ -2,6 +2,7 @@
 //! contents.
 
 use std::cell::Cell;
+use std::fs;
 use std::sync::atomic::AtomicBool;
 
 use lforge_rage9::rpf::Progress;
@@ -391,6 +392,76 @@ fn names_come_from_candidate_paths() {
     assert!(detail(&entries[0], "Names").starts_with("Unknown"));
     fs::remove_file(&candidates).unwrap();
     assert_eq!(detail(&files::list(&path).unwrap()[2], "Names"), "Unknown");
+}
+
+#[test]
+fn names_can_be_declared_for_stored_keys() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("mapped.rpf");
+    let item = hash64(b"props/item");
+    let readme = joaat(b"readme");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(item),
+                ..spec(&[1; 16], RPF_TYPE)
+            },
+            Spec {
+                key: Some(readme),
+                ..spec(&[2; 16], NO_TYPE)
+            },
+        ]),
+    )
+    .unwrap();
+    let names = temp.path().join("mapped.rpf.names.txt");
+    fs::write(
+        &names,
+        format!(
+            "# declared keys\n\
+             hash64:{item:016X}\tProps/Item.ydr\n\
+             key32:{readme:08X}\tReadme.txt\n\
+             hash64:nothex\tignored\n"
+        ),
+    )
+    .unwrap();
+
+    let entries = files::list(&path).unwrap();
+    // The entry remains its row: a name never becomes a path.
+    assert_eq!(names_of(&entries), ["Row 00000", "Row 00001"]);
+    assert_eq!(
+        entries[0].path.file_name().unwrap().to_str().unwrap(),
+        "Row 00000"
+    );
+    assert_eq!(detail(&entries[0], "Names"), "Props/Item.ydr");
+    assert_eq!(
+        detail(&entries[0], "Name source"),
+        "User mapping, verified by hash"
+    );
+    assert_eq!(detail(&entries[1], "Names"), "Readme.txt");
+    // The stored key is still shown unchanged.
+    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+    assert_eq!(detail(&entries[1], "Name key"), format!("0x{readme:08X}"));
+    let note = files::describe(&path).unwrap();
+    assert!(
+        note.contains("2 of 2 entries are named by the 2 name mappings"),
+        "{note}"
+    );
+    assert!(note.contains("2 of 2 name mappings are verified"), "{note}");
+    assert!(note.contains("1 line was not a valid entry"), "{note}");
+
+    // A name that does not hash to the declared key stays a suggestion.
+    fs::write(&names, format!("hash64:{item:016X}\tnot/that/item\n")).unwrap();
+    let entries = files::list(&path).unwrap();
+    assert_eq!(detail(&entries[0], "Names"), "not/that/item");
+    assert_eq!(
+        detail(&entries[0], "Name source"),
+        "User mapping, unconfirmed"
+    );
+    let note = files::describe(&path).unwrap();
+    assert!(note.contains("0 of 1 name mappings are verified"), "{note}");
+    assert!(note.contains("1 is unconfirmed"), "{note}");
+    assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
 }
 
 #[test]
