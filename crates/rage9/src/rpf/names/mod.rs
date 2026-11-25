@@ -1,6 +1,8 @@
 //! RPF9 entry names. An archive stores hashes of entry paths, not the paths.
 //! [`match_candidates`] finds the rows that candidate paths from outside the
-//! archive address, following the engine's resolver.
+//! archive address, following the engine's resolver. [`Resolver`] applies a
+//! local [`StringTable`] to rows and reports unresolved, resolved and
+//! ambiguous results with provenance.
 //!
 //! The engine's extension and type class tables are executable data and are
 //! not included. Only `rpf`, type 0 and its 64-bit class are built in; the
@@ -12,6 +14,15 @@
 use std::collections::HashMap;
 
 use super::metadata::{Entry, Error, Metadata};
+
+pub mod resolve;
+pub mod table;
+
+pub use resolve::{
+    CandidateOutcome, CandidateResult, Name, Namespace, Resolution, ResolutionSet, Resolver,
+    RowNames,
+};
+pub use table::{Provenance, StringTable, TableEntry};
 
 /// The type ID of nested archives, extension `rpf`.
 pub const RPF_TYPE: u8 = 0;
@@ -175,7 +186,7 @@ impl MountPrefix {
 }
 
 /// Which row field holds the key of a type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Class {
     /// [`hash64`] of the stem, in the name hash column.
     Hash64,

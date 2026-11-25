@@ -46,9 +46,39 @@ fn hash64_vectors() {
     assert_eq!(hash64(b"hello"), 0xCBD8_A7B3_41BD_9B02);
 }
 
+/// Vectors generated with the independent `mmh3` 5.3.1 package for
+/// MurmurHash3_x64_128, seed 0, x64 architecture, first 64-bit word. Below 256
+/// bytes the engine's low-byte length mixing equals the standard length, so
+/// these check the block loop, tail, endianness and finalizer independently of
+/// this implementation.
+#[test]
+fn hash64_matches_an_independent_implementation_below_256_bytes() {
+    let cases: [(&[u8], u64); 11] = [
+        (b"", 0x0000_0000_0000_0000),
+        (b"hello", 0xCBD8_A7B3_41BD_9B02),
+        (b"a", 0x8555_5565_F659_7889),
+        (b"abc", 0xB496_3F3F_3FAD_7867),
+        (b"alpha/beta/gamma", 0x7489_FBD9_4F2A_4C86),
+        (b"widget", 0x08E2_9CA2_FA83_C05A),
+        (b"ui/menu.v2.layout", 0x7825_5B90_7998_6159),
+        (b"caf\xC3\xA9/item", 0xC580_3A91_8B18_D3ED),
+        (b"sub/dir/item.name", 0x3FC6_02FC_F22D_7472),
+        (b"dev:/synthetic/Packs/", 0x4F70_72CD_AD2C_FF1E),
+        (&[b'x'; 100], 0x0404_E502_8859_6AE2),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(hash64(input), expected, "{}", input.escape_ascii());
+    }
+    // The last length where the engine's low-byte rule equals full-length
+    // mixing also matches `mmh3`.
+    assert_eq!(hash64(&long(255)), 0x7C9B_5EB2_48E0_7F31);
+}
+
+/// The engine-only length rule from 256 bytes on has no independent reference
+/// implementation. These values follow RPF9-F56 and guard against regressions;
+/// they are not external evidence.
 #[test]
 fn hash64_mixes_only_the_low_length_byte() {
-    assert_eq!(hash64(&long(255)), 0x7C9B_5EB2_48E0_7F31);
     // Standard MurmurHash3 gives 0xC168A72B90FD64CC and 0xF73B45F99E163F09.
     assert_eq!(hash64(&long(256)), 0x7515_B6DF_B512_9164);
     assert_eq!(hash64(&long(257)), 0x018C_14B2_CF45_0E79);
