@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_rage9::rpf::metadata::transform::Algorithm;
 use lforge_rage9::rpf::metadata::{Entry, Field};
 use lforge_rage9::rpf::names::{Class, Key, MountPrefix, Resolver, RowNames, Types};
 use serde_json::{Value, json};
@@ -159,6 +160,18 @@ impl Listing {
             }),
             "payload_transform": match &entry.payload_transform {
                 Ok(flag) => json!(flag),
+                Err(reason) => json!({ "malformed": reason }),
+            },
+            "payload_cipher": match &entry.payload_cipher {
+                Ok(None) => Value::Null,
+                Ok(Some(cipher)) => match Algorithm::of(cipher.kind) {
+                    Ok(algorithm) => json!({
+                        "type": cipher.kind,
+                        "algorithm": format!("{:#x}", algorithm.id()),
+                        "supported": false,
+                    }),
+                    Err(reason) => json!({ "type": cipher.kind, "malformed": reason.to_string() }),
+                },
                 Err(reason) => json!({ "malformed": reason }),
             },
             "read_source": match &entry.read_source {
@@ -682,6 +695,7 @@ mod tests {
             name_key: Ok(name_key),
             chunks: Ok(None),
             payload_transform: Ok(false),
+            payload_cipher: Ok(None),
             read_source: Ok(None),
         }
     }
