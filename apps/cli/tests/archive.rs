@@ -280,6 +280,30 @@ fn reports_reconstructed_resources() {
     );
 }
 
+#[test]
+fn refuses_a_drawable_walk_of_a_resource_without_the_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let (path, offsets) = partial_resource(temp.path());
+    let id = format!("0x{:X}", offsets[0]);
+    let output = lforge(
+        &[
+            "archive",
+            "resource",
+            path.to_str().unwrap(),
+            &id,
+            "--drawable",
+            "--no-cache",
+        ],
+        temp.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("does not have the drawable chain shape"),
+        "{stderr}"
+    );
+}
+
 /// Decoded metadata with two rows, then their payloads: row 0 raw, named
 /// `item`, row 1 compressed, named `packed`. `selector` is `hdr[0x2E]`.
 fn decoded_rpf(path: &Path, selector: u8) {
