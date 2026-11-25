@@ -198,6 +198,15 @@ pub fn chunk4(logical: u32, stored_len: u32, padding: u32, method: u8) -> u64 {
         | (u64::from(method) << 56)
 }
 
+/// One encoding-2 chunk table entry. `logical` and `stored_len` are
+/// multiples of 16.
+pub fn chunk2(logical: u32, stored_len: u32, padding: u32, method: u8) -> u64 {
+    u64::from(logical / 16)
+        | (u64::from(stored_len / 16) << 32)
+        | (u64::from(padding) << 58)
+        | (u64::from(method) << 62)
+}
+
 /// An archive for `specs`, with `companions` listed in `B` sub-block 3.
 pub fn assemble(specs: &[Spec], companions: &[(Vec<u8>, u64)]) -> Vec<u8> {
     let mut data = Vec::new();
@@ -335,6 +344,25 @@ pub fn copy_chunk(data: &[u8]) -> (Vec<u8>, u64) {
     region.resize(stored, 0);
     let entry = chunk4(data.len() as u32, stored as u32, padding as u32, 0);
     (region, entry)
+}
+
+/// A region holding an encoding-2 zlib chunk: the stream, then padding to
+/// 16 bytes.
+pub fn zlib_chunk2(data: &[u8]) -> (Vec<u8>, u64) {
+    let stream = zlib(data);
+    let stored = stream.len().next_multiple_of(16);
+    let padding = (stored - stream.len()) as u64;
+    let mut region = stream;
+    region.resize(stored, 0xA5);
+    let entry = chunk2(data.len() as u32, stored as u32, padding as u32, 3);
+    (region, entry)
+}
+
+/// A region holding an encoding-2 copied (uncompressed) chunk.
+pub fn copy_chunk2(data: &[u8]) -> (Vec<u8>, u64) {
+    assert_eq!(data.len() % 16, 0);
+    let entry = chunk2(data.len() as u32, data.len() as u32, 0, 0);
+    (data.to_vec(), entry)
 }
 
 pub fn lforge(args: &[&str]) -> Output {

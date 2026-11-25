@@ -65,6 +65,39 @@ fn exports_a_chunked_entry_with_zlib_and_copy_methods() {
 }
 
 #[test]
+fn exports_an_encoding_2_chunked_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let first: Vec<u8> = (0..0x1000u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let second: Vec<u8> = (0..32u32).map(|i| (i % 251) as u8).collect();
+    let (region_a, entry_a) = zlib_chunk2(&first);
+    let (region_b, entry_b) = copy_chunk2(&second);
+    // Encoding-2 entries hold 16 bytes before the first chunk.
+    let mut payload = vec![0u8; 16];
+    payload.extend_from_slice(&region_a);
+    payload.extend_from_slice(&region_b);
+    let row = Spec {
+        chunks: Some(chunk_value(2, 2, &[entry_a, entry_b])),
+        logical: Some((first.len() + second.len()) as u64),
+        ..spec(&payload)
+    };
+    let archive = write_archive(temp.path(), "chunked2.rpf", &assemble(&[row], &[]));
+    let out = temp.path().join("out.bin");
+
+    let output = extract(&archive, 0, &out, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(std::fs::read(&out).unwrap(), expected);
+
+    // The listing reports the same row as decodable.
+    let listing = lforge(&["archive", "ls", archive.to_str().unwrap(), "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let value: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(value["rows"][0]["contents"]["readable"], true);
+    assert_eq!(value["rows"][0]["contents"]["state"], "decoded");
+}
+
+#[test]
 fn exports_an_entry_read_from_a_companion() {
     let temp = tempfile::tempdir().unwrap();
     let payload = b"these bytes live only in the companion".to_vec();

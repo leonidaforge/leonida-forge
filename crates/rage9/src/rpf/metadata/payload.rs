@@ -27,6 +27,13 @@ const INPUT_LEN: usize = 64 * 1024;
 const SKIP_LEN: usize = 64 * 1024;
 /// The chunk method that holds a zlib stream. The others are copied.
 const ZLIB_METHOD: u8 = 3;
+/// Encoding-2 entries store a 16-byte prefix before the first chunk. The
+/// chunk table measures only the chunks: on real rows their stored sizes sum
+/// to exactly 16 less than the entry's stored size, and the first zlib stream
+/// starts at offset 16. The prefix's meaning is not established, but its
+/// length is the same on every observed entry. It is skipped only for
+/// encoding 2; encodings 3 and 4 start their chunks at offset 0.
+const ENCODING_2_PREFIX: u64 = 16;
 /// Zlib chunks up to this size are kept in memory while they are read.
 /// Larger ones are kept in a temporary file.
 const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
@@ -265,8 +272,19 @@ impl Payload {
         table: &ChunkTable,
     ) -> Result<Self, Error> {
         let malformed = |what: String| invalid(format!("entry {row}: {what}"));
+        let prefix = if table.encoding == 2 {
+            ENCODING_2_PREFIX
+        } else {
+            0
+        };
+        if prefix > stored.len() {
+            return Err(malformed(format!(
+                "its {prefix}-byte stored prefix does not fit in its {} stored bytes",
+                stored.len()
+            )));
+        }
         let mut spans = Vec::with_capacity(table.chunks.len());
-        let (mut logical, mut stored_at) = (0u64, 0u64);
+        let (mut logical, mut stored_at) = (0u64, prefix);
         for (n, chunk) in table.chunks.iter().enumerate() {
             let compressed = chunk.stored_len.checked_sub(chunk.padding).ok_or_else(|| {
                 malformed(format!(

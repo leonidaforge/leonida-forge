@@ -2016,6 +2016,10 @@ mod decoding {
     /// chunks hold a zlib stream, the others a copy. Padding is nonzero.
     fn chunked(encoding: u8, chunks: &[(u8, Vec<u8>)]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut stored = Vec::new();
+        if encoding == 2 {
+            // Encoding 2 reserves 16 bytes before the first chunk.
+            stored.resize(16, 0);
+        }
         let mut entries = Vec::new();
         let mut contents = Vec::new();
         for (method, data) in chunks {
@@ -2201,6 +2205,55 @@ mod decoding {
     }
 
     #[test]
+    fn encoding_2_chunks_start_after_a_stored_prefix() {
+        let first = data(0x100, 30);
+        let second = data(0x80, 31);
+        let (mut stored, table, expected) = chunked(2, &[(3, first), (3, second)]);
+        // Only the prefix length is part of the container; its bytes are not
+        // required to be zero.
+        stored[..16].fill(0x5A);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), expected);
+        // The second chunk starts one logical chunk later, not one stored
+        // chunk later.
+        let mut payload = entries[0].payload(&source, &[]).unwrap();
+        payload.seek(SeekFrom::Start(0x100)).unwrap();
+        let mut buf = [0; 8];
+        payload.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, expected[0x100..0x108]);
+    }
+
+    #[test]
+    fn rejects_encoding_2_rows_without_room_for_the_prefix() {
+        let entry = chunk_entry(2, 16, 16, 16, 0);
+        let table = ChunkTable {
+            encoding: 2,
+            chunks: vec![Chunk::decode(entry, 2).unwrap()],
+        };
+        for stored_len in [0, 8, 15] {
+            let stored = file(&vec![0; stored_len]);
+            let reason = invalid_reason(Payload::chunked(0, stored, 16, &table));
+            assert!(reason.contains("stored prefix"), "{stored_len}: {reason}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_encoding_2_streams() {
+        let original = data(0x2000, 32);
+        let mut stream = zlib(&original);
+        *stream.last_mut().unwrap() ^= 1;
+        let stored_len = stream.len().next_multiple_of(16);
+        let mut stored = vec![0; 16];
+        stored.extend_from_slice(&stream);
+        stored.resize(16 + stored_len, 0xA5);
+        let entry = chunk_entry(2, original.len(), stream.len(), stored_len, 3);
+        let table = chunk_value(8, 1, 2, &[entry]);
+        let (source, entries) = open(&[chunked_spec(stored, table, original.len())]);
+        let message = invalid_data(contents(&entries[0], &source));
+        assert!(message.contains("invalid"), "{message}");
+    }
+
+    #[test]
     fn reads_chunked_entries_at_any_position() {
         let chunks = [
             (3, data(0x1000, 15)),
@@ -2317,9 +2370,18 @@ mod decoding {
         let big = chunk_value(8, 1, 4, &[chunk_entry(4, 0x40, 0x40, 0x40, 0)]);
         let message = reason(chunked_spec(vec![0; 0x20], big, 0x40));
         assert!(message.contains("more than its"), "{message}");
+        // An encoding-2 chunk table whose spans and prefix exceed the stored
+        // range.
+        let big = chunk_value(8, 1, 2, &[chunk_entry(2, 0x40, 0x40, 0x40, 0)]);
+        let message = reason(chunked_spec(vec![0; 0x30], big, 0x40));
+        assert!(message.contains("more than its"), "{message}");
         // A table whose entries lie outside the pool, or with an encoding
         // that is not 2, 3 or 4.
-        for table in [chunk_value(8, 100, 4, &[0]), chunk_value(8, 1, 9, &[0])] {
+        for table in [
+            chunk_value(8, 100, 4, &[0]),
+            chunk_value(8, 100, 2, &[0]),
+            chunk_value(8, 1, 9, &[0]),
+        ] {
             let message = reason(chunked_spec(stored.clone(), table, 0x40));
             assert!(message.contains("malformed chunk table"), "{message}");
         }
@@ -2354,8 +2416,12 @@ mod decoding {
 
     #[test]
     fn decoded_entries_hold_nested_archives() {
-        let inner = Build::default().build(&[Column::new(KEY_X, 4, &[&[4, 3, 2, 1]], &[Some(0)])]);
+        // A 16-byte column keeps the nested archive a multiple of 16 bytes,
+        // which encoding 2 requires.
+        let value = [4u8, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let inner = Build::default().build(&[Column::new(KEY_X, 16, &[&value], &[Some(0)])]);
         let (stored, table, expected) = chunked(3, &[(3, inner.clone())]);
+        let (stored_2, table_2, expected_2) = chunked(2, &[(3, inner.clone())]);
         let (source, entries) = open(&[
             Spec {
                 mode: 1,
@@ -2363,11 +2429,12 @@ mod decoding {
                 ..spec(RecordLayout::A, deflate(&inner), 0)
             },
             chunked_spec(stored, table, expected.len()),
+            chunked_spec(stored_2, table_2, expected_2.len()),
         ]);
         for entry in &entries {
             let bytes = contents(entry, &source).unwrap();
             let nested = Stored::from_bytes(bytes).unwrap().decode().unwrap();
-            assert_eq!(nested.field(0, KEY_X).unwrap(), Some(&[4, 3, 2, 1][..]));
+            assert_eq!(nested.field(0, KEY_X).unwrap(), Some(&value[..]));
         }
     }
 
