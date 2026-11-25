@@ -124,7 +124,19 @@ Entries are identified by their row number in the table. `archive metadata --ent
 
 `archive extract` writes one entry to `--output`, decoded where its storage is supported. It handles stored bytes, raw DEFLATE, and chunked payloads whose chunks are zlib streams or copied, including entries whose bytes live in a companion file next to the archive. It refuses encrypted or processed metadata, payload transforms and compression modes it cannot decode, and companions that are not available, rather than writing wrong bytes. The output goes through a temporary file in the destination directory and replaces an existing file only with `--overwrite`; a failed decode leaves no partial file behind.
 
-RPF9 stores a hash of each entry's path, not the path. `archive metadata --entries` always shows the stored hash and key. A local name table can add candidate names, but a name is display data: it never changes a row's key, a payload offset, an authentication result or an extraction destination. `--name-file FILE` reads one; without it, `<archive>.names.txt` next to the archive is used when present. The table is UTF-8, one entry per line: a candidate path, or `hash64:HASH<TAB>NAME` and `key32:HASH<TAB>NAME` for a declared key. Candidate paths are verified by hashing them with the type's class. A declared name is verified only when its normalized form or its stem reproduces the key; otherwise it is reported as unconfirmed. Use `--archive-path`, `--mount-prefix` and `--extension` to describe paths that the built-in `rpf` mapping cannot.
+RPF9 stores a hash of each entry's path, not the path. `archive metadata --entries` always shows the stored hash and key. A local name table can add candidate names, but a name is display data: it never changes a row's key, a payload offset, an authentication result or an extraction destination. `--name-file FILE` is repeatable and accepts a `.names.txt` table or a Leonida Forge LUT; without it, `<archive>.names.txt` next to the archive is used when present. The `.names.txt` format is UTF-8, one entry per line: a candidate path, or `hash64:HASH<TAB>NAME` and `key32:HASH<TAB>NAME` for a declared key. Candidate paths are verified by hashing them with the type's class. A declared name is verified only when its normalized form or its stem reproduces the key; otherwise it is reported as unconfirmed. Use `--archive-path`, `--mount-prefix` and `--extension` to describe paths that the built-in `rpf` mapping cannot.
+
+The desktop explorer labels an entry with a verified unambiguous name, otherwise with the stored key in canonical hexadecimal form. Only `rpf` to type 0 is a confirmed extension, so unknown type IDs get no invented extension. Row numbers remain the entry paths and stay in details. The sidecar may be a `.names.txt` table or a LUT; `<archive>.lut` is also loaded when present.
+
+The native index and candidate pipeline are available without a network service:
+
+```sh
+lforge names index "GAME_DIRECTORY" --executable game.exe --json
+lforge names harvest "GAME_DIRECTORY" --executable game.exe --sources payloads,executable --output results.jsonl --json
+lforge names export results.jsonl --format lut --output resolved.lut --json
+```
+
+`names index` authenticates each `.rpf` recursively and builds an in-memory index of stored keys and rows. `names harvest` extracts bounded path-like strings from readable payloads and initialized executable sections, hashes a small set of variants, and writes local JSONL evidence for hash matches. `names export` writes one validated LUT per namespace (`resolved.hash64.lut`, `resolved.key32.lut` when both are present). A hash match is a candidate, not proof of the original developer filename; 32-bit matches are weaker.
 
 ## AI Contributions
 

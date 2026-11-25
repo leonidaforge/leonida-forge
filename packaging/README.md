@@ -69,14 +69,19 @@ This is not full native GTA VI RPF9 support.
 - Inspect any file as bytes in the Binary Inspector.
 - Export an entry from its context menu or from **File > Save Selection As**.
 - List and export recovery candidates from the CLI.
+- Index native hashes, harvest candidate names from readable payloads and the
+  local executable, and export validated LUT files with `lforge names`.
 
 ## Known limitations
 
 - Encrypted RPF9 table-of-contents metadata needs a compatible local
   executable. Without one, only recovery by scanning is available.
-- Native entries keep their stored hash names. A local `<archive>.names.txt`
-  table can supply candidate paths or declared key/name mappings; verified
-  names are display data and never replace the hash or an entry path.
+- Native entries are labelled by a verified unambiguous name when a local
+  `<archive>.names.txt` or `<archive>.lut` table supplies one, otherwise by
+  the stored key in canonical hexadecimal form. Row numbers remain the entry
+  paths. Only `rpf` to type 0 is a confirmed extension. Many rows remain
+  unresolved, and a hash match is a candidate, not proof of the original
+  developer filename.
 - Recovered entries have no original names or paths.
 - A recovered entry can be partial or unverified. The UI reports its status,
   and an export keeps that caveat in the result message.

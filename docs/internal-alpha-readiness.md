@@ -32,10 +32,13 @@ pushed.
 - Read a processed table of contents after authenticating it against a local
   game executable selected in the explorer. Native rows keep their row number
   and name hash, and are never merged with recovered entries.
-- Show a native row's name from a local `<archive>.names.txt` table next to the
-  archive: candidate paths, or declared `hash64`/`key32` mappings. A name is
-  marked verified only when hashing reproduces the stored key. Names are
+- Show a native row's name from a local `<archive>.names.txt` or
+  `<archive>.lut` table next to the archive. A name is marked verified only
+  when hashing reproduces the stored key. Unresolved and ambiguous rows use the
+  stored key in canonical hexadecimal form as the visible label. Names are
   display data; the row number and stored hash remain authoritative.
+- Index native hashes, harvest candidate strings from readable payloads and the
+  local executable, and export validated LUT files with `lforge names`.
 - Inspect any file as bytes in the Binary Inspector, including files inside
   archives.
 - Export one entry to a chosen path, from the entry context menu and the File
@@ -53,6 +56,8 @@ pushed.
   signature does not verify, an encrypted archive falls back to scan recovery.
 - Original names and folder structure for recovered entries. Names are archive
   offsets; grouping is by detected kind.
+- Virtual folder grouping from resolved native paths. The native list is flat;
+  path-like candidate names are display data and do not become directories.
 - Payload transforms and compression modes beyond stored, raw DEFLATE and
   chunked zlib or copied chunks. Entries that need anything else are refused.
 - Writing to game files. All file access is read-only by design.
@@ -266,7 +271,9 @@ C++ Redistributable installed.
    native rows. Place a `<archive>.names.txt` with a known candidate path next
    to the archive, reopen it, and confirm the name appears while the row label
    and stored hash stay. Remove the file and confirm the names return to
-   unknown.
+   unknown. Copy an archive and a LUT to a temporary folder, name the LUT
+   `<archive>.lut`, and confirm the resolved name becomes the entry label while
+   `Row NNNNN` remains its path.
 8. Browse `Recovered Entries`, `Resource Pages` and `Unrecovered Regions`.
    Confirm offsets, sizes and completeness text are plausible.
 9. Open a plain file and an entry inside an archive in the Binary Inspector.
