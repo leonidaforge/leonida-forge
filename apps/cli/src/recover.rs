@@ -34,6 +34,10 @@ const NOTE: &str = "Candidates are entries recovered by scanning the archive dat
 const NOTHING: &str = "No zlib streams were found, so there are no recovery candidates. This does \
      not mean the archive is empty.";
 
+/// The schema of a recovery list document. `inferred.kind` uses the
+/// corrected kind names; a PSIN payload is `psin`, not `pso`.
+const LIST_SCHEMA: &str = "leonida-forge.recovery-list/1";
+
 pub struct Options {
     pub file: PathBuf,
     pub list: bool,
@@ -131,6 +135,7 @@ fn list_json(index: &Index, out: &mut impl Write) -> io::Result<()> {
         .map(|entry| candidate_json(index, entry))
         .collect();
     let listing = json!({
+        "schema": LIST_SCHEMA,
         "note": if index.entries.is_empty() {
             format!("{NOTE} {NOTHING}")
         } else {

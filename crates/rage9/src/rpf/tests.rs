@@ -222,7 +222,12 @@ fn classifies_conservatively() {
     assert_eq!(classify(b"\xEF\xBB\xBF<?xml version"), Kind::Xml);
     // Markup without a declaration may be the middle of a file.
     assert_eq!(classify(b"<Item>value</Item>"), Kind::Text);
-    assert_eq!(classify(b"PSIN\x00\x00"), Kind::Pso);
+    assert_eq!(classify(b"PSIN\x00\x00"), Kind::Psin);
+    // The magic is a signature, but PSIN has no established extension and is
+    // not a confirmed PSO payload.
+    assert_eq!(Kind::Psin.name(), "psin");
+    assert_eq!(Kind::Psin.extension(), "bin");
+    assert!(Kind::Psin.is_file_start());
     assert_eq!(classify(b"RBF0\x00"), Kind::Rbf);
     assert_eq!(classify(b"DDS \x7C"), Kind::Dds);
     assert_eq!(classify(&[0u8, 1, 2, 3]), Kind::Binary);

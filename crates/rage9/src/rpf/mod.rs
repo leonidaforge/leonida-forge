@@ -163,8 +163,9 @@ pub(crate) fn align_up(offset: u64) -> Option<u64> {
 pub enum Kind {
     /// An XML declaration, optionally after a UTF-8 byte order mark.
     Xml,
-    /// Starts with `PSIN`.
-    Pso,
+    /// Starts with `PSIN`. The payload encoding is unresolved; nothing
+    /// relates it to a confirmed PSO format.
+    Psin,
     /// Starts with `RBF0`.
     Rbf,
     Png,
@@ -180,7 +181,7 @@ pub enum Kind {
 impl Kind {
     pub const ALL: [Kind; 8] = [
         Kind::Xml,
-        Kind::Pso,
+        Kind::Psin,
         Kind::Rbf,
         Kind::Png,
         Kind::Dds,
@@ -192,7 +193,7 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Xml => "xml",
-            Kind::Pso => "pso",
+            Kind::Psin => "psin",
             Kind::Rbf => "rbf",
             Kind::Png => "png",
             Kind::Dds => "dds",
@@ -202,11 +203,12 @@ impl Kind {
         }
     }
 
-    /// The extension given to recovered entries of this kind.
+    /// The extension given to recovered entries of this kind. A PSIN payload
+    /// has no established extension, so it gets the neutral one.
     pub fn extension(self) -> &'static str {
         match self {
             Kind::Xml => "xml",
-            Kind::Pso => "pso",
+            Kind::Psin => "bin",
             Kind::Rbf => "rbf",
             Kind::Png => "png",
             Kind::Dds => "dds",

@@ -126,7 +126,7 @@ pub(crate) fn classify(head: &[u8]) -> Kind {
         return Kind::Xml;
     }
     if head.starts_with(b"PSIN") {
-        return Kind::Pso;
+        return Kind::Psin;
     }
     if head.starts_with(b"RBF0") {
         return Kind::Rbf;

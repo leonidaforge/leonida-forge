@@ -336,7 +336,7 @@ pub fn build_index(
 fn folder_name(kind: Kind) -> &'static str {
     match kind {
         Kind::Xml => "XML",
-        Kind::Pso => "PSO",
+        Kind::Psin => "PSIN",
         Kind::Rbf => "RBF",
         Kind::Png => "PNG",
         Kind::Dds => "DDS",
@@ -349,7 +349,7 @@ fn folder_name(kind: Kind) -> &'static str {
 fn type_name(kind: Kind, status: Status) -> String {
     let name = match kind {
         Kind::Xml => "XML document",
-        Kind::Pso => "PSO data",
+        Kind::Psin => "PSIN data",
         Kind::Rbf => "RBF data",
         Kind::Png => "PNG image",
         Kind::Dds => "DDS texture",
