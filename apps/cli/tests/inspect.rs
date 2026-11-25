@@ -204,46 +204,45 @@ fn binary_inspect_reports_an_unrecognised_file() {
     assert!(text.contains("unrecognised"), "{text}");
 }
 
-/// A synthetic RBF0 document: header, root name, one object value, one
-/// string value and one attribute.
+/// A synthetic RBF0 document: a versioned header, a root element with one
+/// name attribute, a nested element, one named number value and one text
+/// node.
 fn rbf0() -> Vec<u8> {
     fn name(bytes: &[u8]) -> Vec<u8> {
         let mut out = (bytes.len() as u16).to_le_bytes().to_vec();
         out.extend_from_slice(bytes);
         out
     }
-    fn object(attributes: &[u8], fields: &[u8]) -> Vec<u8> {
-        let mut out = 0u32.to_le_bytes().to_vec();
-        out.extend_from_slice(&((!attributes.is_empty()) as u16).to_le_bytes());
-        out.extend_from_slice(attributes);
-        out.extend_from_slice(fields);
-        out.extend_from_slice(&0xFFFFu16.to_le_bytes());
-        out
+    fn token(code: u16, index: u16) -> Vec<u8> {
+        ((code << 12) | index).to_le_bytes().to_vec()
     }
-    let inner = object(&[], &[]);
-    let mut attribute = 0x6003u16.to_le_bytes().to_vec();
-    attribute.extend_from_slice(&name(b"SYNTHETIC-ATTRIBUTE-NAME"));
-    attribute.extend_from_slice(&4u16.to_le_bytes());
-    attribute.extend_from_slice(b"kind");
-    let mut fields = 0x0001u16.to_le_bytes().to_vec();
-    fields.extend_from_slice(&name(b"SYNTHETIC-OBJECT-NAME"));
-    fields.extend_from_slice(&inner);
-    fields.extend_from_slice(&0x0004u16.to_le_bytes());
-    fields.extend_from_slice(&name(b"SYNTHETIC-STRING-NAME"));
-    fields.extend_from_slice(&0u32.to_le_bytes());
-    fields.extend_from_slice(&0u16.to_le_bytes());
-    fields.extend_from_slice(&0xFFFDu16.to_le_bytes());
-    let value = b"SYNTHETIC-TEXT-VALUE\0";
-    fields.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    fields.extend_from_slice(value);
-    fields.extend_from_slice(&0xFFFFu16.to_le_bytes());
-    let root = object(&attribute, &fields);
-
     let mut bytes = b"RBF0".to_vec();
     bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
-    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    // Root element with one attribute.
+    bytes.extend_from_slice(&token(0, 0));
     bytes.extend_from_slice(&name(b"SYNTHETIC-ROOT-NAME"));
-    bytes.extend_from_slice(&root);
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&token(6, 1));
+    bytes.extend_from_slice(&name(b"SYNTHETIC-ATTRIBUTE-NAME"));
+    bytes.extend_from_slice(&4u16.to_le_bytes());
+    bytes.extend_from_slice(b"kind");
+    // A nested element.
+    bytes.extend_from_slice(&token(0, 2));
+    bytes.extend_from_slice(&name(b"SYNTHETIC-OBJECT-NAME"));
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+    // A named number value and a text node.
+    bytes.extend_from_slice(&token(1, 3));
+    bytes.extend_from_slice(&name(b"SYNTHETIC-STRING-NAME"));
+    bytes.extend_from_slice(&[0u8; 8]);
+    bytes.extend_from_slice(&0xFFFDu16.to_le_bytes());
+    let text = b"SYNTHETIC-TEXT-VALUE";
+    bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(text);
+    bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
     bytes
 }
 
@@ -259,23 +258,23 @@ fn binary_inspect_parses_an_rbf0_document() {
     assert_eq!(document["format"]["support"], "structural");
     let structure = &document["structure"];
     assert_eq!(structure["valid"], true);
-    assert_eq!(structure["header"]["marker"], "0xFFFB");
-    assert_eq!(structure["header"]["value"], 1);
-    assert_eq!(structure["header"]["root_name_len"], 19);
+    assert_eq!(structure["header"]["versioned"], true);
+    assert_eq!(structure["header"]["version"], 1);
+    assert_eq!(structure["header"]["number_len"], 8);
+    assert_eq!(structure["header"]["body_offset"], 8);
     let body = &structure["body"];
     assert_eq!(body["objects"], 2);
     assert_eq!(body["depth"], 1);
-    assert_eq!(body["fields"], 2);
-    assert_eq!(body["object_fields"], 1);
-    assert_eq!(body["string_fields"], 1);
+    assert_eq!(body["fields"], 1);
     assert_eq!(body["attributes"], 1);
-    assert_eq!(body["definitions"]["count"], 3);
+    assert_eq!(body["text_nodes"], 1);
+    assert_eq!(body["definitions"]["count"], 4);
     assert_eq!(body["strings"]["count"], 1);
-    assert_eq!(body["attribute_values"]["count"], 1);
-    assert_eq!(body["attribute_values"]["bytes"], 4);
+    assert_eq!(body["length_prefixed_values"]["count"], 1);
+    assert_eq!(body["length_prefixed_values"]["bytes"], 4);
     let ranges = structure["parsed_ranges"].as_array().unwrap();
-    assert!(ranges.iter().any(|range| range["field"] == "root name"));
-    assert!(ranges.iter().any(|range| range["field"] == "body"));
+    assert!(ranges.iter().any(|range| range["field"] == "header"));
+    assert!(ranges.iter().any(|range| range["field"] == "token stream"));
     // Names and text values are payload text and never part of the document.
     let text = serde_json::to_string(&document).unwrap();
     for banned in [
@@ -304,14 +303,12 @@ fn binary_inspect_limits_the_definition_sample() {
     assert!(output.status.success(), "{}", common::stderr(&output));
     let document = json(&output);
     let definitions = &document["structure"]["body"]["definitions"];
-    assert_eq!(definitions["count"], 3);
+    assert_eq!(definitions["count"], 4);
     assert_eq!(definitions["shown"], 2);
     assert_eq!(definitions["items"].as_array().unwrap().len(), 2);
-    // The attribute is defined before the root object's fields.
-    assert_eq!(definitions["items"][0]["field_id"], "0x6003");
-    assert_eq!(definitions["items"][0]["class"], "attribute");
-    assert_eq!(definitions["items"][1]["field_id"], "0x0001");
-    assert_eq!(definitions["items"][1]["class"], "object");
+    // Names are defined in first-use order.
+    assert_eq!(definitions["items"][0]["name_index"], 0);
+    assert_eq!(definitions["items"][1]["name_index"], 1);
 }
 
 #[test]
@@ -325,10 +322,10 @@ fn binary_inspect_is_deterministic() {
 }
 
 #[test]
-fn binary_inspect_reports_an_unsupported_rbf0_header() {
+fn binary_inspect_reports_an_unsupported_rbf0_version() {
     let temp = tempfile::tempdir().unwrap();
     let mut bytes = rbf0();
-    bytes[4..6].copy_from_slice(&0xFFF0u16.to_le_bytes());
+    bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
     let path = write(temp.path(), "doc.bin", &bytes);
     let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
     assert!(!output.status.success());
@@ -340,7 +337,7 @@ fn binary_inspect_reports_an_unsupported_rbf0_header() {
         document["structure"]["error"]
             .as_str()
             .unwrap()
-            .contains("0xFFF0")
+            .contains("version 2")
     );
 }
 
@@ -348,9 +345,10 @@ fn binary_inspect_reports_an_unsupported_rbf0_header() {
 fn binary_inspect_reports_an_rbf0_body_failure() {
     let temp = tempfile::tempdir().unwrap();
     let mut bytes = rbf0();
-    // The first field identifier after the root object header is unsupported.
-    let at = 12 + 19 + 6;
-    bytes[at..at + 2].copy_from_slice(&0x0003u16.to_le_bytes());
+    // The final terminator becomes a type-7 token, which the grammar does not
+    // define.
+    let at = bytes.len() - 2;
+    bytes[at..].copy_from_slice(&0x7000u16.to_le_bytes());
     let path = write(temp.path(), "doc.bin", &bytes);
     let output = lforge(&["binary", "inspect", path.to_str().unwrap(), "--json"]);
     assert!(!output.status.success());
@@ -358,12 +356,12 @@ fn binary_inspect_reports_an_rbf0_body_failure() {
     assert_eq!(document["format"]["id"], "rbf0");
     assert_eq!(document["failure_stage"], "structure");
     assert_eq!(document["structure"]["valid"], false);
-    assert_eq!(document["structure"]["header"]["marker"], "0xFFFB");
+    assert_eq!(document["structure"]["header"]["versioned"], true);
     assert!(
         document["structure"]["error"]
             .as_str()
             .unwrap()
-            .contains("outside the observed identifier sets")
+            .contains("token class 7")
     );
 }
 

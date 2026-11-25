@@ -1,31 +1,32 @@
-//! RBF0: a recursive object stream with inline field names.
+//! RBF0: a binary token stream with a per-document name table.
 //!
-//! Established on 18 payloads of one nested archive (research findings RBF0-F01
-//! to RBF0-F14):
+//! The grammar is the one the research validated on 238 unique payloads
+//! (RBF0-F15 to RBF0-F17):
 //!
 //! ```text
-//! Document  := Header Object
-//! Header    := "RBF0" u16(0xFFFB) u32(1) u16(root_name_len) root_name
-//! Object    := u32(0) u16(attribute_count) Attribute* Field* u16(0xFFFF)
-//! Attribute := FieldId [u16(name_len) name] u16(value_len) value
-//! Field     := FieldId [u16(name_len) name] FieldValue
-//! FieldId   := u16
+//! Document      := "RBF0" VersionHeader? Element
+//! VersionHeader := u16(0xFFFB) u16(version)
+//! Element       := Token(type=0) Name? u32(reserved) u16(attribute_count)
+//!                  Attribute* BodyToken* u16(0xFFFF)
+//! Attribute     := Token(type=1..6) Name? Value
+//! BodyToken     := Element | Value | Text | u16(0xFFFF)
+//! Value         := Token(type=1..6) Name? bytes
+//! Text          := u16(0xFFFD) u32(byte_length) bytes
+//! Token         := u16(name_index | (type_code << 12))
 //! ```
 //!
-//! A field name is present only on the first use of its identifier within one
-//! payload. A string value is `u32(0) u16(0) u16(0xFFFD) u32(len) bytes
-//! u16(0xFFFF)`, an object value is another object, and `0x1006` carries eight
-//! bytes with no length prefix and no terminator.
+//! The versioned header makes numbers 8 bytes wide; the versionless one
+//! starts the token stream at `+0x04` and numbers are 4 bytes wide. `Name?`
+//! is present only when the token's 12-bit name index equals the current name
+//! table length; a lower index reuses an earlier name, a higher one is an
+//! error.
 //!
-//! Only the identifiers the research observed are accepted: `0x0001` and
-//! `0x0002` for objects, `0x0004` to `0x000A` for strings, `0x1006` for the
-//! eight-byte value and `0x6003`/`0x6004` for attributes. Any other identifier
-//! stops the parse instead of being guessed at.
+//! Type codes 7 to 14 were not observed. A token with one of them stops the
+//! parse with its offset and class instead of being skipped.
 //!
-//! The root name, the field names and every text value are payload text. They
-//! stay in memory so a caller can hash them and are never part of a report.
+//! Names and text values are payload text. They stay in memory so a caller
+//! can hash them and are never part of a report.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,62 +34,45 @@ use sha2::{Digest, Sha256};
 
 /// The four bytes the payload starts with.
 pub const MAGIC: [u8; 4] = *b"RBF0";
-/// Bytes before the root name: magic, header marker, header value and root
-/// name length.
-pub const PREFIX_LEN: usize = 0x0C;
-/// The `u16` at +0x04 in every verified payload. Meaning unknown.
+/// The `u16` that marks the versioned header, at `+0x04`.
 pub const HEADER_MARKER: u16 = 0xFFFB;
-/// The `u32` at +0x06 in every verified payload. Meaning unknown.
-pub const HEADER_VALUE: u32 = 1;
-/// Closes an object and follows every string value.
+/// The only version observed with the versioned header.
+pub const VERSION: u16 = 1;
+/// Number width of a versioned document.
+pub const VERSIONED_NUMBER_LEN: usize = 8;
+/// Number width of a versionless document.
+pub const VERSIONLESS_NUMBER_LEN: usize = 4;
+/// Closes the innermost open element.
 pub const TERMINATOR: u16 = 0xFFFF;
-/// Tags a string value after its two zero words.
-pub const STRING_VALUE_TAG: u16 = 0xFFFD;
-/// The one observed field identifier with a fixed eight-byte value.
-pub const FIXED8_FIELD: u16 = 0x1006;
-/// Length of that value.
-pub const FIXED8_LEN: usize = 8;
-/// Field identifiers whose value is another object.
-pub const OBJECT_FIELDS: [u16; 2] = [0x0001, 0x0002];
-/// The field identifiers whose value is a string.
-pub const STRING_FIELDS: std::ops::RangeInclusive<u16> = 0x0004..=0x000A;
-/// The field identifiers used for attributes.
-pub const ATTRIBUTE_FIELDS: [u16; 2] = [0x6003, 0x6004];
+/// A text node: `u32` byte length, then bytes.
+pub const TEXT_TOKEN: u16 = 0xFFFD;
+/// The low 12 bits of a token: the name index.
+pub const NAME_INDEX_MASK: u16 = 0x0FFF;
+/// The high 4 bits of a token: the type code.
+pub const TYPE_SHIFT: u32 = 12;
 
 /// Whether `head` starts an RBF0 payload.
 pub fn is_rbf0(head: &[u8]) -> bool {
     head.starts_with(&MAGIC)
 }
 
-/// How the verified identifier sets classify a field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldClass {
-    Object,
-    String,
-    Fixed8,
-    Attribute,
+/// The type code of a token word.
+pub fn type_code(token: u16) -> u8 {
+    (token >> TYPE_SHIFT) as u8
 }
 
-impl FieldClass {
-    /// The class of `field_id`, or `None` when the identifier is outside the
-    /// observed sets.
-    pub fn of(field_id: u16) -> Option<Self> {
-        match field_id {
-            id if OBJECT_FIELDS.contains(&id) => Some(FieldClass::Object),
-            id if STRING_FIELDS.contains(&id) => Some(FieldClass::String),
-            FIXED8_FIELD => Some(FieldClass::Fixed8),
-            id if ATTRIBUTE_FIELDS.contains(&id) => Some(FieldClass::Attribute),
-            _ => None,
-        }
-    }
+/// The name index of a token word.
+pub fn name_index(token: u16) -> u16 {
+    token & NAME_INDEX_MASK
+}
 
-    pub fn name(self) -> &'static str {
-        match self {
-            FieldClass::Object => "object",
-            FieldClass::String => "string",
-            FieldClass::Fixed8 => "fixed8",
-            FieldClass::Attribute => "attribute",
-        }
+/// Bytes a value of type code `code` occupies, when it is fixed. `None` for
+/// the length-prefixed and zero-byte forms, which the parser handles.
+pub fn fixed_value_len(code: u8) -> Option<usize> {
+    match code {
+        2 | 3 => Some(0),
+        5 => Some(12),
+        _ => None,
     }
 }
 
@@ -103,6 +87,14 @@ pub enum ErrorKind {
     UnsupportedVersion,
     /// The bytes contradict the established grammar.
     Structure,
+    /// A token class the grammar does not define.
+    UnsupportedToken,
+    /// A name index beyond the current name table.
+    NameIndex,
+    /// An element without its `0xFFFF` terminator.
+    Unterminated,
+    /// Bytes after the root element.
+    Trailing,
     /// A caller limit was reached.
     Limit,
     Cancelled,
@@ -134,47 +126,81 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The header in front of the root name.
+/// The document header: the versioned form or the versionless one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
-    /// The `u16` at +0x04. Meaning unknown; [`HEADER_MARKER`] in every sample.
-    pub word: u16,
-    /// The `u32` at +0x06. Meaning unknown; [`HEADER_VALUE`] in every sample.
-    pub flags: u32,
-    /// The `u16` at +0x0A: the length of the root name that follows.
-    pub root_name_len: u16,
+    /// Whether the `0xFFFB` marker and a version word are present.
+    pub versioned: bool,
+    /// The `u16` after the marker. `None` for the versionless form.
+    pub version: Option<u16>,
 }
 
 impl Header {
-    /// Parses the header from `head`, the start of the payload. No root name
-    /// byte is read or checked.
+    /// Parses the header from `head`, the start of the payload. No token is
+    /// read.
     pub fn parse(head: &[u8]) -> Result<Self, Error> {
         if !is_rbf0(head) {
             return Err(Error::new(ErrorKind::NotRbf0, 0, "not an RBF0 payload"));
         }
-        let prefix = head.get(..PREFIX_LEN).ok_or_else(|| {
-            Error::new(
+        if head.len() < MAGIC.len() + 2 {
+            return Err(Error::new(
                 ErrorKind::TooShort,
                 head.len(),
-                "the payload is shorter than the 12-byte header",
-            )
-        })?;
+                "the payload ends before the first token",
+            ));
+        }
+        let word = u16::from_le_bytes([head[4], head[5]]);
+        if word == HEADER_MARKER {
+            let version = head
+                .get(6..8)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+            let Some(version) = version else {
+                return Err(Error::new(
+                    ErrorKind::TooShort,
+                    6,
+                    "the versioned header ends before its version word",
+                ));
+            };
+            return Ok(Self {
+                versioned: true,
+                version: Some(version),
+            });
+        }
         Ok(Self {
-            word: u16::from_le_bytes([prefix[4], prefix[5]]),
-            flags: u32::from_le_bytes([prefix[6], prefix[7], prefix[8], prefix[9]]),
-            root_name_len: u16::from_le_bytes([prefix[0x0A], prefix[0x0B]]),
+            versioned: false,
+            version: None,
         })
+    }
+
+    /// The offset of the first token.
+    pub fn body_offset(&self) -> usize {
+        if self.versioned {
+            MAGIC.len() + 4
+        } else {
+            MAGIC.len()
+        }
+    }
+
+    /// The width of a number value, which the header variant decides.
+    pub fn number_len(&self) -> usize {
+        if self.versioned {
+            VERSIONED_NUMBER_LEN
+        } else {
+            VERSIONLESS_NUMBER_LEN
+        }
     }
 }
 
 /// Caps one parse.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Nested objects allowed below the root object. The root is depth 0.
+    /// Nested elements allowed below the root element. The root is depth 0.
     pub max_depth: usize,
-    /// Field identifiers stored as a definition.
-    pub max_definitions: usize,
-    /// Bytes a single name or value may declare.
+    /// Names the document may define.
+    pub max_names: usize,
+    /// Elements the document may hold.
+    pub max_elements: usize,
+    /// Bytes a single name, text node or value may declare.
     pub max_value_len: u32,
     /// Text bytes copied out of one payload.
     pub max_text: usize,
@@ -184,7 +210,8 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_depth: 32,
-            max_definitions: 4096,
+            max_names: 4096,
+            max_elements: 1 << 20,
             max_value_len: 1 << 20,
             max_text: 8 << 20,
         }
@@ -198,10 +225,11 @@ pub struct Diagnostic {
     pub message: &'static str,
 }
 
-/// One field identifier and the name defined for it.
+/// One name the document defines, by its name index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Definition {
-    pub field_id: u16,
+    /// The 12-bit name index.
+    pub index: u16,
     /// Offset of the name length that starts the definition.
     pub offset: usize,
     pub name_len: usize,
@@ -236,30 +264,37 @@ impl TextStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub header: Header,
-    /// SHA-256 of the root name bytes.
+    /// SHA-256 of the root element's name bytes.
     pub root_name_digest: [u8; 32],
-    /// Offset of the root object.
+    /// Offset of the first token.
     pub body_offset: usize,
-    /// Objects, including the root object.
+    /// Names the document defined.
+    pub names: usize,
+    /// Elements, including the root element.
     pub objects: usize,
-    /// Deepest object depth, the root object being 0.
+    /// Deepest element depth, the root element being 0.
     pub depth: usize,
+    /// Value tokens in body positions.
     pub fields: usize,
-    pub object_fields: usize,
-    pub string_fields: usize,
-    pub fixed8_fields: usize,
+    /// Attribute tokens.
     pub attributes: usize,
+    /// Text nodes.
+    pub text_nodes: usize,
+    /// Value tokens per type code, indices 1 to 6.
+    pub types: [usize; 7],
     pub definitions: Vec<Definition>,
+    /// Counts and lengths of the text nodes.
     pub strings: TextStats,
+    /// Counts and lengths of the length-prefixed (type 6) values.
     pub attribute_values: TextStats,
-    /// Verified field names, in definition order. Payload text: a caller may
-    /// hash it, and it is never reported.
+    /// Defined names, in definition order. Payload text: a caller may hash
+    /// it, and it is never reported.
     pub field_names: Vec<String>,
-    /// Verified string values, in document order. Payload text, as above.
+    /// Text-node content, in document order. Payload text, as above.
     pub string_texts: Vec<String>,
-    /// Verified attribute values, in document order. Payload text, as above.
+    /// Type 6 values, in document order. Payload text, as above.
     pub attribute_texts: Vec<String>,
-    /// End of the root object.
+    /// End of the root element.
     pub end: usize,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -282,38 +317,38 @@ impl TextKind {
     }
 }
 
-/// Parses a whole RBF0 payload.
+/// Parses a whole RBF0 payload. The root element must consume the payload
+/// exactly.
 pub fn parse(bytes: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Document, Error> {
     let header = Header::parse(bytes)?;
-    if header.word != HEADER_MARKER {
+    if let Some(version) = header.version
+        && version != VERSION
+    {
         return Err(Error::new(
             ErrorKind::UnsupportedVersion,
-            4,
-            format!(
-                "header marker 0x{:04X} is not the verified 0x{HEADER_MARKER:04X}",
-                header.word
-            ),
+            6,
+            format!("version {version} was not observed; only {VERSION} is supported"),
         ));
     }
     let mut parser = Parser {
         bytes,
-        at: PREFIX_LEN,
+        at: header.body_offset(),
         limits: *limits,
         cancel,
-        defined: HashSet::new(),
+        names: Vec::new(),
         text: 0,
         diagnostics: Vec::new(),
         document: Document {
             header,
             root_name_digest: [0; 32],
-            body_offset: PREFIX_LEN,
+            body_offset: header.body_offset(),
+            names: 0,
             objects: 0,
             depth: 0,
             fields: 0,
-            object_fields: 0,
-            string_fields: 0,
-            fixed8_fields: 0,
             attributes: 0,
+            text_nodes: 0,
+            types: [0; 7],
             definitions: Vec::new(),
             strings: TextStats::default(),
             attribute_values: TextStats::default(),
@@ -324,23 +359,25 @@ pub fn parse(bytes: &[u8], limits: &Limits, cancel: &AtomicBool) -> Result<Docum
             diagnostics: Vec::new(),
         },
     };
-    if header.flags != HEADER_VALUE {
-        parser.diagnostics.push(Diagnostic {
-            offset: 6,
-            message: "the header value is not the observed 1",
-        });
-    }
-    let root_name_len = usize::from(header.root_name_len);
-    let root_name = parser.take(root_name_len, "root name")?;
-    parser.document.root_name_digest = Sha256::digest(root_name).into();
-    parser.document.body_offset = parser.at;
-    parser.object(0)?;
-    if parser.at != bytes.len() {
+    let root_offset = parser.at;
+    let token = parser.u16("root token")?;
+    if type_code(token) != 0 {
         return Err(Error::new(
             ErrorKind::Structure,
+            root_offset,
+            format!(
+                "the first token has type code {}, but the root must be an element (0)",
+                type_code(token)
+            ),
+        ));
+    }
+    parser.element_at(token, root_offset, 0)?;
+    if parser.at != bytes.len() {
+        return Err(Error::new(
+            ErrorKind::Trailing,
             parser.at,
             format!(
-                "{} bytes follow the root object, which must end the payload",
+                "{} bytes follow the root element, which must end the payload",
                 bytes.len() - parser.at
             ),
         ));
@@ -356,8 +393,8 @@ struct Parser<'a> {
     at: usize,
     limits: Limits,
     cancel: &'a AtomicBool,
-    /// Field identifiers whose name has been defined in this payload.
-    defined: HashSet<u16>,
+    /// Defined names, by name index.
+    names: Vec<String>,
     /// Text bytes copied so far.
     text: usize,
     diagnostics: Vec<Diagnostic>,
@@ -412,36 +449,54 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    fn object(&mut self, depth: usize) -> Result<(), Error> {
+    /// Parses one element whose type-0 token has already been read.
+    fn element_at(&mut self, token: u16, token_offset: usize, depth: usize) -> Result<(), Error> {
         self.check_cancel()?;
         if depth > self.limits.max_depth {
             return Err(Error::new(
                 ErrorKind::Limit,
-                self.at,
+                token_offset,
                 format!(
-                    "objects nest deeper than the {} level limit",
+                    "elements nest deeper than the {} level limit",
                     self.limits.max_depth
+                ),
+            ));
+        }
+        if self.document.objects >= self.limits.max_elements {
+            return Err(Error::new(
+                ErrorKind::Limit,
+                token_offset,
+                format!(
+                    "the payload holds more than {} elements",
+                    self.limits.max_elements
                 ),
             ));
         }
         self.document.objects += 1;
         self.document.depth = self.document.depth.max(depth);
+        self.name_of(token, token_offset)?;
+        if depth == 0
+            && let Some(name) = self.names.first()
+        {
+            self.document.root_name_digest = Sha256::digest(name.as_bytes()).into();
+        }
 
         let reserved = self.at;
-        if self.u32("object reserved word")? != 0 {
+        if self.u32("element reserved word")? != 0 {
             self.diagnostics.push(Diagnostic {
                 offset: reserved,
-                message: "the object reserved word is not zero",
+                message: "the element reserved word is not zero",
             });
         }
-        let declared = usize::from(self.u16("object attribute count")?);
-        // An attribute is at least three bytes, so a larger count cannot fit.
-        if declared > self.remaining() / 3 {
+        let declared = usize::from(self.u16("element attribute count")?);
+        // An attribute token is at least two bytes, so a larger count cannot
+        // fit in what is left.
+        if declared > self.remaining() / 2 {
             return Err(Error::new(
                 ErrorKind::Structure,
                 self.at,
                 format!(
-                    "the object declares {declared} attributes, more than the remaining {} bytes hold",
+                    "the element declares {declared} attributes, more than the remaining {} bytes hold",
                     self.remaining()
                 ),
             ));
@@ -452,53 +507,33 @@ impl<'a> Parser<'a> {
         }
         loop {
             self.check_cancel()?;
-            let field_offset = self.at;
             if self.remaining() < 2 {
                 return Err(Error::new(
-                    ErrorKind::Structure,
+                    ErrorKind::Unterminated,
                     self.at,
-                    "the object has no terminator",
+                    "the element has no terminator",
                 ));
             }
-            let field_id = self.u16("field identifier")?;
-            if field_id == TERMINATOR {
+            let offset = self.at;
+            let token = self.u16("body token")?;
+            if token == TERMINATOR {
                 return Ok(());
             }
-            let Some(class) = FieldClass::of(field_id) else {
-                return Err(Error::new(
-                    ErrorKind::Structure,
-                    field_offset,
-                    format!(
-                        "field identifier 0x{field_id:04X} is outside the observed identifier sets"
-                    ),
-                ));
-            };
-            match class {
-                FieldClass::Object => {
-                    self.definition(field_id)?;
+            if token == TEXT_TOKEN {
+                self.text_node()?;
+                continue;
+            }
+            match type_code(token) {
+                0 => self.element_at(token, offset, depth + 1)?,
+                1..=6 => {
+                    self.value(token, offset)?;
                     self.document.fields += 1;
-                    self.document.object_fields += 1;
-                    self.object(depth + 1)?;
                 }
-                FieldClass::String => {
-                    self.definition(field_id)?;
-                    self.document.fields += 1;
-                    self.document.string_fields += 1;
-                    self.string_value()?;
-                }
-                FieldClass::Fixed8 => {
-                    self.definition(field_id)?;
-                    self.document.fields += 1;
-                    self.document.fixed8_fields += 1;
-                    self.take(FIXED8_LEN, "fixed eight-byte value")?;
-                }
-                FieldClass::Attribute => {
+                code => {
                     return Err(Error::new(
-                        ErrorKind::Structure,
-                        field_offset,
-                        format!(
-                            "attribute identifier 0x{field_id:04X} occurs in the field stream; attribute position is unresolved"
-                        ),
+                        ErrorKind::UnsupportedToken,
+                        offset,
+                        format!("token class {code} is not part of the grammar"),
                     ));
                 }
             }
@@ -507,80 +542,122 @@ impl<'a> Parser<'a> {
 
     fn attribute(&mut self) -> Result<(), Error> {
         let offset = self.at;
-        let field_id = self.u16("attribute identifier")?;
-        match FieldClass::of(field_id) {
-            Some(FieldClass::Attribute) => {}
-            Some(class) => {
-                return Err(Error::new(
-                    ErrorKind::Structure,
-                    offset,
-                    format!(
-                        "identifier 0x{field_id:04X} is used as an attribute but carries {} values",
-                        class.name()
-                    ),
-                ));
-            }
-            None => {
-                return Err(Error::new(
-                    ErrorKind::Structure,
-                    offset,
-                    format!(
-                        "attribute identifier 0x{field_id:04X} is outside the observed identifier sets"
-                    ),
-                ));
-            }
+        let token = self.u16("attribute token")?;
+        let code = type_code(token);
+        if code == 0 {
+            return Err(Error::new(
+                ErrorKind::Structure,
+                offset,
+                "an element token appears in an attribute position",
+            ));
         }
-        self.definition(field_id)?;
+        if !(1..=6).contains(&code) {
+            return Err(Error::new(
+                ErrorKind::UnsupportedToken,
+                offset,
+                format!("attribute token class {code} is not part of the grammar"),
+            ));
+        }
+        self.value(token, offset)?;
         self.document.attributes += 1;
-        let len = usize::from(self.u16("attribute value length")?);
-        self.check_len(len, "attribute value")?;
-        let bytes = self.take(len, "attribute value")?;
-        self.document.attribute_values.add(len);
-        self.note_text(bytes, TextKind::AttributeValue, false);
         Ok(())
     }
 
-    fn string_value(&mut self) -> Result<(), Error> {
-        let header = self.at;
-        let reserved = self.u32("string value reserved word")?;
-        let zero = self.u16("string value zero word")?;
-        if reserved != 0 || zero != 0 {
-            self.diagnostics.push(Diagnostic {
-                offset: header,
-                message: "the string value starts with two words that are not zero",
-            });
-        }
-        let tag_offset = self.at;
-        let tag = self.u16("string value tag")?;
-        if tag != STRING_VALUE_TAG {
-            return Err(Error::new(
-                ErrorKind::Structure,
-                tag_offset,
-                format!(
-                    "string value tag 0x{tag:04X} is not the observed 0x{STRING_VALUE_TAG:04X}"
-                ),
-            ));
-        }
-        let len = self.u32("string value length")?;
+    /// A text node: `u16 0xFFFD`, `u32` length, then bytes.
+    fn text_node(&mut self) -> Result<(), Error> {
+        let len_at = self.at;
+        let len = self.u32("text length")?;
         let len = usize::try_from(len).map_err(|_| {
             Error::new(
                 ErrorKind::Limit,
-                tag_offset,
-                "the string value length does not fit in memory",
+                len_at,
+                "the text length does not fit in memory",
             )
         })?;
-        self.check_len(len, "string value")?;
-        let bytes = self.take(len, "string value")?;
+        self.check_len(len, "text node")?;
+        let bytes = self.take(len, "text node")?;
+        self.document.text_nodes += 1;
         self.document.strings.add(len);
-        self.note_text(bytes, TextKind::StringValue, true);
-        let terminator_offset = self.at;
-        if self.u16("string value terminator")? != TERMINATOR {
+        self.note_text(bytes, TextKind::StringValue, false);
+        Ok(())
+    }
+
+    /// Reads a value token's optional name and then its value bytes.
+    fn value(&mut self, token: u16, offset: usize) -> Result<(), Error> {
+        let code = type_code(token);
+        self.name_of(token, offset)?;
+        self.document.types[usize::from(code.min(6))] += 1;
+        match code {
+            1 | 4 => {
+                let width = self.document.header.number_len();
+                self.take(width, "number value")?;
+            }
+            2 | 3 => {}
+            5 => {
+                self.take(12, "twelve-byte value")?;
+            }
+            6 => {
+                let len_at = self.at;
+                let len = usize::from(self.u16("value length")?);
+                self.check_len(len, "length-prefixed value")?;
+                let bytes = self.take(len, "length-prefixed value")?;
+                let _ = len_at;
+                self.document.attribute_values.add(len);
+                self.note_text(bytes, TextKind::AttributeValue, false);
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::UnsupportedToken,
+                    offset,
+                    format!("token class {code} is not part of the grammar"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the name of a token: its `u16` length and bytes when the index
+    /// equals the current table length, or nothing when it reuses a name.
+    fn name_of(&mut self, token: u16, token_offset: usize) -> Result<(), Error> {
+        let index = name_index(token);
+        let defined = self.names.len();
+        if usize::from(index) < defined {
+            return Ok(());
+        }
+        if usize::from(index) > defined {
             return Err(Error::new(
-                ErrorKind::Structure,
-                terminator_offset,
-                format!("the string value is not closed by 0x{TERMINATOR:04X}"),
+                ErrorKind::NameIndex,
+                token_offset,
+                format!("name index {index} is beyond the {defined} names defined so far"),
             ));
         }
+        if defined >= self.limits.max_names {
+            return Err(Error::new(
+                ErrorKind::Limit,
+                token_offset,
+                format!(
+                    "the payload defines more than {} names",
+                    self.limits.max_names
+                ),
+            ));
+        }
+        let name_offset = self.at;
+        let name_len = usize::from(self.u16("name length")?);
+        self.check_len(name_len, "name")?;
+        let name = self.take(name_len, "name")?;
+        let digest = Sha256::digest(name).into();
+        self.note_text(name, TextKind::FieldName, false);
+        let text = std::str::from_utf8(name)
+            .map(str::to_string)
+            .unwrap_or_default();
+        self.names.push(text);
+        self.document.names = self.names.len();
+        self.document.definitions.push(Definition {
+            index,
+            offset: name_offset,
+            name_len,
+            name_digest: digest,
+        });
         Ok(())
     }
 
@@ -595,36 +672,6 @@ impl<'a> Parser<'a> {
                 ),
             ));
         }
-        Ok(())
-    }
-
-    fn definition(&mut self, field_id: u16) -> Result<(), Error> {
-        if self.defined.contains(&field_id) {
-            return Ok(());
-        }
-        if self.document.definitions.len() >= self.limits.max_definitions {
-            return Err(Error::new(
-                ErrorKind::Limit,
-                self.at,
-                format!(
-                    "the payload defines more than {} field identifiers",
-                    self.limits.max_definitions
-                ),
-            ));
-        }
-        let name_offset = self.at;
-        let name_len = usize::from(self.u16("field name length")?);
-        self.check_len(name_len, "field name")?;
-        let name = self.take(name_len, "field name")?;
-        let digest = Sha256::digest(name).into();
-        self.note_text(name, TextKind::FieldName, false);
-        self.defined.insert(field_id);
-        self.document.definitions.push(Definition {
-            field_id,
-            offset: name_offset,
-            name_len,
-            name_digest: digest,
-        });
         Ok(())
     }
 

@@ -1662,23 +1662,26 @@ mod tests {
         assert!(!sensitive_candidate("synthetic/path/file.bin"));
     }
 
-    /// A minimal RBF0 document with one named string field.
+    /// A minimal RBF0 document: an empty root name, one named number value
+    /// and one text node.
     fn rbf0_document() -> Vec<u8> {
         let mut bytes = b"RBF0".to_vec();
         bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        // Root element: token 0, empty name, reserved word, no attributes.
+        bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0x0004u16.to_le_bytes());
+        // A number value whose name index 1 defines "field".
+        bytes.extend_from_slice(&(1u16 << 12 | 1).to_le_bytes());
         bytes.extend_from_slice(&5u16.to_le_bytes());
         bytes.extend_from_slice(b"field");
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        // A text node.
         bytes.extend_from_slice(&0xFFFDu16.to_le_bytes());
-        bytes.extend_from_slice(&6u32.to_le_bytes());
-        bytes.extend_from_slice(b"value\0");
-        bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(b"value");
         bytes.extend_from_slice(&0xFFFFu16.to_le_bytes());
         bytes
     }

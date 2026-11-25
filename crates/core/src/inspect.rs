@@ -126,9 +126,13 @@ pub enum Summary {
         warning: Option<String>,
     },
     Rbf0 {
-        word: u16,
-        flags: u32,
-        root_name_len: u16,
+        /// Whether the versioned header with the `0xFFFB` marker is present.
+        versioned: bool,
+        version: Option<u16>,
+        /// Width of a number value, from the header variant.
+        number_len: usize,
+        /// Names the document defined.
+        names: usize,
         /// Counts from the parsed body; `None` when the body did not parse.
         body: Option<Rbf0Body>,
     },
@@ -605,9 +609,10 @@ fn rbf0_structure<R: Read + Seek>(
                 None => json!({ "valid": false, "error": message.clone() }),
             };
             let summary = header.map(|header| Summary::Rbf0 {
-                word: header.word,
-                flags: header.flags,
-                root_name_len: header.root_name_len,
+                versioned: header.versioned,
+                version: header.version,
+                number_len: header.number_len(),
+                names: 0,
                 body: None,
             });
             (structure, summary, Some(Failure { stage, message }))
@@ -643,10 +648,10 @@ fn read_bounded<R: Read + Seek>(
 
 fn rbf0_header(header: &rbf0::Header, digest: Option<&[u8; 32]>) -> Value {
     let mut value = json!({
-        "len": rbf0::PREFIX_LEN,
-        "marker": format!("0x{:04X}", header.word),
-        "value": header.flags,
-        "root_name_len": header.root_name_len,
+        "versioned": header.versioned,
+        "version": header.version,
+        "number_len": header.number_len(),
+        "body_offset": header.body_offset(),
     });
     if let Some(digest) = digest {
         value["root_name_sha256"] = json!(lforge_binary::hex_bytes(digest));
@@ -656,9 +661,10 @@ fn rbf0_header(header: &rbf0::Header, digest: Option<&[u8; 32]>) -> Value {
 
 fn rbf0_summary(document: &rbf0::Document) -> Summary {
     Summary::Rbf0 {
-        word: document.header.word,
-        flags: document.header.flags,
-        root_name_len: document.header.root_name_len,
+        versioned: document.header.versioned,
+        version: document.header.version,
+        number_len: document.header.number_len(),
+        names: document.names,
         body: Some(Rbf0Body {
             objects: document.objects,
             depth: document.depth,
@@ -691,10 +697,7 @@ fn rbf0_document(document: &rbf0::Document, options: &Options) -> Value {
         .take(sample)
         .map(|definition| {
             json!({
-                "field_id": format!("0x{:04X}", definition.field_id),
-                "class": rbf0::FieldClass::of(definition.field_id)
-                    .map_or("unknown", |class| class.name()),
-                "slot": definition.field_id & 0x0FFF,
+                "name_index": definition.index,
                 "offset": hex(definition.offset as u64),
                 "name_len": definition.name_len,
                 "name_sha256": lforge_binary::hex_bytes(&definition.name_digest),
@@ -713,47 +716,45 @@ fn rbf0_document(document: &rbf0::Document, options: &Options) -> Value {
         })
         .collect();
     let body_len = (document.end - document.body_offset) as u64;
+    let header_len = document.body_offset as u64;
     json!({
         "valid": true,
         "header": rbf0_header(&document.header, Some(&document.root_name_digest)),
         "body": {
             "offset": hex(document.body_offset as u64),
             "length": body_len,
+            "names": document.names,
             "objects": document.objects,
             "depth": document.depth,
             "fields": document.fields,
-            "object_fields": document.object_fields,
-            "string_fields": document.string_fields,
-            "fixed8_fields": document.fixed8_fields,
             "attributes": document.attributes,
+            "text_nodes": document.text_nodes,
+            "values_by_type": document.types.iter().enumerate().map(|(code, count)| {
+                json!({ "type": code, "count": count })
+            }).collect::<Vec<Value>>(),
             "definitions": {
                 "count": document.definitions.len(),
                 "shown": definitions.len(),
                 "items": definitions,
             },
             "strings": text_stats(document.strings),
-            "attribute_values": text_stats(document.attribute_values),
+            "length_prefixed_values": text_stats(document.attribute_values),
         },
         "parsed_ranges": [
-            { "offset": hex(0), "length": rbf0::PREFIX_LEN, "field": "header" },
-            {
-                "offset": hex(rbf0::PREFIX_LEN as u64),
-                "length": u64::from(document.header.root_name_len),
-                "field": "root name",
-            },
+            { "offset": hex(0), "length": header_len, "field": "header" },
             {
                 "offset": hex(document.body_offset as u64),
                 "length": body_len,
-                "field": "body",
+                "field": "token stream",
             },
         ],
         "unknown_regions": [],
         "diagnostics": diagnostics,
         "limitations": [
-            "the meaning of the header marker, the header value and every field identifier is unknown",
-            "field names and text values are payload text; only their lengths and digests are reported",
-            "only identifiers 0x0001, 0x0002, 0x0004 to 0x000A, 0x1006 and 0x6003/0x6004 are parsed; another identifier stops the parse",
-            "attribute position is unresolved: the counted attributes precede the fields",
+            "the meaning of the version marker, the reserved word and every name is unknown",
+            "names and text values are payload text; only their lengths and digests are reported",
+            "token classes 7 to 14 were not observed and stop the parse",
+            "the value forms are widths; no numeric or boolean meaning is established",
         ],
     })
 }

@@ -1719,12 +1719,14 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// A minimal RBF0 document: header, empty root name and an empty root
-    /// object. `flags` is the unknown header value.
-    fn rbf0(flags: u32) -> Vec<u8> {
+    /// A minimal RBF0 document: a versioned header, an empty root name and an
+    /// empty root element. `version` is the version word of the header.
+    fn rbf0(version: u16) -> Vec<u8> {
         let mut bytes = b"RBF0".to_vec();
         bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
-        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&version.to_le_bytes());
+        // Root token, empty name, reserved word, no attributes, terminator.
+        bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&0u16.to_le_bytes());
@@ -1734,7 +1736,7 @@ mod tests {
 
     #[test]
     fn classify_parses_a_minimal_rbf0_document() {
-        let bytes = rbf0(3);
+        let bytes = rbf0(1);
         let len = bytes.len() as u64;
         let mut reader = Cursor::new(bytes);
         let content = classify(&mut reader, len, &AtomicBool::new(false));

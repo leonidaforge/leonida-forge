@@ -11,78 +11,92 @@ fn u32v(value: u32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
+/// One token word: `name_index | type_code << 12`.
+fn token(code: u8, index: u16) -> Vec<u8> {
+    u16v(u16::from(code) << TYPE_SHIFT | index)
+}
+
+/// A name definition: `u16` length and bytes.
 fn named(name: &[u8]) -> Vec<u8> {
     let mut bytes = u16v(name.len() as u16);
     bytes.extend_from_slice(name);
     bytes
 }
 
-fn string_value(value: &[u8]) -> Vec<u8> {
-    let mut bytes = u32v(0);
-    bytes.extend_from_slice(&u16v(0));
-    bytes.extend_from_slice(&u16v(STRING_VALUE_TAG));
-    bytes.extend_from_slice(&u32v(value.len() as u32));
-    bytes.extend_from_slice(value);
-    bytes.extend_from_slice(&u16v(TERMINATOR));
-    bytes
-}
-
-fn attribute(field_id: u16, name: &[u8], value: &[u8]) -> Vec<u8> {
-    let mut bytes = u16v(field_id);
-    bytes.extend_from_slice(&named(name));
-    bytes.extend_from_slice(&u16v(value.len() as u16));
-    bytes.extend_from_slice(value);
-    bytes
-}
-
-fn object(attribute_count: u16, attributes: &[u8], fields: &[u8]) -> Vec<u8> {
-    let mut bytes = u32v(0);
-    bytes.extend_from_slice(&u16v(attribute_count));
-    bytes.extend_from_slice(attributes);
-    bytes.extend_from_slice(fields);
-    bytes.extend_from_slice(&u16v(TERMINATOR));
-    bytes
-}
-
-fn header(root_name: &[u8]) -> Vec<u8> {
+fn versioned(body: &[u8]) -> Vec<u8> {
     let mut bytes = MAGIC.to_vec();
     bytes.extend_from_slice(&u16v(HEADER_MARKER));
-    bytes.extend_from_slice(&u32v(HEADER_VALUE));
-    bytes.extend_from_slice(&named(root_name));
+    bytes.extend_from_slice(&u16v(VERSION));
+    bytes.extend_from_slice(body);
     bytes
 }
 
-/// A document with five objects, one attribute, one string and one fixed
-/// eight-byte value.
-fn sample() -> Vec<u8> {
-    let mut inner_fields = u16v(0x0004);
-    inner_fields.extend_from_slice(&named(b"text"));
-    inner_fields.extend_from_slice(&string_value(b"x\0"));
-    inner_fields.extend_from_slice(&u16v(FIXED8_FIELD));
-    inner_fields.extend_from_slice(&named(b"number"));
-    inner_fields.extend_from_slice(&[0xFF; FIXED8_LEN]);
-    let inner = object(0, &[], &inner_fields);
-    let empty = object(0, &[], &[]);
-
-    let mut first_fields = u16v(0x0002);
-    first_fields.extend_from_slice(&inner);
-    first_fields.extend_from_slice(&u16v(0x0002));
-    first_fields.extend_from_slice(&empty);
-    let first = object(1, &attribute(0x6003, b"kind", b"item"), &first_fields);
-
-    let mut container_fields = u16v(0x0002);
-    container_fields.extend_from_slice(&named(b"item"));
-    container_fields.extend_from_slice(&first);
-    let container = object(0, &[], &container_fields);
-
-    let mut root_fields = u16v(0x0001);
-    root_fields.extend_from_slice(&named(b"list"));
-    root_fields.extend_from_slice(&container);
-    let root = object(0, &[], &root_fields);
-
-    let mut bytes = header(b"doc");
-    bytes.extend_from_slice(&root);
+fn versionless(body: &[u8]) -> Vec<u8> {
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(body);
     bytes
+}
+
+/// An element: its type-0 token, optional name, reserved word, attribute
+/// count, attributes, body and terminator.
+fn element(index: u16, name: Option<&[u8]>, attributes: &[Vec<u8>], body: &[u8]) -> Vec<u8> {
+    let mut bytes = token(0, index);
+    if let Some(name) = name {
+        bytes.extend_from_slice(&named(name));
+    }
+    bytes.extend_from_slice(&u32v(0));
+    bytes.extend_from_slice(&u16v(attributes.len() as u16));
+    for attribute in attributes {
+        bytes.extend_from_slice(attribute);
+    }
+    bytes.extend_from_slice(body);
+    bytes.extend_from_slice(&u16v(TERMINATOR));
+    bytes
+}
+
+/// A value token, its optional name and its value bytes.
+fn value(code: u8, index: u16, name: Option<&[u8]>, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = token(code, index);
+    if let Some(name) = name {
+        bytes.extend_from_slice(&named(name));
+    }
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// A text node.
+fn text(value: &[u8]) -> Vec<u8> {
+    let mut bytes = u16v(TEXT_TOKEN);
+    bytes.extend_from_slice(&u32v(value.len() as u32));
+    bytes.extend_from_slice(value);
+    bytes
+}
+
+/// A type-6 value payload: `u16` length and bytes.
+fn prefixed(value: &[u8]) -> Vec<u8> {
+    let mut bytes = u16v(value.len() as u16);
+    bytes.extend_from_slice(value);
+    bytes
+}
+
+/// A document that uses every supported form: a root element with one
+/// attribute, a text node, both number widths, both zero-byte values, the
+/// twelve-byte value, a nested element, a reused name and a type-6 value.
+fn sample() -> Vec<u8> {
+    let mut child_body = value(4, 2, None, &[1; VERSIONED_NUMBER_LEN]);
+    child_body.extend_from_slice(&text(b"y"));
+    let child = element(5, Some(b"child"), &[], &child_body);
+
+    let mut root_body = text(b"x");
+    root_body.extend_from_slice(&value(1, 2, Some(b"num"), &[2; VERSIONED_NUMBER_LEN]));
+    root_body.extend_from_slice(&value(2, 3, Some(b"flag"), &[]));
+    root_body.extend_from_slice(&value(5, 4, Some(b"vec"), &[3; 12]));
+    root_body.extend_from_slice(&child);
+    root_body.extend_from_slice(&value(6, 6, Some(b"data"), &prefixed(b"hi")));
+
+    let attribute = value(6, 1, Some(b"kind"), &prefixed(b"item"));
+    let root = element(0, Some(b"doc"), &[attribute], &root_body);
+    versioned(&root)
 }
 
 fn parse(bytes: &[u8]) -> Result<Document, Error> {
@@ -94,386 +108,261 @@ fn parse_with(bytes: &[u8], limits: &Limits) -> Result<Document, Error> {
 }
 
 #[test]
-fn parses_the_verified_grammar() {
+fn parses_every_token_form() {
     let bytes = sample();
     let document = parse(&bytes).expect("a valid document");
-    assert_eq!(document.header.word, HEADER_MARKER);
-    assert_eq!(document.header.flags, HEADER_VALUE);
-    assert_eq!(document.header.root_name_len, 3);
-    assert_eq!(document.body_offset, PREFIX_LEN + 3);
+    assert!(document.header.versioned);
+    assert_eq!(document.header.version, Some(VERSION));
+    assert_eq!(document.header.number_len(), VERSIONED_NUMBER_LEN);
+    assert_eq!(document.header.body_offset(), 8);
+    assert_eq!(document.body_offset, 8);
     assert_eq!(document.end, bytes.len());
-    assert_eq!(document.objects, 5);
-    assert_eq!(document.depth, 3);
-    assert_eq!(document.fields, 6);
-    assert_eq!(document.object_fields, 4);
-    assert_eq!(document.string_fields, 1);
-    assert_eq!(document.fixed8_fields, 1);
+    assert_eq!(document.names, 7);
+    assert_eq!(document.objects, 2);
+    assert_eq!(document.depth, 1);
+    // Four body values in the root plus the reused value in the child.
+    assert_eq!(document.fields, 5);
     assert_eq!(document.attributes, 1);
+    assert_eq!(document.text_nodes, 2);
+    assert_eq!(document.types[1], 1);
+    assert_eq!(document.types[2], 1);
+    assert_eq!(document.types[4], 1);
+    assert_eq!(document.types[5], 1);
+    assert_eq!(document.types[6], 2);
     assert!(
         document.diagnostics.is_empty(),
         "{:?}",
         document.diagnostics
     );
+    assert_eq!(
+        document.root_name_digest,
+        <[u8; 32]>::from(Sha256::digest(b"doc"))
+    );
 }
 
 #[test]
-fn keeps_the_field_dictionary_in_first_definition_order() {
+fn keeps_the_name_table_in_first_definition_order() {
     let document = parse(&sample()).unwrap();
-    let ids: Vec<u16> = document
+    let indices: Vec<u16> = document
         .definitions
         .iter()
-        .map(|definition| definition.field_id)
+        .map(|definition| definition.index)
         .collect();
-    assert_eq!(ids, [0x0001, 0x0002, 0x6003, 0x0004, FIXED8_FIELD]);
-    let classes: Vec<&str> = ids
-        .iter()
-        .map(|id| FieldClass::of(*id).unwrap().name())
-        .collect();
-    assert_eq!(
-        classes,
-        ["object", "object", "attribute", "string", "fixed8"]
-    );
+    assert_eq!(indices, [0, 1, 2, 3, 4, 5, 6]);
     assert_eq!(
         document.field_names,
-        ["list", "item", "kind", "text", "number"]
+        ["doc", "kind", "num", "flag", "vec", "child", "data"]
     );
-    assert_eq!(document.attribute_texts, ["item"]);
-    assert_eq!(document.string_texts, ["x"]);
-}
-
-#[test]
-fn reports_text_lengths_without_the_terminator() {
-    let document = parse(&sample()).unwrap();
-    assert_eq!(document.strings.count, 1);
-    // The declared length includes the NUL.
+    assert_eq!(document.names, document.definitions.len());
+    assert_eq!(document.attribute_texts, ["item", "hi"]);
+    assert_eq!(document.string_texts, ["x", "y"]);
+    assert_eq!(document.strings.count, 2);
     assert_eq!(document.strings.bytes, 2);
-    assert_eq!(document.strings.min_len, 2);
-    assert_eq!(document.strings.max_len, 2);
-    assert_eq!(document.attribute_values.count, 1);
-    assert_eq!(document.attribute_values.bytes, 4);
 }
 
 #[test]
-fn the_root_name_is_digested_not_kept() {
-    let document = parse(&sample()).unwrap();
-    let expected: [u8; 32] = Sha256::digest(b"doc").into();
-    assert_eq!(document.root_name_digest, expected);
-}
-
-#[test]
-fn rejects_other_magics_and_short_prefixes() {
-    assert_eq!(
-        Header::parse(b"RBFX\0\0\0\0\0\0\0\0").unwrap_err().kind,
-        ErrorKind::NotRbf0
+fn parses_the_versionless_header_with_four_byte_numbers() {
+    let mut body = element(
+        0,
+        Some(b"r"),
+        &[],
+        &value(1, 1, Some(b"n"), &[0xAA; VERSIONLESS_NUMBER_LEN]),
     );
-    assert_eq!(
-        Header::parse(b"RBF0\0\0").unwrap_err().kind,
-        ErrorKind::TooShort
-    );
-    assert_eq!(Header::parse(&[]).unwrap_err().kind, ErrorKind::NotRbf0);
-    assert!(!is_rbf0(b"RB"));
-    assert_eq!(parse(b"RBF0").unwrap_err().kind, ErrorKind::TooShort);
+    body.extend_from_slice(&[]);
+    let bytes = versionless(&body);
+    let document = parse(&bytes).unwrap();
+    assert!(!document.header.versioned);
+    assert_eq!(document.header.version, None);
+    assert_eq!(document.header.number_len(), VERSIONLESS_NUMBER_LEN);
+    assert_eq!(document.body_offset, 4);
+    assert_eq!(document.objects, 1);
+    assert_eq!(document.fields, 1);
+    assert_eq!(document.end, bytes.len());
 }
 
 #[test]
-fn rejects_an_unknown_header_marker() {
-    let mut bytes = sample();
-    bytes[4..6].copy_from_slice(&0xFFF0u16.to_le_bytes());
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::UnsupportedVersion);
-    assert_eq!(error.offset, 4);
-    assert!(error.message.contains("0xFFF0"), "{}", error.message);
-}
-
-#[test]
-fn reports_a_different_header_value_without_rejecting_it() {
-    let mut bytes = sample();
-    bytes[6..10].copy_from_slice(&2u32.to_le_bytes());
-    let document = parse(&bytes).expect("the header value is not a version gate");
-    assert_eq!(document.header.flags, 2);
-    assert_eq!(document.diagnostics.len(), 1);
-    assert_eq!(document.diagnostics[0].offset, 6);
-}
-
-#[test]
-fn reports_a_non_zero_object_reserved_word_without_rejecting_it() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0001);
-    fields.extend_from_slice(&named(b"child"));
-    fields.extend_from_slice(&object(0, &[], &[]));
-    let mut root = u32v(1);
-    root.extend_from_slice(&u16v(0));
-    root.extend_from_slice(&fields);
-    root.extend_from_slice(&u16v(TERMINATOR));
-    bytes.extend_from_slice(&root);
-
-    let document = parse(&bytes).expect("a reserved word does not change the grammar");
-    assert_eq!(document.objects, 2);
-    assert_eq!(document.diagnostics.len(), 1);
-    assert_eq!(document.diagnostics[0].offset, PREFIX_LEN + 3);
-}
-
-#[test]
-fn rejects_an_identifier_outside_the_observed_sets() {
-    for field_id in [0x0003u16, 0x000B, 0x1007, 0x5FFF, 0x6005] {
-        let mut bytes = header(b"doc");
-        let mut fields = u16v(field_id);
-        fields.extend_from_slice(&named(b"text"));
-        fields.extend_from_slice(&string_value(b"x\0"));
-        bytes.extend_from_slice(&object(0, &[], &fields));
-        let error = parse(&bytes).unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Structure, "{field_id:#06X}");
-        assert!(
-            error
-                .message
-                .contains("outside the observed identifier sets"),
-            "{}",
-            error.message
-        );
-    }
-}
-
-#[test]
-fn rejects_an_unsupported_value_tag() {
-    let mut bytes = sample();
-    let at = bytes
-        .windows(2)
-        .position(|pair| pair == u16v(STRING_VALUE_TAG))
-        .expect("the string value tag");
-    bytes[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert_eq!(error.offset, at);
-    assert!(error.message.contains("0xFFFE"), "{}", error.message);
-}
-
-#[test]
-fn rejects_an_attribute_identifier_in_the_field_stream() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x6003);
-    fields.extend_from_slice(&named(b"kind"));
-    fields.extend_from_slice(&u16v(3));
-    fields.extend_from_slice(b"abc");
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(
-        error.message.contains("attribute position is unresolved"),
-        "{}",
-        error.message
-    );
-}
-
-#[test]
-fn rejects_a_non_attribute_identifier_in_the_attribute_stream() {
-    let mut bytes = header(b"doc");
-    let mut attributes = u16v(0x0004);
-    attributes.extend_from_slice(&named(b"kind"));
-    attributes.extend_from_slice(&u16v(3));
-    attributes.extend_from_slice(b"abc");
-    bytes.extend_from_slice(&object(1, &attributes, &[]));
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(
-        error.message.contains("carries string values"),
-        "{}",
-        error.message
-    );
-}
-
-#[test]
-fn rejects_a_truncated_payload() {
-    let bytes = sample();
-    for cut in 1..=4 {
-        let error = parse(&bytes[..bytes.len() - cut]).unwrap_err();
-        assert!(
-            matches!(error.kind, ErrorKind::TooShort | ErrorKind::Structure),
-            "{cut}: {error}"
-        );
-    }
-}
-
-#[test]
-fn rejects_bytes_after_the_root_object() {
+fn requires_the_payload_to_end_with_the_root_element() {
     let mut bytes = sample();
     bytes.push(0);
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(
-        error.message.contains("follow the root object"),
-        "{}",
-        error.message
+    let err = parse(&bytes).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Trailing);
+    assert_eq!(err.offset, bytes.len() - 1);
+}
+
+#[test]
+fn rejects_an_unknown_token_class() {
+    let mut body = element(0, Some(b"r"), &[], &[]);
+    // Drop the root terminator and insert an unsupported type-7 token.
+    body.truncate(body.len() - 2);
+    body.extend_from_slice(&token(7, 0));
+    body.extend_from_slice(&u16v(TERMINATOR));
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::UnsupportedToken);
+    assert!(err.message.contains('7'), "{}", err.message);
+}
+
+#[test]
+fn rejects_a_name_index_beyond_the_table() {
+    let body = element(
+        0,
+        Some(b"r"),
+        &[],
+        &value(1, 4, None, &[0; VERSIONED_NUMBER_LEN]),
     );
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NameIndex);
 }
 
 #[test]
-fn rejects_an_object_without_a_terminator() {
-    let mut bytes = header(b"doc");
-    bytes.extend_from_slice(&u32v(0));
-    bytes.extend_from_slice(&u16v(0));
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(error.message.contains("no terminator"), "{}", error.message);
+fn rejects_a_truncated_name_or_value() {
+    let mut body = element(0, Some(b"r"), &[], &[]);
+    let len = body.len();
+    body.truncate(len - 2);
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unterminated);
+    assert_eq!(err.offset, 8 + len - 2);
+
+    // A name that declares more bytes than remain.
+    let mut body = token(0, 0);
+    body.extend_from_slice(&u16v(0x20));
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TooShort);
+
+    // A text node whose length overruns the payload.
+    let mut body = element(0, Some(b"r"), &[], &[]);
+    body.truncate(body.len() - 2);
+    body.extend_from_slice(&u16v(TEXT_TOKEN));
+    body.extend_from_slice(&u32v(0x100));
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TooShort);
 }
 
 #[test]
-fn rejects_an_attribute_count_larger_than_the_payload() {
-    let mut bytes = header(b"doc");
-    bytes.extend_from_slice(&u32v(0));
-    bytes.extend_from_slice(&u16v(1000));
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(
-        error.message.contains("1000 attributes"),
-        "{}",
-        error.message
+fn rejects_an_element_token_in_an_attribute_position() {
+    let attribute = element(1, Some(b"bad"), &[], &[]);
+    let body = element(0, Some(b"r"), &[attribute], &[]);
+    let err = parse(&versioned(&body)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Structure);
+    assert!(err.message.contains("attribute position"));
+}
+
+#[test]
+fn enforces_depth_element_name_and_length_limits() {
+    let nested = element(
+        1,
+        Some(b"inner"),
+        &[],
+        &value(1, 2, Some(b"n"), &[0; VERSIONED_NUMBER_LEN]),
     );
+    let body = element(0, Some(b"r"), &[], &nested);
+    let bytes = versioned(&body);
+
+    let limits = Limits {
+        max_depth: 0,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_with(&bytes, &limits).unwrap_err().kind,
+        ErrorKind::Limit
+    );
+
+    let limits = Limits {
+        max_elements: 1,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_with(&bytes, &limits).unwrap_err().kind,
+        ErrorKind::Limit
+    );
+
+    let limits = Limits {
+        max_names: 2,
+        ..Limits::default()
+    };
+    assert_eq!(
+        parse_with(&bytes, &limits).unwrap_err().kind,
+        ErrorKind::Limit
+    );
+
+    let mut body = element(
+        0,
+        Some(b"r"),
+        &[],
+        &value(6, 1, Some(b"d"), &prefixed(b"long")),
+    );
+    body.truncate(body.len());
+    let limits = Limits {
+        max_value_len: 2,
+        ..Limits::default()
+    };
+    let err = parse_with(&versioned(&body), &limits).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Limit);
 }
 
 #[test]
-fn rejects_a_string_value_not_closed_by_the_terminator() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&string_value(b"x\0"));
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    // The payload ends with the value terminator, then the object terminator.
-    let value_terminator = bytes.len() - 4;
-    bytes[value_terminator..value_terminator + 2].copy_from_slice(&u16v(0));
-    let error = parse(&bytes).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Structure);
-    assert!(error.message.contains("not closed"), "{}", error.message);
+fn caps_copied_text_without_failing_the_parse() {
+    let body = element(0, Some(b"r"), &[], &text(b"0123456789"));
+    let limits = Limits {
+        max_text: 4,
+        ..Limits::default()
+    };
+    let document = parse_with(&versioned(&body), &limits).unwrap();
+    assert_eq!(document.text_nodes, 1);
+    assert_eq!(document.strings.bytes, 10);
+    assert!(document.string_texts.is_empty());
 }
 
 #[test]
-fn reports_a_string_value_without_a_nul_without_rejecting_it() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&string_value(b"plain"));
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let document = parse(&bytes).expect("the value is still a string");
-    assert_eq!(document.string_texts, ["plain"]);
+fn reports_non_zero_reserved_words_and_invalid_utf8_without_failing() {
+    let mut body = token(0, 0);
+    body.extend_from_slice(&named(b"r"));
+    body.extend_from_slice(&u32v(1));
+    body.extend_from_slice(&u16v(0));
+    body.extend_from_slice(&text(&[0xFF, 0xFE]));
+    body.extend_from_slice(&u16v(TERMINATOR));
+    let document = parse(&versioned(&body)).unwrap();
     assert!(
         document
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("NUL"))
+            .any(|diagnostic| diagnostic.message.contains("reserved word"))
     );
-}
-
-#[test]
-fn reports_text_that_is_not_utf8() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&string_value(&[0xFF, 0xFE, 0x00]));
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let document = parse(&bytes).expect("the value fits the grammar");
-    assert!(document.string_texts.is_empty());
     assert!(
         document
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("UTF-8"))
     );
-}
-
-#[test]
-fn rejects_a_declared_value_above_the_limit() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&u32v(0));
-    fields.extend_from_slice(&u16v(0));
-    fields.extend_from_slice(&u16v(STRING_VALUE_TAG));
-    fields.extend_from_slice(&u32v(u32::MAX));
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let limits = Limits {
-        max_value_len: 1024,
-        ..Limits::default()
-    };
-    let error = parse_with(&bytes, &limits).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Limit);
-}
-
-#[test]
-fn rejects_object_nesting_above_the_limit() {
-    // The outermost field defines the identifier; every nested object reuses
-    // it without a name, one object value per level.
-    let mut nested = object(0, &[], &[]);
-    for _ in 1..8 {
-        let mut inner = u16v(0x0001);
-        inner.extend_from_slice(&nested);
-        nested = object(0, &[], &inner);
-    }
-    let mut fields = u16v(0x0001);
-    fields.extend_from_slice(&named(b"child"));
-    fields.extend_from_slice(&nested);
-    let mut bytes = header(b"doc");
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let limits = Limits {
-        max_depth: 3,
-        ..Limits::default()
-    };
-    let error = parse_with(&bytes, &limits).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Limit);
-    assert!(error.message.contains("nest deeper"), "{}", error.message);
-}
-
-#[test]
-fn rejects_more_definitions_than_the_limit() {
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&string_value(b"v\0"));
-    let mut bytes = header(b"doc");
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let limits = Limits {
-        max_definitions: 0,
-        ..Limits::default()
-    };
-    let error = parse_with(&bytes, &limits).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Limit);
-    assert!(
-        error.message.contains("defines more than"),
-        "{}",
-        error.message
-    );
-}
-
-#[test]
-fn a_cancelled_parse_stops_at_the_next_step() {
-    let bytes = sample();
-    let cancel = AtomicBool::new(true);
-    let error = super::parse(&bytes, &Limits::default(), &cancel).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::Cancelled);
-}
-
-#[test]
-fn text_above_the_limit_is_not_kept() {
-    let mut bytes = header(b"doc");
-    let mut fields = u16v(0x0004);
-    fields.extend_from_slice(&named(b"text"));
-    fields.extend_from_slice(&string_value(b"abcdef\0"));
-    bytes.extend_from_slice(&object(0, &[], &fields));
-    let limits = Limits {
-        max_text: 2,
-        ..Limits::default()
-    };
-    let document = parse_with(&bytes, &limits).expect("the grammar still holds");
     assert!(document.string_texts.is_empty());
-    assert_eq!(document.strings.count, 1);
 }
 
 #[test]
-fn field_class_maps_only_observed_identifiers() {
-    assert_eq!(FieldClass::of(0x0001), Some(FieldClass::Object));
-    assert_eq!(FieldClass::of(0x0002), Some(FieldClass::Object));
-    assert_eq!(FieldClass::of(0x0004), Some(FieldClass::String));
-    assert_eq!(FieldClass::of(0x000A), Some(FieldClass::String));
-    assert_eq!(FieldClass::of(0x000B), None);
-    assert_eq!(FieldClass::of(FIXED8_FIELD), Some(FieldClass::Fixed8));
-    assert_eq!(FieldClass::of(0x6003), Some(FieldClass::Attribute));
-    assert_eq!(FieldClass::of(0x6004), Some(FieldClass::Attribute));
-    assert_eq!(FieldClass::of(0x6005), None);
+fn rejects_an_unobserved_version() {
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(&u16v(HEADER_MARKER));
+    bytes.extend_from_slice(&u16v(2));
+    bytes.extend_from_slice(&element(0, Some(b"r"), &[], &[]));
+    let err = parse(&bytes).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::UnsupportedVersion);
+}
+
+#[test]
+fn rejects_a_short_or_foreign_payload() {
+    assert_eq!(parse(b"RBF").unwrap_err().kind, ErrorKind::NotRbf0);
+    assert_eq!(parse(b"RBF0").unwrap_err().kind, ErrorKind::TooShort);
+    assert_eq!(
+        parse(&MAGIC.to_vec()).unwrap_err().kind,
+        ErrorKind::TooShort
+    );
+    // The versioned marker without its version word.
+    let mut bytes = MAGIC.to_vec();
+    bytes.extend_from_slice(&u16v(HEADER_MARKER));
+    assert_eq!(parse(&bytes).unwrap_err().kind, ErrorKind::TooShort);
+}
+
+#[test]
+fn stops_when_cancelled() {
+    let engine = AtomicBool::new(true);
+    let err = super::parse(&sample(), &Limits::default(), &engine).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Cancelled);
 }

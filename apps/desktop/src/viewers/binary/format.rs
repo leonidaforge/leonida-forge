@@ -81,15 +81,23 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             fields
         }
         Some(Summary::Rbf0 {
-            word,
-            flags,
-            root_name_len,
+            versioned,
+            version,
+            number_len,
+            names,
             body,
         }) => {
             let mut fields = vec![
-                ("Version word", format!("0x{word:04X}")),
-                ("Flags", flags.to_string()),
-                ("Root name", format!("{root_name_len} bytes")),
+                (
+                    "Header",
+                    if *versioned {
+                        format!("versioned (version {})", version.unwrap_or(0))
+                    } else {
+                        "versionless".to_string()
+                    },
+                ),
+                ("Numbers", format!("{number_len} bytes")),
+                ("Names", names.to_string()),
             ];
             if let Some(body) = body {
                 fields.push((
@@ -99,7 +107,7 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
                 fields.push(("Fields", body.fields.to_string()));
                 fields.push(("Definitions", body.definitions.to_string()));
                 fields.push(("Attributes", body.attributes.to_string()));
-                fields.push(("String values", body.string_values.to_string()));
+                fields.push(("Text nodes", body.string_values.to_string()));
             }
             fields
         }
@@ -125,11 +133,13 @@ mod tests {
         assert!(report.error.is_none());
     }
 
-    /// A minimal RBF0 document: header, root name and an empty root object.
+    /// A minimal RBF0 document: a versioned header, a named root element and
+    /// an empty body.
     fn rbf0_document() -> Vec<u8> {
         let mut bytes = b"RBF0".to_vec();
         bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
         bytes.extend_from_slice(&3u16.to_le_bytes());
         bytes.extend_from_slice(b"doc");
         bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -156,9 +166,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(fields.contains(&("Objects", "1 (depth 0)")), "{fields:?}");
         assert!(fields.contains(&("Fields", "0")), "{fields:?}");
-        assert!(fields.contains(&("Definitions", "0")), "{fields:?}");
+        assert!(fields.contains(&("Definitions", "1")), "{fields:?}");
         assert!(fields.contains(&("Attributes", "0")), "{fields:?}");
-        assert!(fields.contains(&("String values", "0")), "{fields:?}");
+        assert!(fields.contains(&("Text nodes", "0")), "{fields:?}");
     }
 
     #[test]
@@ -166,7 +176,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.bin");
         let mut bytes = rbf0_document();
-        bytes[4..6].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        // A type-7 token in the body, which the grammar does not define.
+        let at = bytes.len() - 2;
+        bytes[at..].copy_from_slice(&0x7000u16.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         let mut source = Source::open(&path).unwrap();
 
@@ -176,7 +188,7 @@ mod tests {
         assert!(
             report
                 .fields
-                .contains(&("Root name", "3 bytes".to_string()))
+                .contains(&("Header", "versioned (version 1)".to_string()))
         );
     }
 
