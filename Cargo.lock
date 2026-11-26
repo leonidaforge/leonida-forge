@@ -2613,6 +2613,7 @@ dependencies = [
  "flate2",
  "lforge-binary",
  "lforge-rage9",
+ "roxmltree 0.21.2",
  "serde",
  "serde_json",
  "zip",
