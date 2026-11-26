@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 use lforge_model::{self as decoded, TextureProvider, TextureReference, TextureResolution};
 use lforge_scene::Scene;
@@ -12,17 +12,20 @@ use lforge_texture::StoreSet;
 use super::Access;
 
 const MAX_CACHED_ROOTS: usize = 4;
-/// A model is decoded from in-memory segments. Native page metadata bounds
-/// the exact read; the fallback for a resource without metadata uses this
-/// operation limit.
+/// A model is decoded from a bounded in-memory copy of its native segments.
+/// The drawable decoder needs random access across the graphics segment for
+/// vertex buffers, index buffers and embedded textures, so the complete
+/// segments are materialized rather than read one small range at a time.
+/// Native page metadata bounds the exact read; a standalone resource uses the
+/// same limit before its boundary is inferred.
 const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
 
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Arc<StoreSet>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Serializes segment materialization so several open model windows cannot
-/// each hold a 256 MiB source copy at the same time. Decoded scenes are
-/// separate allocations owned by their viewers.
-static SOURCE_LOAD: Mutex<()> = Mutex::new(());
+/// Aggregate ownership of model source buffers. The permit lives in
+/// `ResourceBytes`, so a source copy is counted until decoding has finished.
+static MODEL_SOURCE_BUDGET: LazyLock<Arc<MemoryBudget>> =
+    LazyLock::new(|| Arc::new(MemoryBudget::new(MAX_MODEL_BYTES)));
 
 pub struct LoadedModel {
     pub name: String,
@@ -88,10 +91,84 @@ impl TextureProvider for Stores {
     }
 }
 
+/// A weighted semaphore for model source buffers. The generic 64 MiB
+/// materialization policy applies to whole-file helpers; a native drawable
+/// may legitimately need more, so this model-specific policy caps the sum of
+/// live source copies at the same 256 MiB upper bound.
+struct MemoryBudget {
+    capacity: u64,
+    used: Mutex<u64>,
+    released: Condvar,
+}
+
+struct MemoryPermit {
+    budget: Arc<MemoryBudget>,
+    bytes: u64,
+}
+
+impl MemoryBudget {
+    fn new(capacity: u64) -> Self {
+        Self {
+            capacity,
+            used: Mutex::new(0),
+            released: Condvar::new(),
+        }
+    }
+
+    fn acquire(self: &Arc<Self>, bytes: u64) -> Result<MemoryPermit, String> {
+        if bytes > self.capacity {
+            return Err(format!(
+                "the resource needs {bytes} bytes, more than the {}-byte model source budget",
+                self.capacity
+            ));
+        }
+        let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
+        while used
+            .checked_add(bytes)
+            .is_none_or(|total| total > self.capacity)
+        {
+            used = self
+                .released
+                .wait(used)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+        *used += bytes;
+        Ok(MemoryPermit {
+            budget: self.clone(),
+            bytes,
+        })
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        *used = used.saturating_sub(self.bytes);
+        self.budget.released.notify_all();
+    }
+}
+
 struct ResourceBytes {
-    system: Vec<u8>,
-    graphics: Vec<u8>,
+    bytes: Vec<u8>,
+    system_len: usize,
     exact: bool,
+    /// Keeps the source allocation charged to the model source budget for as
+    /// long as the decoder can still read it.
+    _permit: MemoryPermit,
+}
+
+impl ResourceBytes {
+    fn system(&self) -> &[u8] {
+        &self.bytes[..self.system_len]
+    }
+
+    fn graphics(&self) -> &[u8] {
+        &self.bytes[self.system_len..]
+    }
 }
 
 /// Content check used before opening a recovered resource as a model. It
@@ -100,7 +177,7 @@ pub fn is_drawable_resource(path: &Path, access: &Access) -> bool {
     let Ok(resource) = read_resource(path, access) else {
         return false;
     };
-    decoded::has_drawable(&resource.system, &resource.graphics)
+    decoded::has_drawable(resource.system(), resource.graphics())
 }
 
 /// Reads a resource through the existing streaming archive layer. A native
@@ -119,20 +196,20 @@ pub fn load(path: &Path, access: &Access, gta_root: Option<&Path>) -> Result<Loa
         None => None,
     };
     let decoded = match &stores {
-        Some(provider) => decoded::decode(&resource.system, &resource.graphics, provider),
-        None => decoded::decode(&resource.system, &resource.graphics, &decoded::NoTextures),
+        Some(provider) => decoded::decode(resource.system(), resource.graphics(), provider),
+        None => decoded::decode(resource.system(), resource.graphics(), &decoded::NoTextures),
     }
     .map_err(|err| err.to_string())?;
     finish(path, resource.exact, decoded)
 }
 
 fn read_resource(path: &Path, access: &Access) -> Result<ResourceBytes, String> {
-    let _materializing = SOURCE_LOAD.lock().unwrap_or_else(|err| err.into_inner());
     let binary = super::open_binary_with(path, access)
         .map_err(|err| format!("could not open the resource: {err}"))?;
     let source = binary.source;
-    if let Some(split) = super::resource_split_with(path, access, &source)
-        .map_err(|err| format!("the native resource layout is invalid: {err}"))?
+    let (system_len, total, exact) = if let Some(split) =
+        super::resource_split_with(path, access, &source)
+            .map_err(|err| format!("the native resource layout is invalid: {err}"))?
     {
         let total = split
             .system_len
@@ -143,30 +220,31 @@ fn read_resource(path: &Path, access: &Access) -> Result<ResourceBytes, String> 
                 "the native resource needs {total} bytes, more than the {MAX_MODEL_BYTES}-byte model limit"
             ));
         }
-        return Ok(ResourceBytes {
-            system: read_exact(&source, 0, split.system_len)?,
-            graphics: read_exact(&source, split.system_len, split.graphics_len)?,
-            exact: true,
-        });
-    }
-    if source.len() > MAX_MODEL_BYTES {
-        return Err(format!(
-            "the resource is {} bytes; no native page metadata is available and the {MAX_MODEL_BYTES}-byte inference limit was exceeded",
-            source.len()
-        ));
-    }
-    let mut bytes = Vec::with_capacity(source.len() as usize);
-    source
-        .clone()
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("could not read the resource: {err}"))?;
-    let split = decoded::split_resource(&bytes)
-        .ok_or_else(|| "this resource has no drawable graphics segment".to_string())?;
-    let (system, graphics) = bytes.split_at(split.system_len);
+        (split.system_len, total, true)
+    } else {
+        let total = source.len();
+        if total > MAX_MODEL_BYTES {
+            return Err(format!(
+                "the resource is {total} bytes; no native page metadata is available and the {MAX_MODEL_BYTES}-byte inference limit was exceeded"
+            ));
+        }
+        (0, total, false)
+    };
+    let permit = MODEL_SOURCE_BUDGET.acquire(total)?;
+    let bytes = read_exact(&source, 0, total)?;
+    let system_len = if exact {
+        usize::try_from(system_len)
+            .map_err(|_| "the system segment length overflows".to_string())?
+    } else {
+        decoded::split_resource(&bytes)
+            .ok_or_else(|| "this resource has no drawable graphics segment".to_string())?
+            .system_len
+    };
     Ok(ResourceBytes {
-        system: system.to_vec(),
-        graphics: graphics.to_vec(),
-        exact: false,
+        bytes,
+        system_len,
+        exact,
+        _permit: permit,
     })
 }
 
@@ -402,5 +480,36 @@ mod tests {
         let source = lforge_binary::Source::open(&path).unwrap();
         let err = read_exact(&source, 0, 8).unwrap_err();
         assert!(err.contains("segment"), "{err}");
+    }
+
+    #[test]
+    fn the_model_source_budget_rejects_an_oversized_request() {
+        let budget = Arc::new(MemoryBudget::new(10));
+        let err = budget.acquire(11).err().expect("over capacity");
+        assert!(err.contains("model source budget"), "{err}");
+    }
+
+    #[test]
+    fn the_model_source_budget_counts_live_permits_and_releases_them() {
+        let budget = Arc::new(MemoryBudget::new(10));
+        let permit = budget.acquire(6).expect("first permit");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiting = budget.clone();
+        let thread = std::thread::spawn(move || {
+            let second = waiting.acquire(6).expect("second permit");
+            sender.send(()).unwrap();
+            drop(second);
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "the second permit must wait for aggregate capacity"
+        );
+        drop(permit);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the released permit wakes the waiter");
+        thread.join().unwrap();
     }
 }
