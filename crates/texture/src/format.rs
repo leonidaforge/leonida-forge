@@ -1,31 +1,38 @@
-//! Pixel format ids observed in texture stores.
+//! Pixel format ids observed in texture stores and dictionaries.
 //!
-//! The id is a descriptor field. The names and codecs below are the readings
-//! that decode the sampled stores into usable images; an id outside this table
-//! is reported without a pixel interpretation.
+//! The id is a descriptor field. The readings below are the ones that reproduce
+//! the encoded sizes and produce usable images in the sampled assets; an id
+//! outside this table is reported without a pixel interpretation.
 
 /// The decoding path for one pixel format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     /// Four linear bytes per texel, in R, G, B, A order.
     Rgba8,
-    /// 8 bytes per 4 × 4 block, BC1 row-major.
+    /// Two bytes per texel, IEEE 754 binary16.
+    R16Float,
+    /// 8 bytes per 4 x 4 block, BC1.
     Bc1,
-    /// 8 bytes per 4 × 4 block, BC4 row-major.
+    /// 16 bytes per 4 x 4 block, BC3.
+    Bc3,
+    /// 8 bytes per 4 x 4 block, BC4.
     Bc4,
-    /// Two 8-byte BC4 planes per 4 × 4 block.
+    /// 16 bytes per 4 x 4 block, two BC4 planes (BC5).
     Bc5,
+    /// 16 bytes per 4 x 4 block, BC7.
+    Bc7,
 }
 
 impl Codec {
-    /// Bytes one level of `width` × `height` needs.
+    /// Bytes one level of `width` x `height` needs.
     pub fn level_len(self, width: u32, height: u32) -> u64 {
         let width = u64::from(width.max(1));
         let height = u64::from(height.max(1));
         match self {
             Codec::Rgba8 => width * height * 4,
+            Codec::R16Float => width * height * 2,
             Codec::Bc1 | Codec::Bc4 => width.div_ceil(4) * height.div_ceil(4) * 8,
-            Codec::Bc5 => width.div_ceil(4) * height.div_ceil(4) * 16,
+            Codec::Bc3 | Codec::Bc5 | Codec::Bc7 => width.div_ceil(4) * height.div_ceil(4) * 16,
         }
     }
 }
@@ -53,23 +60,41 @@ pub fn pixel_format(id: u8) -> PixelFormat {
             codec: Some(Codec::Rgba8),
             detail: "four linear bytes per texel; the sampled images decode as R, G, B, A",
         },
+        54 => PixelFormat {
+            id,
+            name: "R16_FLOAT",
+            codec: Some(Codec::R16Float),
+            detail: "one binary16 value per texel; the preview clamps to [0, 1]",
+        },
         71 | 72 => PixelFormat {
             id,
             name: "BC1",
             codec: Some(Codec::Bc1),
-            detail: "8 bytes per 4 × 4 block, row-major; the BC1 candidate passes the mip comparison",
+            detail: "8 bytes per 4 x 4 block, row-major; the BC1 candidate passes the mip comparison",
+        },
+        77 => PixelFormat {
+            id,
+            name: "BC3",
+            codec: Some(Codec::Bc3),
+            detail: "16 bytes per 4 x 4 block, BC3 alpha and colour; the sampled glyphs decode",
         },
         80 => PixelFormat {
             id,
             name: "BC4",
             codec: Some(Codec::Bc4),
-            detail: "8 bytes per 4 × 4 block, row-major single channel",
+            detail: "8 bytes per 4 x 4 block, row-major single channel",
         },
         83 => PixelFormat {
             id,
             name: "BC5",
             codec: Some(Codec::Bc5),
-            detail: "two 8-byte BC4 planes per 4 × 4 block; decoded as X, Y, 255",
+            detail: "two 8-byte BC4 planes per 4 x 4 block; decoded as X, Y, 255",
+        },
+        98 | 99 => PixelFormat {
+            id,
+            name: "BC7",
+            codec: Some(Codec::Bc7),
+            detail: "16 bytes per 4 x 4 block; the sampled text atlas decodes",
         },
         _ => PixelFormat {
             id,
@@ -88,18 +113,21 @@ mod tests {
     fn level_sizes_follow_the_block_grid() {
         assert_eq!(Codec::Rgba8.level_len(2, 2), 16);
         assert_eq!(Codec::Rgba8.level_len(17, 5), 340);
+        assert_eq!(Codec::R16Float.level_len(2, 2), 8);
         assert_eq!(Codec::Bc1.level_len(4, 4), 8);
         assert_eq!(Codec::Bc1.level_len(5, 1), 16);
+        assert_eq!(Codec::Bc3.level_len(8, 8), 64);
         assert_eq!(Codec::Bc4.level_len(8, 8), 32);
         assert_eq!(Codec::Bc5.level_len(4, 4), 16);
+        assert_eq!(Codec::Bc7.level_len(4, 4), 16);
     }
 
     #[test]
     fn only_observed_formats_are_decodable() {
-        for id in [28, 71, 72, 80, 83] {
+        for id in [28, 54, 71, 72, 77, 80, 83, 98, 99] {
             assert!(pixel_format(id).is_supported(), "{id}");
         }
-        for id in [54, 77, 98, 99, 255] {
+        for id in [10, 87, 95, 255] {
             assert!(!pixel_format(id).is_supported(), "{id}");
         }
     }

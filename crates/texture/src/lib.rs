@@ -11,12 +11,14 @@
 
 mod cache;
 mod decode;
+mod dictionary;
 mod format;
 mod image;
 #[cfg(test)]
 mod tests;
 
 pub use cache::ImageCache;
+pub use dictionary::DictionaryStore;
 pub use format::{Codec, PixelFormat, pixel_format};
 pub use image::Image;
 
@@ -37,6 +39,8 @@ const MAX_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Debug)]
 pub enum Error {
     NotRds5,
+    /// The system segment does not have the dictionary grammar.
+    NotDictionary(&'static str),
     /// A format, kind or layout that this crate does not decode.
     Unsupported(String),
     /// Bytes that do not satisfy the format or size contract.
@@ -49,6 +53,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::NotRds5 => f.write_str("not an RDS5 texture store"),
+            Error::NotDictionary(reason) => f.write_str(reason),
             Error::Unsupported(reason) => f.write_str(reason),
             Error::Invalid(reason) => f.write_str(reason),
             Error::Io(err) => err.fmt(f),
@@ -121,9 +126,13 @@ pub struct LevelInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureInfo {
     pub index: u32,
-    /// The descriptor's 8-byte key. Its meaning is not established; it is
-    /// displayed as the texture's identifier in these stores.
+    /// The displayed name. RDS5 stores have none, so this is synthesized from
+    /// the index; a native dictionary uses the stored name when it is readable.
+    pub name: String,
+    /// The descriptor's 8-byte key. Its meaning is not established.
     pub key: u64,
+    /// Which container supplied the texture.
+    pub container: &'static str,
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
@@ -142,15 +151,75 @@ pub struct TextureInfo {
     pub status: Status,
     /// The descriptor range could not be read.
     pub range_error: Option<String>,
+    /// Offset of the texture's allocation in the graphics segment, for a
+    /// native dictionary. `None` for an RDS5 descriptor.
+    pub allocation: Option<u64>,
 }
 
 impl TextureInfo {
-    pub fn name(&self) -> String {
-        format!("Texture {}", self.index)
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn dimensions(&self) -> String {
         format!("{} × {}", self.width, self.height)
+    }
+}
+
+/// A texture source that the viewer can browse and decode without knowing its
+/// container format.
+#[derive(Debug, Clone)]
+pub enum TextureStore {
+    Rds5(Store),
+    Dictionary(DictionaryStore),
+}
+
+impl TextureStore {
+    pub fn textures(&self) -> &[TextureInfo] {
+        match self {
+            TextureStore::Rds5(store) => store.textures(),
+            TextureStore::Dictionary(store) => store.textures(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.textures().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.textures().is_empty()
+    }
+
+    pub fn decode(
+        &self,
+        index: u32,
+        level: u32,
+        layer: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Image, Error> {
+        match self {
+            TextureStore::Rds5(store) => {
+                if layer != 0 {
+                    return Err(Error::Invalid(format!(
+                        "texture {index} has no array layer {layer}"
+                    )));
+                }
+                store.decode(index, level, cancel)
+            }
+            TextureStore::Dictionary(store) => store.decode(index, level, layer, cancel),
+        }
+    }
+
+    pub fn thumbnail(
+        &self,
+        index: u32,
+        max_side: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Image, Error> {
+        match self {
+            TextureStore::Rds5(store) => store.thumbnail(index, max_side, cancel),
+            TextureStore::Dictionary(store) => store.thumbnail(index, max_side, cancel),
+        }
     }
 }
 
@@ -343,7 +412,9 @@ fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Erro
     let (status, levels) = classify(entry, format, encoded_len, level0_len);
     TextureInfo {
         index: entry.index,
+        name: format!("Texture {}", entry.index),
         key,
+        container: "RDS5 store",
         width: entry.width(),
         height: entry.height(),
         format,
@@ -357,6 +428,7 @@ fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Erro
         levels,
         status,
         range_error,
+        allocation: None,
     }
 }
 

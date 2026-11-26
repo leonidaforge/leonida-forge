@@ -87,8 +87,54 @@ fn bc4_decodes_a_solid_block() {
 }
 
 #[test]
+fn bc3_decodes_a_solid_block() {
+    // Alpha 255 everywhere, then a BC1 red block.
+    let block = vec![
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let bytes = build(&[block], &[entry(4, 4, 77, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 0, 0, 255]);
+    }
+}
+
+#[test]
+fn bc5_decodes_a_solid_two_plane_block() {
+    let block = vec![
+        0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let bytes = build(&[block], &[entry(4, 4, 83, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255]);
+    }
+}
+
+#[test]
+fn r16_float_clamps_to_the_preview_range() {
+    let mut data = Vec::new();
+    for value in [0.0f32, 0.5, 1.0, 2.0] {
+        data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
+    }
+    let bytes = build(&[data], &[entry(2, 2, 54, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        image.rgba,
+        vec![
+            0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255, 255, 255, 255, 255
+        ]
+    );
+}
+
+#[test]
 fn unsupported_formats_are_reported_not_decoded() {
-    let bytes = build(&[vec![0; 16]], &[entry(4, 4, 98, 2, 1)]);
+    let bytes = build(&[vec![0; 16]], &[entry(4, 4, 10, 2, 1)]);
     let store = open(&bytes);
     let texture = &store.textures()[0];
     assert!(matches!(texture.status, Status::Unsupported(_)));
