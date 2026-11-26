@@ -882,9 +882,7 @@ impl Explorer {
         let texture = entry
             .extension()
             .is_some_and(|extension| extension == "ttpf");
-        // A type-5 resource may be a texture dictionary. Opening it as one
-        // falls back to the Binary Inspector when it is not.
-        let resource = entry.resource_type == Some(5);
+        let entry_type = entry.resource_type;
         let access = self.access();
         let gta_root = self.workspace.gta.clone();
         match model_entry_kind(entry) {
@@ -900,8 +898,14 @@ impl Explorer {
             let (path, access) = (path.clone(), access.clone());
             async move { files::identify_with(&path, &access) }
         });
+        // The type alone never decides what an entry is; the classification
+        // reads a bounded head and says what it can actually do with it.
+        let classified = cx.background_spawn({
+            let (path, access) = (path.clone(), access.clone());
+            async move { files::classify_with(&path, &access, entry_type) }
+        });
         cx.spawn(async move |this, cx| {
-            let identified = identified.await;
+            let (identified, classified) = (identified.await, classified.await);
             let model = if sniff && matches!(&identified, Ok(Identified::Unknown)) {
                 let (path, access) = (path.clone(), access.clone());
                 cx.background_spawn(
@@ -911,25 +915,42 @@ impl Explorer {
             } else {
                 false
             };
-            this.update(cx, |this, cx| match identified {
-                Ok(Identified::Archive(_)) => {
-                    this.mark_archive(&path);
-                    this.navigate(path, cx);
-                }
-                // Opening it explains why it is not a valid archive.
-                Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
-                Ok(Identified::Unknown) if model => open_model_viewer(path, access, gta_root, cx),
-                Ok(Identified::Unknown) if texture => {
-                    crate::viewers::texture::open(path, access, cx)
-                }
-                Ok(Identified::Unknown) if resource => {
-                    crate::viewers::texture::open_resource(path, access, cx)
-                }
-                Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
-                Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
-                Err(err) => {
-                    log::warn!("could not identify {}: {err}", path.display());
-                    open_binary_inspector(path, access, cx);
+            this.update(cx, |this, cx| {
+                let classification = classified.as_ref().cloned();
+                let capability = classification.as_ref().map(|value| value.capability);
+                match identified {
+                    Ok(Identified::Archive(_)) => {
+                        this.mark_archive(&path);
+                        this.navigate(path, cx);
+                    }
+                    // Opening it explains why it is not a valid archive.
+                    Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                    // A drawable resource is a model before it is a container.
+                    Ok(Identified::Unknown) if model => {
+                        open_model_viewer(path, access, gta_root, cx)
+                    }
+                    Ok(Identified::Unknown) if texture => {
+                        crate::viewers::texture::open(path, access, cx)
+                    }
+                    // A resource container may be a texture dictionary; the
+                    // viewer falls back when it is not one.
+                    Ok(Identified::Unknown)
+                        if capability == Some(lforge_core::classify::Capability::Archive) =>
+                    {
+                        this.mark_archive(&path);
+                        this.navigate(path, cx);
+                    }
+                    Ok(Identified::Unknown)
+                        if capability == Some(lforge_core::classify::Capability::Resource) =>
+                    {
+                        crate::viewers::texture::open_resource(path, access, cx)
+                    }
+                    Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
+                    Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
+                    Err(err) => {
+                        log::warn!("could not identify {}: {err}", path.display());
+                        open_binary_inspector(path, access, cx);
+                    }
                 }
             })
             .ok();

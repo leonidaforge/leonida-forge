@@ -223,6 +223,34 @@ pub fn identify_with(path: &Path, access: &Access) -> io::Result<Identified> {
     }
 }
 
+/// Classifies a file wherever it is stored, from a bounded head of its bytes.
+/// `entry_type` is the native row type when the entry has one. Returns nothing
+/// when the bytes cannot be read, so a caller keeps its own fallback.
+pub fn classify_with(
+    path: &Path,
+    access: &Access,
+    entry_type: Option<u8>,
+) -> Option<lforge_core::classify::Classification> {
+    match archive::locate_prepared_with(path, access).ok()? {
+        Location::Archive(..) => None,
+        Location::Inside(archive, inner) if archive::is_file(&archive, &inner).ok()? => {
+            archive::classify(&archive, &inner, entry_type).ok()
+        }
+        Location::Plain if path.is_file() => {
+            let mut head = [0u8; lforge_core::classify::HEAD_LEN];
+            let read = std::fs::File::open(path)
+                .and_then(|mut file| io::Read::read(&mut file, &mut head))
+                .ok()?;
+            Some(archive::classify_head(
+                &head[..read],
+                entry_type,
+                path.extension(),
+            ))
+        }
+        Location::Inside(..) | Location::Plain => None,
+    }
+}
+
 /// The file on disk that `path` is stored in, and the path inside it, for
 /// paths inside archives. Does not read any file.
 pub fn split_location(path: &Path) -> Option<(&Path, &Path)> {

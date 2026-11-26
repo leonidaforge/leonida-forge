@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use lforge_binary::Source;
 use lforge_core::archive::{self as identify, HEAD_LEN};
 pub use lforge_core::archive::{Format, Identified};
+use lforge_core::classify::{self, Classification};
 use lforge_rage9::rpf::Progress;
 
 use super::executable::Access;
@@ -535,6 +536,41 @@ pub fn sniff(archive: &Archive, inner: &Path) -> io::Result<Identified> {
         Err(err) => return Err(err),
     }
     Ok(identify::sniff(&head.0, len))
+}
+
+/// Classifies a file in an archive from a bounded head of its decoded bytes.
+/// `entry_type` is the native row type when the entry has one, and never
+/// decides the format on its own.
+pub fn classify(
+    archive: &Archive,
+    inner: &Path,
+    entry_type: Option<u8>,
+) -> io::Result<Classification> {
+    let mut head = Head(Vec::with_capacity(HEAD_LEN));
+    match copy(archive, inner, &mut head, MAX_READ) {
+        Ok(_) => {}
+        Err(err) if err.get_ref().is_some_and(|inner| inner.is::<HeadFull>()) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(classify_head(&head.0, entry_type, inner.extension()))
+}
+
+/// [`classify`] for the first bytes of a file, wherever they were read.
+pub fn classify_head(
+    head: &[u8],
+    entry_type: Option<u8>,
+    extension: Option<&std::ffi::OsStr>,
+) -> Classification {
+    let extension = extension
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    classify::classify(classify::Inputs {
+        entry_type,
+        original_extension: extension.as_deref(),
+        storage: None,
+        payload: classify::PayloadState::Decoded,
+        head: Some(head),
+    })
 }
 
 #[derive(Debug)]
