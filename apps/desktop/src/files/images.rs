@@ -100,12 +100,32 @@ fn decode_scaled_jpeg(bytes: &[u8], max_side: u32) -> Result<DynamicImage, Strin
     image.ok_or_else(|| "JPEG data does not match its header".to_string())
 }
 
-/// GPUI expects BGRA pixels.
-fn rgba_to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
-    for pixel in rgba.pixels_mut() {
+/// Builds a GPUI image from RGBA bytes. GPUI expects BGRA, so red and blue
+/// are swapped here. The length must be `width * height * 4`.
+pub fn render_rgba(rgba: Vec<u8>, width: u32, height: u32) -> Result<Arc<RenderImage>, String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "the image dimensions overflow".to_string())?;
+    if rgba.len() != expected {
+        return Err(format!(
+            "the image holds {} bytes, not the {expected} its dimensions need",
+            rgba.len()
+        ));
+    }
+    let mut image = RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "the image dimensions do not match its bytes".to_string())?;
+    for pixel in image.pixels_mut() {
         pixel.0.swap(0, 2);
     }
-    Arc::new(RenderImage::new([Frame::new(rgba)]))
+    Ok(Arc::new(RenderImage::new([Frame::new(image)])))
+}
+
+/// GPUI expects BGRA pixels.
+fn rgba_to_render_image(rgba: RgbaImage) -> Arc<RenderImage> {
+    let (width, height) = rgba.dimensions();
+    render_rgba(rgba.into_raw(), width, height)
+        .expect("an RgbaImage holds width * height * 4 bytes")
 }
 
 #[cfg(test)]
@@ -144,6 +164,13 @@ mod tests {
         assert_eq!((thumbnail.width, thumbnail.height), (1024, 512));
         let size = thumbnail.image.size(0);
         assert_eq!((size.width.0, size.height.0), (128, 64));
+    }
+
+    #[test]
+    fn rgba_render_image_swaps_channels_and_checks_length() {
+        let image = render_rgba(vec![10, 20, 30, 40], 1, 1).unwrap();
+        assert_eq!(&image.as_bytes(0).unwrap()[..4], &[30, 20, 10, 40]);
+        assert!(render_rgba(vec![0; 3], 1, 1).is_err());
     }
 
     #[test]

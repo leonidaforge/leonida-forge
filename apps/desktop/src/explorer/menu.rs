@@ -122,6 +122,13 @@ impl Explorer {
                     .selected_entry()
                     .filter(|entry| entry.is_inspectable())
                     .map(|entry| entry.path.clone());
+                let texture = self
+                    .selected_entry()
+                    .filter(|entry| {
+                        entry.kind == EntryKind::File
+                            && entry.extension().as_deref() == Some("ttpf")
+                    })
+                    .map(|entry| entry.path.clone());
                 let exporting = self.exporting();
                 let exportable = self
                     .selected_entry()
@@ -154,6 +161,23 @@ impl Explorer {
                         }),
                     )
                     .child(ui::menu_separator())
+                    .child(
+                        ui::menu_item(
+                            "open-texture",
+                            "Open as Texture",
+                            false,
+                            texture.is_some(),
+                            None,
+                        )
+                        .when_some(texture, |el, path| {
+                            el.on_click(self.menu_action(
+                                move |this, _, cx| {
+                                    crate::viewers::texture::open(path.clone(), this.access(), cx)
+                                },
+                                cx,
+                            ))
+                        }),
+                    )
                     .child(
                         ui::menu_item(
                             "open-in-inspector",
@@ -318,6 +342,9 @@ impl Explorer {
             Menu::Entry { entry, .. } => {
                 let open = entry.clone();
                 let path = entry.path.clone();
+                let texture = (entry.kind == EntryKind::File
+                    && entry.extension().as_deref() == Some("ttpf"))
+                .then(|| entry.path.clone());
                 let exporting = self.exporting();
                 let exportable = (entry.kind == EntryKind::File).then(|| entry.clone());
                 panel
@@ -326,6 +353,21 @@ impl Explorer {
                             self.menu_action(move |this, _, cx| this.open_entry(&open, cx), cx),
                         ),
                     )
+                    .when_some(texture, |el, path| {
+                        el.child(
+                            ui::menu_item("open-texture", "Open as Texture", false, true, None)
+                                .on_click(self.menu_action(
+                                    move |this, _, cx| {
+                                        crate::viewers::texture::open(
+                                            path.clone(),
+                                            this.access(),
+                                            cx,
+                                        )
+                                    },
+                                    cx,
+                                )),
+                        )
+                    })
                     .child(
                         ui::menu_item(
                             "open-in-inspector",

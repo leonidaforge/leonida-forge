@@ -879,6 +879,9 @@ impl Explorer {
         }
         let path = entry.path.clone();
         let image = entry.is_supported_image();
+        let texture = entry
+            .extension()
+            .is_some_and(|extension| extension == "ttpf");
         let access = self.access();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
@@ -893,6 +896,9 @@ impl Explorer {
                 }
                 // Opening it explains why it is not a valid archive.
                 Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                Ok(Identified::Unknown) if texture => {
+                    crate::viewers::texture::open(path, access, cx)
+                }
                 Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
                 Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
                 Err(err) => {
