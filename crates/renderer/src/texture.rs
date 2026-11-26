@@ -26,11 +26,24 @@ pub(crate) fn upload(
     texture
         .validate()
         .map_err(|reason| Error::Texture(format!("{}: {reason}", texture.name)))?;
-    if compressed_supported(texture.format, device.features()) {
+    if compressed_supported(texture.format, device.features())
+        && compressed_aligned(texture.format, texture.width, texture.height)
+    {
         upload_compressed(device, queue, texture)
     } else {
         upload_decoded(device, queue, texture)
     }
+}
+
+/// WebGPU requires a block-compressed texture's dimensions to be whole block
+/// multiples. A valid source texture may have a smaller logical size; it is
+/// decoded to RGBA8 at the logical dimensions instead of being rejected or
+/// padded, so UVs still address the full image.
+fn compressed_aligned(format: TextureFormat, width: u32, height: u32) -> bool {
+    if !format.is_compressed() {
+        return true;
+    }
+    width.is_multiple_of(4) && height.is_multiple_of(4)
 }
 
 fn wgpu_format(format: TextureFormat) -> wgpu::TextureFormat {
@@ -110,6 +123,12 @@ fn upload_compressed(
 }
 
 /// Expands block-compressed data to RGBA8 for adapters without BC support.
+///
+/// The 4 x 4 block decoder is `bcdec_rs`, the same crate `lforge-texture`
+/// uses. This loop stays local because it consumes a GPU-ready
+/// [`lforge_scene::Texture`] and applies the BC5 normal-map Z interpretation;
+/// `lforge-texture` owns source reconstruction and image visualization, and
+/// the renderer must not depend on the RAGE parsers.
 fn decode_rgba8(texture: &Texture) -> Result<Vec<u8>, Error> {
     let (width, height) = (texture.width as usize, texture.height as usize);
     if width == 0 || height == 0 || width > 16384 || height > 16384 {

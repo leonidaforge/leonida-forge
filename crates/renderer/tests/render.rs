@@ -387,3 +387,86 @@ fn a_zero_sized_gpu_target_is_rejected() {
     assert!(renderer.create_target(0, 16).is_err());
     assert!(renderer.create_target(16, 0).is_err());
 }
+
+fn solid_bc1_texture(width: u32, height: u32) -> Texture {
+    // BC1: red endpoint, every selector picks it.
+    let block = [0x00u8, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut data = Vec::new();
+    for _ in 0..width.div_ceil(4) * height.div_ceil(4) {
+        data.extend_from_slice(&block);
+    }
+    Texture {
+        name: format!("bc1-{width}x{height}"),
+        width,
+        height,
+        format: TextureFormat::Bc1Unorm,
+        source_mip_levels: 1,
+        data,
+        source: "synthetic".into(),
+    }
+}
+
+#[test]
+fn bc3_srgb_texture_uploads_and_samples() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.textures.push(Texture {
+        name: "bc3-srgb".into(),
+        width: 4,
+        height: 4,
+        format: TextureFormat::Bc3UnormSrgb,
+        source_mip_levels: 1,
+        data: vec![
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ],
+        source: "synthetic".into(),
+    });
+    scene.materials.push(Material {
+        name: "bc3-srgb".into(),
+        diffuse: Some(0),
+        ..Material::default()
+    });
+    let mut mesh = Mesh::new("quad");
+    mesh.primitives.push(quad(0));
+    scene.meshes.push(mesh);
+    scene.validate();
+    let frame = renderer
+        .render_offscreen(&scene, &OffscreenOptions::new(64, 64))
+        .expect("render");
+    let center = center(&frame);
+    assert!(
+        center[0] > 150 && center[1] < 100 && center[2] < 100,
+        "{center:?}"
+    );
+}
+
+#[test]
+fn small_compressed_textures_upload_and_sample() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    for (width, height) in [(1, 1), (4, 1), (13, 1), (4, 4), (5, 3), (17, 9)] {
+        let mut scene = Scene::new();
+        scene.textures.push(solid_bc1_texture(width, height));
+        scene.materials.push(Material {
+            name: "bc1".into(),
+            diffuse: Some(0),
+            ..Material::default()
+        });
+        let mut mesh = Mesh::new("quad");
+        mesh.primitives.push(quad(0));
+        scene.meshes.push(mesh);
+        scene.validate();
+        let frame = renderer
+            .render_offscreen(&scene, &OffscreenOptions::new(64, 64))
+            .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
+        let center = center(&frame);
+        assert!(
+            center[0] > 150 && center[1] < 100 && center[2] < 100,
+            "{width}x{height}: {center:?}"
+        );
+    }
+}
