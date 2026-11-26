@@ -1,12 +1,12 @@
 //! Decoding of entries behind the payload transform.
 //!
 //! The transform is a counter-mode keystream over the stored bytes. The
-//! engine does not transform the whole stored range: the verified sample shows
-//! the first 2048 bytes of an entry and the first 1024 bytes of each later
-//! 9216-byte stream buffer transformed, while the rest is plaintext. The exact
-//! segmentation for large and multi-chunk entries is not fully established, so
-//! this module tries the verified models and accepts a result only when every
-//! chunk inflates to its declared logical size.
+//! engine does not transform the whole stored range: the first 2048 bytes of a
+//! stream, the first 1024 bytes of the buffer at offset 9216 and the first
+//! 1024 bytes of every 8192 bytes after that are transformed, while the rest is
+//! plaintext. The offsets are verified across the transformed rows of the
+//! tested archives, but a result is accepted only when every chunk inflates to
+//! its declared logical size.
 
 use std::io::Read;
 
@@ -20,9 +20,10 @@ const ZLIB_METHOD: u8 = 3;
 const ENCODING_2_PREFIX: usize = 16;
 /// The first transformed span of every stream.
 const LEADING: usize = 2048;
-/// Later stream buffers are 9216 bytes and only their first 1024 are
-/// transformed.
+/// The first later stream buffer is 9216 bytes; later buffers advance by
+/// 8192 bytes. Only the first 1024 bytes of each are transformed.
 const BUFFER: usize = 9216;
+const BUFFER_STEP: usize = 8192;
 const BUFFER_PREFIX: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +98,7 @@ impl Model {
                 while start < plain.len() {
                     let end = (start + BUFFER_PREFIX).min(plain.len());
                     decrypt_span(plain, parameter, block, start, end);
-                    start += BUFFER;
+                    start += BUFFER_STEP;
                 }
             }
         }
@@ -205,6 +206,63 @@ fn decode_chunks(table: &ChunkTable, stored: &[u8], logical_len: u64) -> Result<
 mod tests {
     use super::*;
     use crate::rpf::metadata::Chunk;
+    use crate::rpf::metadata::provider::FixedTables;
+    use crate::rpf::metadata::recognize::{STATE_LEN, StateBytes};
+    use zeroize::Zeroizing;
+
+    fn state() -> StateBytes {
+        let mut bytes = vec![0u8; STATE_LEN];
+        bytes[0..4]
+            .copy_from_slice(&crate::rpf::metadata::recognize::STREAM_STATE_MAGIC.to_le_bytes());
+        for word in 0..60 {
+            bytes[4 + 4 * word..8 + 4 * word].copy_from_slice(&((word as u32) + 1).to_le_bytes());
+        }
+        for table in 0..16 {
+            for value in 0..256 {
+                bytes[0xF4 + 0x100 * table + value] = value as u8;
+            }
+        }
+        StateBytes::new(Zeroizing::new(bytes))
+    }
+
+    fn tables() -> FixedTables {
+        let mut stage = [[0u8; 256]; 16];
+        for table in &mut stage {
+            for (value, slot) in table.iter_mut().enumerate() {
+                *slot = value as u8;
+            }
+        }
+        let mut round = [[0u32; 256]; 16];
+        for (index, table) in round.iter_mut().enumerate() {
+            for (value, slot) in table.iter_mut().enumerate() {
+                *slot = ((value as u32) * 0x0101_0101) ^ ((index as u32) * 0x1111_1111);
+            }
+        }
+        FixedTables::from_parts(stage, round)
+    }
+
+    #[test]
+    fn buffer_model_uses_9216_then_steps_of_8192() {
+        let block = EncodedStreamBlock::new(state(), tables()).unwrap();
+        let original = vec![0u8; 30000];
+        let mut data = original.clone();
+        Model::Buffers.apply(&mut data, [0u8; 16], &block);
+        let ranges = [0..2048, 9216..10240, 17408..18432, 25600..26624];
+        for range in &ranges {
+            assert!(
+                data[range.clone()]
+                    .iter()
+                    .zip(&original[range.clone()])
+                    .any(|(a, b)| a != b),
+                "range {range:?} was not transformed"
+            );
+        }
+        for (index, (a, b)) in data.iter().zip(&original).enumerate() {
+            if !ranges.iter().any(|range| range.contains(&index)) {
+                assert_eq!(a, b, "byte {index} outside the transform");
+            }
+        }
+    }
 
     #[test]
     fn adds_the_counter_in_big_endian_order() {
