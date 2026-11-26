@@ -5,7 +5,7 @@
 //! The renderer itself is window-system independent and is also used for
 //! headless images.
 
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -32,13 +32,111 @@ pub enum RendererStatus {
     Failed(String),
 }
 
+/// One pending replaceable render state. Submitting a newer state overwrites
+/// the previous one, so the queue length cannot grow with resize or drag
+/// events.
+struct LatestState<T> {
+    state: Mutex<Pending<T>>,
+    ready: Condvar,
+}
+
+struct Pending<T> {
+    value: Option<T>,
+    closed: bool,
+}
+
+struct LatestSender<T> {
+    state: Arc<LatestState<T>>,
+}
+
+impl<T> LatestState<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Pending {
+                value: None,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn submit(&self, value: T) -> bool {
+        let mut pending = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if pending.closed {
+            return false;
+        }
+        pending.value = Some(value);
+        self.ready.notify_one();
+        true
+    }
+
+    fn next(&self) -> Option<T> {
+        let mut pending = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        loop {
+            if pending.closed {
+                pending.value = None;
+                return None;
+            }
+            if let Some(value) = pending.value.take() {
+                return Some(value);
+            }
+            pending = self
+                .ready
+                .wait(pending)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut pending = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        pending.closed = true;
+        pending.value = None;
+        self.ready.notify_all();
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        usize::from(
+            self.state
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .value
+                .is_some(),
+        )
+    }
+}
+
+impl<T> LatestSender<T> {
+    fn new() -> (Self, Arc<LatestState<T>>) {
+        let state = Arc::new(LatestState::new());
+        (
+            Self {
+                state: state.clone(),
+            },
+            state,
+        )
+    }
+
+    fn submit(&self, value: T) -> bool {
+        self.state.submit(value)
+    }
+}
+
+impl<T> Drop for LatestSender<T> {
+    fn drop(&mut self) {
+        self.state.close();
+    }
+}
+
 enum Response {
     Ready { adapter: String, backend: String },
-    Frame(Frame),
+    Frame { generation: u64, frame: Frame },
     Failed(String),
 }
 
+#[derive(Clone, Copy)]
 struct Request {
+    generation: u64,
     size: Size<DevicePixels>,
     camera: OrbitCamera,
 }
@@ -56,7 +154,9 @@ pub struct Viewport {
     pub auto_rotate: bool,
     bounds: Aabb,
     framed: bool,
-    requests: Option<mpsc::Sender<Request>>,
+    requests: Option<LatestSender<Request>>,
+    next_generation: u64,
+    applied_generation: u64,
     image: Option<Arc<RenderImage>>,
     stale_images: Vec<Arc<RenderImage>>,
     drag: Option<Drag>,
@@ -96,6 +196,8 @@ impl Viewport {
             bounds,
             framed: false,
             requests,
+            next_generation: 0,
+            applied_generation: 0,
             image: None,
             stale_images: Vec::new(),
             drag: None,
@@ -126,7 +228,11 @@ impl Viewport {
                 self.status = RendererStatus::Ready { adapter, backend };
                 self.request_frame();
             }
-            Response::Frame(frame) => {
+            Response::Frame { generation, frame } => {
+                if generation < self.applied_generation {
+                    return;
+                }
+                self.applied_generation = generation;
                 let image = to_render_image(frame);
                 self.stale_images.extend(self.image.replace(image));
             }
@@ -145,11 +251,13 @@ impl Viewport {
         let Some(requests) = &self.requests else {
             return;
         };
+        self.next_generation = self.next_generation.wrapping_add(1);
         let request = Request {
+            generation: self.next_generation,
             size: self.size,
             camera: self.camera,
         };
-        if requests.send(request).is_err() {
+        if !requests.submit(request) {
             self.requests = None;
         }
     }
@@ -332,8 +440,8 @@ fn viewport_canvas(
 fn spawn_render_thread(
     scene: Arc<Scene>,
     responses: UnboundedSender<Response>,
-) -> std::io::Result<mpsc::Sender<Request>> {
-    let (request_tx, requests) = mpsc::channel::<Request>();
+) -> std::io::Result<LatestSender<Request>> {
+    let (request_tx, requests) = LatestSender::<Request>::new();
     thread::Builder::new()
         .name("renderer".into())
         .spawn(move || {
@@ -360,12 +468,7 @@ fn spawn_render_thread(
                 return;
             }
 
-            while let Ok(mut request) = requests.recv() {
-                // Only the latest camera and size matter; skip frames that are
-                // already stale.
-                while let Ok(newer) = requests.try_recv() {
-                    request = newer;
-                }
+            while let Some(request) = requests.next() {
                 let response = match renderer.render(
                     &gpu_scene,
                     &request.camera,
@@ -373,7 +476,10 @@ fn spawn_render_thread(
                     request.size.height.0 as u32,
                     Background::DARK,
                 ) {
-                    Ok(frame) => Response::Frame(frame),
+                    Ok(frame) => Response::Frame {
+                        generation: request.generation,
+                        frame,
+                    },
                     Err(err) => Response::Failed(err.to_string()),
                 };
                 let failed = matches!(response, Response::Failed(_));
@@ -390,4 +496,41 @@ fn to_render_image(frame: Frame) -> Arc<RenderImage> {
     let buffer = RgbaImage::from_raw(frame.width, frame.height, frame.to_bgra8())
         .expect("renderer returns width * height * 4 bytes");
     Arc::new(RenderImage::new([ImageFrame::new(buffer)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn rapid_updates_keep_one_pending_state_and_return_the_latest() {
+        let state = Arc::new(LatestState::new());
+        for value in 0..1000 {
+            assert!(state.submit(value));
+            assert_eq!(state.pending_count(), 1);
+        }
+        assert_eq!(state.next(), Some(999));
+        assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn closing_wakes_a_waiting_consumer() {
+        let (sender, state) = LatestSender::<i32>::new();
+        let (done, result) = std::sync::mpsc::channel();
+        let waiting = thread::spawn(move || {
+            done.send(state.next()).unwrap();
+        });
+        drop(sender);
+        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), None);
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn a_submit_after_close_is_rejected() {
+        let (sender, state) = LatestSender::<i32>::new();
+        drop(sender);
+        assert!(!state.submit(1));
+        assert_eq!(state.next(), None);
+    }
 }
