@@ -44,6 +44,7 @@ struct Counts {
     unsupported_compression: u64,
     missing_source: u64,
     malformed_metadata: u64,
+    decode_failed: u64,
     too_large: u64,
     parse_failed: u64,
     recognized_documents: u64,
@@ -171,9 +172,24 @@ pub fn run(options: Options) -> Result<(), String> {
         }
         let mut bytes = Vec::with_capacity(declared.min(16 * 1024 * 1024) as usize);
         if let Err(err) = read_payload(&mut payload, &mut bytes, options.max_row_bytes) {
-            counts.too_large += 1;
-            if issues.len() < 100 {
-                issues.push(json!({ "row": row, "stage": "limit", "message": err }));
+            match err {
+                ReadError::Limit(message) => {
+                    counts.too_large += 1;
+                    if issues.len() < 100 {
+                        issues.push(json!({ "row": row, "stage": "limit", "message": message }));
+                    }
+                }
+                ReadError::Decode(message) => {
+                    counts.decode_failed += 1;
+                    if issues.len() < 100 {
+                        issues.push(json!({
+                            "row": row,
+                            "stage": "decoding",
+                            "cause": "decode_failed",
+                            "message": message
+                        }));
+                    }
+                }
             }
             continue;
         }
@@ -248,6 +264,12 @@ pub fn run(options: Options) -> Result<(), String> {
             counts.malformed_metadata
         ));
     }
+    if counts.decode_failed > 0 {
+        limitations.push(format!(
+            "{} row(s) failed while reading the decoded payload",
+            counts.decode_failed
+        ));
+    }
     if counts.too_large > 0 {
         limitations.push(format!(
             "{} row(s) exceeded the {} byte decoded-row limit",
@@ -280,6 +302,7 @@ pub fn run(options: Options) -> Result<(), String> {
             "unsupportedCompression": counts.unsupported_compression,
             "missingSource": counts.missing_source,
             "malformedMetadata": counts.malformed_metadata,
+            "decodeFailed": counts.decode_failed,
             "tooLarge": counts.too_large,
             "parseFailed": counts.parse_failed,
             "recognizedDocuments": counts.recognized_documents,
@@ -312,7 +335,12 @@ pub fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
-fn read_payload(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<(), String> {
+enum ReadError {
+    Limit(String),
+    Decode(String),
+}
+
+fn read_payload(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<(), ReadError> {
     let cancel = AtomicBool::new(false);
     let mut buffer = vec![0u8; READ_CHUNK];
     loop {
@@ -320,11 +348,17 @@ fn read_payload(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<
             Ok(0) => return Ok(()),
             Ok(count) => {
                 if out.len() as u64 + count as u64 > limit {
-                    return Err(format!("the decoded row exceeds the {limit} byte limit"));
+                    return Err(ReadError::Limit(format!(
+                        "the decoded row exceeds the {limit} byte limit"
+                    )));
                 }
                 out.extend_from_slice(&buffer[..count]);
             }
-            Err(err) => return Err(format!("row could not be decoded: {err}")),
+            Err(err) => {
+                return Err(ReadError::Decode(format!(
+                    "row could not be decoded: {err}"
+                )));
+            }
         }
     }
 }
