@@ -2595,6 +2595,7 @@ dependencies = [
  "lforge-rage9",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "zip",
 ]
@@ -2643,7 +2644,9 @@ dependencies = [
  "iced-x86",
  "lforge-binary",
  "rand_core 0.6.4",
+ "roxmltree 0.21.2",
  "rsa",
+ "serde",
  "sha2",
  "tempfile",
  "zeroize",

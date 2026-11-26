@@ -261,7 +261,7 @@ pub struct MaterialSummary {
 }
 
 /// The header fields whose positions the research confirmed.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HeaderView {
     pub page_map: u32,
     pub shader_group: Option<u32>,
@@ -271,6 +271,9 @@ pub struct HeaderView {
     pub distances: [f32; LOD_SLOTS],
     pub flags: [u32; LOD_SLOTS],
     pub name: Option<u32>,
+    /// The NUL-terminated ASCII bytes at the name pointer. The field is a
+    /// descriptive label; no engine role is established for the string.
+    pub name_text: Option<String>,
     pub list: Option<u32>,
     pub word_a8_hi: u64,
 }
@@ -489,6 +492,8 @@ impl HeaderView {
             distances,
             flags,
             name: system_pointer(u64_at(system, 0xA8).unwrap_or(0)),
+            name_text: system_pointer(u64_at(system, 0xA8).unwrap_or(0))
+                .and_then(|offset| ascii_string(system, offset as usize)),
             list: system_pointer(u64_at(system, 0xB0).unwrap_or(0)),
             word_a8_hi: u64_at(system, 0xB8).unwrap_or(0),
         })
@@ -1381,6 +1386,20 @@ fn system_pointer(value: u64) -> Option<u32> {
 
 fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// A printable ASCII string starting at `at` and ending at a NUL. Longer than
+/// 256 bytes without a terminator, any non-printable byte or a non-ASCII byte
+/// yields nothing, so a pointer that does not carry a name is not guessed.
+fn ascii_string(bytes: &[u8], at: usize) -> Option<String> {
+    const MAX: usize = 256;
+    let tail = bytes.get(at..)?;
+    let end = tail.iter().take(MAX).position(|&byte| byte == 0)?;
+    let text = tail.get(..end)?;
+    if text.is_empty() || text.iter().any(|&byte| !(0x20..=0x7E).contains(&byte)) {
+        return None;
+    }
+    std::str::from_utf8(text).ok().map(str::to_owned)
 }
 
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {

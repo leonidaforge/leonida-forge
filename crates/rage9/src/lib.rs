@@ -2,6 +2,7 @@
 //! sibling containers and payload encodings found in archive rows.
 
 pub mod adat;
+pub mod catalog;
 pub mod dictionary;
 pub mod drawable;
 pub mod edup;
