@@ -188,6 +188,10 @@ pub struct Record {
     pub name_variant: NameVariant,
     /// The `u32` at name record `+0x18`, only for the hash variant.
     pub name_hash: Option<u32>,
+    /// The ASCII text the hash variant points at, when it is reachable and
+    /// terminated inside the bounded window. Display data, not a recovered
+    /// filename.
+    pub name: Option<String>,
     pub name_check: NameCheck,
 }
 
@@ -416,10 +420,11 @@ pub fn parse(system: &[u8], graphics_len: u64, limits: &Limits) -> Result<Report
             next.saturating_sub(start)
         });
         let name_at = system_at(u64_at(system, base + 0x30).unwrap_or(0));
-        let (name_variant, name_hash, name_check) = match name_at {
+        let (name_variant, name_hash, name, name_check) = match name_at {
             Some(name) => read_name(system, name),
             None => (
                 NameVariant::Pointer,
+                None,
                 None,
                 NameCheck::NotChecked("no name record"),
             ),
@@ -448,6 +453,7 @@ pub fn parse(system: &[u8], graphics_len: u64, limits: &Limits) -> Result<Report
             ],
             name_variant,
             name_hash,
+            name,
             name_check,
         });
     }
@@ -492,12 +498,13 @@ fn read_array<const N: usize>(
 }
 
 /// Reads a name record and checks its hash when the variant carries one.
-fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
+fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, Option<String>, NameCheck) {
     let base = at as usize;
     let discriminator = u64_at(system, base + 0x10).unwrap_or(0);
     if discriminator != NAME_HASH_VARIANT {
         return (
             NameVariant::Pointer,
+            None,
             None,
             NameCheck::NotChecked("the name record is not the hash variant"),
         );
@@ -507,6 +514,7 @@ fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
         return (
             NameVariant::Hash,
             Some(stored),
+            None,
             NameCheck::NotChecked("no text pointer"),
         );
     };
@@ -514,6 +522,7 @@ fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
         return (
             NameVariant::Hash,
             Some(stored),
+            None,
             NameCheck::NotChecked("the text pointer overflows"),
         );
     };
@@ -521,6 +530,7 @@ fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
         return (
             NameVariant::Hash,
             Some(stored),
+            None,
             NameCheck::NotChecked("the text is unreachable"),
         );
     };
@@ -528,6 +538,7 @@ fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
         return (
             NameVariant::Hash,
             Some(stored),
+            None,
             NameCheck::NotChecked("the text is not terminated inside the 64-byte window"),
         );
     };
@@ -537,7 +548,9 @@ fn read_name(system: &[u8], at: u32) -> (NameVariant, Option<u32>, NameCheck) {
     } else {
         NameCheck::Mismatched { stored, computed }
     };
-    (NameVariant::Hash, Some(stored), check)
+    let name =
+        (!window[..len].is_empty()).then(|| String::from_utf8_lossy(&window[..len]).into_owned());
+    (NameVariant::Hash, Some(stored), name, check)
 }
 
 /// The texture parameter word a drawable shader carries at entry `+0x04`.

@@ -18,6 +18,7 @@ mod cache;
 pub mod metadata;
 pub mod names;
 mod reconstruct;
+pub mod resource;
 mod scan;
 
 use std::fmt;
@@ -35,6 +36,8 @@ pub const HEADER_LEN: usize = 0x40;
 pub const ALIGN: u64 = 16;
 /// Inflated size of every stream of a chunked file except the last.
 pub const CHUNK_LEN: u32 = 0x1_0000;
+/// Largest system segment read to find a resource page map.
+pub const RESOURCE_SYSTEM_LIMIT: u64 = 64 << 20;
 
 #[derive(Debug)]
 pub enum Error {
