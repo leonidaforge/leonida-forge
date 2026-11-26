@@ -410,3 +410,94 @@ fn bc7_interpolates_mode6_endpoints_and_alpha() {
     assert_eq!(image.rgba[15 * 4], 254);
     assert_eq!(image.rgba[15 * 4 + 3], 254);
 }
+
+/// Reproducible census for the 64 KiB layout claim. It scans every `.ttpf`
+/// store below the selected game root and compares the descriptor range with
+/// the 64 KiB mip-chain total for simple 2D, supported tile-0 textures.
+#[test]
+#[ignore = "requires LF_TEST_GAME_ROOT"]
+fn tile_zero_64k_corpus_census() {
+    let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+    let ttdb = std::path::Path::new(&root).join("data").join("ttdb");
+    let set = super::StoreSet::scan(&ttdb).expect("scan");
+    let mut selected = 0usize;
+    let mut exact = 0usize;
+    let mut fit = 0usize;
+    for store_index in 0..set.len() {
+        let store = set.open(store_index).expect("open store");
+        for info in store.textures() {
+            if info.kind != 2 || info.tile_mode != 0 || info.format.codec.is_none() {
+                continue;
+            }
+            if info.array_size != 1 {
+                continue;
+            }
+            if info.width == 0 || info.height == 0 {
+                continue;
+            }
+            let Some(total) = d64k_total(
+                info.width,
+                info.height,
+                info.format.codec.unwrap(),
+                info.mip_field,
+            ) else {
+                continue;
+            };
+            selected += 1;
+            if total == info.encoded_len {
+                exact += 1;
+            }
+            if total <= info.encoded_len {
+                fit += 1;
+            }
+        }
+    }
+    eprintln!("corpus: {} stores", set.len());
+    eprintln!("selected={selected} exact={exact} fit={fit}");
+    assert_eq!(selected, 38542);
+    assert_eq!(exact, 38303);
+    assert_eq!(fit, 38542);
+}
+
+fn d64k_total(width: u32, height: u32, codec: super::Codec, mip_field: u8) -> Option<u64> {
+    let (tw, th, bpe): (u32, u32, u32) = match codec {
+        super::Codec::Rgba8 => (128, 128, 4),
+        super::Codec::R16Float => (256, 128, 2),
+        super::Codec::Bc1 | super::Codec::Bc4 => (128, 64, 8),
+        super::Codec::Bc3 | super::Codec::Bc5 | super::Codec::Bc7 => (64, 64, 16),
+    };
+    let mips = u32::from(mip_field) + 1;
+    let block_bytes = u64::from(tw) * u64::from(th) * u64::from(bpe);
+    let max_tail = 12u32;
+    let tail_width = tw / 2;
+    let tail_height = th;
+    let dims: Vec<(u32, u32)> = (0..mips)
+        .map(|mip| {
+            let w = (width >> mip).max(1);
+            let h = (height >> mip).max(1);
+            match codec {
+                super::Codec::Rgba8 | super::Codec::R16Float => (w, h),
+                _ => (w.div_ceil(4), h.div_ceil(4)),
+            }
+        })
+        .collect();
+    let first = if mips == 1 {
+        1
+    } else {
+        dims.iter()
+            .enumerate()
+            .position(|(index, &(w, h))| {
+                w <= tail_width && h <= tail_height && mips - index as u32 <= max_tail
+            })
+            .unwrap_or(mips as usize)
+    };
+    let mut total = if first < mips as usize {
+        block_bytes
+    } else {
+        0
+    };
+    for &(w, h) in dims.iter().take(first).rev() {
+        total += u64::from(w.div_ceil(tw) * tw) * u64::from(h.div_ceil(th) * th) * u64::from(bpe);
+    }
+    Some(total)
+}
