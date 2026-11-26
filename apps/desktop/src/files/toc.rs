@@ -864,7 +864,7 @@ impl Native {
                     if self.stream.is_some() {
                         "Transform available; decoded on read".to_string()
                     } else {
-                        "Required, not supported".to_string()
+                        "Required; no executable key state".to_string()
                     },
                 ));
                 match &row.payload_cipher {

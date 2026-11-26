@@ -277,7 +277,7 @@ fn row_details_name_the_payload_transform_descriptor() {
     let entries = files::list(&path).unwrap();
     assert_eq!(
         detail(&entries[0], "Payload transform"),
-        "Required, not supported"
+        "Required; no executable key state"
     );
     assert_eq!(
         detail(&entries[0], "Transform cipher"),
