@@ -1,0 +1,443 @@
+//! Decoding and access for the texture stores the game ships as `.ttpf`.
+//!
+//! A store is an RDS5 container whose ETPF chunk holds one descriptor per
+//! texture. This crate turns a container into texture metadata and decodes the
+//! pixels of one requested level. It is independent of the desktop UI: the
+//! viewer, a renderer and an exporter can share it.
+//!
+//! The established chain stops at the decoded bytes of a descriptor. The
+//! format ids below are the ones whose bytes form usable images in the sampled
+//! stores; every other id is reported as unsupported rather than guessed.
+
+mod cache;
+mod decode;
+mod format;
+mod image;
+#[cfg(test)]
+mod tests;
+
+pub use cache::ImageCache;
+pub use format::{Codec, PixelFormat, pixel_format};
+pub use image::Image;
+
+use std::fmt;
+use std::io::{self, Read, Seek};
+use std::sync::atomic::AtomicBool;
+
+use lforge_binary::Source;
+use lforge_rage9::rds5::{self, Container, DescriptorRange, Limits};
+
+/// The largest edge a decoded texture may have.
+pub const MAX_EDGE: u32 = 16 * 1024;
+/// The largest pixel count a decoded texture may have.
+pub const MAX_PIXELS: u64 = 64 * 1024 * 1024;
+/// The cumulative decoded bytes one texture may produce.
+const MAX_TEXTURE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum Error {
+    NotRds5,
+    /// A format, kind or layout that this crate does not decode.
+    Unsupported(String),
+    /// Bytes that do not satisfy the format or size contract.
+    Invalid(String),
+    Io(io::Error),
+    Cancelled,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::NotRds5 => f.write_str("not an RDS5 texture store"),
+            Error::Unsupported(reason) => f.write_str(reason),
+            Error::Invalid(reason) => f.write_str(reason),
+            Error::Io(err) => err.fmt(f),
+            Error::Cancelled => f.write_str("cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<rds5::Error> for Error {
+    fn from(err: rds5::Error) -> Self {
+        match err {
+            rds5::Error::NotRds5 => Error::NotRds5,
+            rds5::Error::Cancelled => Error::Cancelled,
+            rds5::Error::Io(err) => Error::Io(err),
+            rds5::Error::Invalid(reason) => Error::Invalid(reason),
+        }
+    }
+}
+
+/// Whether the bytes start an RDS5 store.
+pub fn is_store(head: &[u8]) -> bool {
+    rds5::is_rds5(head)
+}
+
+/// What can be done with one texture entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    Decodable,
+    /// A confirmed format whose pixel layout is not established, or a kind
+    /// that is not a simple 2D image.
+    Unsupported(String),
+    /// Metadata or encoded bytes that do not satisfy their own contract.
+    Invalid(String),
+}
+
+impl Status {
+    pub fn is_decodable(&self) -> bool {
+        matches!(self, Status::Decodable)
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Status::Decodable => None,
+            Status::Unsupported(reason) | Status::Invalid(reason) => Some(reason),
+        }
+    }
+}
+
+/// One decoded level that the encoded range can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelInfo {
+    pub level: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes this level needs.
+    pub encoded_len: u64,
+    /// Offset of the level in the reconstructed range.
+    pub offset: u64,
+}
+
+/// Metadata for one descriptor, without image data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureInfo {
+    pub index: u32,
+    /// The descriptor's 8-byte key. Its meaning is not established; it is
+    /// displayed as the texture's identifier in these stores.
+    pub key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    pub flags: u8,
+    pub kind: u8,
+    pub tile_mode: u8,
+    pub array_size: u32,
+    /// The raw descriptor mip word. Its relation to a level count is not
+    /// established.
+    pub mip_field: u8,
+    /// The virtual length of the descriptor's block range.
+    pub encoded_len: u64,
+    /// The bytes of the first level when the range holds it.
+    pub level0_len: Option<u64>,
+    pub levels: Vec<LevelInfo>,
+    pub status: Status,
+    /// The descriptor range could not be read.
+    pub range_error: Option<String>,
+}
+
+impl TextureInfo {
+    pub fn name(&self) -> String {
+        format!("Texture {}", self.index)
+    }
+
+    pub fn dimensions(&self) -> String {
+        format!("{} × {}", self.width, self.height)
+    }
+}
+
+/// An RDS5 store opened for metadata and pixel reads.
+#[derive(Debug, Clone)]
+pub struct Store {
+    source: Source,
+    container: Container,
+    textures: Vec<TextureInfo>,
+    key_count: usize,
+}
+
+impl Store {
+    /// Reads the container structure, descriptor table and keys. No block is
+    /// decoded here.
+    pub fn open(source: Source) -> Result<Self, Error> {
+        let mut reader = source.clone();
+        let len = reader.len();
+        let mut head = [0u8; 16];
+        let read = reader.read(&mut head).unwrap_or(0);
+        if !is_store(&head[..read]) {
+            return Err(Error::NotRds5);
+        }
+        reader.seek(io::SeekFrom::Start(0))?;
+        let container = Container::read(
+            &mut reader,
+            len,
+            &Limits::default(),
+            &AtomicBool::new(false),
+        )?;
+        let entries = container.entries(&mut reader, 0, container.entry_count)?;
+        let keys = container.keys(&mut reader).unwrap_or_default();
+        let key_count = keys.len();
+        let mut textures = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let range = rds5::descriptor_range(&mut reader, &container, entry.index);
+            let key = keys.get(entry.index as usize).copied().unwrap_or(0);
+            textures.push(info(entry, key, range));
+        }
+        Ok(Self {
+            source,
+            container,
+            textures,
+            key_count,
+        })
+    }
+
+    pub fn textures(&self) -> &[TextureInfo] {
+        &self.textures
+    }
+
+    pub fn len(&self) -> usize {
+        self.textures.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.textures.is_empty()
+    }
+
+    /// The number of keys read from the key table.
+    pub fn key_count(&self) -> usize {
+        self.key_count
+    }
+
+    pub fn source_len(&self) -> u64 {
+        self.source.len()
+    }
+
+    pub fn version(&self) -> u32 {
+        self.container.version
+    }
+
+    /// The reconstructed byte length of one level. The offset follows the
+    /// level order the container uses: the largest level first.
+    fn level_range(&self, info: &TextureInfo, level: u32) -> Result<(u64, u64), Error> {
+        let codec = info.format.codec.ok_or_else(|| {
+            Error::Unsupported(
+                info.status
+                    .reason()
+                    .unwrap_or("the pixel format is not supported")
+                    .to_string(),
+            )
+        })?;
+        if level >= 32 {
+            return Err(Error::Invalid(format!(
+                "mip level {level} is outside the supported range"
+            )));
+        }
+        let mut offset = 0u64;
+        for current in 0..level {
+            offset = offset
+                .checked_add(codec.level_len(info.width >> current, info.height >> current))
+                .ok_or_else(|| Error::Invalid("the mip offset overflows".into()))?;
+        }
+        let (width, height) = ((info.width >> level).max(1), (info.height >> level).max(1));
+        let len = codec.level_len(width, height);
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > info.encoded_len)
+        {
+            return Err(Error::Invalid(format!(
+                "level {level} needs bytes {offset:#x}..{:#x}, beyond the {:#x}-byte range",
+                offset + len,
+                info.encoded_len
+            )));
+        }
+        Ok((offset, len))
+    }
+
+    /// Decodes one level of one texture. The work runs on the caller's thread;
+    /// pass a cancellation flag when it runs on a background thread.
+    pub fn decode(&self, index: u32, level: u32, cancel: &AtomicBool) -> Result<Image, Error> {
+        let info = self
+            .textures
+            .get(index as usize)
+            .ok_or_else(|| Error::Invalid(format!("texture {index} does not exist")))?;
+        if !info.status.is_decodable() {
+            return Err(Error::Unsupported(
+                info.status
+                    .reason()
+                    .unwrap_or("the texture cannot be decoded")
+                    .to_string(),
+            ));
+        }
+        let (offset, len) = self.level_range(info, level)?;
+        let mut container = self.container.clone();
+        container.decoded_total = 0;
+        let mut source = self.source.clone();
+        let mut bytes = Vec::with_capacity(len as usize);
+        rds5::reconstruct_texture(
+            &mut source,
+            &mut container,
+            index,
+            &Limits {
+                max_total_len: MAX_TEXTURE_BYTES,
+                ..Limits::default()
+            },
+            cancel,
+            |chunk| {
+                let remaining = len.saturating_sub(bytes.len() as u64);
+                let take = remaining.min(chunk.len() as u64) as usize;
+                bytes.extend_from_slice(&chunk[..take]);
+                Ok(())
+            },
+        )?;
+        if (bytes.len() as u64) < offset + len {
+            return Err(Error::Invalid(format!(
+                "the range holds {} bytes, less than level {level}'s {} bytes",
+                bytes.len(),
+                len
+            )));
+        }
+        let codec = info
+            .format
+            .codec
+            .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
+        let (width, height) = ((info.width >> level).max(1), (info.height >> level).max(1));
+        let start = offset as usize;
+        let rgba = decode::decode(codec, &bytes[start..start + len as usize], width, height)?;
+        Ok(Image {
+            width,
+            height,
+            level,
+            rgba,
+        })
+    }
+
+    /// Decodes a level and scales it into a thumbnail.
+    pub fn thumbnail(
+        &self,
+        index: u32,
+        max_side: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Image, Error> {
+        let image = self.decode(index, 0, cancel)?;
+        Ok(image.thumbnail(max_side))
+    }
+}
+
+fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Error>) -> TextureInfo {
+    let format = pixel_format(entry.format_id());
+    let (encoded_len, range_error) = match &range {
+        Ok(range) => (range.virtual_len, None),
+        Err(err) => (0, Some(err.to_string())),
+    };
+    let level0_len = format
+        .codec
+        .filter(|_| encoded_len > 0)
+        .map(|codec| codec.level_len(entry.width(), entry.height()));
+    let (status, levels) = classify(entry, format, encoded_len, level0_len);
+    TextureInfo {
+        index: entry.index,
+        key,
+        width: entry.width(),
+        height: entry.height(),
+        format,
+        flags: entry.flags(),
+        kind: entry.kind(),
+        tile_mode: entry.tile_mode(),
+        array_size: entry.array_size(),
+        mip_field: entry.mip(),
+        encoded_len,
+        level0_len,
+        levels,
+        status,
+        range_error,
+    }
+}
+
+fn classify(
+    entry: &rds5::Entry,
+    format: PixelFormat,
+    encoded_len: u64,
+    level0_len: Option<u64>,
+) -> (Status, Vec<LevelInfo>) {
+    if entry.width() == 0 || entry.height() == 0 {
+        return (
+            Status::Invalid("the descriptor declares a zero dimension".into()),
+            Vec::new(),
+        );
+    }
+    if entry.width() > MAX_EDGE || entry.height() > MAX_EDGE {
+        return (
+            Status::Invalid(format!(
+                "{} × {} exceeds the {MAX_EDGE}-pixel edge limit",
+                entry.width(),
+                entry.height()
+            )),
+            Vec::new(),
+        );
+    }
+    let pixels = u64::from(entry.width()) * u64::from(entry.height());
+    if pixels > MAX_PIXELS {
+        return (
+            Status::Invalid(format!(
+                "{pixels} pixels exceed the {MAX_PIXELS}-pixel limit"
+            )),
+            Vec::new(),
+        );
+    }
+    if format.codec.is_none() {
+        return (
+            Status::Unsupported(format!(
+                "format id {} has no established pixel layout",
+                format.id
+            )),
+            Vec::new(),
+        );
+    }
+    if entry.kind() != 2 {
+        return (
+            Status::Unsupported(format!("kind {} is not a simple 2D texture", entry.kind())),
+            Vec::new(),
+        );
+    }
+    if entry.array_size() != 1 {
+        return (
+            Status::Unsupported(format!(
+                "an array of {} slices is not decoded",
+                entry.array_size()
+            )),
+            Vec::new(),
+        );
+    }
+    let Some(level0_len) = level0_len else {
+        return (
+            Status::Invalid("the descriptor range could not be read".into()),
+            Vec::new(),
+        );
+    };
+    if encoded_len < level0_len {
+        return (
+            Status::Invalid(format!(
+                "the range holds {encoded_len} bytes, less than level 0's {level0_len} bytes"
+            )),
+            Vec::new(),
+        );
+    }
+    let level = LevelInfo {
+        level: 0,
+        width: entry.width(),
+        height: entry.height(),
+        encoded_len: level0_len,
+        offset: 0,
+    };
+    (Status::Decodable, vec![level])
+}
+
+#[cfg(test)]
+mod test_support;

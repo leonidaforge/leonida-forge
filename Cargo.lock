@@ -2628,6 +2628,7 @@ dependencies = [
  "lforge-core",
  "lforge-rage9",
  "lforge-renderer",
+ "lforge-texture",
  "log",
  "serde",
  "serde_json",
@@ -2660,6 +2661,16 @@ dependencies = [
  "glam",
  "pollster 1.0.3",
  "wgpu 30.0.2",
+]
+
+[[package]]
+name = "lforge-texture"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "lforge-binary",
+ "lforge-rage9",
+ "tempfile",
 ]
 
 [[package]]

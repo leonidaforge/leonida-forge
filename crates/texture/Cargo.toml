@@ -1,0 +1,16 @@
+[package]
+name = "lforge-texture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+lforge-binary.workspace = true
+lforge-rage9.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true
+tempfile.workspace = true
