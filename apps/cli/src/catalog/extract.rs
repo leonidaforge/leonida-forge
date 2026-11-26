@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use lforge_rage9::catalog::{DocumentExtraction, Observation};
-use lforge_rage9::rpf::metadata::{Entry, Field, Payload};
+use lforge_rage9::rpf::metadata::{Entry, Error, Field, Payload};
 use serde_json::{Value, json};
 
 use crate::catalog::CategoryFilter;
@@ -40,12 +40,59 @@ struct Counts {
     decoded: u64,
     not_xml: u64,
     unsupported: u64,
+    unsupported_transform: u64,
+    unsupported_compression: u64,
+    missing_source: u64,
+    malformed_metadata: u64,
     too_large: u64,
     parse_failed: u64,
     recognized_documents: u64,
     unrecognized_documents: u64,
     observations: BTreeMap<&'static str, u64>,
     entity_types: BTreeMap<String, u64>,
+}
+
+/// A payload failure's cause, as the report names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    Transform,
+    Compression,
+    Source,
+    Malformed,
+}
+
+impl Cause {
+    fn of(err: &Error) -> Self {
+        match err {
+            Error::Encoded { encoding, .. } if *encoding == "behind the payload transform" => {
+                Cause::Transform
+            }
+            Error::Encoded { .. } | Error::Undecodable { .. } => Cause::Compression,
+            Error::ReadSource { .. } => Cause::Source,
+            _ => Cause::Malformed,
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Cause::Transform => "unsupported_transform",
+            Cause::Compression => "unsupported_compression",
+            Cause::Source => "missing_source",
+            Cause::Malformed => "malformed_metadata",
+        }
+    }
+}
+
+impl Counts {
+    fn add_unsupported(&mut self, cause: Cause) {
+        self.unsupported += 1;
+        match cause {
+            Cause::Transform => self.unsupported_transform += 1,
+            Cause::Compression => self.unsupported_compression += 1,
+            Cause::Source => self.missing_source += 1,
+            Cause::Malformed => self.malformed_metadata += 1,
+        }
+    }
 }
 
 pub fn run(options: Options) -> Result<(), String> {
@@ -97,11 +144,15 @@ pub fn run(options: Options) -> Result<(), String> {
         let mut payload = match entry.payload(&source, alternates.sources()) {
             Ok(payload) => payload,
             Err(err) => {
-                counts.unsupported += 1;
+                let cause = Cause::of(&err);
+                counts.add_unsupported(cause);
                 if issues.len() < 100 {
-                    issues.push(
-                        json!({ "row": row, "stage": "payload", "message": err.to_string() }),
-                    );
+                    issues.push(json!({
+                        "row": row,
+                        "stage": "payload",
+                        "cause": cause.code(),
+                        "message": err.to_string()
+                    }));
                 }
                 continue;
             }
@@ -173,10 +224,28 @@ pub fn run(options: Options) -> Result<(), String> {
         "complete"
     };
     let mut limitations = Vec::new();
-    if counts.unsupported > 0 {
+    if counts.unsupported_transform > 0 {
         limitations.push(format!(
-            "{} row(s) are stored behind an unsupported payload transform or compression and were not decoded",
-            counts.unsupported
+            "{} row(s) are stored behind the payload transform and were not decoded",
+            counts.unsupported_transform
+        ));
+    }
+    if counts.unsupported_compression > 0 {
+        limitations.push(format!(
+            "{} row(s) use an unsupported compression mode and were not decoded",
+            counts.unsupported_compression
+        ));
+    }
+    if counts.missing_source > 0 {
+        limitations.push(format!(
+            "{} row(s) read through an alternate source that is not available and were not decoded",
+            counts.missing_source
+        ));
+    }
+    if counts.malformed_metadata > 0 {
+        limitations.push(format!(
+            "{} row(s) have malformed metadata and could not be read",
+            counts.malformed_metadata
         ));
     }
     if counts.too_large > 0 {
@@ -207,6 +276,10 @@ pub fn run(options: Options) -> Result<(), String> {
             "decoded": counts.decoded,
             "notXml": counts.not_xml,
             "unsupported": counts.unsupported,
+            "unsupportedTransform": counts.unsupported_transform,
+            "unsupportedCompression": counts.unsupported_compression,
+            "missingSource": counts.missing_source,
+            "malformedMetadata": counts.malformed_metadata,
             "tooLarge": counts.too_large,
             "parseFailed": counts.parse_failed,
             "recognizedDocuments": counts.recognized_documents,
@@ -330,5 +403,62 @@ fn field<T>(value: &Field<T>, show: impl Fn(&T) -> String) -> Value {
         Ok(Some(value)) => json!(show(value)),
         Ok(None) => Value::Null,
         Err(reason) => json!({ "malformed": reason }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn payload_failures_are_classified_by_cause() {
+        assert_eq!(
+            Cause::of(&Error::Encoded {
+                row: 0,
+                encoding: "behind the payload transform"
+            }),
+            Cause::Transform
+        );
+        assert_eq!(
+            Cause::of(&Error::Encoded {
+                row: 1,
+                encoding: "compressed"
+            }),
+            Cause::Compression
+        );
+        assert_eq!(
+            Cause::of(&Error::Undecodable {
+                row: 2,
+                reason: "mode 2".to_string()
+            }),
+            Cause::Compression
+        );
+        assert_eq!(
+            Cause::of(&Error::ReadSource { row: 3, index: 1 }),
+            Cause::Source
+        );
+        assert_eq!(
+            Cause::of(&Error::Invalid("bad metadata".to_string())),
+            Cause::Malformed
+        );
+    }
+
+    #[test]
+    fn unsupported_counts_keep_the_total_and_each_cause() {
+        let mut counts = Counts::default();
+        for cause in [
+            Cause::Transform,
+            Cause::Transform,
+            Cause::Compression,
+            Cause::Source,
+            Cause::Malformed,
+        ] {
+            counts.add_unsupported(cause);
+        }
+        assert_eq!(counts.unsupported, 5);
+        assert_eq!(counts.unsupported_transform, 2);
+        assert_eq!(counts.unsupported_compression, 1);
+        assert_eq!(counts.missing_source, 1);
+        assert_eq!(counts.malformed_metadata, 1);
     }
 }

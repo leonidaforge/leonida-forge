@@ -20,6 +20,7 @@ use lforge_binary::Source;
 use lforge_core::archive::Format;
 use lforge_core::inspect as recognition;
 use lforge_core::zip as zip_archive;
+use lforge_rage9::rpf::metadata::transform::Algorithm;
 use lforge_rage9::rpf::metadata::{Entry, Payload};
 use serde_json::{Map, Value, json};
 
@@ -262,7 +263,7 @@ fn inspect_row(
                 let len = stored.source.len();
                 let provenance = resolved.provenance_json(
                     selection,
-                    representation("stored", false, stored.note, None),
+                    representation("stored", false, &stored.note, None),
                 );
                 emit(
                     &mut stored.source,
@@ -291,12 +292,20 @@ fn inspect_row(
             emit_payload(payload, len, Context { source, provenance }, options)
         }
         Err(err) => {
-            let note = "the row cannot be decoded by this build";
+            let note = if transform_descriptor(&entry).is_some() {
+                "the row is stored behind a payload transform, which this build does not decode"
+            } else {
+                "the row cannot be decoded by this build"
+            };
+            let message = match transform_descriptor(&entry) {
+                Some(descriptor) => format!("{err} ({descriptor})"),
+                None => err.to_string(),
+            };
             let provenance = resolved.provenance_json(
                 selection,
-                representation("logical", false, note, Some(err.to_string())),
+                representation("logical", false, note, Some(message.clone())),
             );
-            emit_failure(source, provenance, "decoding", err.to_string(), options)
+            emit_failure(source, provenance, "decoding", message, options)
         }
     }
 }
@@ -306,7 +315,29 @@ fn inspect_row(
 struct StoredSource {
     source: Source,
     /// How the bytes relate to the row's contents.
-    note: &'static str,
+    note: String,
+}
+
+/// The cipher descriptor of a row's payload transform, when the row has the
+/// transform flag. The engine selects the key state and algorithm from it; this
+/// build does not implement that algorithm.
+fn transform_descriptor(entry: &Entry) -> Option<String> {
+    if !matches!(entry.payload_transform, Ok(true)) {
+        return None;
+    }
+    Some(match &entry.payload_cipher {
+        Ok(Some(cipher)) => {
+            let algorithm = Algorithm::of(cipher.kind)
+                .map(|algorithm| format!("{:#x}", algorithm.id()))
+                .unwrap_or_else(|err| err.to_string());
+            format!(
+                "cipher type {:#x}, algorithm {algorithm}, key id 0x{:08X}",
+                cipher.kind, cipher.key_id
+            )
+        }
+        Ok(None) => "no cipher descriptor".to_string(),
+        Err(reason) => format!("cipher descriptor malformed: {reason}"),
+    })
 }
 
 fn stored_bytes(
@@ -384,11 +415,14 @@ fn stored_bytes(
         )
     })?;
     let note = if plain {
-        "the bytes as stored, which are the row's contents"
+        "the bytes as stored, which are the row's contents".to_string()
     } else if transformed {
-        "the stored representation before the unsupported payload transform; it may include alignment padding"
+        format!(
+            "the stored representation before the payload transform ({}); it may include alignment padding",
+            transform_descriptor(entry).unwrap_or_else(|| "descriptor unknown".to_string())
+        )
     } else {
-        "the stored representation before decoding; it may include alignment padding"
+        "the stored representation before decoding; it may include alignment padding".to_string()
     };
     Ok(StoredSource { source, note })
 }

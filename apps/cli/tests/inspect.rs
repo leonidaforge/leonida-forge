@@ -414,6 +414,46 @@ fn archive_inspect_reads_a_row_without_extracting_it() {
 }
 
 #[test]
+fn archive_inspect_names_the_payload_transform_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut descriptor = Vec::new();
+    descriptor.extend_from_slice(&0x1000_002Eu32.to_le_bytes());
+    descriptor.extend_from_slice(&0x11u16.to_le_bytes());
+    descriptor.extend(0..16u8);
+    let row = common::Spec {
+        transform: true,
+        transform_descriptor: Some(descriptor),
+        ..common::spec(&[0x11; 64])
+    };
+    let path = write_archive(temp.path(), "transform.rpf", &assemble(&[row], &[]));
+
+    let output = lforge(&[
+        "archive",
+        "inspect",
+        path.to_str().unwrap(),
+        "--row",
+        "0",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["failure_stage"], "decoding");
+    let failure = document["failure"].as_str().unwrap();
+    assert!(failure.contains("payload transform"), "{failure}");
+    assert!(failure.contains("cipher type 0x11"), "{failure}");
+    assert!(failure.contains("algorithm 0x11"), "{failure}");
+    assert!(failure.contains("key id 0x1000002E"), "{failure}");
+    let representation = &document["provenance"]["representation"];
+    assert_eq!(representation["decoded"], false);
+    assert!(
+        representation["note"]
+            .as_str()
+            .unwrap()
+            .contains("payload transform")
+    );
+}
+
+#[test]
 fn archive_inspect_seeks_through_a_chunked_row() {
     let temp = tempfile::tempdir().unwrap();
     let payload = rds5(&[block(), block()]);

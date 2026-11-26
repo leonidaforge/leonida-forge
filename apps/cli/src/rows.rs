@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
-use lforge_rage9::rpf::metadata::transform::Algorithm;
+use lforge_rage9::rpf::metadata::transform::{Algorithm, CipherDescriptor};
 use lforge_rage9::rpf::metadata::{Entry, Field};
 use lforge_rage9::rpf::names::{Class, Key, MountPrefix, Resolver, RowNames, Types};
 use serde_json::{Value, json};
@@ -185,14 +185,7 @@ impl Listing {
             },
             "payload_cipher": match &entry.payload_cipher {
                 Ok(None) => Value::Null,
-                Ok(Some(cipher)) => match Algorithm::of(cipher.kind) {
-                    Ok(algorithm) => json!({
-                        "type": cipher.kind,
-                        "algorithm": format!("{:#x}", algorithm.id()),
-                        "supported": false,
-                    }),
-                    Err(reason) => json!({ "type": cipher.kind, "malformed": reason.to_string() }),
-                },
+                Ok(Some(cipher)) => cipher_json(cipher),
                 Err(reason) => json!({ "malformed": reason }),
             },
             "read_source": match &entry.read_source {
@@ -235,6 +228,21 @@ fn field<T>(value: &Field<T>, show: impl Fn(&T) -> Value) -> Value {
 
 fn hex<T: std::fmt::UpperHex>(value: T, digits: usize) -> String {
     format!("0x{value:0digits$X}")
+}
+
+/// The descriptor the engine would use for a row's payload transform. `supported`
+/// is false for every descriptor: this build does not decode transformed rows.
+pub(crate) fn cipher_json(cipher: &CipherDescriptor) -> Value {
+    match Algorithm::of(cipher.kind) {
+        Ok(algorithm) => json!({
+            "type": cipher.kind,
+            "algorithm": format!("{:#x}", algorithm.id()),
+            "key_id": format!("0x{:08X}", cipher.key_id),
+            "parameter": cipher.parameter.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "supported": false,
+        }),
+        Err(reason) => json!({ "type": cipher.kind, "malformed": reason.to_string() }),
+    }
 }
 
 fn raw_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
@@ -720,6 +728,39 @@ mod tests {
             read_source: Ok(None),
             payload_end: None,
         }
+    }
+
+    #[test]
+    fn payload_cipher_descriptors_report_type_algorithm_key_and_parameter() {
+        let descriptor = CipherDescriptor {
+            key_id: 0x1000_002E,
+            kind: 0x11,
+            parameter: [0xAB; 16],
+        };
+        let value = cipher_json(&descriptor);
+        assert_eq!(value["type"], 0x11);
+        assert_eq!(value["algorithm"], "0x11");
+        assert_eq!(value["key_id"], "0x1000002E");
+        assert_eq!(value["parameter"], "abababababababababababababababab");
+        assert_eq!(value["supported"], false);
+
+        // A cipher type that selects CBC reports the algorithm family
+        // identifier, not the cipher type.
+        let cbc = CipherDescriptor {
+            kind: 16,
+            ..descriptor
+        };
+        assert_eq!(cipher_json(&cbc)["algorithm"], "0x10");
+
+        // Cipher types the engine rejects are reported as malformed.
+        let invalid = CipherDescriptor {
+            kind: 13,
+            ..descriptor
+        };
+        let value = cipher_json(&invalid);
+        assert_eq!(value["type"], 13);
+        assert!(value["malformed"].is_string());
+        assert!(value.get("algorithm").is_none());
     }
 
     #[test]

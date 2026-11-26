@@ -19,6 +19,12 @@ fn metadata_reports_payload_readability() {
         },
         Spec {
             transform: true,
+            transform_descriptor: Some({
+                let mut value = 0x1000_002Eu32.to_le_bytes().to_vec();
+                value.extend_from_slice(&0x11u16.to_le_bytes());
+                value.extend(0..16u8);
+                value
+            }),
             ..spec(&[0x11; 16])
         },
         Spec {
@@ -62,6 +68,13 @@ fn metadata_reports_payload_readability() {
     assert_eq!(state(1), "decoded");
     assert_eq!(state(2), "unsupported_transform");
     assert_eq!(listed[2]["contents"]["readable"], false);
+    assert_eq!(listed[2]["payload_cipher"]["type"], 0x11);
+    assert_eq!(listed[2]["payload_cipher"]["algorithm"], "0x11");
+    assert_eq!(listed[2]["payload_cipher"]["key_id"], "0x1000002E");
+    assert_eq!(
+        listed[2]["payload_cipher"]["parameter"],
+        "000102030405060708090a0b0c0d0e0f"
+    );
     assert_eq!(state(3), "unsupported_compression");
     assert_eq!(state(4), "alternate_source");
     assert_eq!(state(5), "decoded");

@@ -5,7 +5,7 @@ mod common;
 
 use std::fs;
 
-use common::{assemble, lforge, spec, write_archive};
+use common::{Spec, assemble, lforge, spec, write_archive};
 use lforge_rage9::rpf::names::{hash64, joaat};
 use serde_json::Value;
 
@@ -31,6 +31,37 @@ fn json(output: &std::process::Output) -> Value {
         common::stderr(output)
     );
     serde_json::from_slice(&output.stdout).expect("stdout is JSON")
+}
+
+#[test]
+fn reports_the_payload_transform_cipher_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut descriptor = Vec::new();
+    descriptor.extend_from_slice(&0x1000_002Eu32.to_le_bytes());
+    descriptor.extend_from_slice(&0x11u16.to_le_bytes());
+    descriptor.extend(0..16u8);
+    let row = Spec {
+        transform: true,
+        transform_descriptor: Some(descriptor),
+        ..spec(&[0x11; 48])
+    };
+    let path = write_archive(temp.path(), "transform.rpf", &assemble(&[row], &[]));
+    let value = json(&lforge(&[
+        "archive",
+        "ls",
+        path.to_str().unwrap(),
+        "--json",
+    ]));
+    let row = &value["rows"][0];
+    assert_eq!(row["payload_transform"], true);
+    assert_eq!(row["contents"]["readable"], false);
+    assert_eq!(row["contents"]["state"], "unsupported_transform");
+    let cipher = &row["payload_cipher"];
+    assert_eq!(cipher["type"], 0x11);
+    assert_eq!(cipher["algorithm"], "0x11");
+    assert_eq!(cipher["key_id"], "0x1000002E");
+    assert_eq!(cipher["parameter"], "000102030405060708090a0b0c0d0e0f");
+    assert_eq!(cipher["supported"], false);
 }
 
 #[test]

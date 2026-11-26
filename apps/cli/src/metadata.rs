@@ -326,6 +326,11 @@ fn entry_json(
             Ok(flag) => json!(flag),
             Err(reason) => json!({ "malformed": reason }),
         },
+        "payload_cipher": match &entry.payload_cipher {
+            Ok(None) => Value::Null,
+            Ok(Some(cipher)) => crate::rows::cipher_json(cipher),
+            Err(reason) => json!({ "malformed": reason }),
+        },
         "read_source": match &entry.read_source {
             Ok(None) => json!("main"),
             Ok(Some(index)) => json!(index),

@@ -146,6 +146,9 @@ pub struct Spec {
     pub logical: Option<u64>,
     pub chunks: Option<Vec<u8>>,
     pub transform: bool,
+    /// The payload-transform field's value. Defaults to one byte when
+    /// `transform` is set.
+    pub transform_descriptor: Option<Vec<u8>>,
     pub source: Option<u32>,
     pub has_location: bool,
     pub shift: u32,
@@ -161,6 +164,7 @@ pub fn spec(payload: &[u8]) -> Spec {
         logical: None,
         chunks: None,
         transform: false,
+        transform_descriptor: None,
         source: None,
         has_location: true,
         shift: 0,
@@ -238,6 +242,12 @@ fn assemble_inner(specs: &[Spec], companions: &[(Vec<u8>, u64)], selector: u8) -
         .max()
         .unwrap_or(8)
         .max(8);
+    let transform_width = specs
+        .iter()
+        .filter_map(|s| s.transform_descriptor.as_ref().map(Vec::len))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let mut columns = vec![
         column(keys::LOCATION_A, 16, locations),
         column(
@@ -255,10 +265,16 @@ fn assemble_inner(specs: &[Spec], companions: &[(Vec<u8>, u64)], selector: u8) -
         ),
         column(
             keys::PAYLOAD_TRANSFORM,
-            1,
+            transform_width as u16,
             specs
                 .iter()
-                .map(|s| s.transform.then(|| vec![1u8]))
+                .map(|s| {
+                    s.transform.then(|| {
+                        let mut value = s.transform_descriptor.clone().unwrap_or_else(|| vec![1u8]);
+                        value.resize(transform_width, 0);
+                        value
+                    })
+                })
                 .collect(),
         ),
         column(
