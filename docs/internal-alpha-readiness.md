@@ -114,8 +114,7 @@ pushed.
   resource view, not the parsers, which are shared.
 - Virtual folder grouping from resolved native paths. The native list is flat;
   path-like candidate names are display data and do not become directories.
-- Payload transforms and compression modes beyond stored, raw DEFLATE and
-  chunked zlib or copied chunks. Entries that need anything else are refused.
+- Payload transforms are decoded when the executable that authenticated the metadata provides the algorithm-`0x11` key state; a stream shape the trial decoder cannot verify is refused. Compression modes beyond stored, raw DEFLATE and chunked zlib or copied chunks are refused.
 - Writing to game files. All file access is read-only by design.
 
 ## Export request handling

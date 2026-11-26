@@ -209,6 +209,9 @@ pub struct Native {
     companions: Companions,
     authentication: Authentication,
     types: Types,
+    /// Present when the metadata was authenticated; it can build
+    /// payload-transform blocks.
+    stream: Option<lforge_rage9::rpf::metadata::provider::RecognizedSource>,
 }
 
 fn names_file(archive: &Archive) -> PathBuf {
@@ -556,6 +559,7 @@ impl Native {
             archive,
             metadata,
             Authentication::Unencrypted,
+            None,
         ))
     }
 
@@ -564,14 +568,25 @@ impl Native {
     /// so no unverified metadata can be listed as native entries.
     ///
     /// [`AuthenticatedMetadata`]: lforge_rage9::rpf::metadata::verify::AuthenticatedMetadata
-    pub fn from_authenticated(archive: &Archive, metadata: Metadata, report: VerifyReport) -> Self {
-        Self::from_metadata(archive, metadata, Authentication::Authenticated(report))
+    pub fn from_authenticated(
+        archive: &Archive,
+        metadata: Metadata,
+        report: VerifyReport,
+        stream: lforge_rage9::rpf::metadata::provider::RecognizedSource,
+    ) -> Self {
+        Self::from_metadata(
+            archive,
+            metadata,
+            Authentication::Authenticated(report),
+            Some(stream),
+        )
     }
 
     fn from_metadata(
         archive: &Archive,
         metadata: Metadata,
         authentication: Authentication,
+        stream: Option<lforge_rage9::rpf::metadata::provider::RecognizedSource>,
     ) -> Self {
         let rows: Vec<Row> = metadata.entries().collect();
         let types = Types::default();
@@ -585,6 +600,7 @@ impl Native {
             companions,
             authentication,
             types,
+            stream,
         }
     }
 
@@ -843,7 +859,14 @@ impl Native {
         }
         match &row.payload_transform {
             Ok(true) => {
-                details.push(("Payload transform", "Required, not supported".to_string()));
+                details.push((
+                    "Payload transform",
+                    if self.stream.is_some() {
+                        "Decoded with the executable's key state".to_string()
+                    } else {
+                        "Required, not supported".to_string()
+                    },
+                ));
                 match &row.payload_cipher {
                     Ok(Some(cipher)) => {
                         details.push(("Transform cipher", cipher_text(cipher)));
@@ -871,6 +894,9 @@ impl Native {
                     "Readable as stored".to_string()
                 }
                 Ok(_) => "Readable, decoded when read".to_string(),
+                Err(_) if matches!(row.payload_transform, Ok(true)) && self.stream.is_some() => {
+                    "Readable after the payload transform".to_string()
+                }
                 Err(err) => format!("Not readable: {err}"),
             },
         ));
@@ -950,6 +976,57 @@ impl Native {
             .map_err(to_io)
     }
 
+    /// Decodes a row behind the payload transform with the authenticated
+    /// executable state. `None` when the archive has no such state.
+    fn transformed(&self, archive: &Archive, row: &Row, limit: u64) -> io::Result<Option<Vec<u8>>> {
+        let Some(stream) = &self.stream else {
+            return Ok(None);
+        };
+        let location = match &row.location {
+            Ok(Some(location)) => *location,
+            Ok(None) => return Err(not_found()),
+            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
+        };
+        let table = match &row.chunks {
+            Ok(Some(table)) => table,
+            Ok(None) => return Err(not_found()),
+            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
+        };
+        let cipher = match &row.payload_cipher {
+            Ok(Some(cipher)) => cipher,
+            Ok(None) => return Err(not_found()),
+            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
+        };
+        if location.stored_len > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the stored row exceeds the output limit",
+            ));
+        }
+        let read_source: &Source = match &row.read_source {
+            Ok(None) => &archive.source,
+            Ok(Some(index)) => self
+                .alternates()
+                .get(*index as usize)
+                .and_then(|source| source.as_ref())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing companion"))?,
+            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
+        };
+        let mut stored = read_source.slice(location.payload_offset, location.stored_len)?;
+        let mut bytes = Vec::with_capacity(location.stored_len as usize);
+        stored.read_to_end(&mut bytes)?;
+        let blocks = stream.stream_blocks(cipher.key_id);
+        lforge_rage9::rpf::metadata::provider::decode_transformed(
+            &bytes,
+            table,
+            location.logical_len,
+            cipher,
+            &blocks,
+        )
+        .map(Some)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+    }
+
     /// Writes the contents of an entry, decoded where that is supported.
     /// Entries that cannot be read, also through an unavailable companion,
     /// are refused. Decoding stops once `cancel` is set.
@@ -962,9 +1039,18 @@ impl Native {
         cancel: &AtomicBool,
     ) -> io::Result<()> {
         let row = self.row(inner).ok_or_else(not_found)?;
-        let mut payload = row
-            .payload(&archive.source, self.alternates())
-            .map_err(to_io)?;
+        let mut payload = match row.payload(&archive.source, self.alternates()) {
+            Ok(payload) => payload,
+            Err(err) if matches!(row.payload_transform, Ok(true)) => {
+                if let Some(bytes) = self.transformed(archive, row, limit)? {
+                    check_size(bytes.len() as u64, limit)?;
+                    out.write_all(&bytes)?;
+                    return Ok(());
+                }
+                return Err(to_io(err));
+            }
+            Err(err) => return Err(to_io(err)),
+        };
         check_size(payload.len(), limit)?;
         // A payload never yields more than its declared size. `io::copy`
         // would retry the `Interrupted` that cancellation returns.

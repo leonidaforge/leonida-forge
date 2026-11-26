@@ -205,10 +205,16 @@ fn authenticate(
             report.stage
         )));
     };
+    let Some(stream) = open.source else {
+        return Err(Arc::from(
+            "The executable did not yield a usable key source for the payload transform.",
+        ));
+    };
     Ok(toc::Native::from_authenticated(
         archive,
         authenticated.into_metadata(),
         report,
+        stream,
     ))
 }
 

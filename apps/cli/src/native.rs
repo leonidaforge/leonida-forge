@@ -51,6 +51,9 @@ pub struct Opened {
     pub source: Source,
     pub metadata: Metadata,
     pub authentication: Authentication,
+    /// Present when the executable authenticated the metadata; it can build
+    /// payload-transform blocks.
+    pub stream: Option<lforge_rage9::rpf::metadata::provider::RecognizedSource>,
 }
 
 /// One name table that was read, and what became of it.
@@ -230,6 +233,89 @@ pub fn contents_state(
     }
 }
 
+/// Decodes a row behind the payload transform with the recognized executable
+/// state. The result is accepted only when every chunk decodes to its declared
+/// logical size.
+pub fn transformed_payload(
+    entry: &Entry,
+    source: &Source,
+    alternates: &Alternates,
+    stream: &lforge_rage9::rpf::metadata::provider::RecognizedSource,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
+    let location = match &entry.location {
+        Ok(Some(location)) => *location,
+        Ok(None) => return Err(format!("row {} has no location record", entry.row)),
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed location record: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let table = match &entry.chunks {
+        Ok(Some(table)) => table,
+        Ok(None) => return Err(format!("row {} has no chunk table", entry.row)),
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed chunk table: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let cipher = match &entry.payload_cipher {
+        Ok(Some(cipher)) => cipher,
+        Ok(None) => return Err(format!("row {} has no payload cipher", entry.row)),
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed payload cipher: {reason}",
+                entry.row
+            ));
+        }
+    };
+    if location.stored_len > limit {
+        return Err(format!(
+            "row {} stores {} bytes, above the {limit} byte limit",
+            entry.row, location.stored_len
+        ));
+    }
+    let read_source: &Source = match &entry.read_source {
+        Ok(None) => source,
+        Ok(Some(index)) => alternates
+            .sources()
+            .get(*index as usize)
+            .and_then(|source| source.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "row {}: alternate source {index} is not available",
+                    entry.row
+                )
+            })?,
+        Err(reason) => {
+            return Err(format!(
+                "row {}: malformed read source: {reason}",
+                entry.row
+            ));
+        }
+    };
+    let mut stored = read_source
+        .slice(location.payload_offset, location.stored_len)
+        .map_err(|err| format!("row {}: cannot read the stored bytes: {err}", entry.row))?;
+    let mut bytes = Vec::with_capacity(location.stored_len as usize);
+    stored
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("row {}: cannot read the stored bytes: {err}", entry.row))?;
+    let blocks = stream.stream_blocks(cipher.key_id);
+    lforge_rage9::rpf::metadata::provider::decode_transformed(
+        &bytes,
+        table,
+        location.logical_len,
+        cipher,
+        &blocks,
+    )
+    .map_err(|err| format!("row {}: {err}", entry.row))
+}
+
 /// Whether the entry's stored bytes can be read as they are, and why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawState {
@@ -352,6 +438,7 @@ pub fn open_metadata_cancellable(
             source,
             metadata,
             authentication: Authentication::NotApplicable,
+            stream: None,
         });
     }
     let Some(executable) = executable else {
@@ -388,6 +475,7 @@ pub fn open_metadata_cancellable(
         source,
         metadata: authenticated.into_metadata(),
         authentication: Authentication::Authenticated(report),
+        stream: open.source,
     })
 }
 

@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lforge_binary::pe::ExecutableView;
 
 use super::probe::ATableSummary;
-use super::provider::{EncodedAesError, FixedTablesError, SelectionError, select_source};
+use super::provider::{
+    EncodedAesError, FixedTablesError, RecognizedSource, SelectionError, select_source,
+};
 use super::recognize::{DescriptorError, RecognitionError, RegistryError};
 use super::signature::{self, SignatureError};
 use super::transform::Error as CipherError;
@@ -222,6 +224,9 @@ impl fmt::Debug for AuthenticatedMetadata {
 pub struct OpenReport {
     pub report: VerifyReport,
     pub authenticated: Option<AuthenticatedMetadata>,
+    /// The recognized key source that authenticated the metadata. It can build
+    /// payload-transform blocks; it is present only on success.
+    pub source: Option<RecognizedSource>,
 }
 
 impl OpenReport {
@@ -229,6 +234,7 @@ impl OpenReport {
         Self {
             report,
             authenticated: None,
+            source: None,
         }
     }
 }
@@ -334,6 +340,7 @@ pub fn open_authenticated(
         Ok(metadata) => Ok(OpenReport {
             report,
             authenticated: Some(AuthenticatedMetadata { metadata }),
+            source: Some(selection.source),
         }),
         Err(_) => {
             report.outcome =

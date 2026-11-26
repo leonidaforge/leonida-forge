@@ -27,6 +27,7 @@ pub fn run(
     executable: Option<&Path>,
 ) -> Result<(), String> {
     let opened = native::open_metadata(file, MAX_METADATA, executable)?;
+    let stream = opened.stream;
     let source = opened.source;
     let metadata = opened.metadata;
     let rows = metadata.rows();
@@ -40,22 +41,51 @@ pub fn run(
     let entry = metadata.entry(row).map_err(|err| err.to_string())?;
     output::ensure_not_input(output, &[file])?;
     let alternates = Alternates::resolve(file, &metadata);
-    let mut payload = entry
-        .payload(&source, alternates.sources())
-        .map_err(|err| format!("row {row} cannot be extracted: {err}"))?;
-    if payload.len() > output::MAX_OUTPUT {
-        return Err(format!(
-            "row {row} holds {} bytes, more than the {} byte output limit",
-            payload.len(),
-            output::MAX_OUTPUT
-        ));
-    }
-    let written = output::write_file(output, overwrite, |writer| {
-        decode(&mut payload, writer, output)
-    })?;
+    let transformed = matches!(entry.payload_transform, Ok(true));
+    let written = match entry.payload(&source, alternates.sources()) {
+        Ok(mut payload) => {
+            if payload.len() > output::MAX_OUTPUT {
+                return Err(format!(
+                    "row {row} holds {} bytes, more than the {} byte output limit",
+                    payload.len(),
+                    output::MAX_OUTPUT
+                ));
+            }
+            output::write_file(output, overwrite, |writer| {
+                decode(&mut payload, writer, output)
+            })?
+        }
+        Err(err) if transformed => {
+            let Some(stream) = stream.as_ref() else {
+                return Err(format!(
+                    "row {row} cannot be extracted: {err}; the payload transform requires the executable that provided the key state"
+                ));
+            };
+            let bytes = native::transformed_payload(
+                &entry,
+                &source,
+                &alternates,
+                stream,
+                output::MAX_OUTPUT,
+            )?;
+            output::write_file(output, overwrite, |writer| {
+                writer
+                    .write_all(&bytes)
+                    .map_err(|err| output::write_error(output, err))?;
+                Ok(bytes.len() as u64)
+            })?
+        }
+        Err(err) => {
+            return Err(format!("row {row} cannot be extracted: {err}"));
+        }
+    };
     println!(
         "extracted row {row} ({}): {written} bytes to {}",
-        kind(&entry),
+        if transformed {
+            "transformed"
+        } else {
+            kind(&entry)
+        },
         output.display()
     );
     Ok(())
