@@ -39,7 +39,7 @@ pub fn entry(width: u32, height: u32, format: u8, kind: u8, page: u32) -> [u32; 
 /// grid; `0` is the non-tiled path in the current viewer.
 pub fn entry_tiled(width: u32, height: u32, format: u8, kind: u8, page: u32, tile: u8) -> [u32; 4] {
     let mut words = entry(width, height, format, kind, page);
-    words[1] |= u32::from(tile) << 24;
+    words[1] = (words[1] & !(0xF << 24)) | u32::from(tile) << 24;
     words
 }
 
