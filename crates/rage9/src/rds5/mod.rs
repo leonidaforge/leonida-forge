@@ -693,8 +693,21 @@ impl Container {
         max: usize,
         cancel: &AtomicBool,
     ) -> Result<usize, Error> {
+        self.classify_range(source, 0, max, cancel)
+    }
+
+    /// Classifies at most `count` blocks starting at `start`. A caller that
+    /// reads one descriptor does not pay for the blocks before it.
+    pub fn classify_range<R: Read + Seek>(
+        &mut self,
+        source: &mut R,
+        start: usize,
+        count: usize,
+        cancel: &AtomicBool,
+    ) -> Result<usize, Error> {
+        let end = start.saturating_add(count).min(self.blocks.len());
         let mut done = 0;
-        for index in 0..self.blocks.len().min(max) {
+        for index in start..end {
             check(cancel)?;
             let (offset, stored_len, class) = {
                 let block = &self.blocks[index];
@@ -1058,17 +1071,30 @@ pub struct TextureReport {
     pub notes: Vec<String>,
 }
 
-/// Reconstructs one descriptor's bytes, streams them to `sink`, and reports
-/// the chain. Blocks are decoded by class; a block of an undecoded class
-/// refuses the whole chain rather than returning partial bytes.
-pub fn reconstruct_texture<R: Read + Seek>(
+/// The block range one descriptor references, computed without decoding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorRange {
+    /// The descriptor's first page.
+    pub first_page: u32,
+    /// The index of the first block in [`Container::blocks`].
+    pub first_block: u32,
+    pub block_count: u32,
+    pub virtual_start: u64,
+    pub virtual_end: u64,
+    /// The virtual length of the range: the reconstructed byte count.
+    pub virtual_len: u64,
+    /// The stored bytes the selected blocks occupy, padding excluded.
+    pub stored_len: u64,
+    /// Trailing zero bytes of the selected blocks' stored spans.
+    pub padding: u64,
+}
+
+/// Finds the block range of `descriptor` without decoding any block.
+pub fn descriptor_range<R: Read + Seek>(
     source: &mut R,
-    container: &mut Container,
+    container: &Container,
     descriptor: u32,
-    limits: &Limits,
-    cancel: &AtomicBool,
-    mut sink: impl FnMut(&[u8]) -> io::Result<()>,
-) -> Result<TextureReport, Error> {
+) -> Result<DescriptorRange, Error> {
     if descriptor >= container.entry_count {
         return Err(invalid(format!(
             "descriptor {descriptor} does not exist; the chunk holds {}",
@@ -1095,15 +1121,16 @@ pub fn reconstruct_texture<R: Read + Seek>(
             ))
         })?;
     // The range runs to the next descriptor's first page, or to the end
-    // record for the last descriptor.
-    let end_page =
+    // record for the last descriptor. The last end is not page-rounded, so a
+    // small final texture that shares a page is still included.
+    let end =
         if usize::try_from(descriptor).unwrap_or(usize::MAX) + 1 < container.entry_count as usize {
             let next = container
                 .entries(source, descriptor + 1, 1)?
                 .pop()
                 .map(|entry| entry.locator_page());
             match next {
-                Some(page) if page > first_page => u64::from(page),
+                Some(page) if page > first_page => u64::from(page) * 0x1000,
                 _ => {
                     return Err(invalid(format!(
                         "descriptor {} does not start after descriptor {descriptor}",
@@ -1115,22 +1142,72 @@ pub fn reconstruct_texture<R: Read + Seek>(
             container
                 .records
                 .last()
-                .map(|record| record.virtual_position() / 0x1000)
+                .map(Record::virtual_position)
                 .unwrap_or(0)
         };
     let mut block_count = 0u32;
     for block in &container.blocks[first_block..] {
-        if block.virtual_position / 0x1000 >= end_page {
+        if block.virtual_position >= end {
             break;
         }
         block_count += 1;
     }
     if block_count == 0 {
-        return Err(invalid(format!("descriptor {descriptor} covers no block")));
+        // The last record's virtual position is page-granular. A final block
+        // shorter than a page therefore ends where it starts in that encoding,
+        // but the block itself still belongs to the descriptor.
+        let is_last =
+            usize::try_from(descriptor).unwrap_or(usize::MAX) + 1 >= container.entry_count as usize;
+        if is_last && first_block < container.blocks.len() {
+            block_count = 1;
+        } else {
+            return Err(invalid(format!("descriptor {descriptor} covers no block")));
+        }
     }
+    let virtual_start = container.blocks[first_block].virtual_position;
+    let mut stored_len = 0u64;
+    let mut padding = 0u64;
+    for block in &container.blocks[first_block..first_block + block_count as usize] {
+        stored_len += block.content_len;
+        padding += u64::from(block.padding);
+    }
+    let last = &container.blocks[first_block + block_count as usize - 1];
+    let virtual_end = last.virtual_position + last.virtual_len;
+    Ok(DescriptorRange {
+        first_page,
+        first_block: first_block as u32,
+        block_count,
+        virtual_start,
+        virtual_end,
+        virtual_len: virtual_end.saturating_sub(virtual_start),
+        stored_len,
+        padding,
+    })
+}
 
-    // Classify every block once; decode_block refuses an unclassified one.
-    container.classify(source, usize::MAX, cancel)?;
+/// Reconstructs one descriptor's bytes, streams them to `sink`, and reports
+/// the chain. Blocks are decoded by class; a block of an undecoded class
+/// refuses the whole chain rather than returning partial bytes.
+pub fn reconstruct_texture<R: Read + Seek>(
+    source: &mut R,
+    container: &mut Container,
+    descriptor: u32,
+    limits: &Limits,
+    cancel: &AtomicBool,
+    mut sink: impl FnMut(&[u8]) -> io::Result<()>,
+) -> Result<TextureReport, Error> {
+    let range = descriptor_range(source, container, descriptor)?;
+    let entry = container
+        .entries(source, descriptor, 1)?
+        .pop()
+        .ok_or_else(|| invalid(format!("descriptor {descriptor} cannot be read")))?;
+    let first_page = range.first_page;
+    let first_block = range.first_block as usize;
+    let block_count = range.block_count;
+
+    // Classify the descriptor's blocks once; decode_block refuses an
+    // unclassified one.
+    container.classify_range(source, first_block, block_count as usize, cancel)?;
     let mut decoded_len = 0u64;
     let mut stored_len = 0u64;
     let mut padding = 0u64;
@@ -1146,14 +1223,12 @@ pub fn reconstruct_texture<R: Read + Seek>(
         classes.push(block.class_id);
     }
 
-    let virtual_start = container.blocks[first_block].virtual_position;
-    let last = &container.blocks[first_block + block_count as usize - 1];
-    let virtual_end = last.virtual_position + last.virtual_len;
+    let (virtual_start, virtual_end) = (range.virtual_start, range.virtual_end);
     let texels = u64::from(entry.width()) * u64::from(entry.height());
     let bytes_per_texel = (texels > 0 && decoded_len.is_multiple_of(texels))
         .then(|| u32::try_from(decoded_len / texels).ok())
         .flatten();
-    let complete = decoded_len == virtual_end.saturating_sub(virtual_start);
+    let complete = decoded_len == range.virtual_len;
 
     let mut notes = Vec::new();
     if bytes_per_texel != Some(1) {

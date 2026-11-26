@@ -187,6 +187,17 @@ fn build_standard() -> Vec<u8> {
 }
 
 #[test]
+fn a_last_descriptor_shorter_than_a_page_keeps_its_block() {
+    let bytes = Build::default().build(&[vec![0x11; 16]], 0);
+    let container = read(&bytes).unwrap();
+    let mut source = Cursor::new(&bytes);
+    let range = descriptor_range(&mut source, &container, 0).unwrap();
+    assert_eq!(range.first_page, 1);
+    assert_eq!(range.block_count, 1);
+    assert_eq!(range.first_block, 0);
+}
+
+#[test]
 fn parses_header_records_and_blocks() {
     let bytes = build_standard();
     let container = read(&bytes).unwrap();
