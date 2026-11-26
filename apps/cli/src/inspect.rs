@@ -291,6 +291,31 @@ fn inspect_row(
                 resolved.provenance_json(selection, representation("logical", true, note, None));
             emit_payload(payload, len, Context { source, provenance }, options)
         }
+        Err(err) if matches!(entry.payload_transform, Ok(true)) && opened.stream.is_some() => {
+            let stream = opened.stream.as_ref().expect("checked");
+            match native::transformed_payload(&entry, &opened.source, &alternates, stream) {
+                Ok(payload) => {
+                    let len = payload.len();
+                    let note = "decoded through the verified payload transform";
+                    let provenance = resolved
+                        .provenance_json(selection, representation("logical", true, note, None));
+                    emit_payload(payload, len, Context { source, provenance }, options)
+                }
+                Err(reason) => {
+                    let message = format!("{err} ({reason})");
+                    let provenance = resolved.provenance_json(
+                        selection,
+                        representation(
+                            "logical",
+                            false,
+                            "the payload transform could not be verified",
+                            Some(message.clone()),
+                        ),
+                    );
+                    emit_failure(source, provenance, "decoding", message, options)
+                }
+            }
+        }
         Err(err) => {
             let note = if transform_descriptor(&entry).is_some() {
                 "the row is stored behind a payload transform, which this build does not decode"

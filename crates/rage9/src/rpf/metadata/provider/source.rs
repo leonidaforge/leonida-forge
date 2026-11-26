@@ -13,11 +13,13 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use lforge_binary::Source;
 use lforge_binary::pe::ExecutableView;
 
 use super::block::{EncodedAesBlock, EncodedAesError};
 use super::fixed::{FixedTables, FixedTablesError, recognize_candidates, recognize_fixed_tables};
 use super::stream_block::EncodedStreamBlock;
+use super::stream_payload::{StreamTransformError, prepare_stream_transform};
 use crate::rpf::metadata::probe::{ATableSummary, validate_a_table};
 use crate::rpf::metadata::recognize::{
     Limits, RecognitionError, Recognized, STATIC_STEP1_MODE, StaticDescriptor,
@@ -25,6 +27,7 @@ use crate::rpf::metadata::recognize::{
 use crate::rpf::metadata::transform::{
     Algorithm, Block, Cipher, CipherDescriptor, CipherSource, Error as CipherError,
 };
+use crate::rpf::metadata::{Entry, StreamTransform};
 
 #[derive(Debug)]
 pub enum SourceError {
@@ -107,6 +110,21 @@ impl RecognizedSource {
     /// may use. The archive data selects one when a transformed row is read.
     pub(crate) fn set_stream_tables(&mut self, tables: Vec<FixedTables>) {
         self.stream_tables = tables;
+    }
+
+    /// Builds the verified streaming transform for `entry` from a bounded
+    /// stored prefix. The first zlib chunk selects the candidate table.
+    pub fn stream_transform(
+        &self,
+        entry: &Entry,
+        main: &Source,
+        alternates: &[Option<Source>],
+    ) -> Result<StreamTransform, StreamTransformError> {
+        let key_id = match &entry.payload_cipher {
+            Ok(Some(cipher)) => cipher.key_id,
+            _ => 0,
+        };
+        prepare_stream_transform(entry, main, alternates, self.stream_blocks(key_id))
     }
 
     /// One keystream block per candidate table set for `key_id`. Empty when

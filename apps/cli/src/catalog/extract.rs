@@ -22,6 +22,7 @@ use crate::native::{self, Alternates};
 
 const MAX_METADATA: u64 = 256 * 1024 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
+const PREFIX_LEN: u64 = 64 * 1024;
 
 pub struct Options {
     pub archive: PathBuf,
@@ -45,6 +46,8 @@ struct Counts {
     missing_source: u64,
     malformed_metadata: u64,
     decode_failed: u64,
+    excluded: u64,
+    prefix_only: u64,
     too_large: u64,
     parse_failed: u64,
     recognized_documents: u64,
@@ -143,47 +146,21 @@ pub fn run(options: Options) -> Result<(), String> {
                 continue;
             }
         };
-        let bytes = match entry.payload(&source, alternates.sources()) {
-            Ok(mut payload) => {
-                let declared = payload.len();
-                if declared > options.max_row_bytes {
-                    counts.too_large += 1;
-                    if issues.len() < 100 {
-                        issues.push(json!({
-                            "row": row,
-                            "stage": "limit",
-                            "message": format!("the decoded row is {declared} bytes, above the {0} byte limit", options.max_row_bytes)
-                        }));
-                    }
-                    continue;
-                }
-                let mut bytes = Vec::with_capacity(declared.min(16 * 1024 * 1024) as usize);
-                if let Err(err) = read_payload(&mut payload, &mut bytes, options.max_row_bytes) {
-                    match err {
-                        ReadError::Limit(message) => {
-                            counts.too_large += 1;
-                            if issues.len() < 100 {
-                                issues.push(
-                                    json!({ "row": row, "stage": "limit", "message": message }),
-                                );
-                            }
-                        }
-                        ReadError::Decode(message) => {
-                            counts.decode_failed += 1;
-                            if issues.len() < 100 {
-                                issues.push(json!({
-                                    "row": row,
-                                    "stage": "decoding",
-                                    "cause": "decode_failed",
-                                    "message": message
-                                }));
-                            }
-                        }
-                    }
-                    continue;
-                }
-                bytes
+        if entry.type_id() == Some(0) {
+            // Type 0 is a nested RPF archive, never a catalog XML document.
+            counts.excluded += 1;
+            if issues.len() < 100 {
+                issues.push(json!({
+                    "row": row,
+                    "stage": "catalog",
+                    "cause": "nested_archive",
+                    "message": "nested RPF archive excluded from catalog extraction"
+                }));
             }
+            continue;
+        }
+        let mut payload = match entry.payload(&source, alternates.sources()) {
+            Ok(payload) => payload,
             Err(_err) if matches!(entry.payload_transform, Ok(true)) => {
                 let Some(stream) = stream.as_ref() else {
                     counts.add_unsupported(Cause::Transform);
@@ -197,25 +174,8 @@ pub fn run(options: Options) -> Result<(), String> {
                     }
                     continue;
                 };
-                match native::transformed_payload(
-                    &entry,
-                    &source,
-                    &alternates,
-                    stream,
-                    options.max_row_bytes,
-                ) {
-                    Ok(bytes) if bytes.len() as u64 <= options.max_row_bytes => bytes,
-                    Ok(bytes) => {
-                        counts.too_large += 1;
-                        if issues.len() < 100 {
-                            issues.push(json!({
-                                "row": row,
-                                "stage": "limit",
-                                "message": format!("the decoded row is {} bytes, above the {} byte limit", bytes.len(), options.max_row_bytes)
-                            }));
-                        }
-                        continue;
-                    }
+                match native::transformed_payload(&entry, &source, &alternates, stream) {
+                    Ok(payload) => payload,
                     Err(reason) => {
                         counts.add_unsupported(Cause::Transform);
                         if issues.len() < 100 {
@@ -244,6 +204,62 @@ pub fn run(options: Options) -> Result<(), String> {
                 continue;
             }
         };
+        let declared = payload.len();
+        if declared > options.max_row_bytes {
+            // A large non-XML resource is classified from a bounded prefix
+            // instead of being decoded in full or counted as a document limit.
+            let mut prefix = Vec::new();
+            if let Err(err) = read_prefix(&mut payload, &mut prefix, PREFIX_LEN) {
+                counts.decode_failed += 1;
+                if issues.len() < 100 {
+                    issues.push(json!({
+                        "row": row,
+                        "stage": "decoding",
+                        "cause": "decode_failed",
+                        "message": err
+                    }));
+                }
+                continue;
+            }
+            let body = prefix.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&prefix);
+            if !body.starts_with(b"<") {
+                counts.not_xml += 1;
+                counts.prefix_only += 1;
+                continue;
+            }
+            counts.too_large += 1;
+            if issues.len() < 100 {
+                issues.push(json!({
+                    "row": row,
+                    "stage": "limit",
+                    "message": format!("the decoded XML document is {declared} bytes, above the {} byte materialization limit", options.max_row_bytes)
+                }));
+            }
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(declared.min(16 * 1024 * 1024) as usize);
+        if let Err(err) = read_payload(&mut payload, &mut bytes, options.max_row_bytes) {
+            match err {
+                ReadError::Limit(message) => {
+                    counts.too_large += 1;
+                    if issues.len() < 100 {
+                        issues.push(json!({ "row": row, "stage": "limit", "message": message }));
+                    }
+                }
+                ReadError::Decode(message) => {
+                    counts.decode_failed += 1;
+                    if issues.len() < 100 {
+                        issues.push(json!({
+                            "row": row,
+                            "stage": "decoding",
+                            "cause": "decode_failed",
+                            "message": message
+                        }));
+                    }
+                }
+            }
+            continue;
+        }
         counts.decoded += 1;
 
         let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
@@ -321,9 +337,21 @@ pub fn run(options: Options) -> Result<(), String> {
             counts.decode_failed
         ));
     }
+    if counts.excluded > 0 {
+        limitations.push(format!(
+            "{} nested archive row(s) were excluded from catalog extraction",
+            counts.excluded
+        ));
+    }
+    if counts.prefix_only > 0 {
+        limitations.push(format!(
+            "{} large non-XML row(s) were classified from a bounded prefix",
+            counts.prefix_only
+        ));
+    }
     if counts.too_large > 0 {
         limitations.push(format!(
-            "{} row(s) exceeded the {} byte decoded-row limit",
+            "{} row(s) exceeded the {} byte XML materialization limit",
             counts.too_large, options.max_row_bytes
         ));
     }
@@ -354,6 +382,8 @@ pub fn run(options: Options) -> Result<(), String> {
             "missingSource": counts.missing_source,
             "malformedMetadata": counts.malformed_metadata,
             "decodeFailed": counts.decode_failed,
+            "excluded": counts.excluded,
+            "prefixOnly": counts.prefix_only,
             "tooLarge": counts.too_large,
             "parseFailed": counts.parse_failed,
             "recognizedDocuments": counts.recognized_documents,
@@ -391,6 +421,20 @@ enum ReadError {
     Decode(String),
 }
 
+fn read_prefix(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    let mut buffer = vec![0u8; READ_CHUNK];
+    while (out.len() as u64) < limit {
+        let want = (limit - out.len() as u64).min(READ_CHUNK as u64) as usize;
+        match payload.read_cancellable(&mut buffer[..want], &cancel) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buffer[..n]),
+            Err(err) => return Err(format!("the payload prefix cannot be read: {err}")),
+        }
+    }
+    Ok(())
+}
+
 fn read_payload(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<(), ReadError> {
     let cancel = AtomicBool::new(false);
     let mut buffer = vec![0u8; READ_CHUNK];
@@ -400,7 +444,7 @@ fn read_payload(payload: &mut Payload, out: &mut Vec<u8>, limit: u64) -> Result<
             Ok(count) => {
                 if out.len() as u64 + count as u64 > limit {
                     return Err(ReadError::Limit(format!(
-                        "the decoded row exceeds the {limit} byte limit"
+                        "the decoded XML document exceeds the {limit} byte limit"
                     )));
                 }
                 out.extend_from_slice(&buffer[..count]);

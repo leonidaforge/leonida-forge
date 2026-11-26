@@ -20,7 +20,8 @@ use std::ops::Range;
 use super::{HEADER_LEN, MAGIC};
 pub use companion::{Companion, Companions, Status as CompanionStatus};
 pub use entry::{Entry, Field};
-pub use payload::Payload;
+pub(crate) use payload::PayloadSource;
+pub use payload::{Payload, StreamTransform};
 use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
 
 mod companion;

@@ -33,6 +33,9 @@ use super::{Entry, EntryKind, format_size, rpf, zip};
 
 /// Caps what reading one file from an archive may allocate in memory or on disk.
 pub const MAX_READ: u64 = 512 * 1024 * 1024;
+/// Largest resource materialized into memory by the generic read helpers.
+/// Larger files must be opened for random access or exported instead.
+pub const MAX_MATERIALIZE: u64 = 64 * 1024 * 1024;
 /// Archives in a chain, counting the one on disk.
 pub const MAX_DEPTH: usize = 8;
 /// Caps the bytes decompressed for an archive and the archives it is stored in.
@@ -848,9 +851,10 @@ fn open_nested(parent: &Archive, inner: &Path) -> io::Result<Archive> {
 /// Reads a whole archive into memory.
 pub fn read_all(archive: &Archive) -> io::Result<Vec<u8>> {
     if archive.depth == 1 {
+        check_size(fs::metadata(&archive.path)?.len(), MAX_MATERIALIZE)?;
         return fs::read(&archive.path);
     }
-    check_size(archive.source.len(), MAX_READ)?;
+    check_size(archive.source.len(), MAX_MATERIALIZE)?;
     let mut source = archive.source.clone();
     source.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();

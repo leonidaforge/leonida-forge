@@ -295,8 +295,13 @@ fn raw_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Va
 
 /// How the entry's contents can be obtained: one of the readability states.
 /// This reports actual payload readability, not only raw-byte availability.
-fn contents_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
-    let state = native::contents_state(entry, source, alternates);
+fn contents_json(
+    entry: &Entry,
+    source: &Source,
+    alternates: &[Option<Source>],
+    stream: Option<&lforge_rage9::rpf::metadata::provider::RecognizedSource>,
+) -> Value {
+    let state = native::contents_state(entry, source, alternates, stream);
     let mut value = json!({ "readable": state.readable, "state": state.state });
     if let Some(reason) = state.reason {
         value["reason"] = json!(reason);
@@ -309,6 +314,7 @@ fn entry_json(
     source: &Source,
     alternates: &[Option<Source>],
     names: &RowNames,
+    stream: Option<&lforge_rage9::rpf::metadata::provider::RecognizedSource>,
 ) -> Value {
     let location = &entry.location;
     let mut value = json!({
@@ -337,7 +343,7 @@ fn entry_json(
             Err(reason) => json!({ "malformed": reason }),
         },
         "raw": raw_json(entry, source, alternates),
-        "contents": contents_json(entry, source, alternates),
+        "contents": contents_json(entry, source, alternates, stream),
     });
     value["name_resolution"] = resolution_json(names);
     value["names"] = names
@@ -422,9 +428,9 @@ fn report(path: &Path, options: &Options, naming: &Naming) -> Value {
         "verified": false,
         "authentication": { "status": "not_attempted" },
     });
-    let (metadata, metadata_source, authentication) = if probe.processing.is_none() {
+    let (metadata, metadata_source, authentication, stream) = if probe.processing.is_none() {
         match Stored::read(&mut source, MAX_METADATA).and_then(Stored::decode) {
-            Ok(metadata) => (metadata, source, Authentication::NotApplicable),
+            Ok(metadata) => (metadata, source, Authentication::NotApplicable, None),
             Err(err) => {
                 report["state"] = json!("stored");
                 report["entries"] = json!({ "available": false, "reason": err.to_string() });
@@ -433,7 +439,12 @@ fn report(path: &Path, options: &Options, naming: &Naming) -> Value {
         }
     } else if options.executable.is_some() {
         match native::open_metadata(path, MAX_METADATA, options.executable.as_deref()) {
-            Ok(opened) => (opened.metadata, opened.source, opened.authentication),
+            Ok(opened) => (
+                opened.metadata,
+                opened.source,
+                opened.authentication,
+                opened.stream,
+            ),
             Err(reason) => {
                 report["state"] = json!("stored");
                 report["authentication"] = json!({ "status": "unavailable", "reason": reason });
@@ -468,7 +479,14 @@ fn report(path: &Path, options: &Options, naming: &Naming) -> Value {
         }
     }
     let alternates = Alternates::resolve(path, &metadata);
-    report["entries"] = entries_json(&metadata, &metadata_source, &alternates, options, naming);
+    report["entries"] = entries_json(
+        &metadata,
+        &metadata_source,
+        &alternates,
+        options,
+        naming,
+        stream.as_ref(),
+    );
     report
 }
 
@@ -512,6 +530,7 @@ fn entries_json(
     alternates: &Alternates,
     options: &Options,
     naming: &Naming,
+    stream: Option<&lforge_rage9::rpf::metadata::provider::RecognizedSource>,
 ) -> Value {
     let entries: Vec<Entry> = metadata.entries().collect();
     let mut value = json!({
@@ -610,6 +629,7 @@ fn entries_json(
                     source,
                     alternates.sources(),
                     &resolved.rows[position],
+                    stream,
                 )
             })
             .collect();

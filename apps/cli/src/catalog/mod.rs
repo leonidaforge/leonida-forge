@@ -38,7 +38,7 @@ pub enum Command {
         /// Only emit observations in this category
         #[arg(long, value_enum, default_value_t = CategoryFilter::All)]
         category: CategoryFilter,
-        /// The largest decoded row read into memory
+        /// The largest decoded XML document materialized in memory
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_row_bytes: u64,
         /// Stop after this many rows

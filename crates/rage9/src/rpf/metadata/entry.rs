@@ -5,7 +5,9 @@ use std::ops::Range;
 use lforge_binary::Source;
 
 use super::transform::CipherDescriptor;
-use super::{ChunkTable, Error, Location, Metadata, Payload, invalid};
+use super::{
+    ChunkTable, Error, Location, Metadata, Payload, PayloadSource, StreamTransform, invalid,
+};
 
 /// A field of a row: `Ok(None)` if the row has no value for it, `Err` with
 /// the reason if the value is malformed.
@@ -164,6 +166,16 @@ impl Entry {
         }
     }
 
+    /// The source the entry's stored bytes are read through: `main`, or
+    /// `alternates[i]` for read source `i`.
+    pub(crate) fn source<'a>(
+        &self,
+        main: &'a Source,
+        alternates: &'a [Option<Source>],
+    ) -> Result<&'a Source, Error> {
+        self.read_through(main, alternates)
+    }
+
     /// The contents of the entry, decoded where that is supported.
     ///
     /// The engine's order applies: an entry behind the payload transform is
@@ -173,6 +185,27 @@ impl Entry {
     /// stream. Other modes fail with [`Error::Undecodable`]. Stored bytes are
     /// read through `main` or `alternates[i]` as for [`Entry::raw_source`].
     pub fn payload(&self, main: &Source, alternates: &[Option<Source>]) -> Result<Payload, Error> {
+        self.payload_with(main, alternates, None)
+    }
+
+    /// The contents of an entry behind the payload transform, decoded with
+    /// `transform`. The bytes are transformed while they are read, so a large
+    /// entry is never materialized whole.
+    pub fn transformed_payload(
+        &self,
+        main: &Source,
+        alternates: &[Option<Source>],
+        transform: StreamTransform,
+    ) -> Result<Payload, Error> {
+        self.payload_with(main, alternates, Some(transform))
+    }
+
+    fn payload_with(
+        &self,
+        main: &Source,
+        alternates: &[Option<Source>],
+        transform: Option<StreamTransform>,
+    ) -> Result<Payload, Error> {
         let row = self.row;
         let location = match &self.location {
             Ok(Some(location)) => *location,
@@ -180,22 +213,33 @@ impl Entry {
             Err(reason) => return Err(self.malformed("location record", reason)),
         };
         match &self.payload_transform {
-            Ok(false) => {}
-            Ok(true) => {
+            Ok(false) if transform.is_some() => {
+                return Err(invalid(format!("row {row} has no payload transform field")));
+            }
+            Ok(true) if transform.is_none() => {
                 return Err(Error::Encoded {
                     row,
                     encoding: "behind the payload transform",
                 });
             }
+            Ok(_) => {}
             Err(reason) => return Err(self.malformed("payload transform flag", reason)),
         }
+        let wrap = |source: Source| match &transform {
+            Some(transform) => PayloadSource::transformed(source, transform.clone()),
+            None => PayloadSource::plain(source),
+        };
         let table = match &self.chunks {
             Ok(table) => table.as_ref(),
             Err(reason) => return Err(self.malformed("chunk table", reason)),
         };
         if table.is_none() {
             match location.mode {
-                0 => return self.raw_source(main, alternates).map(Payload::stored),
+                0 => {
+                    return self
+                        .raw_source(main, alternates)
+                        .map(|source| Payload::stored(wrap(source)));
+                }
                 1 => {}
                 2 => {
                     return Err(Error::Undecodable {
@@ -224,7 +268,7 @@ impl Entry {
                 source.len()
             )));
         }
-        let stored = source.slice(location.payload_offset, location.stored_len)?;
+        let stored = wrap(source.slice(location.payload_offset, location.stored_len)?);
         match table {
             Some(table) => Payload::chunked(row, stored, location.logical_len, table),
             None => Ok(Payload::deflate(stored, location.logical_len)),

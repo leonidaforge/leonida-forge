@@ -1131,11 +1131,16 @@ fn walk_rpf9(
             engine.truncate("max_entries");
             return Ok(());
         }
-        let state = native::contents_state(entry, &source, alternates.sources());
-        let payload = PayloadInfo::new(state.readable, state.state, state.reason.clone());
+        let state =
+            native::contents_state(entry, &source, alternates.sources(), opened.stream.as_ref());
+        let payload = PayloadInfo::new(
+            state.readable.unwrap_or(false),
+            state.state,
+            state.reason.clone(),
+        );
         let mut content = ContentInfo::not_inspected();
         let mut nested: Option<(Format, u64)> = None;
-        if state.readable {
+        if state.readable == Some(true) {
             match entry.payload(&source, alternates.sources()) {
                 Ok(mut decoded) => {
                     let len = decoded.len();

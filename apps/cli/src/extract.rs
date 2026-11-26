@@ -24,6 +24,7 @@ pub fn run(
     row: u32,
     output: &Path,
     overwrite: bool,
+    max_output_bytes: u64,
     executable: Option<&Path>,
 ) -> Result<(), String> {
     let opened = native::open_metadata(file, MAX_METADATA, executable)?;
@@ -44,11 +45,11 @@ pub fn run(
     let transformed = matches!(entry.payload_transform, Ok(true));
     let written = match entry.payload(&source, alternates.sources()) {
         Ok(mut payload) => {
-            if payload.len() > output::MAX_OUTPUT {
+            if payload.len() > max_output_bytes {
                 return Err(format!(
                     "row {row} holds {} bytes, more than the {} byte output limit",
                     payload.len(),
-                    output::MAX_OUTPUT
+                    max_output_bytes
                 ));
             }
             output::write_file(output, overwrite, |writer| {
@@ -61,25 +62,16 @@ pub fn run(
                     "row {row} cannot be extracted: {err}; the payload transform requires the executable that provided the key state"
                 ));
             };
-            let bytes = native::transformed_payload(
-                &entry,
-                &source,
-                &alternates,
-                stream,
-                output::MAX_OUTPUT,
-            )?;
-            if bytes.len() as u64 > output::MAX_OUTPUT {
+            let mut payload = native::transformed_payload(&entry, &source, &alternates, stream)?;
+            if payload.len() > max_output_bytes {
                 return Err(format!(
                     "row {row} decodes to {} bytes, more than the {} byte output limit",
-                    bytes.len(),
-                    output::MAX_OUTPUT
+                    payload.len(),
+                    max_output_bytes
                 ));
             }
             output::write_file(output, overwrite, |writer| {
-                writer
-                    .write_all(&bytes)
-                    .map_err(|err| output::write_error(output, err))?;
-                Ok(bytes.len() as u64)
+                decode(&mut payload, writer, output)
             })?
         }
         Err(err) => {

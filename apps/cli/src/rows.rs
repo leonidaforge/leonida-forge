@@ -194,7 +194,12 @@ impl Listing {
                 Err(reason) => json!({ "malformed": reason }),
             },
             "raw": raw_json(entry, source, alternates.sources()),
-            "contents": contents_json(entry, source, alternates.sources()),
+            "contents": contents_json(
+                entry,
+                source,
+                alternates.sources(),
+                self.opened.stream.as_ref(),
+            ),
             "authentication": self.opened.authentication.status(),
         });
         record["archive"] = json!(self.relative);
@@ -239,7 +244,7 @@ pub(crate) fn cipher_json(cipher: &CipherDescriptor) -> Value {
             "algorithm": format!("{:#x}", algorithm.id()),
             "key_id": format!("0x{:08X}", cipher.key_id),
             "parameter": cipher.parameter.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-            "supported": false,
+            "supported": matches!(algorithm, Algorithm::Untraced(0x11)),
         }),
         Err(reason) => json!({ "type": cipher.kind, "malformed": reason.to_string() }),
     }
@@ -254,8 +259,13 @@ fn raw_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Va
     }
 }
 
-fn contents_json(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> Value {
-    let state = native::contents_state(entry, source, alternates);
+fn contents_json(
+    entry: &Entry,
+    source: &Source,
+    alternates: &[Option<Source>],
+    stream: Option<&lforge_rage9::rpf::metadata::provider::RecognizedSource>,
+) -> Value {
+    let state = native::contents_state(entry, source, alternates, stream);
     let mut value = json!({ "readable": state.readable, "state": state.state });
     if let Some(reason) = state.reason {
         value["reason"] = json!(reason);
@@ -467,8 +477,14 @@ fn matches(
         }
     }
     if let Some(readable) = options.readable {
-        let state = native::contents_state(entry, &listing.opened.source, alternates.sources());
-        if state.readable != readable {
+        let state = native::contents_state(
+            entry,
+            &listing.opened.source,
+            alternates.sources(),
+            listing.opened.stream.as_ref(),
+        );
+        let matched = state.readable.is_some_and(|value| value == readable);
+        if !matched {
             return false;
         }
     }
@@ -748,7 +764,7 @@ mod tests {
         assert_eq!(value["algorithm"], "0x11");
         assert_eq!(value["key_id"], "0x1000002E");
         assert_eq!(value["parameter"], "abababababababababababababababab");
-        assert_eq!(value["supported"], false);
+        assert_eq!(value["supported"], true);
 
         // A cipher type that selects CBC reports the algorithm family
         // identifier, not the cipher type.

@@ -138,6 +138,9 @@ pub enum Command {
         /// Replace the output file if it already exists
         #[arg(long)]
         overwrite: bool,
+        /// The largest decoded output written for this operation
+        #[arg(long, default_value_t = crate::output::MAX_OUTPUT)]
+        max_output_bytes: u64,
         /// The executable to recognize the metadata key provider in. Required
         /// only for encrypted metadata
         #[arg(long)]
@@ -419,6 +422,7 @@ pub fn run(command: Command) -> Result<(), String> {
             row,
             output,
             overwrite,
+            max_output_bytes,
             executable,
         } => {
             let cancel = AtomicBool::new(false);
@@ -428,7 +432,14 @@ pub fn run(command: Command) -> Result<(), String> {
             let path = resolved
                 .as_ref()
                 .map_or(file.as_path(), |r| r.path.as_path());
-            extract::run(path, row, &output, overwrite, executable.as_deref())
+            extract::run(
+                path,
+                row,
+                &output,
+                overwrite,
+                max_output_bytes,
+                executable.as_deref(),
+            )
         }
         Command::Inspect {
             file,

@@ -235,11 +235,14 @@ pub fn read(path: &Path) -> io::Result<Vec<u8>> {
 
 pub fn read_with(path: &Path, access: &Access) -> io::Result<Vec<u8>> {
     match archive::locate_prepared_with(path, access)? {
-        Location::Plain => fs::read(path),
+        Location::Plain => {
+            archive::check_size(fs::metadata(path)?.len(), archive::MAX_MATERIALIZE)?;
+            fs::read(path)
+        }
         Location::Archive(archive) => archive::read_all(&archive),
         Location::Inside(archive, inner) => {
             let mut bytes = Vec::new();
-            archive::copy(&archive, &inner, &mut bytes, archive::MAX_READ)?;
+            archive::copy(&archive, &inner, &mut bytes, archive::MAX_MATERIALIZE)?;
             Ok(bytes)
         }
     }
@@ -666,6 +669,16 @@ mod export_tests {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn read_refuses_a_file_above_the_materialization_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.bin");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(archive::MAX_MATERIALIZE + 1).unwrap();
+        let err = read(&path).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
 
     fn file(name: &str, size: u64) -> Entry {
         Entry::new(

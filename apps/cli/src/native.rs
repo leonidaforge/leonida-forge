@@ -14,10 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lforge_binary::Source;
 use lforge_binary::pe::ExecutableView;
 use lforge_rage9::rpf;
+use lforge_rage9::rpf::metadata::provider::RecognizedSource;
+use lforge_rage9::rpf::metadata::transform::Algorithm;
 use lforge_rage9::rpf::metadata::verify::{
     OpenReport, VerifyOutcome, VerifyReport, open_authenticated,
 };
-use lforge_rage9::rpf::metadata::{Companion, CompanionStatus, Entry, Error, Metadata, Stored};
+use lforge_rage9::rpf::metadata::{
+    Companion, CompanionStatus, Entry, Error, Metadata, Payload, Stored,
+};
 use lforge_rage9::rpf::names::{Builtin, Lut, StringTable};
 
 /// How the native table of contents was obtained.
@@ -179,11 +183,14 @@ pub fn load_name_tables(archive: &Path, files: &[PathBuf]) -> Result<NameTables,
 }
 
 /// How an entry's contents can be read: one of the readability states. This
-/// reports actual payload readability, not only raw-byte availability.
+/// reports storage and the available decoding capability, not a decode that
+/// was not attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentsState {
-    pub readable: bool,
-    /// `stored`, `decoded`, `unsupported_transform`, `unsupported_compression`,
+    /// `None` when the storage is supported but decoding was not attempted.
+    pub readable: Option<bool>,
+    /// `stored`, `decoded`, `transform_available`, `transform_key_missing`,
+    /// `unsupported_transform`, `unsupported_compression`,
     /// `alternate_source` or `malformed`.
     pub state: &'static str,
     pub reason: Option<String>,
@@ -194,12 +201,14 @@ pub fn contents_state(
     entry: &Entry,
     source: &Source,
     alternates: &[Option<Source>],
+    stream: Option<&RecognizedSource>,
 ) -> ContentsState {
-    let state = |readable: bool, state: &'static str, reason: Option<String>| ContentsState {
-        readable,
-        state,
-        reason,
-    };
+    let state =
+        |readable: Option<bool>, state: &'static str, reason: Option<String>| ContentsState {
+            readable,
+            state,
+            reason,
+        };
     // A field that did not parse takes precedence: nothing downstream is trustworthy.
     let malformed = [
         entry.location.as_ref().err(),
@@ -211,109 +220,117 @@ pub fn contents_state(
     .flatten()
     .next();
     if let Some(reason) = malformed {
-        return state(false, "malformed", Some(reason.clone()));
+        return state(Some(false), "malformed", Some(reason.clone()));
     }
     match entry.payload(source, alternates) {
-        Ok(_) if entry.raw_source(source, alternates).is_ok() => state(true, "stored", None),
-        Ok(_) => state(true, "decoded", None),
+        Ok(_) if entry.raw_source(source, alternates).is_ok() => state(Some(true), "stored", None),
+        Ok(_) => state(Some(true), "decoded", None),
+        Err(Error::Encoded { .. }) if matches!(entry.payload_transform, Ok(true)) => {
+            transform_state(entry, stream)
+        }
         Err(Error::Encoded { encoding, .. }) => state(
-            false,
+            Some(false),
             "unsupported_transform",
             Some(format!("stored {encoding}")),
         ),
         Err(Error::Undecodable { reason, .. }) => {
-            state(false, "unsupported_compression", Some(reason))
+            state(Some(false), "unsupported_compression", Some(reason))
         }
         Err(Error::ReadSource { index, .. }) => state(
-            false,
+            Some(false),
             "alternate_source",
             Some(format!("alternate read source {index} is not available")),
         ),
-        Err(err) => state(false, "malformed", Some(err.to_string())),
+        Err(err) => state(Some(false), "malformed", Some(err.to_string())),
     }
 }
 
-/// Decodes a row behind the payload transform with the recognized executable
-/// state. The result is accepted only when every chunk decodes to its declared
-/// logical size.
+/// The transform's storage is supported when the algorithm is known and the
+/// executable has a key state for the descriptor. Decoding is not attempted
+/// here, so `readable` is `None` rather than `true`.
+fn transform_state(entry: &Entry, stream: Option<&RecognizedSource>) -> ContentsState {
+    let cipher = match &entry.payload_cipher {
+        Ok(Some(cipher)) => cipher,
+        Ok(None) => {
+            return ContentsState {
+                readable: Some(false),
+                state: "unsupported_transform",
+                reason: Some("the transform has no cipher descriptor".to_string()),
+            };
+        }
+        Err(reason) => {
+            return ContentsState {
+                readable: Some(false),
+                state: "unsupported_transform",
+                reason: Some(format!("malformed cipher descriptor: {reason}")),
+            };
+        }
+    };
+    match Algorithm::of(cipher.kind) {
+        Ok(Algorithm::Untraced(0x11)) => {}
+        Ok(_) => {
+            return ContentsState {
+                readable: Some(false),
+                state: "unsupported_transform",
+                reason: Some(format!(
+                    "cipher type {:#x} selects an algorithm this build does not decode",
+                    cipher.kind
+                )),
+            };
+        }
+        Err(reason) => {
+            return ContentsState {
+                readable: Some(false),
+                state: "unsupported_transform",
+                reason: Some(reason.to_string()),
+            };
+        }
+    }
+    let Some(stream) = stream else {
+        return ContentsState {
+            readable: Some(false),
+            state: "transform_key_missing",
+            reason: Some(
+                "stored behind the payload transform; no executable key state is available"
+                    .to_string(),
+            ),
+        };
+    };
+    if stream.stream_blocks(cipher.key_id).is_empty() {
+        return ContentsState {
+            readable: Some(false),
+            state: "transform_key_missing",
+            reason: Some(
+                "stored behind the payload transform; the executable has no key state for this key identifier"
+                    .to_string(),
+            ),
+        };
+    }
+    ContentsState {
+        readable: None,
+        state: "transform_available",
+        reason: Some(
+            "stored behind the payload transform; the executable key state is available and decoding was not attempted"
+                .to_string(),
+        ),
+    }
+}
+
+/// Builds the streaming payload of a row behind the payload transform. The
+/// transform is verified against the first zlib chunk from a bounded prefix;
+/// the returned payload transforms and decompresses on read.
 pub fn transformed_payload(
     entry: &Entry,
     source: &Source,
     alternates: &Alternates,
     stream: &lforge_rage9::rpf::metadata::provider::RecognizedSource,
-    limit: u64,
-) -> Result<Vec<u8>, String> {
-    let location = match &entry.location {
-        Ok(Some(location)) => *location,
-        Ok(None) => return Err(format!("row {} has no location record", entry.row)),
-        Err(reason) => {
-            return Err(format!(
-                "row {}: malformed location record: {reason}",
-                entry.row
-            ));
-        }
-    };
-    let table = match &entry.chunks {
-        Ok(Some(table)) => table,
-        Ok(None) => return Err(format!("row {} has no chunk table", entry.row)),
-        Err(reason) => {
-            return Err(format!(
-                "row {}: malformed chunk table: {reason}",
-                entry.row
-            ));
-        }
-    };
-    let cipher = match &entry.payload_cipher {
-        Ok(Some(cipher)) => cipher,
-        Ok(None) => return Err(format!("row {} has no payload cipher", entry.row)),
-        Err(reason) => {
-            return Err(format!(
-                "row {}: malformed payload cipher: {reason}",
-                entry.row
-            ));
-        }
-    };
-    if location.stored_len > limit {
-        return Err(format!(
-            "row {} stores {} bytes, above the {limit} byte limit",
-            entry.row, location.stored_len
-        ));
-    }
-    let read_source: &Source = match &entry.read_source {
-        Ok(None) => source,
-        Ok(Some(index)) => alternates
-            .sources()
-            .get(*index as usize)
-            .and_then(|source| source.as_ref())
-            .ok_or_else(|| {
-                format!(
-                    "row {}: alternate source {index} is not available",
-                    entry.row
-                )
-            })?,
-        Err(reason) => {
-            return Err(format!(
-                "row {}: malformed read source: {reason}",
-                entry.row
-            ));
-        }
-    };
-    let mut stored = read_source
-        .slice(location.payload_offset, location.stored_len)
-        .map_err(|err| format!("row {}: cannot read the stored bytes: {err}", entry.row))?;
-    let mut bytes = Vec::with_capacity(location.stored_len as usize);
-    stored
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("row {}: cannot read the stored bytes: {err}", entry.row))?;
-    let blocks = stream.stream_blocks(cipher.key_id);
-    lforge_rage9::rpf::metadata::provider::decode_transformed(
-        &bytes,
-        table,
-        location.logical_len,
-        cipher,
-        &blocks,
-    )
-    .map_err(|err| format!("row {}: {err}", entry.row))
+) -> Result<Payload, String> {
+    let transform = stream
+        .stream_transform(entry, source, alternates.sources())
+        .map_err(|err| format!("row {}: {err}", entry.row))?;
+    entry
+        .transformed_payload(source, alternates.sources(), transform)
+        .map_err(|err| format!("row {}: {err}", entry.row))
 }
 
 /// Whether the entry's stored bytes can be read as they are, and why not.

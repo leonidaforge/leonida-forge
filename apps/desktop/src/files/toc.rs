@@ -27,7 +27,7 @@ use lforge_binary::Source;
 use lforge_rage9::rpf::metadata::transform::{Algorithm, CipherDescriptor};
 use lforge_rage9::rpf::metadata::verify::VerifyReport;
 use lforge_rage9::rpf::metadata::{
-    ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
+    ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Payload, Stored,
 };
 use lforge_rage9::rpf::names::{
     self, Builtin, CandidateOutcome, Class, Key, MountPrefix, Provenance, Resolution,
@@ -862,7 +862,7 @@ impl Native {
                 details.push((
                     "Payload transform",
                     if self.stream.is_some() {
-                        "Decoded with the executable's key state".to_string()
+                        "Transform available; decoded on read".to_string()
                     } else {
                         "Required, not supported".to_string()
                     },
@@ -895,7 +895,7 @@ impl Native {
                 }
                 Ok(_) => "Readable, decoded when read".to_string(),
                 Err(_) if matches!(row.payload_transform, Ok(true)) && self.stream.is_some() => {
-                    "Readable after the payload transform".to_string()
+                    "Decodable with the payload transform (not attempted)".to_string()
                 }
                 Err(err) => format!("Not readable: {err}"),
             },
@@ -976,55 +976,18 @@ impl Native {
             .map_err(to_io)
     }
 
-    /// Decodes a row behind the payload transform with the authenticated
-    /// executable state. `None` when the archive has no such state.
-    fn transformed(&self, archive: &Archive, row: &Row, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    /// Builds the streaming payload of a row behind the payload transform.
+    /// `None` when the archive has no authenticated key state.
+    fn transformed(&self, archive: &Archive, row: &Row) -> io::Result<Option<Payload>> {
         let Some(stream) = &self.stream else {
             return Ok(None);
         };
-        let location = match &row.location {
-            Ok(Some(location)) => *location,
-            Ok(None) => return Err(not_found()),
-            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
-        };
-        let table = match &row.chunks {
-            Ok(Some(table)) => table,
-            Ok(None) => return Err(not_found()),
-            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
-        };
-        let cipher = match &row.payload_cipher {
-            Ok(Some(cipher)) => cipher,
-            Ok(None) => return Err(not_found()),
-            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
-        };
-        if location.stored_len > limit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the stored row exceeds the output limit",
-            ));
-        }
-        let read_source: &Source = match &row.read_source {
-            Ok(None) => &archive.source,
-            Ok(Some(index)) => self
-                .alternates()
-                .get(*index as usize)
-                .and_then(|source| source.as_ref())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing companion"))?,
-            Err(reason) => return Err(to_io(Error::Invalid(reason.clone()))),
-        };
-        let mut stored = read_source.slice(location.payload_offset, location.stored_len)?;
-        let mut bytes = Vec::with_capacity(location.stored_len as usize);
-        stored.read_to_end(&mut bytes)?;
-        let blocks = stream.stream_blocks(cipher.key_id);
-        lforge_rage9::rpf::metadata::provider::decode_transformed(
-            &bytes,
-            table,
-            location.logical_len,
-            cipher,
-            &blocks,
-        )
-        .map(Some)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+        let transform = stream
+            .stream_transform(row, &archive.source, self.alternates())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        row.transformed_payload(&archive.source, self.alternates(), transform)
+            .map(Some)
+            .map_err(to_io)
     }
 
     /// Writes the contents of an entry, decoded where that is supported.
@@ -1042,12 +1005,10 @@ impl Native {
         let mut payload = match row.payload(&archive.source, self.alternates()) {
             Ok(payload) => payload,
             Err(err) if matches!(row.payload_transform, Ok(true)) => {
-                if let Some(bytes) = self.transformed(archive, row, limit)? {
-                    check_size(bytes.len() as u64, limit)?;
-                    out.write_all(&bytes)?;
-                    return Ok(());
+                match self.transformed(archive, row)? {
+                    Some(payload) => payload,
+                    None => return Err(to_io(err)),
                 }
-                return Err(to_io(err));
             }
             Err(err) => return Err(to_io(err)),
         };

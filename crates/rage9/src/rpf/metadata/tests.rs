@@ -2266,7 +2266,12 @@ mod decoding {
         };
         for stored_len in [0, 8, 15] {
             let stored = file(&vec![0; stored_len]);
-            let reason = invalid_reason(Payload::chunked(0, stored, 16, &table));
+            let reason = invalid_reason(Payload::chunked(
+                0,
+                super::payload::PayloadSource::plain(stored),
+                16,
+                &table,
+            ));
             assert!(reason.contains("stored prefix"), "{stored_len}: {reason}");
         }
     }

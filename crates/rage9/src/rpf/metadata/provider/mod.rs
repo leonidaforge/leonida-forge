@@ -34,4 +34,4 @@ pub use fixed::{
 pub use source::{RecognizedSource, SourceError};
 pub(crate) use source::{SelectionError, select_source};
 pub use stream_block::{EncodedStreamBlock, EncodedStreamError};
-pub use stream_payload::{DecodeError, decode_transformed};
+pub use stream_payload::{StreamTransformError, prepare_stream_transform};

@@ -55,13 +55,13 @@ fn reports_the_payload_transform_cipher_descriptor() {
     let row = &value["rows"][0];
     assert_eq!(row["payload_transform"], true);
     assert_eq!(row["contents"]["readable"], false);
-    assert_eq!(row["contents"]["state"], "unsupported_transform");
+    assert_eq!(row["contents"]["state"], "transform_key_missing");
     let cipher = &row["payload_cipher"];
     assert_eq!(cipher["type"], 0x11);
     assert_eq!(cipher["algorithm"], "0x11");
     assert_eq!(cipher["key_id"], "0x1000002E");
     assert_eq!(cipher["parameter"], "000102030405060708090a0b0c0d0e0f");
-    assert_eq!(cipher["supported"], false);
+    assert_eq!(cipher["supported"], true);
 }
 
 #[test]

@@ -162,6 +162,46 @@ fn refuses_entries_read_from_missing_or_invalid_companions() {
 }
 
 #[test]
+fn enforces_the_operation_output_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = write_archive(
+        temp.path(),
+        "limit.rpf",
+        &assemble(&[spec(&[7u8; 100])], &[]),
+    );
+    let out = temp.path().join("out.bin");
+
+    let over = lforge(&[
+        "archive",
+        "extract",
+        archive.to_str().unwrap(),
+        "--row",
+        "0",
+        "--output",
+        out.to_str().unwrap(),
+        "--max-output-bytes",
+        "99",
+    ]);
+    assert_eq!(over.status.code(), Some(1));
+    assert!(stderr(&over).contains("output limit"), "{}", stderr(&over));
+    assert!(!out.exists());
+
+    let at = lforge(&[
+        "archive",
+        "extract",
+        archive.to_str().unwrap(),
+        "--row",
+        "0",
+        "--output",
+        out.to_str().unwrap(),
+        "--max-output-bytes",
+        "100",
+    ]);
+    assert!(at.status.success(), "{}", stderr(&at));
+    assert_eq!(std::fs::read(&out).unwrap(), vec![7u8; 100]);
+}
+
+#[test]
 fn rejects_unsupported_transforms_and_compression_modes() {
     let temp = tempfile::tempdir().unwrap();
     let transform = Spec {

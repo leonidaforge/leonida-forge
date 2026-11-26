@@ -14,11 +14,13 @@
 //! rest of the stream is intact.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use lforge_binary::Source;
 
+use super::transform::{BLOCK_LEN, BlockDecrypt};
 use super::{Chunk, ChunkTable, Error, invalid};
 
 /// Stored bytes read per decoder step.
@@ -40,6 +42,210 @@ const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
 /// For reads that cannot be cancelled.
 static NEVER: AtomicBool = AtomicBool::new(false);
 
+/// The verified payload-transform regions, in stored bytes.
+const LEADING: u64 = 2048;
+const BUFFER: u64 = 9216;
+const BUFFER_STEP: u64 = 8192;
+const BUFFER_PREFIX: u64 = 1024;
+
+/// The counter-mode keystream of an authenticated payload transform. The
+/// covered range is the descriptor-dependent partial range or, where the first
+/// zlib chunk verifies it, the whole stored range.
+#[derive(Clone)]
+pub struct StreamTransform {
+    parameter: [u8; BLOCK_LEN],
+    block: Arc<dyn BlockDecrypt + Send + Sync>,
+    model: StreamModel,
+}
+
+impl StreamTransform {
+    pub fn new(parameter: [u8; BLOCK_LEN], block: Arc<dyn BlockDecrypt + Send + Sync>) -> Self {
+        Self {
+            parameter,
+            block,
+            model: StreamModel::Partial,
+        }
+    }
+
+    pub(crate) fn with_model(
+        parameter: [u8; BLOCK_LEN],
+        block: Arc<dyn BlockDecrypt + Send + Sync>,
+        model: StreamModel,
+    ) -> Self {
+        Self {
+            parameter,
+            block,
+            model,
+        }
+    }
+
+    fn apply(&self, buf: &mut [u8], absolute: u64) {
+        apply_transform(buf, absolute, self.parameter, &*self.block, self.model);
+    }
+}
+
+/// Applies the verified payload-transform regions to `buf`, which starts at
+/// `origin` within the entry's stored range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamModel {
+    /// The verified first-2048 and later-buffer regions.
+    Partial,
+    /// The whole stored range, used only for a single-chunk stream where the
+    /// verified regions do not verify it.
+    Whole,
+}
+
+pub(crate) fn apply_transform(
+    buf: &mut [u8],
+    origin: u64,
+    parameter: [u8; BLOCK_LEN],
+    block: &dyn BlockDecrypt,
+    model: StreamModel,
+) {
+    if model == StreamModel::Whole {
+        if buf.is_empty() {
+            return;
+        }
+        let end = origin + buf.len() as u64;
+        let first = origin / BLOCK_LEN as u64;
+        let last = (end - 1) / BLOCK_LEN as u64;
+        for index in first..=last {
+            let start = index * BLOCK_LEN as u64;
+            let from = start.max(origin);
+            let to = (start + BLOCK_LEN as u64).min(end);
+            let mut counter = add_be(parameter, index);
+            block.decrypt_block(&mut counter);
+            for offset in from..to {
+                buf[(offset - origin) as usize] ^= counter[(offset - start) as usize];
+            }
+        }
+        return;
+    }
+    if buf.is_empty() {
+        return;
+    }
+    let end = origin + buf.len() as u64;
+    let first = origin / BLOCK_LEN as u64;
+    let last = (end - 1) / BLOCK_LEN as u64;
+    for index in first..=last {
+        let start = index * BLOCK_LEN as u64;
+        let from = start.max(origin);
+        let to = (start + BLOCK_LEN as u64).min(end);
+        if !is_transformed(from) {
+            continue;
+        }
+        let mut counter = add_be(parameter, index);
+        block.decrypt_block(&mut counter);
+        for offset in from..to {
+            buf[(offset - origin) as usize] ^= counter[(offset - start) as usize];
+        }
+    }
+}
+
+impl std::fmt::Debug for StreamTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamTransform")
+    }
+}
+
+fn add_be(counter: [u8; BLOCK_LEN], value: u64) -> [u8; BLOCK_LEN] {
+    let mut out = counter;
+    let mut carry = value;
+    for byte in out.iter_mut().rev() {
+        let total = u64::from(*byte) + (carry & 0xFF);
+        *byte = total as u8;
+        carry = (carry >> 8) + (total >> 8);
+    }
+    out
+}
+
+fn is_transformed(offset: u64) -> bool {
+    offset < LEADING || (offset >= BUFFER && (offset - BUFFER) % BUFFER_STEP < BUFFER_PREFIX)
+}
+
+/// Stored bytes, with the payload transform applied on read when present.
+#[derive(Clone)]
+pub(crate) struct PayloadSource {
+    source: Source,
+    origin: u64,
+    transform: Option<StreamTransform>,
+    pos: u64,
+}
+
+impl PayloadSource {
+    pub(super) fn plain(source: Source) -> Self {
+        Self {
+            source,
+            origin: 0,
+            transform: None,
+            pos: 0,
+        }
+    }
+
+    pub(super) fn transformed(source: Source, transform: StreamTransform) -> Self {
+        Self {
+            source,
+            origin: 0,
+            transform: Some(transform),
+            pos: 0,
+        }
+    }
+
+    pub(super) fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    pub(super) fn slice(&self, offset: u64, len: u64) -> io::Result<Self> {
+        let origin = self
+            .origin
+            .checked_add(offset)
+            .ok_or_else(|| bad("the stored slice overflows"))?;
+        Ok(Self {
+            source: self.source.slice(offset, len)?,
+            origin,
+            transform: self.transform.clone(),
+            pos: 0,
+        })
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let mut source = self.source.clone();
+        source.seek(SeekFrom::Start(offset))?;
+        let n = source.read(buf)?;
+        if let Some(transform) = &self.transform {
+            transform.apply(&mut buf[..n], self.origin + offset);
+        }
+        Ok(n)
+    }
+}
+
+impl Read for PayloadSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len() {
+            return Ok(0);
+        }
+        let room = usize::try_from(self.len() - self.pos).unwrap_or(usize::MAX);
+        let take = buf.len().min(room);
+        let n = self.read_at(self.pos, &mut buf[..take])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PayloadSource {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(delta) => self.len().checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.pos.checked_add_signed(delta),
+        };
+        self.pos = target.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "seek to an invalid position")
+        })?;
+        Ok(self.pos)
+    }
+}
+
 fn cancelled() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "cancelled")
 }
@@ -51,7 +257,7 @@ fn bad(message: impl Into<String>) -> io::Error {
 /// One DEFLATE stream over stored bytes that must decode to exactly `len`
 /// bytes.
 struct Inflater {
-    stored: Source,
+    stored: PayloadSource,
     /// Whether the stream must use all stored bytes, as a chunk's does.
     exact_input: bool,
     decompress: Decompress,
@@ -64,7 +270,7 @@ struct Inflater {
 }
 
 impl Inflater {
-    fn new(stored: Source, zlib: bool, exact_input: bool, len: u64) -> Self {
+    fn new(stored: PayloadSource, zlib: bool, exact_input: bool, len: u64) -> Self {
         Self {
             stored,
             exact_input,
@@ -213,14 +419,14 @@ impl Span {
 
 enum Kind {
     /// The stored bytes are the contents.
-    Stored(Source),
+    Stored(PayloadSource),
     /// One raw DEFLATE stream from the start of the stored bytes.
     Deflate {
-        stored: Source,
-        inflater: Option<Inflater>,
+        stored: PayloadSource,
+        inflater: Option<Box<Inflater>>,
     },
     Chunked {
-        stored: Source,
+        stored: PayloadSource,
         spans: Vec<Span>,
         /// The zlib chunk read last, by chunk number.
         current: Option<(usize, Decoded)>,
@@ -244,7 +450,7 @@ pub struct Payload {
 }
 
 impl Payload {
-    pub(super) fn stored(source: Source) -> Self {
+    pub(super) fn stored(source: PayloadSource) -> Self {
         Self {
             len: source.len(),
             pos: 0,
@@ -252,7 +458,7 @@ impl Payload {
         }
     }
 
-    pub(super) fn deflate(stored: Source, len: u64) -> Self {
+    pub(super) fn deflate(stored: PayloadSource, len: u64) -> Self {
         Self {
             len,
             pos: 0,
@@ -267,7 +473,7 @@ impl Payload {
     /// bytes.
     pub(super) fn chunked(
         row: u32,
-        stored: Source,
+        stored: PayloadSource,
         len: u64,
         table: &ChunkTable,
     ) -> Result<Self, Error> {
@@ -351,11 +557,22 @@ impl Payload {
         let buf = &mut buf[..buf_len];
         let pos = self.pos;
         let n = match &mut self.kind {
-            Kind::Stored(source) => read_at(source, pos, buf)?,
+            Kind::Stored(source) => {
+                let n = source.read_at(pos, buf)?;
+                if n == 0 && !buf.is_empty() {
+                    return Err(bad("the stored bytes end early"));
+                }
+                n
+            }
             Kind::Deflate { stored, inflater } => {
                 let reusable = inflater.as_ref().is_some_and(|i| i.out <= pos);
                 if !reusable {
-                    *inflater = Some(Inflater::new(stored.clone(), false, false, self.len));
+                    *inflater = Some(Box::new(Inflater::new(
+                        stored.clone(),
+                        false,
+                        false,
+                        self.len,
+                    )));
                 }
                 let inflater = inflater.as_mut().expect("set above");
                 inflater.skip_to(pos, cancel)?;
@@ -373,7 +590,11 @@ impl Payload {
                 let buf_len = buf.len().min(room);
                 let buf = &mut buf[..buf_len];
                 if span.chunk.method != ZLIB_METHOD {
-                    read_at(stored, span.stored + offset, buf)?
+                    let n = stored.read_at(span.stored + offset, buf)?;
+                    if n == 0 && !buf.is_empty() {
+                        return Err(bad(format!("chunk {index} ends early")));
+                    }
+                    n
                 } else {
                     if !matches!(current, Some((n, _)) if *n == index) {
                         // Drops the previous chunk first, so that at most
@@ -389,7 +610,7 @@ impl Payload {
                             buf[..n].copy_from_slice(&chunk[..n]);
                             n
                         }
-                        Some(Decoded::Spooled(file)) => read_at(file, offset, buf)?,
+                        Some(Decoded::Spooled(file)) => source_read_at(file, offset, buf)?,
                         None => 0,
                     };
                     if n == 0 {
@@ -420,7 +641,7 @@ impl std::fmt::Debug for Payload {
 }
 
 /// A zlib chunk, decoded and checked completely before any of it is used.
-fn decode_chunk(stored: &Source, span: &Span, cancel: &AtomicBool) -> io::Result<Decoded> {
+fn decode_chunk(stored: &PayloadSource, span: &Span, cancel: &AtomicBool) -> io::Result<Decoded> {
     let len = u64::from(span.chunk.logical_len);
     let compressed = stored
         .slice(span.stored, span.chunk.compressed_len.into())
@@ -441,7 +662,7 @@ fn decode_chunk(stored: &Source, span: &Span, cancel: &AtomicBool) -> io::Result
     Ok(Decoded::Spooled(spooled))
 }
 
-fn read_at(source: &Source, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+fn source_read_at(source: &Source, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     let mut source = source.clone();
     source.seek(SeekFrom::Start(offset))?;
     let n = source.read(buf)?;
@@ -468,5 +689,98 @@ impl Seek for Payload {
             io::Error::new(io::ErrorKind::InvalidInput, "seek to an invalid position")
         })?;
         Ok(self.pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpf::metadata::transform::BlockDecrypt;
+
+    struct Toy;
+
+    impl BlockDecrypt for Toy {
+        fn decrypt_block(&self, block: &mut [u8; BLOCK_LEN]) {
+            for (index, byte) in block.iter_mut().enumerate() {
+                *byte = byte.wrapping_add(index as u8) ^ 0xA5;
+            }
+        }
+    }
+
+    fn transform(parameter: [u8; BLOCK_LEN]) -> StreamTransform {
+        StreamTransform::new(parameter, Arc::new(Toy))
+    }
+
+    #[test]
+    fn transform_covers_only_the_verified_regions() {
+        let original = vec![0u8; 30_000];
+        let mut data = original.clone();
+        apply_transform(&mut data, 0, [0u8; BLOCK_LEN], &Toy, StreamModel::Partial);
+        let ranges = [0..2048, 9216..10_240, 17_408..18_432, 25_600..26_624];
+        for range in &ranges {
+            assert!(
+                data[range.clone()]
+                    .iter()
+                    .zip(&original[range.clone()])
+                    .any(|(a, b)| a != b),
+                "range {range:?} was not transformed"
+            );
+        }
+        for (index, (a, b)) in data.iter().zip(&original).enumerate() {
+            if !ranges.iter().any(|range| range.contains(&index)) {
+                assert_eq!(a, b, "byte {index} outside the transform");
+            }
+        }
+    }
+
+    #[test]
+    fn transform_origin_keeps_the_counter_relative_to_the_entry() {
+        let parameter = [0x11; BLOCK_LEN];
+        let mut full = vec![0u8; 20_000];
+        apply_transform(&mut full, 0, parameter, &Toy, StreamModel::Partial);
+        let mut tail = vec![0u8; 10_784];
+        apply_transform(&mut tail, 9_216, parameter, &Toy, StreamModel::Partial);
+        assert_eq!(&tail[..], &full[9_216..]);
+    }
+
+    #[test]
+    fn streaming_payload_matches_the_decoded_chunk() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let text = b"<CVehicleDistantLightData>streaming transform test</CVehicleDistantLightData>";
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(text).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let parameter = [0x33; BLOCK_LEN];
+        let mut stored = compressed.clone();
+        apply_transform(&mut stored, 0, parameter, &Toy, StreamModel::Partial);
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = temp.as_file();
+        file.write_all(&stored).unwrap();
+        file.flush().unwrap();
+        let source = Source::open(temp.path()).unwrap();
+        let table = ChunkTable {
+            encoding: 4,
+            chunks: vec![Chunk {
+                logical_len: text.len() as u32,
+                stored_len: compressed.len() as u32,
+                padding: 0,
+                compressed_len: compressed.len() as u32,
+                method: 3,
+            }],
+        };
+        let mut payload = Payload::chunked(
+            0,
+            PayloadSource::transformed(source, transform(parameter)),
+            text.len() as u64,
+            &table,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        payload.read_to_end(&mut out).unwrap();
+        assert_eq!(out, text);
     }
 }

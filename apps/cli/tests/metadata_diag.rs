@@ -66,11 +66,12 @@ fn metadata_reports_payload_readability() {
     assert_eq!(state(0), "stored");
     assert_eq!(listed[0]["contents"]["readable"], true);
     assert_eq!(state(1), "decoded");
-    assert_eq!(state(2), "unsupported_transform");
+    assert_eq!(state(2), "transform_key_missing");
     assert_eq!(listed[2]["contents"]["readable"], false);
     assert_eq!(listed[2]["payload_cipher"]["type"], 0x11);
     assert_eq!(listed[2]["payload_cipher"]["algorithm"], "0x11");
     assert_eq!(listed[2]["payload_cipher"]["key_id"], "0x1000002E");
+    assert_eq!(listed[2]["payload_cipher"]["supported"], true);
     assert_eq!(
         listed[2]["payload_cipher"]["parameter"],
         "000102030405060708090a0b0c0d0e0f"
