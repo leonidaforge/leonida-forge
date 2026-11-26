@@ -17,6 +17,8 @@
 mod block;
 mod fixed;
 mod source;
+mod stream_block;
+mod stream_payload;
 #[cfg(test)]
 pub(crate) mod synthetic;
 #[cfg(test)]
@@ -31,3 +33,5 @@ pub use fixed::{
 };
 pub use source::{RecognizedSource, SourceError};
 pub(crate) use source::{SelectionError, select_source};
+pub use stream_block::{EncodedStreamBlock, EncodedStreamError};
+pub use stream_payload::{DecodeError, decode_transformed};

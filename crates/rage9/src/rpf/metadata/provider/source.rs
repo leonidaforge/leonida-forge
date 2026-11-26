@@ -17,6 +17,7 @@ use lforge_binary::pe::ExecutableView;
 
 use super::block::{EncodedAesBlock, EncodedAesError};
 use super::fixed::{FixedTables, FixedTablesError, recognize_candidates, recognize_fixed_tables};
+use super::stream_block::EncodedStreamBlock;
 use crate::rpf::metadata::probe::{ATableSummary, validate_a_table};
 use crate::rpf::metadata::recognize::{
     Limits, RecognitionError, Recognized, STATIC_STEP1_MODE, StaticDescriptor,
@@ -66,9 +67,13 @@ impl From<EncodedAesError> for SourceError {
 /// Construction requires a unique structurally valid fixed-table block; an
 /// image with several is rejected as ambiguous. The archive probe selects
 /// among them by the decrypted A table.
+#[derive(Clone)]
 pub struct RecognizedSource {
     recognized: Recognized,
     tables: FixedTables,
+    /// Fixed table blocks that are not the static descriptor's block. The
+    /// payload transform uses one of them; the archive data selects which.
+    stream_tables: Vec<FixedTables>,
 }
 
 impl RecognizedSource {
@@ -91,7 +96,32 @@ impl RecognizedSource {
     ) -> Result<Self, SourceError> {
         let state = recognized.state().map_err(RecognitionError::Registry)?;
         EncodedAesBlock::new(state, tables.clone())?;
-        Ok(Self { recognized, tables })
+        Ok(Self {
+            recognized,
+            tables,
+            stream_tables: Vec::new(),
+        })
+    }
+
+    /// Sets the non-descriptor fixed-table blocks that the payload transform
+    /// may use. The archive data selects one when a transformed row is read.
+    pub(crate) fn set_stream_tables(&mut self, tables: Vec<FixedTables>) {
+        self.stream_tables = tables;
+    }
+
+    /// One keystream block per candidate table set for `key_id`. Empty when
+    /// the executable has no algorithm-`0x11` state for the key.
+    pub fn stream_blocks(&self, key_id: u32) -> Vec<EncodedStreamBlock> {
+        let mut blocks = Vec::with_capacity(self.stream_tables.len());
+        for tables in &self.stream_tables {
+            let Ok(state) = self.recognized.registry().state_for_stream_key(key_id) else {
+                continue;
+            };
+            if let Ok(block) = EncodedStreamBlock::new(state, tables.clone()) {
+                blocks.push(block);
+            }
+        }
+        blocks
     }
 
     pub fn descriptor(&self) -> &StaticDescriptor {
@@ -252,7 +282,15 @@ pub(crate) fn select_source(
     match plausible.len() {
         0 => Err(SelectionError::NoPlausible),
         1 => {
-            let (selected, source, a_table) = plausible.pop().expect("one selection");
+            let (selected, mut source, a_table) = plausible.pop().expect("one selection");
+            source.set_stream_tables(
+                candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != selected)
+                    .map(|(_, tables)| tables.clone())
+                    .collect(),
+            );
             Ok(Selection {
                 source,
                 a_table,

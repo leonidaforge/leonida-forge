@@ -48,10 +48,16 @@ pub use registry::{Registry, RegistryError, recognize_registry};
 pub const STATE_LEN: usize = 0x10F4;
 /// Magic of an encoded algorithm-0x10 key state.
 pub const STATE_MAGIC: u32 = 0x4E3B_9B8E;
+/// Magic of an encoded algorithm-0x11 key state.
+pub const STREAM_STATE_MAGIC: u32 = 0x2718_CE5D;
 /// Length of a registry entry that is not an encoded key state.
 pub const DEFAULT_RECORD_LEN: u64 = 0x20;
 /// The algorithm of encoded AES-256 decryption.
 pub const ALGORITHM_CBC: u8 = 0x10;
+/// The algorithm of the payload-transform keystream.
+pub const ALGORITHM_STREAM: u8 = 0x11;
+/// The engine mode of the payload-transform stream object.
+pub const STREAM_MODE: u8 = 3;
 /// The step-1 cipher mode of the static descriptor, fixed by the engine's
 /// descriptor initializer. The archive selector chooses the descriptor index,
 /// not the mode, and the selector's parity does not imply it.
@@ -120,6 +126,23 @@ pub(crate) fn validate_encoded_state(bytes: &[u8]) -> Result<(), &'static str> {
         return Err("unexpected state length");
     }
     if read_u32(bytes, 0) != Some(STATE_MAGIC) {
+        return Err("unexpected state magic");
+    }
+    if !schedule_nonzero(bytes) {
+        return Err("the schedule is zero");
+    }
+    if !final_tables_ok(bytes) {
+        return Err("a final-round table is not a permutation");
+    }
+    Ok(())
+}
+
+/// The structure an encoded algorithm-`0x11` key state must have.
+pub(crate) fn validate_stream_state(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() != STATE_LEN {
+        return Err("unexpected state length");
+    }
+    if read_u32(bytes, 0) != Some(STREAM_STATE_MAGIC) {
         return Err("unexpected state magic");
     }
     if !schedule_nonzero(bytes) {

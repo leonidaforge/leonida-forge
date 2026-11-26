@@ -130,6 +130,25 @@ impl Registry {
         Ok(StateBytes::new(bytes))
     }
 
+    /// Reads and revalidates the algorithm-`0x11` state for a payload-transform
+    /// key identifier.
+    pub fn state_for_stream_key(&self, key_id: u32) -> Result<StateBytes, RegistryError> {
+        let selector = selector_for(key_id, super::ALGORITHM_STREAM, super::STREAM_MODE);
+        let record = unique_record(&self.records, selector)?;
+        if record.state_len != STATE_LEN as u64 {
+            return Err(RegistryError::StateMalformed(
+                "the state is not an encoded algorithm-0x11 state",
+            ));
+        }
+        let bytes = Zeroizing::new(
+            self.image
+                .read_va(record.state_va, STATE_LEN)
+                .map_err(|_| RegistryError::StateMalformed("the state cannot be read"))?,
+        );
+        super::validate_stream_state(&bytes).map_err(RegistryError::StateMalformed)?;
+        Ok(StateBytes::new(bytes))
+    }
+
     /// The current identity of the executable, for detecting changes after
     /// recognition.
     pub fn identity(&self, cancel: &AtomicBool) -> Result<Identity, BinaryError> {
