@@ -2634,6 +2634,7 @@ dependencies = [
  "lforge-core",
  "lforge-rage9",
  "lforge-renderer",
+ "lforge-scene",
  "lforge-texture",
  "log",
  "serde",
@@ -2648,8 +2649,11 @@ name = "lforge-rage9"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "glam",
  "iced-x86",
  "lforge-binary",
+ "lforge-scene",
+ "log",
  "rand_core 0.6.4",
  "roxmltree 0.21.2",
  "rsa",

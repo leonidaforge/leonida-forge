@@ -9,8 +9,11 @@ publish.workspace = true
 
 [dependencies]
 flate2.workspace = true
+glam.workspace = true
 iced-x86.workspace = true
 lforge-binary.workspace = true
+lforge-scene.workspace = true
+log.workspace = true
 roxmltree.workspace = true
 rsa.workspace = true
 serde.workspace = true

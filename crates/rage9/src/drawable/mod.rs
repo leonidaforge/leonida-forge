@@ -246,6 +246,9 @@ pub struct Slot {
     pub state: crate::dictionary::SlotState,
     /// The name record's 64-bit key, for a bound slot.
     pub key: Option<u64>,
+    /// The name record's 32-bit dictionary hash, when it carries the `6`
+    /// variant. It shares the dictionary name-hash namespace.
+    pub hash32: Option<u32>,
 }
 
 /// Counts over the shader group. Keys are hashes: nothing is resolved.
@@ -271,8 +274,8 @@ pub struct HeaderView {
     pub distances: [f32; LOD_SLOTS],
     pub flags: [u32; LOD_SLOTS],
     pub name: Option<u32>,
-    /// The NUL-terminated ASCII bytes at the name pointer. The field is a
-    /// descriptive label; no engine role is established for the string.
+    /// The NUL-terminated ASCII bytes at the name pointer. A descriptive
+    /// label; no engine role is established for the string.
     pub name_text: Option<String>,
     pub list: Option<u32>,
     pub word_a8_hi: u64,
@@ -389,6 +392,10 @@ pub struct Shader {
     pub word_06: u16,
     pub slots: u32,
     pub bound_slots: u32,
+    /// The eight record bytes at `+0x38..+0x40`. Byte 4 is observed as a
+    /// render-bucket mask (0x01 opaque, 0x02 alpha, 0x04 decal, 0x08 cutout,
+    /// 0x40 water) in the public material census; the bytes stay raw here.
+    pub flags: [u8; 8],
     pub parameters: Vec<Parameter>,
     pub slot_states: Vec<Slot>,
 }
@@ -426,7 +433,14 @@ pub struct Report {
 /// system segment and at least one LOD slot whose model and geometry arrays
 /// resolve. A local type ID plays no part.
 pub fn is_drawable(system: &[u8], graphics: &[u8]) -> bool {
-    let Ok(header) = HeaderView::parse(system) else {
+    is_drawable_at(system, graphics, 0)
+}
+
+/// Whether a drawable header and chain start at `root` in the system segment.
+/// A fragment or a drawable dictionary can hold member drawables at offsets
+/// other than zero.
+pub fn is_drawable_at(system: &[u8], graphics: &[u8], root: usize) -> bool {
+    let Ok(header) = HeaderView::parse_at(system, root) else {
         return false;
     };
     header.lod_slots.iter().enumerate().any(|(slot, &value)| {
@@ -441,61 +455,62 @@ pub fn is_drawable(system: &[u8], graphics: &[u8]) -> bool {
 }
 
 impl HeaderView {
-    fn parse(system: &[u8]) -> Result<Self, Issue> {
-        if system.len() < 0xC0 {
+    fn parse_at(system: &[u8], base: usize) -> Result<Self, Issue> {
+        if base.checked_add(0xC0).is_none_or(|end| end > system.len()) {
             return Err(Issue::Missing {
                 field: "the 0xC0-byte header",
             });
         }
-        if u64_at(system, 0) != Some(0) {
+        if u64_at(system, base) != Some(0) {
             return Err(Issue::Arithmetic {
                 field: "header +0x00",
                 message: "the first word is not zero".to_string(),
             });
         }
-        let page_map = system_pointer(u64_at(system, 0x08).unwrap_or(0)).ok_or(Issue::Pointer {
+        let page_map_value = u64_at(system, base + 0x08).unwrap_or(0);
+        let page_map = system_pointer(page_map_value).ok_or(Issue::Pointer {
             field: "page map",
-            at: 0x08,
-            value: u64_at(system, 0x08).unwrap_or(0),
+            at: base + 0x08,
+            value: page_map_value,
         })?;
         let mut lod_slots = [0u64; LOD_SLOTS];
         let mut distances = [0f32; LOD_SLOTS];
         let mut flags = [0u32; LOD_SLOTS];
         for slot in 0..LOD_SLOTS {
-            lod_slots[slot] = u64_at(system, 0x50 + 8 * slot).unwrap_or(0);
-            distances[slot] = f32_at(system, 0x70 + 4 * slot).unwrap_or(0.0);
-            flags[slot] = u32_at(system, 0x80 + 4 * slot).unwrap_or(0);
+            lod_slots[slot] = u64_at(system, base + 0x50 + 8 * slot).unwrap_or(0);
+            distances[slot] = f32_at(system, base + 0x70 + 4 * slot).unwrap_or(0.0);
+            flags[slot] = u32_at(system, base + 0x80 + 4 * slot).unwrap_or(0);
         }
+        let name = system_pointer(u64_at(system, base + 0xA8).unwrap_or(0));
         Ok(Self {
             page_map,
-            shader_group: system_pointer(u64_at(system, 0x10).unwrap_or(0)),
-            skeleton: system_pointer(u64_at(system, 0x18).unwrap_or(0)),
+            shader_group: system_pointer(u64_at(system, base + 0x10).unwrap_or(0)),
+            skeleton: system_pointer(u64_at(system, base + 0x18).unwrap_or(0)),
             bounds: Bounds {
                 centre: [
-                    f32_at(system, 0x20).unwrap_or(0.0),
-                    f32_at(system, 0x24).unwrap_or(0.0),
-                    f32_at(system, 0x28).unwrap_or(0.0),
+                    f32_at(system, base + 0x20).unwrap_or(0.0),
+                    f32_at(system, base + 0x24).unwrap_or(0.0),
+                    f32_at(system, base + 0x28).unwrap_or(0.0),
                 ],
-                radius: f32_at(system, 0x2C).unwrap_or(0.0),
+                radius: f32_at(system, base + 0x2C).unwrap_or(0.0),
                 min: [
-                    f32_at(system, 0x30).unwrap_or(0.0),
-                    f32_at(system, 0x34).unwrap_or(0.0),
-                    f32_at(system, 0x38).unwrap_or(0.0),
+                    f32_at(system, base + 0x30).unwrap_or(0.0),
+                    f32_at(system, base + 0x34).unwrap_or(0.0),
+                    f32_at(system, base + 0x38).unwrap_or(0.0),
                 ],
                 max: [
-                    f32_at(system, 0x40).unwrap_or(0.0),
-                    f32_at(system, 0x44).unwrap_or(0.0),
-                    f32_at(system, 0x48).unwrap_or(0.0),
+                    f32_at(system, base + 0x40).unwrap_or(0.0),
+                    f32_at(system, base + 0x44).unwrap_or(0.0),
+                    f32_at(system, base + 0x48).unwrap_or(0.0),
                 ],
             },
             lod_slots,
             distances,
             flags,
-            name: system_pointer(u64_at(system, 0xA8).unwrap_or(0)),
-            name_text: system_pointer(u64_at(system, 0xA8).unwrap_or(0))
-                .and_then(|offset| ascii_string(system, offset as usize)),
-            list: system_pointer(u64_at(system, 0xB0).unwrap_or(0)),
-            word_a8_hi: u64_at(system, 0xB8).unwrap_or(0),
+            name,
+            name_text: name.and_then(|offset| ascii_string(system, offset as usize)),
+            list: system_pointer(u64_at(system, base + 0xB0).unwrap_or(0)),
+            word_a8_hi: u64_at(system, base + 0xB8).unwrap_or(0),
         })
     }
 }
@@ -1081,6 +1096,10 @@ impl<'a> Walk<'a> {
         let marker = self.u32(base + 0x04, "shader marker")?;
         let slots_at = self.pointer(base + 0x10, "texture slot table", Segment::System)?;
         let parameters_at = self.pointer(base + 0x20, "parameter table", Segment::System)?;
+        let flags: [u8; 8] = self
+            .bytes(Segment::System, base + 0x38, 8, "shader flags")?
+            .try_into()
+            .expect("eight bytes");
         let (texture_parameters, total_parameters, word_06) = self.parameter_counts(parameters_at);
         let parameters = self.parameters(parameters_at, total_parameters, texture_parameters);
         let (slots, bound_slots) = self.slot_counts(slots_at, texture_parameters);
@@ -1094,6 +1113,7 @@ impl<'a> Walk<'a> {
             word_06,
             slots,
             bound_slots,
+            flags,
             parameters,
             slot_states,
         })
@@ -1152,15 +1172,16 @@ impl<'a> Walk<'a> {
             else {
                 continue;
             };
-            let key = if state == crate::dictionary::SlotState::Bound {
-                self.record_key(pointer)
+            let (key, hash32) = if state == crate::dictionary::SlotState::Bound {
+                (self.record_key(pointer), self.record_hash32(pointer))
             } else {
-                None
+                (None, None)
             };
             slots.push(Slot {
                 index: parameter.index,
                 state,
                 key,
+                hash32,
             });
         }
         slots
@@ -1173,6 +1194,18 @@ impl<'a> Walk<'a> {
         let name = u64_at(self.system, record as usize + 0x30)?;
         let name = system_pointer(name)?;
         u64_at(self.system, name as usize + 8)
+    }
+
+    /// The name record's 32-bit dictionary hash. It is read only when the
+    /// `+0x10` word is the observed `6` variant; other variants hold a
+    /// pointer there.
+    fn record_hash32(&mut self, pointer: u64) -> Option<u32> {
+        let record = system_pointer(pointer)?;
+        let name = u64_at(self.system, record as usize + 0x30)?;
+        let name = system_pointer(name)?;
+        (u32_at(self.system, name as usize + 0x10) == Some(6))
+            .then(|| u32_at(self.system, name as usize + 0x18))
+            .flatten()
     }
 
     fn parameter_counts(&mut self, at: u32) -> (u8, u16, u16) {
@@ -1212,8 +1245,13 @@ impl<'a> Walk<'a> {
 /// Inspects a reconstructed drawable. `None` when the system segment does not
 /// have the header shape.
 pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
-    let header = HeaderView::parse(system).ok()?;
-    if !is_drawable(system, graphics) {
+    inspect_at(system, graphics, 0)
+}
+
+/// Inspects a drawable whose header starts at `root`.
+pub fn inspect_at(system: &[u8], graphics: &[u8], root: usize) -> Option<Report> {
+    let header = HeaderView::parse_at(system, root).ok()?;
+    if !is_drawable_at(system, graphics, root) {
         return None;
     }
     let mut walk = Walk::new(system, graphics);
@@ -1226,7 +1264,7 @@ pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
             } else {
                 walk.issues.push(Issue::Pointer {
                     field: "LOD slot",
-                    at: 0x50 + 8 * slot,
+                    at: root + 0x50 + 8 * slot,
                     value,
                 });
             }
@@ -1375,6 +1413,20 @@ fn graphics_base(graphics: &[u8], offsets: &[u32]) -> GraphicsBase {
             candidates: candidates.len(),
         },
     }
+}
+
+/// A printable ASCII string starting at `at` and ending at a NUL. Longer than
+/// 256 bytes without a terminator, any non-printable byte or a non-ASCII byte
+/// yields nothing, so a pointer that does not carry a name is not guessed.
+fn ascii_string(bytes: &[u8], at: usize) -> Option<String> {
+    const MAX: usize = 256;
+    let tail = bytes.get(at..)?;
+    let end = tail.iter().take(MAX).position(|&byte| byte == 0)?;
+    let text = tail.get(..end)?;
+    if text.is_empty() || text.iter().any(|&byte| !(0x20..=0x7E).contains(&byte)) {
+        return None;
+    }
+    std::str::from_utf8(text).ok().map(str::to_owned)
 }
 
 fn system_pointer(value: u64) -> Option<u32> {
