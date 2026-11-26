@@ -1,6 +1,7 @@
 mod archive;
 mod binary;
 mod catalog;
+mod census;
 mod extract;
 mod inspect;
 mod inventory;
@@ -53,6 +54,27 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // The command tree is rebuilt on every run, and the argument parser needs
+    // more stack than Windows gives the main thread once the subcommands add up.
+    // Run the interface on a thread with a known stack instead of depending on
+    // the size the linker happens to pick.
+    const STACK: usize = 16 * 1024 * 1024;
+    match std::thread::Builder::new()
+        .name("lforge".to_string())
+        .stack_size(STACK)
+        .spawn(run)
+    {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(err) => {
+            eprintln!("error: cannot start the command thread: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Info { json } => info(json),
