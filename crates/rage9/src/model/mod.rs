@@ -540,7 +540,8 @@ fn semantic(parameter: u32) -> TextureSemantic {
     match parameter {
         DIFFUSE_TEX | DIFFUSE_TEX2 => TextureSemantic::Diffuse,
         BUMP_TEX => TextureSemantic::Normal,
-        SPECULAR_TEX | SPECULAR_TEX2 => TextureSemantic::Specular,
+        SPECULAR_TEX => TextureSemantic::Specular,
+        SPECULAR_TEX2 => TextureSemantic::Specular2,
         _ => TextureSemantic::Unknown,
     }
 }

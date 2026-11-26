@@ -89,6 +89,9 @@ pub enum TextureSemantic {
     Diffuse,
     Normal,
     Specular,
+    /// The second specular slot. The viewer binds it but keeps the first
+    /// specular map as the one the shader samples.
+    Specular2,
     Unknown,
 }
 

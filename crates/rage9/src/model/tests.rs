@@ -169,7 +169,7 @@ fn texture_semantics_are_taken_from_the_parameter_hashes() {
     assert_eq!(semantic(DIFFUSE_TEX2), TextureSemantic::Diffuse);
     assert_eq!(semantic(BUMP_TEX), TextureSemantic::Normal);
     assert_eq!(semantic(SPECULAR_TEX), TextureSemantic::Specular);
-    assert_eq!(semantic(SPECULAR_TEX2), TextureSemantic::Specular);
+    assert_eq!(semantic(SPECULAR_TEX2), TextureSemantic::Specular2);
     assert_eq!(semantic(0x1234_5678), TextureSemantic::Unknown);
 }
 
