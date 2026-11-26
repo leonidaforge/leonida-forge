@@ -7,12 +7,14 @@
 //! by [`StreamTransform`]; this module selects the right key table and range
 //! from the archive data without decoding a whole resource.
 //!
-//! The selection probe uses the first zlib chunk. It applies the partial range
-//! to each candidate table and requires the chunk to inflate to its declared
-//! logical size. The whole-range rule is tried only for a row with a single
-//! chunk, where that chunk covers the entire stream and therefore verifies the
-//! rule on its own; a multi-chunk row with the partial rule cannot verify a
-//! different range from its first chunk. A resource whose stream cannot be
+//! The selection probe uses zlib chunks. It applies the partial range to each
+//! candidate table and requires the chunk to inflate to its declared logical
+//! size. Chunks are verified until one covers a byte that the partial and
+//! whole-range rules treat differently, so the range rule is proven, not
+//! guessed. The whole-range rule is tried only for a row with a single chunk,
+//! where that chunk covers the entire stream and therefore verifies the rule on
+//! its own; a multi-chunk row with the partial rule cannot verify a different
+//! range from its later copied chunks. A resource whose stream cannot be
 //! verified this way is refused rather than decoded speculatively.
 
 use std::fmt;
@@ -23,8 +25,10 @@ use flate2::read::ZlibDecoder;
 use lforge_binary::Source;
 
 use super::stream_block::EncodedStreamBlock;
-use crate::rpf::metadata::payload::{StreamModel, StreamTransform, apply_transform};
-use crate::rpf::metadata::transform::CipherDescriptor;
+use crate::rpf::metadata::payload::{
+    LEADING, StreamModel, StreamTransform, apply_transform, separates_models,
+};
+use crate::rpf::metadata::transform::{BlockDecrypt, CipherDescriptor};
 use crate::rpf::metadata::{ChunkTable, Entry};
 
 /// Stored bytes read to select and verify a transform key table.
@@ -142,9 +146,13 @@ pub fn prepare_stream_transform(
     prefix
         .read_to_end(&mut bytes)
         .map_err(|err| StreamTransformError::Read(err.to_string()))?;
-    let (index, model) = select_stream_block(&bytes, table, cipher, &blocks).ok_or(
+    let views: Vec<&dyn BlockDecrypt> = blocks
+        .iter()
+        .map(|block| block as &dyn BlockDecrypt)
+        .collect();
+    let (index, model) = select_stream_block(&bytes, table, cipher, &views).ok_or(
         StreamTransformError::Unverifiable(
-            "the first zlib chunk did not match any recognized table",
+            "no zlib chunk verified a recognized table and range rule",
         ),
     )?;
     let mut blocks = blocks;
@@ -168,51 +176,236 @@ fn candidate_models(chunk_count: usize) -> &'static [StreamModel] {
     }
 }
 
-/// The index of the candidate table whose keystream makes the first zlib
-/// chunk inflate to its declared logical size.
+/// The index of the candidate table whose keystream verifies the stream, and
+/// the range rule it verifies.
+///
+/// A zlib chunk is decoded and checksummed before it is accepted. Chunks are
+/// verified in order until one covers a byte that the two range rules treat
+/// differently, which proves the rule for the whole stream. A stream that
+/// extends beyond the leading region without such a chunk is refused: a later
+/// copied chunk carries no checksum, so a wrong rule would not be detected.
 fn select_stream_block(
     stored: &[u8],
     table: &ChunkTable,
     cipher: &CipherDescriptor,
-    blocks: &[EncodedStreamBlock],
+    blocks: &[&dyn BlockDecrypt],
 ) -> Option<(usize, StreamModel)> {
+    for &model in candidate_models(table.chunks.len()) {
+        for (index, block) in blocks.iter().enumerate() {
+            if verifies_stream(stored, table, cipher, *block, model) {
+                return Some((index, model));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `block` proves `model` over the whole stream. Every zlib chunk up
+/// to the first one that separates the rules must inflate to its declared
+/// logical size.
+fn verifies_stream(
+    stored: &[u8],
+    table: &ChunkTable,
+    cipher: &CipherDescriptor,
+    block: &dyn BlockDecrypt,
+    model: StreamModel,
+) -> bool {
     let mut start = if table.encoding == 2 {
         ENCODING_2_PREFIX
     } else {
         0
     };
+    // Transformed on demand, so a short probe stays cheap for the common
+    // first-chunk case.
+    let mut plain: Vec<u8> = Vec::new();
+    let mut content_end = 0;
     for chunk in &table.chunks {
-        if chunk.method == ZLIB_METHOD {
-            let compressed = chunk.stored_len.checked_sub(chunk.padding)?;
-            let end = start.checked_add(u64::from(compressed))?;
-            if end > stored.len() as u64 {
-                return None;
-            }
-            let (start, end) = (start as usize, end as usize);
-            for &model in candidate_models(table.chunks.len()) {
-                for (index, block) in blocks.iter().enumerate() {
-                    let mut plain = stored[..end].to_vec();
-                    apply_transform(&mut plain, 0, cipher.parameter, block, model);
-                    let mut decoder = ZlibDecoder::new(&plain[start..end]);
-                    let mut output = Vec::new();
-                    if decoder.read_to_end(&mut output).is_ok()
-                        && output.len() == chunk.logical_len as usize
-                    {
-                        return Some((index, model));
-                    }
-                }
-            }
-            return None;
+        let Some(compressed) = chunk.stored_len.checked_sub(chunk.padding) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(u64::from(compressed)) else {
+            return false;
+        };
+        if end > stored.len() as u64 {
+            return false;
         }
-        start = start.checked_add(u64::from(chunk.stored_len))?;
+        if plain.len() < end as usize {
+            let from = plain.len();
+            plain.extend_from_slice(&stored[from..end as usize]);
+            apply_transform(
+                &mut plain[from..],
+                from as u64,
+                cipher.parameter,
+                block,
+                model,
+            );
+        }
+        if chunk.method == ZLIB_METHOD {
+            let mut decoder = ZlibDecoder::new(&plain[start as usize..end as usize]);
+            let mut output = Vec::new();
+            if decoder.read_to_end(&mut output).is_err()
+                || output.len() != chunk.logical_len as usize
+            {
+                return false;
+            }
+            if separates_models(start, end) {
+                return true;
+            }
+        }
+        content_end = end;
+        let Some(next) = start.checked_add(u64::from(chunk.stored_len)) else {
+            return false;
+        };
+        start = next;
     }
-    None
+    // Both rules agree over the whole leading region, so a stream that ends
+    // there needs no separating chunk.
+    content_end <= LEADING
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpf::metadata::Chunk;
+    use crate::rpf::metadata::payload::{StreamModel, apply_transform, separates_models};
+    use crate::rpf::metadata::transform::{BLOCK_LEN, BlockDecrypt};
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    struct Toy;
+
+    impl BlockDecrypt for Toy {
+        fn decrypt_block(&self, block: &mut [u8; BLOCK_LEN]) {
+            for (index, byte) in block.iter_mut().enumerate() {
+                *byte = byte.wrapping_mul(31).wrapping_add(index as u8);
+            }
+        }
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn cipher() -> CipherDescriptor {
+        CipherDescriptor {
+            key_id: 0x1000_0000,
+            kind: 0x11,
+            parameter: [0x42; BLOCK_LEN],
+        }
+    }
+
+    fn chunk(logical: usize, stored: usize, method: u8) -> Chunk {
+        Chunk {
+            logical_len: logical as u32,
+            stored_len: stored as u32,
+            padding: 0,
+            compressed_len: stored as u32,
+            method,
+        }
+    }
+
+    /// Two chunks whose first zlib chunk ends inside the leading region, so
+    /// only the second chunk separates the two range rules.
+    fn two_chunks(model: StreamModel, second_is_zlib: bool) -> (Vec<u8>, ChunkTable) {
+        let a = vec![0x31u8; 512];
+        let b = vec![0x47u8; 4096];
+        let ca = zlib(&a);
+        let cb = if second_is_zlib { zlib(&b) } else { b.clone() };
+        let mut stored = [ca.clone(), cb.clone()].concat();
+        apply_transform(&mut stored, 0, cipher().parameter, &Toy, model);
+        let table = ChunkTable {
+            encoding: 3,
+            chunks: vec![
+                chunk(a.len(), ca.len(), 3),
+                chunk(b.len(), cb.len(), if second_is_zlib { 3 } else { 0 }),
+            ],
+        };
+        (stored, table)
+    }
+
+    #[test]
+    fn selection_verifies_a_second_chunk_when_the_first_is_short() {
+        let (stored, table) = two_chunks(StreamModel::Partial, true);
+        assert_eq!(
+            select_stream_block(&stored, &table, &cipher(), &[&Toy]),
+            Some((0, StreamModel::Partial))
+        );
+    }
+
+    #[test]
+    fn selection_refuses_a_multi_chunk_whole_range_stream() {
+        // The whole-range rule is only used for a stream whose single chunk
+        // verifies it. A multi-chunk row cannot be verified past a short first
+        // chunk, so it must be refused rather than decoded with the partial
+        // rule.
+        let (stored, table) = two_chunks(StreamModel::Whole, true);
+        assert_eq!(
+            select_stream_block(&stored, &table, &cipher(), &[&Toy]),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_refuses_copied_bytes_that_hide_the_rule() {
+        // The first chunk is too short to separate the rules and the second
+        // is copied, so no checksum can prove the range.
+        let (stored, table) = two_chunks(StreamModel::Partial, false);
+        assert_eq!(
+            select_stream_block(&stored, &table, &cipher(), &[&Toy]),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_accepts_a_stream_inside_the_leading_region() {
+        let plain = vec![0x5Eu8; 500];
+        let compressed = zlib(&plain);
+        let mut stored = compressed.clone();
+        apply_transform(
+            &mut stored,
+            0,
+            cipher().parameter,
+            &Toy,
+            StreamModel::Partial,
+        );
+        let table = ChunkTable {
+            encoding: 3,
+            chunks: vec![chunk(plain.len(), compressed.len(), 3)],
+        };
+        assert_eq!(
+            select_stream_block(&stored, &table, &cipher(), &[&Toy]),
+            Some((0, StreamModel::Partial))
+        );
+    }
+
+    #[test]
+    fn selection_accepts_the_whole_range_for_a_single_long_chunk() {
+        let plain = vec![0x6Au8; 4096];
+        let compressed = zlib(&plain);
+        let mut stored = compressed.clone();
+        apply_transform(&mut stored, 0, cipher().parameter, &Toy, StreamModel::Whole);
+        let table = ChunkTable {
+            encoding: 3,
+            chunks: vec![chunk(plain.len(), compressed.len(), 3)],
+        };
+        assert_eq!(
+            select_stream_block(&stored, &table, &cipher(), &[&Toy]),
+            Some((0, StreamModel::Whole))
+        );
+    }
+
+    #[test]
+    fn separating_ranges_follow_the_verified_regions() {
+        assert!(!separates_models(0, 2048));
+        assert!(separates_models(0, 2049));
+        assert!(!separates_models(9216, 10_240));
+        assert!(separates_models(10_240, 10_241));
+        assert!(!separates_models(17_408, 18_432));
+        assert!(separates_models(17_408, 18_433));
+    }
 
     #[test]
     fn no_transform_is_reported() {

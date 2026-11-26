@@ -113,7 +113,8 @@ impl RecognizedSource {
     }
 
     /// Builds the verified streaming transform for `entry` from a bounded
-    /// stored prefix. The first zlib chunk selects the candidate table.
+    /// stored prefix. Zlib chunks select and verify the candidate table and
+    /// range rule.
     pub fn stream_transform(
         &self,
         entry: &Entry,

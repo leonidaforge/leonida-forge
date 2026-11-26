@@ -43,7 +43,7 @@ const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
 static NEVER: AtomicBool = AtomicBool::new(false);
 
 /// The verified payload-transform regions, in stored bytes.
-const LEADING: u64 = 2048;
+pub(crate) const LEADING: u64 = 2048;
 const BUFFER: u64 = 9216;
 const BUFFER_STEP: u64 = 8192;
 const BUFFER_PREFIX: u64 = 1024;
@@ -159,8 +159,26 @@ fn add_be(counter: [u8; BLOCK_LEN], value: u64) -> [u8; BLOCK_LEN] {
     out
 }
 
-fn is_transformed(offset: u64) -> bool {
+pub(crate) fn is_transformed(offset: u64) -> bool {
     offset < LEADING || (offset >= BUFFER && (offset - BUFFER) % BUFFER_STEP < BUFFER_PREFIX)
+}
+
+/// Whether `[start, end)` holds a byte above the leading region that the
+/// partial rule leaves in plaintext, which the whole-range rule transforms.
+/// Such a verified chunk proves which rule applies.
+pub(crate) fn separates_models(start: u64, end: u64) -> bool {
+    let mut at = start.max(LEADING);
+    while at < end {
+        if !is_transformed(at) {
+            return true;
+        }
+        at = if at < BUFFER {
+            BUFFER
+        } else {
+            BUFFER + (at - BUFFER) / BUFFER_STEP * BUFFER_STEP + BUFFER_PREFIX
+        };
+    }
+    false
 }
 
 /// Stored bytes, with the payload transform applied on read when present.
@@ -782,5 +800,153 @@ mod tests {
         let mut out = Vec::new();
         payload.read_to_end(&mut out).unwrap();
         assert_eq!(out, text);
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn chunk_file(bytes: &[u8]) -> (tempfile::NamedTempFile, Source) {
+        use std::io::Write;
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = temp.as_file();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        let source = Source::open(temp.path()).unwrap();
+        (temp, source)
+    }
+
+    fn chunk(logical: usize, stored: usize, method: u8) -> Chunk {
+        Chunk {
+            logical_len: logical as u32,
+            stored_len: stored as u32,
+            padding: 0,
+            compressed_len: stored as u32,
+            method,
+        }
+    }
+
+    fn two_chunk_table(a: &[u8], ca: &[u8], b: &[u8], cb: &[u8]) -> ChunkTable {
+        ChunkTable {
+            encoding: 3,
+            chunks: vec![chunk(a.len(), ca.len(), 3), chunk(b.len(), cb.len(), 3)],
+        }
+    }
+
+    #[test]
+    fn chunks_decode_in_order_to_their_declared_sizes() {
+        let a = vec![0x11u8; 1000];
+        let b = vec![0x22u8; 5000];
+        let (ca, cb) = (zlib(&a), zlib(&b));
+        let stored = [ca.clone(), cb.clone()].concat();
+        let (_temp, source) = chunk_file(&stored);
+        let table = two_chunk_table(&a, &ca, &b, &cb);
+        let mut payload = Payload::chunked(
+            0,
+            PayloadSource::plain(source),
+            (a.len() + b.len()) as u64,
+            &table,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        payload.read_to_end(&mut out).unwrap();
+        assert_eq!(out, [a, b].concat());
+    }
+
+    #[test]
+    fn a_corrupt_later_chunk_fails_the_read() {
+        let a = vec![0x11u8; 1000];
+        let b = vec![0x22u8; 5000];
+        let (ca, cb) = (zlib(&a), zlib(&b));
+        let mut stored = [ca.clone(), cb.clone()].concat();
+        let last = stored.len() - 1;
+        stored[last] ^= 0xFF;
+        let (_temp, source) = chunk_file(&stored);
+        // The entry size matches the table, so only the checksum can catch it.
+        let table = two_chunk_table(&a, &ca, &b, &cb);
+        let mut payload = Payload::chunked(
+            0,
+            PayloadSource::plain(source),
+            (a.len() + b.len()) as u64,
+            &table,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert!(payload.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn a_chunk_must_not_produce_more_than_its_declared_size() {
+        let plain = vec![0x33u8; 4000];
+        let compressed = zlib(&plain);
+        let (_temp, source) = chunk_file(&compressed);
+        let table = ChunkTable {
+            encoding: 3,
+            chunks: vec![chunk(plain.len() - 1, compressed.len(), 3)],
+        };
+        let mut payload = Payload::chunked(
+            0,
+            PayloadSource::plain(source),
+            (plain.len() - 1) as u64,
+            &table,
+        )
+        .unwrap();
+        assert!(payload.read_to_end(&mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn chunk_sizes_must_sum_to_the_entry_size() {
+        let a = vec![0x44u8; 1000];
+        let b = vec![0x55u8; 5000];
+        let (ca, cb) = (zlib(&a), zlib(&b));
+        let stored = [ca.clone(), cb.clone()].concat();
+        let (_temp, source) = chunk_file(&stored);
+        let table = two_chunk_table(&a, &ca, &b, &cb);
+        let result = Payload::chunked(
+            0,
+            PayloadSource::plain(source),
+            (a.len() + b.len() + 1) as u64,
+            &table,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_copied_chunk_must_be_as_long_as_it_is_stored() {
+        let (_temp, source) = chunk_file(&[0u8; 10]);
+        let table = ChunkTable {
+            encoding: 3,
+            chunks: vec![chunk(9, 10, 0)],
+        };
+        assert!(Payload::chunked(0, PayloadSource::plain(source), 9, &table).is_err());
+    }
+
+    #[test]
+    fn the_transform_uses_absolute_offsets_across_chunks() {
+        let parameter = [0x77; BLOCK_LEN];
+        let a = vec![0x5Au8; 12_000];
+        let b = vec![0xA5u8; 8_000];
+        let (ca, cb) = (zlib(&a), zlib(&b));
+        let mut stored = [ca.clone(), cb.clone()].concat();
+        apply_transform(&mut stored, 0, parameter, &Toy, StreamModel::Partial);
+        let (_temp, source) = chunk_file(&stored);
+        let table = two_chunk_table(&a, &ca, &b, &cb);
+        let mut payload = Payload::chunked(
+            0,
+            PayloadSource::transformed(source, transform(parameter)),
+            (a.len() + b.len()) as u64,
+            &table,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        payload.read_to_end(&mut out).unwrap();
+        assert_eq!(out, [a, b].concat());
     }
 }
