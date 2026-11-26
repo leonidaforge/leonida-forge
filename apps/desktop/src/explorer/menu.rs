@@ -174,7 +174,7 @@ impl Explorer {
                             el.on_click(self.menu_action(
                                 move |this, _, cx| {
                                     if resource {
-                                        crate::viewers::texture::open_resource(
+                                        crate::viewers::texture::open_resource_explicit(
                                             path.clone(),
                                             this.access(),
                                             cx,
@@ -373,7 +373,7 @@ impl Explorer {
                                 .on_click(self.menu_action(
                                     move |this, _, cx| {
                                         if resource {
-                                            crate::viewers::texture::open_resource(
+                                            crate::viewers::texture::open_resource_explicit(
                                                 path.clone(),
                                                 this.access(),
                                                 cx,

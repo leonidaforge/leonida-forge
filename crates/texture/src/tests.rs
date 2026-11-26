@@ -39,6 +39,9 @@ fn recognises_and_lists_one_rgba_texture() {
     assert_eq!(texture.status, Status::Decodable);
     assert_eq!(texture.level0_len, Some(16));
     assert_eq!(texture.levels.len(), 1);
+    // The synthetic page holds the 2 x 2 block behind a zero prelude, as the
+    // sampled level-stream model stores a short level.
+    assert_eq!(texture.levels[0].offset, 0x1000 - 16);
 }
 
 #[test]
@@ -133,6 +136,21 @@ fn r16_float_clamps_to_the_preview_range() {
 }
 
 #[test]
+fn r16_float_maps_non_finite_and_negative_values_to_zero() {
+    let mut data = Vec::new();
+    for value in [-1.0f32, f32::NAN, f32::INFINITY, 0.25] {
+        data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
+    }
+    let bytes = build(&[data], &[entry(2, 2, 54, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        image.rgba,
+        vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 64, 64, 64, 255]
+    );
+}
+
+#[test]
 fn unsupported_formats_are_reported_not_decoded() {
     let bytes = build(&[vec![0; 16]], &[entry(4, 4, 10, 2, 1)]);
     let store = open(&bytes);
@@ -196,4 +214,69 @@ fn a_non_2d_kind_is_reported() {
 fn a_non_rds5_file_is_rejected() {
     let err = Store::open(source(b"not a store")).unwrap_err();
     assert!(matches!(err, super::Error::NotRds5));
+}
+
+fn push_bits(bits: &mut Vec<u8>, value: u32, count: u32) {
+    for shift in 0..count {
+        bits.push(((value >> shift) & 1) as u8);
+    }
+}
+
+/// Builds a BC7 mode-6 block from eight-bit endpoint and 4-bit selector
+/// values. The layout is the one Microsoft documents for mode 6: a 7-bit mode
+/// prefix, RGBA endpoint pairs with a shared p-bit, then the anchor index in
+/// three bits and fifteen 4-bit indices.
+fn bc7_mode6(endpoint0: [u8; 4], endpoint1: [u8; 4], selectors: [u8; 16]) -> Vec<u8> {
+    let mut bits = Vec::with_capacity(128);
+    push_bits(&mut bits, 1 << 6, 7);
+    for channel in 0..4 {
+        push_bits(&mut bits, u32::from(endpoint0[channel] >> 1), 7);
+        push_bits(&mut bits, u32::from(endpoint1[channel] >> 1), 7);
+    }
+    push_bits(&mut bits, u32::from(endpoint0[0] & 1), 1);
+    push_bits(&mut bits, u32::from(endpoint1[0] & 1), 1);
+    push_bits(&mut bits, u32::from(selectors[0]), 3);
+    for selector in &selectors[1..] {
+        push_bits(&mut bits, u32::from(*selector), 4);
+    }
+    assert_eq!(bits.len(), 128, "mode 6 must fill one BC7 block");
+    let mut block = vec![0u8; 16];
+    for (index, bit) in bits.iter().enumerate() {
+        block[index / 8] |= bit << (index % 8);
+    }
+    block
+}
+
+fn bc7_interpolate(endpoint0: u8, endpoint1: u8, selector: u8) -> u8 {
+    const WEIGHTS: [u32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+    let weight = WEIGHTS[selector as usize];
+    (((64 - weight) * u32::from(endpoint0) + weight * u32::from(endpoint1) + 32) / 64) as u8
+}
+
+#[test]
+fn bc7_decodes_a_solid_mode6_block() {
+    let block = bc7_mode6([255, 255, 255, 255], [255, 255, 255, 255], [0; 16]);
+    let bytes = build(&[block], &[entry(4, 4, 98, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 255, 255, 255]);
+    }
+}
+
+#[test]
+fn bc7_interpolates_mode6_endpoints_and_alpha() {
+    let endpoint0 = [0, 0, 0, 0];
+    let endpoint1 = [254, 0, 0, 254];
+    let selectors: [u8; 16] = std::array::from_fn(|index| index as u8);
+    let block = bc7_mode6(endpoint0, endpoint1, selectors);
+    let bytes = build(&[block], &[entry(4, 4, 98, 2, 1)]);
+    let store = open(&bytes);
+    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    for (index, pixel) in image.rgba.as_chunks::<4>().0.iter().enumerate() {
+        let red = bc7_interpolate(endpoint0[0], endpoint1[0], selectors[index]);
+        assert_eq!(pixel, &[red, 0, 0, red], "selector {index}");
+    }
+    assert_eq!(image.rgba[15 * 4], 254);
+    assert_eq!(image.rgba[15 * 4 + 3], 254);
 }

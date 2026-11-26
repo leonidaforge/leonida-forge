@@ -14,6 +14,7 @@ mod decode;
 mod dictionary;
 mod format;
 mod image;
+mod swizzle;
 #[cfg(test)]
 mod tests;
 
@@ -136,6 +137,8 @@ pub struct TextureInfo {
     pub width: u32,
     pub height: u32,
     pub format: PixelFormat,
+    /// How the format reading is supported for this container.
+    pub format_basis: &'static str,
     pub flags: u8,
     pub kind: u8,
     pub tile_mode: u8,
@@ -292,43 +295,6 @@ impl Store {
         self.container.version
     }
 
-    /// The reconstructed byte length of one level. The offset follows the
-    /// level order the container uses: the largest level first.
-    fn level_range(&self, info: &TextureInfo, level: u32) -> Result<(u64, u64), Error> {
-        let codec = info.format.codec.ok_or_else(|| {
-            Error::Unsupported(
-                info.status
-                    .reason()
-                    .unwrap_or("the pixel format is not supported")
-                    .to_string(),
-            )
-        })?;
-        if level >= 32 {
-            return Err(Error::Invalid(format!(
-                "mip level {level} is outside the supported range"
-            )));
-        }
-        let mut offset = 0u64;
-        for current in 0..level {
-            offset = offset
-                .checked_add(codec.level_len(info.width >> current, info.height >> current))
-                .ok_or_else(|| Error::Invalid("the mip offset overflows".into()))?;
-        }
-        let (width, height) = ((info.width >> level).max(1), (info.height >> level).max(1));
-        let len = codec.level_len(width, height);
-        if offset
-            .checked_add(len)
-            .is_none_or(|end| end > info.encoded_len)
-        {
-            return Err(Error::Invalid(format!(
-                "level {level} needs bytes {offset:#x}..{:#x}, beyond the {:#x}-byte range",
-                offset + len,
-                info.encoded_len
-            )));
-        }
-        Ok((offset, len))
-    }
-
     /// Decodes one level of one texture. The work runs on the caller's thread;
     /// pass a cancellation flag when it runs on a background thread.
     pub fn decode(&self, index: u32, level: u32, cancel: &AtomicBool) -> Result<Image, Error> {
@@ -344,11 +310,28 @@ impl Store {
                     .to_string(),
             ));
         }
-        let (offset, len) = self.level_range(info, level)?;
+        let level_info = info
+            .levels
+            .iter()
+            .find(|candidate| candidate.level == level)
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "texture {index} has no established mip level {level}"
+                ))
+            })?;
+        let (offset, len) = (level_info.offset, level_info.encoded_len);
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Invalid("the level range overflows".into()))?;
+        if end > MAX_TEXTURE_BYTES {
+            return Err(Error::Invalid(format!(
+                "level {level} needs {end} bytes, more than the {MAX_TEXTURE_BYTES}-byte decode limit"
+            )));
+        }
         let mut container = self.container.clone();
         container.decoded_total = 0;
         let mut source = self.source.clone();
-        let mut bytes = Vec::with_capacity(len as usize);
+        let mut bytes = Vec::with_capacity(end as usize);
         rds5::reconstruct_texture(
             &mut source,
             &mut container,
@@ -359,29 +342,32 @@ impl Store {
             },
             cancel,
             |chunk| {
-                let remaining = len.saturating_sub(bytes.len() as u64);
+                let remaining = end.saturating_sub(bytes.len() as u64);
                 let take = remaining.min(chunk.len() as u64) as usize;
                 bytes.extend_from_slice(&chunk[..take]);
                 Ok(())
             },
         )?;
-        if (bytes.len() as u64) < offset + len {
+        if (bytes.len() as u64) < end {
             return Err(Error::Invalid(format!(
-                "the range holds {} bytes, less than level {level}'s {} bytes",
-                bytes.len(),
-                len
+                "the range holds {} bytes, less than level {level}'s bytes {offset:#x}..{end:#x}",
+                bytes.len()
             )));
         }
         let codec = info
             .format
             .codec
             .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
-        let (width, height) = ((info.width >> level).max(1), (info.height >> level).max(1));
         let start = offset as usize;
-        let rgba = decode::decode(codec, &bytes[start..start + len as usize], width, height)?;
+        let rgba = decode::decode(
+            codec,
+            &bytes[start..start + len as usize],
+            level_info.width,
+            level_info.height,
+        )?;
         Ok(Image {
-            width,
-            height,
+            width: level_info.width,
+            height: level_info.height,
             level,
             rgba,
         })
@@ -396,6 +382,18 @@ impl Store {
     ) -> Result<Image, Error> {
         let image = self.decode(index, 0, cancel)?;
         Ok(image.thumbnail(max_side))
+    }
+}
+
+/// How the pixel reading for an RDS5 format id is supported. The store samples
+/// validate formats 28 and 80 as images; the other mappings are size fits or
+/// observations that still need an independent check.
+fn rds5_format_basis(id: u8) -> &'static str {
+    match id {
+        28 | 80 => "validated in the sampled RDS5 store",
+        71 | 72 | 77 | 83 | 98 | 99 => "probable: size fit or image observation",
+        54 => "candidate: no simple-2D sample",
+        _ => "unsupported",
     }
 }
 
@@ -418,6 +416,7 @@ fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Erro
         width: entry.width(),
         height: entry.height(),
         format,
+        format_basis: rds5_format_basis(entry.format_id()),
         flags: entry.flags(),
         kind: entry.kind(),
         tile_mode: entry.tile_mode(),
@@ -506,7 +505,9 @@ fn classify(
         width: entry.width(),
         height: entry.height(),
         encoded_len: level0_len,
-        offset: 0,
+        // Levels are stored smallest mip first and the stream is right-aligned
+        // in the descriptor range. Level 0 is therefore at the end.
+        offset: encoded_len - level0_len,
     };
     (Status::Decodable, vec![level])
 }

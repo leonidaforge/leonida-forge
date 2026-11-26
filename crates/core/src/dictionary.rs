@@ -150,6 +150,7 @@ fn record_json(record: &dictionary::Record) -> Value {
         "width": record.width,
         "height": record.height,
         "format_id": record.format_id,
+        "swizzle": record.swizzle,
         "mip_word": record.mip_word,
         "mip_levels": record.mip_levels,
         "neutral": record.neutral,

@@ -7,7 +7,8 @@ use lforge_binary::{Source, read_at};
 use lforge_rage9::dictionary;
 
 use super::{
-    Codec, Error, Image, LevelInfo, MAX_EDGE, MAX_PIXELS, Status, TextureInfo, decode, pixel_format,
+    Codec, Error, Image, LevelInfo, MAX_EDGE, MAX_PIXELS, Status, TextureInfo, decode,
+    pixel_format, swizzle,
 };
 
 /// A type-5 RAGE resource whose system segment passes the dictionary grammar.
@@ -119,6 +120,13 @@ impl DictionaryStore {
             .format
             .codec
             .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
+        // A tiled allocation stores a padded 4 KiB tile grid; the decoder
+        // wants the unpadded row-major elements.
+        let bytes = if info.tile_mode != 0 {
+            swizzle::deswizzle(&bytes, level_info.width, level_info.height, codec)?
+        } else {
+            bytes
+        };
         let rgba = decode::decode(codec, &bytes, level_info.width, level_info.height)?;
         Ok(Image {
             width: level_info.width,
@@ -135,6 +143,18 @@ impl DictionaryStore {
         cancel: &AtomicBool,
     ) -> Result<Image, Error> {
         Ok(self.decode(index, 0, 0, cancel)?.thumbnail(max_side))
+    }
+}
+
+/// How the pixel reading for a native dictionary format id is supported. The
+/// sampled records validate 77 and 98 as images; the other mappings remain
+/// size fits.
+fn native_format_basis(id: u8) -> &'static str {
+    match id {
+        77 | 98 => "validated in a sampled native dictionary",
+        71 | 72 | 80 | 83 | 99 => "probable: size fit",
+        54 => "candidate: no simple-2D sample",
+        _ => "unsupported",
     }
 }
 
@@ -162,9 +182,10 @@ fn texture_info(record: &dictionary::Record) -> TextureInfo {
         width: u32::from(record.width),
         height: u32::from(record.height),
         format,
+        format_basis: native_format_basis(record.format_id),
         flags: 0,
         kind: 2,
-        tile_mode: 0,
+        tile_mode: record.swizzle,
         array_size: 1,
         mip_field: record.mip_levels.min(255) as u8,
         encoded_len: extent,
@@ -219,15 +240,27 @@ fn classify(
             Vec::new(),
         );
     }
-    if extent < level0_len {
+    let stored_len = if record.swizzle != 0 {
+        swizzle::padded_len(codec, width, height)
+    } else {
+        level0_len
+    };
+    if extent < stored_len {
         return (
             Status::Invalid(format!(
-                "the allocation holds {extent} bytes, less than level 0's {level0_len}"
+                "the allocation holds {extent} bytes, less than level 0's {stored_len}"
             )),
             Vec::new(),
         );
     }
-    let levels = plan_levels(codec, width, height, extent, record.mip_levels);
+    let levels = stored_levels(
+        codec,
+        width,
+        height,
+        extent,
+        record.mip_word as u8,
+        record.swizzle != 0,
+    );
     if levels.is_empty() {
         return (
             Status::Invalid("no mip level fits the allocation".into()),
@@ -237,39 +270,45 @@ fn classify(
     (Status::Decodable, levels)
 }
 
-/// Native dictionary mip counts are the low 15 bits of the mip word. A count
-/// of one is the common case; larger values are accepted only while each
-/// level fits the allocation.
-fn plan_levels(
+/// Exposes level 0 only. The native mip word is kept in
+/// [`TextureInfo::mip_field`], but no sampled dictionary establishes whether
+/// it is a level count or a maximum index. Treating allocation padding as
+/// another level would fabricate data, so additional levels are not exposed
+/// until a real multi-level layout is validated.
+fn stored_levels(
     codec: Codec,
     width: u32,
     height: u32,
     extent: u64,
-    mip_levels: u16,
+    mip_count: u8,
+    swizzled: bool,
 ) -> Vec<LevelInfo> {
-    let count = u32::from(mip_levels.max(1));
-    let mut offset = 0u64;
-    let mut levels = Vec::new();
-    for level in 0..count {
-        let level_width = (width >> level).max(1);
-        let level_height = (height >> level).max(1);
-        let encoded_len = codec.level_len(level_width, level_height);
-        if offset
-            .checked_add(encoded_len)
-            .is_none_or(|end| end > extent)
-        {
-            break;
-        }
-        levels.push(LevelInfo {
-            level,
-            width: level_width,
-            height: level_height,
-            encoded_len,
-            offset,
-        });
-        offset += encoded_len;
+    let padded = swizzle::padded_len(codec, width, height);
+    let encoded_len = if swizzled {
+        padded
+    } else {
+        codec.level_len(width, height)
+    };
+    if encoded_len > extent {
+        return Vec::new();
     }
-    levels
+    // Levels are stored smallest first, so level 0 ends the allocation when
+    // the descriptor declares more than one level.
+    let offset = if mip_count > 1 && extent >= padded {
+        extent - padded
+    } else {
+        0
+    };
+    if offset.saturating_add(encoded_len) > extent {
+        return Vec::new();
+    }
+    vec![LevelInfo {
+        level: 0,
+        width,
+        height,
+        encoded_len,
+        offset,
+    }]
 }
 
 #[cfg(test)]
@@ -277,25 +316,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_single_mip_is_planned_from_the_mip_word() {
-        let levels = plan_levels(Codec::Bc7, 1024, 512, 524_288, 1);
+    fn only_level_zero_is_exposed() {
+        let levels = stored_levels(Codec::Bc7, 1024, 512, 524_288, 1, false);
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].encoded_len, 524_288);
         assert_eq!(levels[0].offset, 0);
     }
 
     #[test]
-    fn levels_stop_before_the_allocation_ends() {
-        // BC1 8 x 8 is 32 bytes; its 4 x 4 mip is 8 bytes. An allocation of
-        // 40 bytes holds exactly two levels.
-        let levels = plan_levels(Codec::Bc1, 8, 8, 40, 4);
-        assert_eq!(levels.len(), 2);
-        assert_eq!((levels[1].width, levels[1].height), (4, 4));
-        assert_eq!(levels[1].offset, 32);
+    fn a_roomy_allocation_does_not_add_unvalidated_levels() {
+        // The raw mip word is not used here: 40 bytes never become two levels
+        // without an established layout. The allocation could hold padding.
+        let levels = stored_levels(Codec::Bc1, 8, 8, 40, 1, false);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].encoded_len, 32);
     }
 
     #[test]
-    fn an_allocation_smaller_than_level_zero_plans_nothing() {
-        assert!(plan_levels(Codec::Bc1, 8, 8, 31, 4).is_empty());
+    fn an_allocation_smaller_than_level_zero_exposes_nothing() {
+        assert!(stored_levels(Codec::Bc1, 8, 8, 31, 1, false).is_empty());
+    }
+
+    #[test]
+    fn a_tiled_level_reads_the_padded_allocation() {
+        let levels = stored_levels(Codec::Bc7, 1920, 1080, 2_088_960, 1, true);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].encoded_len, 2_088_960);
+        assert_eq!(levels[0].offset, 0);
+    }
+
+    #[test]
+    fn a_tiled_allocation_smaller_than_its_tiles_exposes_nothing() {
+        // 2,073,600 is the unpadded size; the tile grid needs 2,088,960.
+        assert!(stored_levels(Codec::Bc7, 1920, 1080, 2_073_600, 1, true).is_empty());
+    }
+
+    #[test]
+    fn a_multi_level_allocation_right_aligns_level_zero() {
+        let levels = stored_levels(Codec::Bc7, 1024, 512, 1_572_864, 2, true);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].encoded_len, 524_288);
+        assert_eq!(levels[0].offset, 1_048_576);
+    }
+
+    #[test]
+    fn a_single_level_allocation_is_not_right_aligned() {
+        let levels = stored_levels(Codec::Bc7, 1024, 512, 524_288, 1, true);
+        assert_eq!(levels[0].offset, 0);
     }
 }

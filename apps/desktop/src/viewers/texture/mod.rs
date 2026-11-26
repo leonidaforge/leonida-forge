@@ -30,16 +30,24 @@ pub fn open(path: PathBuf, access: Access, cx: &mut App) {
     open_loaded(path, access, false, cx);
 }
 
-/// Tries to open a native texture dictionary. A resource that is not a
-/// dictionary keeps its existing Binary Inspector behaviour.
+/// Opens a type-5 resource as a texture dictionary, falling back to the Binary
+/// Inspector when it is not one. This is the default double-click behaviour.
 pub fn open_resource(path: PathBuf, access: Access, cx: &mut App) {
     open_loaded(path, access, true, cx);
+}
+
+/// Opens a type-5 resource as a texture dictionary and reports why it cannot
+/// be opened. This is the explicit **Open as Texture** action, which must not
+/// silently substitute a different viewer.
+pub fn open_resource_explicit(path: PathBuf, access: Access, cx: &mut App) {
+    open_loaded(path, access, false, cx);
 }
 
 fn open_loaded(path: PathBuf, access: Access, fallback_inspector: bool, cx: &mut App) {
     let load_path = path.clone();
     let load_access = access.clone();
-    let load = cx.background_spawn(async move { load_store(&load_path, &load_access) });
+    let load = cx
+        .background_spawn(async move { load_store(&load_path, &load_access, fallback_inspector) });
     cx.spawn(async move |cx| {
         let result = load.await;
         cx.update(|cx| match result {
@@ -108,7 +116,11 @@ enum LoadError {
     Message(String),
 }
 
-fn load_store(path: &Path, access: &Access) -> Result<TextureStore, LoadError> {
+fn load_store(
+    path: &Path,
+    access: &Access,
+    fallback_inspector: bool,
+) -> Result<TextureStore, LoadError> {
     let file =
         files::open_binary_with(path, access).map_err(|err| LoadError::Message(err.to_string()))?;
     let head = lforge_binary::read_at(&mut file.source.clone(), 0, 16).unwrap_or_default();
@@ -117,15 +129,24 @@ fn load_store(path: &Path, access: &Access) -> Result<TextureStore, LoadError> {
             .map(TextureStore::Rds5)
             .map_err(|err| LoadError::Message(err.to_string()));
     }
-    // A type-5 resource that is not a texture dictionary keeps its Binary
-    // Inspector behaviour, so a page split we cannot establish is not a
-    // texture error either.
-    let Ok(Some(split)) = files::resource_split_with(path, access, &file.source) else {
-        return Err(LoadError::NotTexture);
+    let split = match files::resource_split_with(path, access, &file.source) {
+        Ok(Some(split)) => split,
+        Ok(None) => return Err(LoadError::NotTexture),
+        Err(_) if fallback_inspector => return Err(LoadError::NotTexture),
+        Err(err) => {
+            return Err(LoadError::Message(format!(
+                "the resource page split could not be established: {err}"
+            )));
+        }
     };
     match DictionaryStore::open(file.source, split.system_len) {
         Ok(store) => Ok(TextureStore::Dictionary(store)),
-        Err(lforge_texture::Error::NotDictionary(_)) => Err(LoadError::NotTexture),
+        Err(lforge_texture::Error::NotDictionary(_)) if fallback_inspector => {
+            Err(LoadError::NotTexture)
+        }
+        Err(lforge_texture::Error::NotDictionary(reason)) => Err(LoadError::Message(format!(
+            "the system segment is not a texture dictionary: {reason}"
+        ))),
         Err(err) => Err(LoadError::Message(err.to_string())),
     }
 }
@@ -145,10 +166,22 @@ fn file_name(path: &Path) -> String {
 }
 
 pub(crate) fn window_options(title: String, window_size: Size<Pixels>, cx: &App) -> WindowOptions {
+    let display = cx.primary_display();
+    let target = match display.as_ref().map(|display| display.visible_bounds()) {
+        Some(visible) => {
+            let max_width = (f32::from(visible.size.width) - 24.).max(200.);
+            let max_height = (f32::from(visible.size.height) - 48.).max(200.);
+            size(
+                px(f32::from(window_size.width).min(max_width)),
+                px(f32::from(window_size.height).min(max_height)),
+            )
+        }
+        None => window_size,
+    };
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            window_size,
+            display.as_ref().map(|display| display.id()),
+            target,
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
@@ -173,6 +206,7 @@ pub(crate) fn metadata_rows(
             "Format",
             SharedString::from(format!("{} (id {})", info.format.name, info.format.id)),
         ),
+        ("Format evidence", SharedString::from(info.format_basis)),
         (
             "Kind / array",
             SharedString::from(format!("kind {}, array {}", info.kind, info.array_size)),
@@ -256,7 +290,7 @@ pub(crate) fn metadata_panel(
 pub(crate) fn initial_window_size(info: &TextureInfo, window: &Window) -> Size<Pixels> {
     let scale = window.scale_factor().max(0.1);
     let width = (info.width as f32 / scale + 120.).clamp(640., 1400.);
-    let height = (info.height as f32 / scale + 340.).clamp(560., 1000.);
+    let height = (info.height as f32 / scale + 340.).clamp(560., 800.);
     size(px(width), px(height))
 }
 

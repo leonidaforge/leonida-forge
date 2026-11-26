@@ -296,13 +296,23 @@ impl TextureDictionaryViewer {
             },
         );
         self.thumbnail_order.push_back(index);
-        while self.thumbnail_order.len() > MAX_THUMBNAILS {
-            let Some(oldest) = self.thumbnail_order.pop_front() else {
+        self.trim_thumbnails();
+    }
+
+    /// Keeps thumbnail state bounded without evicting the selected texture.
+    fn trim_thumbnails(&mut self) {
+        while self.thumbnails.len() > MAX_THUMBNAILS {
+            let Some(position) = self
+                .thumbnail_order
+                .iter()
+                .position(|key| *key != self.selected as u32)
+            else {
                 break;
             };
-            if oldest != self.selected as u32 {
-                self.thumbnails.remove(&oldest);
-            }
+            let Some(key) = self.thumbnail_order.remove(position) else {
+                break;
+            };
+            self.thumbnails.remove(&key);
         }
     }
 

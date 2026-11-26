@@ -45,8 +45,12 @@ pub fn build(blocks: &[Vec<u8>], entries: &[[u32; 4]]) -> Vec<u8> {
         .iter()
         .map(|block| {
             let mut bytes = block.clone();
+            // A page shorter than one virtual page is right-aligned behind a
+            // zero prelude, matching the sampled level model.
             if bytes.len() < 0x1000 {
-                bytes.resize(0x1000, 0);
+                let mut page = vec![0u8; 0x1000];
+                page[0x1000 - bytes.len()..].copy_from_slice(&bytes);
+                bytes = page;
             }
             bytes
         })

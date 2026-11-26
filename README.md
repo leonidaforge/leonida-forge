@@ -67,9 +67,9 @@ It decodes format 28 as linear RGBA8, formats 71 and 72 as BC1, format 77 as BC3
 Format 54 is decoded as R16_FLOAT as a candidate reading; no simple-2D sample confirms it.
 Only simple 2D textures are decoded. A kind that is not 2, or an array of more than one slice, is reported as unsupported.
 Block storage classes `0x20` (zlib) and `0x00` (stored) are decoded. Other storage classes are reported by value and not decoded; the UI and map stores sampled in this build commonly use class `0x04`, whose content is unknown.
-RDS5 stores expose one decoded level. The descriptor's mip word is shown, but its relation to a level count is not established.
+RDS5 levels are stored smallest first and the stream is right-aligned in the descriptor range, so the viewer reads level 0 from the end of that range. The descriptor's mip word is shown, but its relation to a level count is not established.
 A type-5 RAGE resource row whose system segment passes the dictionary grammar opens in the same dictionary viewer. The viewer reads the system and graphics split from the row's chunk table and page map. A type-5 row that is not a dictionary, or whose split cannot be established, opens in the Binary Inspector instead.
-Native dictionary records carry one stored level in the sampled assets. A record whose mip word declares more levels exposes only the levels that fit its allocation.
+Native dictionary records carry one stored level in the sampled assets. A non-zero `+0x40` stores that level as a 4 KiB tile grid; the viewer reorders it before decoding. Only level 0 is exposed; the raw mip word is shown without turning allocation padding into another level.
 
 ## RPF9 archives
 

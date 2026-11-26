@@ -76,7 +76,7 @@ pub fn pixel_format(id: u8) -> PixelFormat {
             id,
             name: "BC3",
             codec: Some(Codec::Bc3),
-            detail: "16 bytes per 4 x 4 block, BC3 alpha and colour; the sampled glyphs decode",
+            detail: "16 bytes per 4 x 4 block, BC3 alpha and colour; the sampled glyphs decode after the tiled reorder",
         },
         80 => PixelFormat {
             id,
@@ -94,7 +94,7 @@ pub fn pixel_format(id: u8) -> PixelFormat {
             id,
             name: "BC7",
             codec: Some(Codec::Bc7),
-            detail: "16 bytes per 4 x 4 block; the sampled text atlas decodes",
+            detail: "16 bytes per 4 x 4 block; the sampled UI and photo records decode after the tiled reorder",
         },
         _ => PixelFormat {
             id,

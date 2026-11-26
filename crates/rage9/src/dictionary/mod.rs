@@ -179,6 +179,9 @@ pub struct Record {
     pub height: u16,
     /// `+0x3F`: format id, not mapped to an enum.
     pub format_id: u8,
+    /// `+0x40`: zero for a row-major allocation; non-zero when the graphics
+    /// segment stores the level in 4 KiB tiles.
+    pub swizzle: u8,
     /// `+0x42`: the raw mip word.
     pub mip_word: u16,
     /// Low 15 bits of the mip word.
@@ -441,6 +444,7 @@ pub fn parse(system: &[u8], graphics_len: u64, limits: &Limits) -> Result<Report
             width: u16_at(system, base + 0x38).unwrap_or(0),
             height: u16_at(system, base + 0x3A).unwrap_or(0),
             format_id: system.get(base + 0x3F).copied().unwrap_or(0),
+            swizzle: system.get(base + 0x40).copied().unwrap_or(0),
             mip_word: u16_at(system, base + 0x42).unwrap_or(0),
             mip_levels: u16_at(system, base + 0x42).unwrap_or(0) & MIP_LEVEL_MASK,
             neutral: [

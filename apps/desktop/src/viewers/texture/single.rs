@@ -282,7 +282,17 @@ impl Render for TextureViewer {
         if !self.resized
             && let Some(info) = &self.info
         {
-            window.resize(initial_window_size(info, window));
+            let mut target = initial_window_size(info, window);
+            if let Some(display) = window.display(cx) {
+                let visible = display.visible_bounds();
+                target.width =
+                    px(f32::from(target.width)
+                        .min((f32::from(visible.size.width) - 24.).max(200.)));
+                target.height =
+                    px(f32::from(target.height)
+                        .min((f32::from(visible.size.height) - 48.).max(200.)));
+            }
+            window.resize(target);
             self.resized = true;
         }
         let (width, height) = self.available_size(window);
