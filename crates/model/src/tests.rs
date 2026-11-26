@@ -206,6 +206,7 @@ fn build(shader: &Shader, provider: &dyn TextureProvider) -> (Material, Scene, V
     let mut diagnostics = Vec::new();
     let embedded = HashMap::new();
     let mut embedded_indices = HashMap::new();
+    let mut texture_bindings = Vec::new();
     let mut external_indices = HashMap::new();
     let material = {
         let mut context = MaterialContext {
@@ -213,6 +214,7 @@ fn build(shader: &Shader, provider: &dyn TextureProvider) -> (Material, Scene, V
             graphics: &[],
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
+            texture_bindings: &mut texture_bindings,
             external_indices: &mut external_indices,
             scene: &mut scene,
             diagnostics: &mut diagnostics,
@@ -234,6 +236,32 @@ fn a_missing_texture_is_a_fallback_with_a_diagnostic() {
             .iter()
             .any(|d| d.reference.as_deref() == Some("0x0123456789ABCDEF"))
     );
+}
+
+#[test]
+fn a_missing_texture_keeps_its_binding_report() {
+    let mut scene = Scene::new();
+    let mut diagnostics = Vec::new();
+    let embedded = HashMap::new();
+    let mut embedded_indices = HashMap::new();
+    let mut external_indices = HashMap::new();
+    let mut texture_bindings = Vec::new();
+    let shader = shader(0);
+    let mut context = MaterialContext {
+        provider: &NoTextures,
+        graphics: &[],
+        embedded: &embedded,
+        embedded_indices: &mut embedded_indices,
+        external_indices: &mut external_indices,
+        texture_bindings: &mut texture_bindings,
+        scene: &mut scene,
+        diagnostics: &mut diagnostics,
+    };
+    build_material(&shader, 0, &mut context);
+    assert_eq!(texture_bindings.len(), 1);
+    assert_eq!(texture_bindings[0].key64, 0x0123_4567_89AB_CDEF);
+    assert_eq!(texture_bindings[0].texture, None);
+    assert_eq!(texture_bindings[0].status, TextureBindingStatus::Missing);
 }
 
 struct OneTexture(SourceLevel);
@@ -264,12 +292,14 @@ fn a_resolved_texture_is_bound_once_and_deduplicated() {
     let provider = OneTexture(texture);
     let embedded = HashMap::new();
     let mut embedded_indices = HashMap::new();
+    let mut texture_bindings = Vec::new();
     let (material, second) = {
         let mut context = MaterialContext {
             provider: &provider,
             graphics: &[],
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
+            texture_bindings: &mut texture_bindings,
             external_indices: &mut external,
             scene: &mut scene,
             diagnostics: &mut diagnostics,
@@ -342,6 +372,7 @@ fn specular_tex_fills_the_sampled_slot_and_tex2_stays_distinct() {
     let mut diagnostics = Vec::new();
     let embedded = HashMap::new();
     let mut embedded_indices = HashMap::new();
+    let mut texture_bindings = Vec::new();
     let mut external_indices = HashMap::new();
     let shader = shader_with_parameters(&[SPECULAR_TEX2, SPECULAR_TEX]);
     let material = {
@@ -350,6 +381,7 @@ fn specular_tex_fills_the_sampled_slot_and_tex2_stays_distinct() {
             graphics: &[],
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
+            texture_bindings: &mut texture_bindings,
             external_indices: &mut external_indices,
             scene: &mut scene,
             diagnostics: &mut diagnostics,
@@ -407,4 +439,18 @@ fn texture_completeness_is_separate_from_geometry() {
         texture_completeness(2, true),
         TextureCompleteness::Partial { missing: 2 }
     );
+}
+
+#[test]
+fn format_78_maps_to_bc3_srgb() {
+    let level = SourceLevel {
+        width: 4,
+        height: 4,
+        level: 0,
+        format: lforge_texture::pixel_format(78),
+        data: vec![0u8; 16],
+        swizzled: false,
+    };
+    let texture = texture_from_source(level, "format 78".into()).unwrap();
+    assert_eq!(texture.format, TextureFormat::Bc3UnormSrgb);
 }

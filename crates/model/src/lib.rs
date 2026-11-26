@@ -163,6 +163,31 @@ pub struct ModelCompleteness {
     pub notes: Vec<String>,
 }
 
+/// What happened to one material texture reference. Every bound slot is
+/// reported, including references that no store could satisfy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextureBindingStatus {
+    Resolved,
+    Missing,
+    Ambiguous(Vec<String>),
+    Failed(String),
+}
+
+/// Provenance for one material texture reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextureBindingReport {
+    pub material: String,
+    pub parameter: u32,
+    pub semantic: lforge_scene::TextureSemantic,
+    pub key64: u64,
+    pub hash32: Option<u32>,
+    /// The record was embedded in the drawable rather than looked up in a store.
+    pub embedded: bool,
+    /// Index in [`Scene::textures`] when the texture was reconstructed.
+    pub texture: Option<usize>,
+    pub status: TextureBindingStatus,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedModel {
     pub scene: Scene,
@@ -171,6 +196,8 @@ pub struct DecodedModel {
     pub lod: usize,
     /// Geometry and texture completeness are separate properties.
     pub completeness: ModelCompleteness,
+    /// Every bound texture reference with its resolution status.
+    pub texture_bindings: Vec<TextureBindingReport>,
 }
 
 /// Whether the resource has the header and LOD chain of a drawable at zero.
@@ -290,8 +317,9 @@ pub fn decode(
         .into_iter()
         .map(|texture| (texture.key, texture))
         .collect();
-    let mut embedded_indices: HashMap<u64, Option<usize>> = HashMap::new();
-    let mut external_indices: HashMap<u64, Option<usize>> = HashMap::new();
+    let mut embedded_indices: HashMap<u64, (Option<usize>, TextureBindingStatus)> = HashMap::new();
+    let mut external_indices: HashMap<u64, (Option<usize>, TextureBindingStatus)> = HashMap::new();
+    let mut texture_bindings = Vec::new();
 
     let used_shaders = used_shader_indices(system, lod, &mut diagnostics);
     let mut shader_materials: HashMap<usize, usize> = HashMap::new();
@@ -302,6 +330,7 @@ pub fn decode(
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
             external_indices: &mut external_indices,
+            texture_bindings: &mut texture_bindings,
             scene: &mut scene,
             diagnostics: &mut diagnostics,
         };
@@ -396,6 +425,7 @@ pub fn decode(
             selected_name,
             notes,
         },
+        texture_bindings,
     })
 }
 
@@ -552,8 +582,9 @@ struct MaterialContext<'a> {
     provider: &'a dyn TextureProvider,
     graphics: &'a [u8],
     embedded: &'a HashMap<u64, EmbeddedTexture>,
-    embedded_indices: &'a mut HashMap<u64, Option<usize>>,
-    external_indices: &'a mut HashMap<u64, Option<usize>>,
+    embedded_indices: &'a mut HashMap<u64, (Option<usize>, TextureBindingStatus)>,
+    external_indices: &'a mut HashMap<u64, (Option<usize>, TextureBindingStatus)>,
+    texture_bindings: &'a mut Vec<TextureBindingReport>,
     scene: &'a mut Scene,
     diagnostics: &'a mut Vec<Diagnostic>,
 }
@@ -569,6 +600,7 @@ fn build_material(
         embedded,
         embedded_indices,
         external_indices,
+        texture_bindings,
         scene,
         diagnostics,
     } = context;
@@ -600,20 +632,21 @@ fn build_material(
             parameter,
             material: name.clone(),
         };
-        let texture_index = if let Some(texture) = embedded.get(&key) {
+        let is_embedded = embedded.contains_key(&key);
+        let (texture_index, binding_status) = if let Some(texture) = embedded.get(&key) {
             match embedded_indices.get(&key) {
-                Some(index) => *index,
+                Some((index, status)) => (*index, status.clone()),
                 None => {
                     let result = decode_embedded(graphics, texture, 0, &AtomicBool::new(false))
                         .map_err(|err| err.to_string())
                         .and_then(|level| {
                             texture_from_source(level, format!("embedded: {}", texture.info().name))
                         });
-                    let index = match result {
+                    let (index, status) = match result {
                         Ok(texture) => {
                             let index = scene.textures.len();
                             scene.textures.push(texture);
-                            Some(index)
+                            (Some(index), TextureBindingStatus::Resolved)
                         }
                         Err(reason) => {
                             diagnostics.push(
@@ -623,65 +656,77 @@ fn build_material(
                                 .with_material(name.clone())
                                 .with_reference(format!("0x{key:016X}")),
                             );
-                            None
+                            (None, TextureBindingStatus::Failed(reason))
                         }
                     };
-                    embedded_indices.insert(key, index);
-                    index
+                    embedded_indices.insert(key, (index, status.clone()));
+                    (index, status)
                 }
             }
+        } else if let Some((index, status)) = external_indices.get(&key) {
+            (*index, status.clone())
         } else {
-            *external_indices
-                .entry(key)
-                .or_insert_with(|| match provider.resolve(&reference) {
-                    TextureResolution::Missing => {
-                        diagnostics.push(
-                            Diagnostic::new("texture is not present in any texture store")
-                                .with_material(name.clone())
-                                .with_reference(format!("0x{key:016X}")),
-                        );
-                        None
-                    }
-                    TextureResolution::Ambiguous(candidates) => {
-                        diagnostics.push(
-                            Diagnostic::new(format!(
-                                "texture reference is ambiguous: {} candidates",
-                                candidates.len()
-                            ))
+            let (index, status) = match provider.resolve(&reference) {
+                TextureResolution::Missing => {
+                    diagnostics.push(
+                        Diagnostic::new("texture is not present in any texture store")
                             .with_material(name.clone())
-                            .with_reference(format!("0x{key:016X}: {}", candidates.join(", "))),
-                        );
-                        None
-                    }
-                    TextureResolution::Failed(reason) => {
-                        diagnostics.push(
-                            Diagnostic::new(format!("texture could not be decoded: {reason}"))
+                            .with_reference(format!("0x{key:016X}")),
+                    );
+                    (None, TextureBindingStatus::Missing)
+                }
+                TextureResolution::Ambiguous(candidates) => {
+                    diagnostics.push(
+                        Diagnostic::new(format!(
+                            "texture reference is ambiguous: {} candidates",
+                            candidates.len()
+                        ))
+                        .with_material(name.clone())
+                        .with_reference(format!("0x{key:016X}: {}", candidates.join(", "))),
+                    );
+                    (None, TextureBindingStatus::Ambiguous(candidates))
+                }
+                TextureResolution::Failed(reason) => {
+                    diagnostics.push(
+                        Diagnostic::new(format!("texture could not be decoded: {reason}"))
+                            .with_material(name.clone())
+                            .with_reference(format!("0x{key:016X}")),
+                    );
+                    (None, TextureBindingStatus::Failed(reason))
+                }
+                TextureResolution::Resolved(resolved) => {
+                    match texture_from_source(resolved.level, resolved.source) {
+                        Ok(texture) => {
+                            let index = scene.textures.len();
+                            scene.textures.push(texture);
+                            (Some(index), TextureBindingStatus::Resolved)
+                        }
+                        Err(reason) => {
+                            diagnostics.push(
+                                Diagnostic::new(format!(
+                                    "texture could not be converted: {reason}"
+                                ))
                                 .with_material(name.clone())
                                 .with_reference(format!("0x{key:016X}")),
-                        );
-                        None
-                    }
-                    TextureResolution::Resolved(resolved) => {
-                        match texture_from_source(resolved.level, resolved.source) {
-                            Ok(texture) => {
-                                let index = scene.textures.len();
-                                scene.textures.push(texture);
-                                Some(index)
-                            }
-                            Err(reason) => {
-                                diagnostics.push(
-                                    Diagnostic::new(format!(
-                                        "texture could not be converted: {reason}"
-                                    ))
-                                    .with_material(name.clone())
-                                    .with_reference(format!("0x{key:016X}")),
-                                );
-                                None
-                            }
+                            );
+                            (None, TextureBindingStatus::Failed(reason))
                         }
                     }
-                })
+                }
+            };
+            external_indices.insert(key, (index, status.clone()));
+            (index, status)
         };
+        texture_bindings.push(TextureBindingReport {
+            material: name.clone(),
+            parameter,
+            semantic,
+            key64: key,
+            hash32: slot.hash32,
+            embedded: is_embedded,
+            texture: texture_index,
+            status: binding_status,
+        });
         let Some(texture_index) = texture_index else {
             missing = true;
             continue;
