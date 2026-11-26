@@ -57,17 +57,19 @@ Known formats are the RDS5 container, whose header, record array, ETPF chunk ext
 
 ## Texture viewer
 
-Double-click a `.ttpf` texture store, or right-click it and choose **Open as Texture**.
+Double-click a `.ttpf` texture store, or a type-5 RAGE resource row, to open it as a texture. Right-click either and choose **Open as Texture** to open it from the menu.
 A store with one texture opens the single-image viewer. A store with several opens the dictionary viewer: a scrollable list with thumbnails and metadata on the left, and the selected texture on the right.
 Double-click an entry, or press Enter, to open that texture in its own window.
 Both windows share fit-to-window scaling, wheel zoom, drag panning, a transparency checkerboard and a mip selector when more than one level is available.
 
 Decoding lives in `lforge-texture`, outside the UI.
-It decodes format 28 as linear RGBA8, formats 71 and 72 as BC1, format 80 as BC4 and format 83 as BC5, with row-major 4 x 4 blocks.
-Block storage classes `0x20` (zlib) and `0x00` (stored) are decoded.
-Other storage classes and format ids 54, 77, 98 and 99 are reported as unsupported rather than guessed; the UI and map stores sampled in this build commonly use storage class `0x04`, which is not decoded.
-The sampled stores expose one decoded level. The descriptor's mip word is shown, but its relation to a level count is not established.
-A type-5 RAGE resource row that carries a texture dictionary is still opened in the Binary Inspector: the native row reader does not expose the system/graphics page split that the dictionary grammar needs.
+It decodes format 28 as linear RGBA8, formats 71 and 72 as BC1, format 77 as BC3, format 80 as BC4, format 83 as BC5 and formats 98 and 99 as BC7, with row-major 4 x 4 blocks.
+Format 54 is decoded as R16_FLOAT as a candidate reading; no simple-2D sample confirms it.
+Only simple 2D textures are decoded. A kind that is not 2, or an array of more than one slice, is reported as unsupported.
+Block storage classes `0x20` (zlib) and `0x00` (stored) are decoded. Other storage classes are reported by value and not decoded; the UI and map stores sampled in this build commonly use class `0x04`, whose content is unknown.
+RDS5 stores expose one decoded level. The descriptor's mip word is shown, but its relation to a level count is not established.
+A type-5 RAGE resource row whose system segment passes the dictionary grammar opens in the same dictionary viewer. The viewer reads the system and graphics split from the row's chunk table and page map. A type-5 row that is not a dictionary, or whose split cannot be established, opens in the Binary Inspector instead.
+Native dictionary records carry one stored level in the sampled assets. A record whose mip word declares more levels exposes only the levels that fit its allocation.
 
 ## RPF9 archives
 
