@@ -59,6 +59,8 @@ pub struct TextureDictionaryViewer {
     generation: u64,
     cancel: Option<Arc<AtomicBool>>,
     _decode: Option<Task<()>>,
+    loading: bool,
+    decode_error: Option<String>,
 }
 
 impl TextureDictionaryViewer {
@@ -87,6 +89,8 @@ impl TextureDictionaryViewer {
             generation: 0,
             cancel: None,
             _decode: None,
+            loading: false,
+            decode_error: None,
         };
         viewer.start_preview(cx);
         viewer
@@ -100,11 +104,21 @@ impl TextureDictionaryViewer {
         self.textures.get(self.selected)
     }
 
+    fn viewer_status(&self) -> Option<String> {
+        if self.loading {
+            Some("Decoding".to_string())
+        } else {
+            self.decode_error.clone()
+        }
+    }
+
     fn start_preview(&mut self, cx: &mut Context<Self>) {
         if let Some(previous) = self.cancel.take() {
             previous.store(true, Ordering::Relaxed);
         }
         let Some(info) = self.textures.get(self.selected).cloned() else {
+            self.loading = false;
+            self.decode_error = None;
             self.preview.update(cx, |preview, cx| preview.clear(cx));
             return;
         };
@@ -116,9 +130,12 @@ impl TextureDictionaryViewer {
         if let Some(image) = self.cache.get(index, level) {
             let (width, height) = (image.width, image.height);
             if let Ok((render, _, _)) = render_image((*image).clone()) {
+                self.loading = false;
+                self.decode_error = None;
                 self.preview.update(cx, |preview, cx| {
                     preview.set_image(render, width, height, cx)
                 });
+                cx.notify();
                 return;
             }
         }
@@ -128,12 +145,18 @@ impl TextureDictionaryViewer {
                 .reason()
                 .unwrap_or("this texture cannot be decoded")
                 .to_string();
+            self.loading = false;
+            self.decode_error = Some(reason.clone());
             self.preview
                 .update(cx, |preview, cx| preview.set_error(reason, cx));
+            cx.notify();
             return;
         }
+        self.loading = true;
+        self.decode_error = None;
         self.preview
             .update(cx, |preview, cx| preview.set_loading(cx));
+        cx.notify();
         let store = self.store.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel.clone());
@@ -162,15 +185,21 @@ impl TextureDictionaryViewer {
                 }
                 match decoded {
                     Ok(Some((cached, render, width, height))) => {
+                        this.loading = false;
+                        this.decode_error = None;
                         this.cache.insert(index, level, cached);
                         this.preview.update(cx, |preview, cx| {
                             preview.set_image(render, width, height, cx)
                         });
+                        cx.notify();
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        this.loading = false;
+                        this.decode_error = Some(err.clone());
                         this.preview
                             .update(cx, |preview, cx| preview.set_error(err, cx));
+                        cx.notify();
                     }
                 }
             })
@@ -634,7 +663,7 @@ impl Render for TextureDictionaryViewer {
                             .min_w_0()
                             .min_h_0()
                             .child(div().flex_1().min_h_0().child(self.preview.clone()))
-                            .child(metadata_panel(self.selected_info(), None)),
+                            .child(metadata_panel(self.selected_info(), self.viewer_status())),
                     ),
             )
             .child(

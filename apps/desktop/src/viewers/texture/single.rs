@@ -33,6 +33,8 @@ pub struct TextureViewer {
     cancel: Option<Arc<AtomicBool>>,
     _decode: Option<Task<()>>,
     resized: bool,
+    loading: bool,
+    decode_error: Option<String>,
 }
 
 impl TextureViewer {
@@ -57,6 +59,8 @@ impl TextureViewer {
             cancel: None,
             _decode: None,
             resized: false,
+            loading: false,
+            decode_error: None,
         };
         if viewer.info.is_none() {
             viewer.preview.update(cx, |preview, cx| {
@@ -75,7 +79,7 @@ impl TextureViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let preview = cx.new(|_| ImagePreview::new());
-        preview.update(cx, |preview, cx| preview.set_error(message, cx));
+        preview.update(cx, |preview, cx| preview.set_error(message.clone(), cx));
         Self {
             path,
             store: None,
@@ -88,6 +92,8 @@ impl TextureViewer {
             cancel: None,
             _decode: None,
             resized: true,
+            loading: false,
+            decode_error: Some(message),
         }
     }
 
@@ -95,10 +101,21 @@ impl TextureViewer {
         &self.focus_handle
     }
 
+    fn viewer_status(&self) -> Option<String> {
+        if self.loading {
+            Some("Decoding".to_string())
+        } else {
+            self.decode_error.clone()
+        }
+    }
+
     fn start_decode(&mut self, cx: &mut Context<Self>) {
         let Some(store) = self.store.clone() else {
             return;
         };
+        self.loading = true;
+        self.decode_error = None;
+        cx.notify();
         if let Some(previous) = self.cancel.take() {
             previous.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -126,14 +143,20 @@ impl TextureViewer {
                 }
                 match decoded {
                     Ok(Some(image)) => {
+                        this.loading = false;
+                        this.decode_error = None;
                         this.preview.update(cx, |preview, cx| {
                             preview.set_image(image.0, image.1, image.2, cx)
                         });
+                        cx.notify();
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        this.loading = false;
+                        this.decode_error = Some(err.clone());
                         this.preview
                             .update(cx, |preview, cx| preview.set_error(err, cx));
+                        cx.notify();
                     }
                 }
             })
@@ -292,7 +315,7 @@ impl Render for TextureViewer {
             .on_key_down(cx.listener(Self::key_down))
             .child(self.toolbar(cx))
             .child(div().flex_1().min_h_0().child(self.preview.clone()))
-            .child(metadata_panel(self.info.as_ref(), None))
+            .child(metadata_panel(self.info.as_ref(), self.viewer_status()))
             .child(
                 div()
                     .flex()

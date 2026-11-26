@@ -120,7 +120,10 @@ pub(crate) fn window_options(title: String, window_size: Size<Pixels>, cx: &App)
     }
 }
 
-pub(crate) fn metadata_rows(info: &TextureInfo) -> Vec<(&'static str, SharedString)> {
+pub(crate) fn metadata_rows(
+    info: &TextureInfo,
+    viewer_status: Option<&str>,
+) -> Vec<(&'static str, SharedString)> {
     let mut rows = vec![
         ("Name", SharedString::from(info.name())),
         ("Key", SharedString::from(format!("0x{:016X}", info.key))),
@@ -161,11 +164,11 @@ pub(crate) fn metadata_rows(info: &TextureInfo) -> Vec<(&'static str, SharedStri
             SharedString::from(format!("{}, {}", info.tile_mode, info.flags)),
         ),
     ];
-    if let Some(reason) = info.status.reason() {
-        rows.push(("Status", SharedString::from(reason.to_string())));
-    } else {
-        rows.push(("Status", SharedString::from("Decoded")));
-    }
+    let status = viewer_status
+        .map(str::to_string)
+        .or_else(|| info.status.reason().map(str::to_string))
+        .unwrap_or_else(|| "Decoded".to_string());
+    rows.push(("Status", SharedString::from(status)));
     rows
 }
 
@@ -174,7 +177,7 @@ pub(crate) fn metadata_panel(
     status: Option<String>,
 ) -> impl IntoElement {
     let rows = match info {
-        Some(info) => metadata_rows(info),
+        Some(info) => metadata_rows(info, status.as_deref()),
         None => Vec::new(),
     };
     div()
@@ -188,18 +191,11 @@ pub(crate) fn metadata_panel(
         .bg(rgb(theme::PANEL))
         .text_xs()
         .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Texture metadata"),
-                )
-                .when_some(status, |el, status| {
-                    el.child(div().text_color(rgb(theme::TEXT_MUTED)).child(status))
-                }),
+            div().flex().items_center().gap_3().child(
+                div()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Texture metadata"),
+            ),
         )
         .children(rows.into_iter().map(|(label, value)| {
             div()
