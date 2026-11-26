@@ -1,5 +1,6 @@
 mod archive;
 mod binary;
+mod catalog;
 mod extract;
 mod inspect;
 mod inventory;
@@ -46,6 +47,9 @@ enum Command {
     /// Index native name hashes, harvest candidate names and export LUT files
     #[command(subcommand)]
     Names(names::Command),
+    /// Extract catalog observations and validate publication packages
+    #[command(subcommand)]
+    Catalog(catalog::Command),
 }
 
 fn main() -> ExitCode {
@@ -55,6 +59,7 @@ fn main() -> ExitCode {
         Command::Binary(command) => report(binary::run(command)),
         Command::Archive(command) => report(archive::run(command)),
         Command::Names(command) => report(names::run(command)),
+        Command::Catalog(command) => report(catalog::run(command)),
     }
 }
 

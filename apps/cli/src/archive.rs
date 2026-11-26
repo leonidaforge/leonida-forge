@@ -969,6 +969,7 @@ fn drawable_json(report: &lforge_rage9::drawable::Report) -> Value {
             "shader_group": report.header.shader_group,
             "skeleton": report.header.skeleton,
             "name": report.header.name,
+            "name_text": report.header.name_text,
             "list": report.header.list,
             "bounds": {
                 "centre": report.header.bounds.centre,
