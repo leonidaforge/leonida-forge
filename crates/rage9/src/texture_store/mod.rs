@@ -656,6 +656,9 @@ fn embedded_texture_at(system: &[u8], graphics: &[u8], offset: usize) -> Option<
         return None;
     }
     let format = format_for_dxgi(dxgi).ok()?;
+    if height == 1 && format.is_compressed() {
+        return None;
+    }
     let data_offset = (data & 0x0FFF_FFFF) as usize;
     let block = format.block_dim();
     let texture = if height == 1 {
