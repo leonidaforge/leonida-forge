@@ -321,6 +321,34 @@ fn blend_material_is_supported() {
 }
 
 #[test]
+fn a_missing_texture_uses_the_checker_fallback() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let mut scene = Scene::new();
+    scene.materials.push(Material {
+        name: "missing".into(),
+        missing_texture: true,
+        ..Material::default()
+    });
+    let mut mesh = Mesh::new("quad");
+    mesh.primitives.push(quad(0));
+    scene.meshes.push(mesh);
+    scene.validate();
+    let frame = renderer
+        .render_offscreen(&scene, &OffscreenOptions::new(64, 64))
+        .expect("render");
+    let mut found = false;
+    for pixel in frame.pixels.as_chunks::<4>().0 {
+        if pixel[0] > 150 && pixel[2] > 150 && pixel[1] < 100 {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "the checker fallback is visible");
+}
+
+#[test]
 fn an_empty_scene_is_reported() {
     let Some(renderer) = renderer() else {
         return;
