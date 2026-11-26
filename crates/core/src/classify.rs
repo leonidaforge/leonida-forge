@@ -21,6 +21,7 @@ use lforge_binary::Source;
 use lforge_rage9::rpf::metadata::{Entry, Error, Payload, StreamTransform};
 
 use crate::inspect::{self, FormatInfo};
+use crate::registry::{self, NativeExtension, Variant};
 
 /// Decoded bytes a classification reads for identification.
 pub const HEAD_LEN: usize = 64;
@@ -30,10 +31,11 @@ pub const XML_LIMIT: u64 = 4 * 1024 * 1024;
 /// The type ID of a nested RPF9 archive.
 pub const ARCHIVE_TYPE: u8 = 0;
 
-/// How strongly an identification is supported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// How strongly one claim is supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Confidence {
     /// The available evidence establishes nothing useful.
+    #[default]
     Unknown,
     /// A plausible hypothesis that independent checks do not confirm.
     Tentative,
@@ -51,6 +53,54 @@ impl Confidence {
             Confidence::Tentative => "tentative",
             Confidence::Unknown => "unknown",
         }
+    }
+}
+
+/// The separate claims a classification makes.
+///
+/// A verified signature is not a verified format. A verified container shape is
+/// not a verified asset class. Each claim records only what its own evidence
+/// establishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Claims {
+    /// The bytes matched the format's signature. Says nothing about structure.
+    pub signature: Confidence,
+    /// The payload's own framing was walked and validated from the head, or the
+    /// whole document parsed.
+    pub structure: Confidence,
+    /// The asset class is established, which only the engine's type registry
+    /// can do.
+    pub asset: Confidence,
+}
+
+impl Claims {
+    /// Nothing is claimed.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A signature was observed and the recogniser walked the framing.
+    pub fn signed_and_parsed() -> Self {
+        Self {
+            signature: Confidence::Verified,
+            structure: Confidence::Verified,
+            asset: Confidence::Unknown,
+        }
+    }
+
+    /// A signature was observed without walking any structure.
+    pub fn signed_only() -> Self {
+        Self {
+            signature: Confidence::Verified,
+            structure: Confidence::Unknown,
+            asset: Confidence::Unknown,
+        }
+    }
+
+    /// The asset class, as far as the registry establishes it.
+    pub fn with_asset(mut self, asset: Confidence) -> Self {
+        self.asset = asset;
+        self
     }
 }
 
@@ -167,30 +217,54 @@ impl ResourceHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identification {
     /// A supported format.
-    Format {
-        format: FormatInfo,
-        confidence: Confidence,
-    },
+    Format { format: FormatInfo, claims: Claims },
     /// Eight zero bytes and a `0x5…`/`0x6…` pointer.
     Resource {
         header: ResourceHeader,
-        confidence: Confidence,
+        claims: Claims,
     },
     /// An XML document, with its root element when it was validated.
     Xml {
         root: Option<String>,
-        confidence: Confidence,
+        claims: Claims,
     },
     /// A named signature without an established format.
     Signature {
         signature: Signature,
-        confidence: Confidence,
+        claims: Claims,
     },
     /// Nothing identifiable.
     Unrecognised,
 }
 
 impl Identification {
+    /// The same identification with the asset claim set.
+    pub fn with_asset(self, asset: Confidence) -> Self {
+        let set = |mut claims: Claims| {
+            claims.asset = asset;
+            claims
+        };
+        match self {
+            Identification::Format { format, claims } => Identification::Format {
+                format,
+                claims: set(claims),
+            },
+            Identification::Resource { header, claims } => Identification::Resource {
+                header,
+                claims: set(claims),
+            },
+            Identification::Xml { root, claims } => Identification::Xml {
+                root,
+                claims: set(claims),
+            },
+            Identification::Signature { signature, claims } => Identification::Signature {
+                signature,
+                claims: set(claims),
+            },
+            Identification::Unrecognised => Identification::Unrecognised,
+        }
+    }
+
     /// The format id, when a supported format was recognised.
     pub fn format_id(&self) -> Option<&'static str> {
         match self {
@@ -210,13 +284,13 @@ impl Identification {
         }
     }
 
-    pub fn confidence(&self) -> Confidence {
+    pub fn claims(&self) -> Claims {
         match self {
-            Identification::Format { confidence, .. }
-            | Identification::Resource { confidence, .. }
-            | Identification::Xml { confidence, .. }
-            | Identification::Signature { confidence, .. } => *confidence,
-            Identification::Unrecognised => Confidence::Unknown,
+            Identification::Format { claims, .. }
+            | Identification::Resource { claims, .. }
+            | Identification::Xml { claims, .. }
+            | Identification::Signature { claims, .. } => *claims,
+            Identification::Unrecognised => Claims::none(),
         }
     }
 }
@@ -226,15 +300,15 @@ impl Identification {
 pub enum Extension {
     /// The archive supplied this extension. Stored exactly as it was found.
     Original(String),
-    /// A verified mapping from the payload format.
+    /// The extension the engine registers for the entry's type.
+    Native {
+        extension: &'static str,
+        variant: Variant,
+    },
+    /// A verified mapping from the payload itself.
     Content {
         extension: &'static str,
         confidence: Confidence,
-    },
-    /// A verified mapping from the entry type, when the payload agrees.
-    Type {
-        extension: &'static str,
-        because: &'static str,
     },
     /// No verified extension.
     Unresolved { reason: &'static str },
@@ -245,7 +319,7 @@ impl Extension {
     pub fn resolved(&self) -> Option<&str> {
         match self {
             Extension::Original(extension) => Some(extension),
-            Extension::Content { extension, .. } | Extension::Type { extension, .. } => {
+            Extension::Native { extension, .. } | Extension::Content { extension, .. } => {
                 Some(extension)
             }
             Extension::Unresolved { .. } => None,
@@ -255,9 +329,20 @@ impl Extension {
     /// Whether the extension may be applied automatically.
     pub fn verified(&self) -> bool {
         match self {
-            Extension::Original(_) | Extension::Type { .. } => true,
+            Extension::Original(_) | Extension::Native { .. } => true,
             Extension::Content { confidence, .. } => *confidence == Confidence::Verified,
             Extension::Unresolved { .. } => false,
+        }
+    }
+
+    /// Where the extension came from: `original`, `native`, `payload` or
+    /// `unresolved`.
+    pub fn provenance(&self) -> &'static str {
+        match self {
+            Extension::Original(_) => "original",
+            Extension::Native { .. } => "native",
+            Extension::Content { .. } => "payload",
+            Extension::Unresolved { .. } => "unresolved",
         }
     }
 
@@ -311,10 +396,15 @@ impl Capability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub entry_type: Option<u8>,
+    /// The extension the engine registers for the type, when it registers one.
+    pub native: Option<NativeExtension>,
     pub storage: Option<Storage>,
     pub payload: PayloadState,
     pub identification: Identification,
     pub extension: Extension,
+    /// Why the engine's extension, the archive's own name and the payload
+    /// disagree, when they do.
+    pub conflict: Option<String>,
     pub capability: Capability,
     /// Why the entry is not identified or not supported, when it is not.
     pub reason: Option<String>,
@@ -324,6 +414,19 @@ impl Classification {
     /// The display extension, if the classification established one.
     pub fn extension(&self) -> Option<&str> {
         self.extension.resolved()
+    }
+
+    /// The native extension of the entry's type, without a dot.
+    pub fn native_extension(&self) -> Option<&'static str> {
+        self.native.map(|native| native.extension)
+    }
+
+    /// Whether the engine's type for this entry is a texture dictionary.
+    /// This is what the texture viewer may attempt; a resource header alone is
+    /// not enough.
+    pub fn is_texture_dictionary(&self) -> bool {
+        self.native_extension()
+            .is_some_and(is_texture_dictionary_extension)
     }
 
     /// The format id, when a supported format was recognised.
@@ -361,7 +464,16 @@ fn assemble(
     payload: PayloadState,
     identification: Identification,
 ) -> Classification {
-    let extension = resolve_extension(entry_type, original_extension, &identification, &payload);
+    let native = entry_type.and_then(registry::native_extension);
+    let asset = match native {
+        // The registry names the asset class the engine assigns to the type. It
+        // says nothing about the payload's format.
+        Some(_) => Confidence::Verified,
+        None => Confidence::Unknown,
+    };
+    let identification = identification.with_asset(asset);
+    let extension = resolve_extension(original_extension, native, &identification, &payload);
+    let conflict = conflict(original_extension, native, &identification);
     let capability = capability(&identification, &payload);
     let reason = reason(&payload, &identification, &extension);
     Classification {
@@ -369,7 +481,9 @@ fn assemble(
         storage,
         payload,
         identification,
+        native,
         extension,
+        conflict,
         capability,
         reason,
     }
@@ -381,31 +495,42 @@ pub fn identify_from_head(head: Option<&[u8]>) -> Identification {
         return Identification::Unrecognised;
     };
     if let Some(format) = inspect::recognise(head) {
-        // A format whose recogniser walks its structure is established by the
-        // head alone; one recognised by its identifier alone is probable.
-        let confidence = if format.support == "structural" {
-            Confidence::Verified
+        // `structural` means the recogniser walked the payload's own framing
+        // from the head. `recognition` means it matched an identifier only, so
+        // the structure is not established by the head.
+        let claims = if format.support == "structural" {
+            Claims::signed_and_parsed()
         } else {
-            Confidence::Probable
+            Claims {
+                signature: Confidence::Verified,
+                structure: Confidence::Probable,
+                asset: Confidence::Unknown,
+            }
         };
-        return Identification::Format { format, confidence };
+        return Identification::Format { format, claims };
     }
     if let Some(header) = ResourceHeader::parse(head) {
         return Identification::Resource {
             header,
-            confidence: Confidence::Probable,
+            // The header shape is verified; the page map it points at is not
+            // read, so the structure and the asset class stay unestablished.
+            claims: Claims::signed_only(),
         };
     }
     if let Some(signature) = observed_signature(head) {
         return Identification::Signature {
             signature,
-            confidence: Confidence::Verified,
+            claims: Claims::signed_only(),
         };
     }
     if looks_like_xml(head) {
         return Identification::Xml {
             root: None,
-            confidence: Confidence::Tentative,
+            claims: Claims {
+                signature: Confidence::Verified,
+                structure: Confidence::Tentative,
+                asset: Confidence::Unknown,
+            },
         };
     }
     Identification::Unrecognised
@@ -470,13 +595,19 @@ fn skip_space(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn resolve_extension(
-    entry_type: Option<u8>,
     original: Option<&str>,
+    native: Option<NativeExtension>,
     identification: &Identification,
     payload: &PayloadState,
 ) -> Extension {
     if let Some(extension) = original {
         return Extension::Original(extension.to_string());
+    }
+    if let Some(native) = native {
+        return Extension::Native {
+            extension: native.extension,
+            variant: native.variant,
+        };
     }
     if matches!(payload, PayloadState::TransformUnavailable) {
         return Extension::Unresolved {
@@ -491,34 +622,67 @@ fn resolve_extension(
         Identification::Format { .. } => Extension::Unresolved {
             reason: "the format is recognised but no extension is established",
         },
-        Identification::Xml {
-            confidence: Confidence::Verified,
-            ..
-        } => Extension::Content {
-            extension: "xml",
-            confidence: Confidence::Verified,
-        },
+        Identification::Xml { claims, .. } if claims.structure == Confidence::Verified => {
+            Extension::Content {
+                extension: "xml",
+                confidence: Confidence::Verified,
+            }
+        }
         Identification::Xml { .. } => Extension::Unresolved {
             reason: "the bytes look like XML but the document was not validated",
         },
         Identification::Resource { .. } => Extension::Unresolved {
-            reason: "a resource container; the asset class is not identified",
+            reason: "a resource container with no registered engine type",
         },
         Identification::Signature { .. } => Extension::Unresolved {
             reason: "the signature is known but no format or extension is established",
         },
-        Identification::Unrecognised => {
-            if entry_type == Some(ARCHIVE_TYPE) {
-                Extension::Unresolved {
-                    reason: "the entry is typed as an archive but its payload is not one",
-                }
-            } else {
-                Extension::Unresolved {
-                    reason: "no verified extension for these bytes",
-                }
-            }
-        }
+        Identification::Unrecognised => Extension::Unresolved {
+            reason: "no verified extension for these bytes",
+        },
     }
+}
+
+/// Why the engine's extension, the archive's own name and the payload disagree,
+/// when they do. The applied extension is never silently replaced.
+fn conflict(
+    original: Option<&str>,
+    native: Option<NativeExtension>,
+    identification: &Identification,
+) -> Option<String> {
+    let payload_extension = match identification {
+        Identification::Format { format, .. } if format.id == "rpf9" => Some("rpf"),
+        Identification::Xml { claims, .. } if claims.structure == Confidence::Verified => {
+            Some("xml")
+        }
+        _ => None,
+    };
+    match (
+        original,
+        native.map(|native| native.extension),
+        payload_extension,
+    ) {
+        (Some(original), Some(native), _) if !same_extension(original, native) => Some(format!(
+            "the archive name uses `{original}` and the engine registers `{native}` for this type"
+        )),
+        (Some(original), None, Some(payload)) if !same_extension(original, payload) => Some(
+            format!("the archive name uses `{original}` and the payload is a `{payload}` document"),
+        ),
+        (None, Some(native), Some(payload)) if !same_extension(native, payload) => Some(format!(
+            "the engine registers `{native}` for this type and the payload is a `{payload}` document"
+        )),
+        _ => None,
+    }
+}
+
+fn same_extension(left: &str, right: &str) -> bool {
+    normalise_extension(left) == normalise_extension(right)
+}
+
+/// Whether a native extension is the texture dictionary one, which is `td`
+/// behind the variant prefix: `ztd`, `itd` or `#td`.
+pub fn is_texture_dictionary_extension(extension: &str) -> bool {
+    extension.len() == 3 && extension.ends_with("td")
 }
 
 fn capability(identification: &Identification, payload: &PayloadState) -> Capability {
@@ -674,11 +838,19 @@ pub fn classify_entry_with_evidence(
         identification = match validate_xml(&document) {
             Some(root) => Identification::Xml {
                 root: Some(root),
-                confidence: Confidence::Verified,
+                claims: Claims {
+                    signature: Confidence::Verified,
+                    structure: Confidence::Verified,
+                    asset: Confidence::Unknown,
+                },
             },
             None => Identification::Xml {
                 root: None,
-                confidence: Confidence::Tentative,
+                claims: Claims {
+                    signature: Confidence::Verified,
+                    structure: Confidence::Tentative,
+                    asset: Confidence::Unknown,
+                },
             },
         };
     }
@@ -782,12 +954,12 @@ mod tests {
             let classification = run(Some(255), None, bytes);
             assert_eq!(classification.format_id(), Some(id), "{id}");
             // Every one of these recognisers walks the payload's own framing
-            // from the head, so the format is established by the head alone.
-            assert_eq!(
-                classification.identification.confidence(),
-                Confidence::Verified,
-                "{id} has a structural recogniser"
-            );
+            // from the head, so the structure is established by the head alone.
+            let claims = classification.identification.claims();
+            assert_eq!(claims.signature, Confidence::Verified, "{id} signature");
+            assert_eq!(claims.structure, Confidence::Verified, "{id} structure");
+            // Type 255 is not registered, so no asset class is claimed.
+            assert_eq!(claims.asset, Confidence::Unknown, "{id} asset");
             assert!(matches!(
                 classification.capability,
                 Capability::Structural(_)
@@ -803,29 +975,71 @@ mod tests {
     }
 
     #[test]
-    fn a_format_recognised_by_its_identifier_alone_is_probable() {
+    fn a_format_recognised_by_its_identifier_alone_has_an_unverified_structure() {
         // The archive recogniser matches the magic only; the structure is
         // verified when a caller opens the archive.
         let classification = run(Some(0), None, b"9FPR\x10\x12\0\0");
+        let claims = classification.identification.claims();
+        assert_eq!(claims.signature, Confidence::Verified);
+        assert_eq!(claims.structure, Confidence::Probable);
+    }
+
+    #[test]
+    fn a_registered_type_supplies_the_extension() {
+        let classification = run(Some(0), None, b"9FPR\x10\x12\0\0");
+        assert_eq!(classification.capability, Capability::Archive);
         assert_eq!(
-            classification.identification.confidence(),
-            Confidence::Probable
+            classification.extension,
+            Extension::Native {
+                extension: "rpf",
+                variant: Variant::Path
+            }
+        );
+        assert_eq!(classification.extension.provenance(), "native");
+        assert_eq!(
+            classification.identification.claims().asset,
+            Confidence::Verified
         );
     }
 
     #[test]
-    fn a_nested_archive_gets_its_extension_from_the_payload() {
-        let classification = run(Some(0), None, b"9FPR\x10\x12\0\0");
-        assert_eq!(classification.capability, Capability::Archive);
+    fn a_registered_type_wins_over_the_payload_without_a_reported_conflict_when_the_payload_has_no_extension()
+     {
+        // Type 0 is registered as `rpf`; these bytes are a PSIN payload. The
+        // engine's extension applies. `PSIN` has no established extension, so
+        // there is no extension-level conflict; the disagreement is visible in
+        // the type, the format and the applied extension themselves.
+        let classification = run(Some(0), None, b"PSIN");
+        assert_eq!(classification.format_id(), Some("psin"));
         assert_eq!(classification.extension(), Some("rpf"));
-        assert!(classification.extension.verified());
+        assert_eq!(classification.extension.provenance(), "native");
+        assert_eq!(classification.conflict, None);
     }
 
     #[test]
-    fn a_type_zero_entry_whose_payload_is_not_an_archive_keeps_its_extension_unresolved() {
-        let classification = run(Some(0), None, b"PSIN");
-        assert_eq!(classification.format_id(), Some("psin"));
-        assert!(classification.extension().is_none());
+    fn a_native_and_a_payload_extension_that_disagree_are_reported() {
+        // Type 11 is registered as `zmt`; a validated document would apply
+        // `xml`. The native extension is kept and the disagreement recorded.
+        let classification = assemble(
+            Some(11),
+            None,
+            storage(),
+            PayloadState::Decoded,
+            Identification::Xml {
+                root: Some("CTuningFile".to_string()),
+                claims: Claims {
+                    signature: Confidence::Verified,
+                    structure: Confidence::Verified,
+                    asset: Confidence::Unknown,
+                },
+            },
+        );
+        assert_eq!(classification.extension(), Some("zmt"));
+        let conflict = classification.conflict.expect("a reported conflict");
+        assert!(
+            conflict.contains("zmt") && conflict.contains("xml"),
+            "{conflict}"
+        );
     }
 
     #[test]
@@ -840,22 +1054,24 @@ mod tests {
     }
 
     #[test]
-    fn a_resource_header_is_recognised_but_not_an_asset_class() {
+    fn a_resource_header_is_a_container_and_the_type_names_the_asset() {
         let mut bytes = vec![0u8; 16];
         bytes[8..16].copy_from_slice(&0x5000_0310u64.to_le_bytes());
         let classification = run(Some(88), None, &bytes);
-        let Identification::Resource { header, .. } = classification.identification else {
+        let Identification::Resource { header, claims } = classification.identification else {
             panic!("expected a resource header");
         };
         assert_eq!(header.segment, 5);
         assert_eq!(header.map_offset, 0x310);
         assert_eq!(header.first_word, 0);
+        // The header shape is observed; the page map it points at is not read.
+        assert_eq!(claims.signature, Confidence::Verified);
+        assert_eq!(claims.structure, Confidence::Unknown);
+        // Type 88 is registered as `zsm`.
+        assert_eq!(claims.asset, Confidence::Verified);
         assert_eq!(classification.capability, Capability::Resource);
-        assert!(classification.extension().is_none());
-        assert_eq!(
-            classification.reason.as_deref(),
-            Some("a resource container; the asset class is not identified")
-        );
+        assert_eq!(classification.extension(), Some("zsm"));
+        assert_eq!(classification.extension.provenance(), "native");
     }
 
     #[test]
@@ -870,11 +1086,12 @@ mod tests {
     }
 
     #[test]
-    fn an_all_zero_header_is_not_a_resource() {
+    fn an_all_zero_header_is_not_a_resource_but_the_type_still_names_the_asset() {
+        // Type 96 is registered as `zasd`. The bytes establish no container.
         let classification = run(Some(96), None, &[0u8; 16]);
         assert_eq!(classification.identification, Identification::Unrecognised);
         assert_eq!(classification.capability, Capability::Bytes);
-        assert!(classification.extension().is_none());
+        assert_eq!(classification.extension(), Some("zasd"));
     }
 
     #[test]
@@ -911,10 +1128,7 @@ mod tests {
         let classification = run(Some(255), None, b"<?xml version=\"1.0\"?>");
         assert!(matches!(
             classification.identification,
-            Identification::Xml {
-                root: None,
-                confidence: Confidence::Tentative
-            }
+            Identification::Xml { root: None, claims } if claims.structure == Confidence::Tentative
         ));
         assert_eq!(classification.capability, Capability::Text);
         assert!(classification.extension().is_none());
@@ -942,10 +1156,15 @@ mod tests {
             PayloadState::Decoded,
             Identification::Xml {
                 root: Some("root".to_string()),
-                confidence: Confidence::Verified,
+                claims: Claims {
+                    signature: Confidence::Verified,
+                    structure: Confidence::Verified,
+                    asset: Confidence::Unknown,
+                },
             },
         );
         assert_eq!(validated.extension(), Some("xml"));
+        assert_eq!(validated.extension.provenance(), "payload");
         assert!(validated.extension.verified());
     }
 
@@ -972,7 +1191,7 @@ mod tests {
             (b"MHIU", "mhiu"),
             (b"SPS1", "sps1"),
         ] {
-            let classification = run(Some(64), None, bytes);
+            let classification = run(Some(255), None, bytes);
             assert_eq!(
                 classification.identification.signature(),
                 Signature::Observed(name)
@@ -1010,7 +1229,9 @@ mod tests {
             classification.capability,
             Capability::Unavailable("the payload transform needs key material")
         );
-        assert!(classification.extension().is_none());
+        // Type 89 is registered as `zscript`, so the extension is known even
+        // though the payload was not decoded.
+        assert_eq!(classification.extension(), Some("zscript"));
         assert_eq!(
             classification.reason.as_deref(),
             Some("the payload is behind the transform and no key state is available")

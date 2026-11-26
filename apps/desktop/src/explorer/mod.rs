@@ -918,6 +918,13 @@ impl Explorer {
             this.update(cx, |this, cx| {
                 let classification = classified.as_ref().cloned();
                 let capability = classification.as_ref().map(|value| value.capability);
+                // A resource container is attempted by the texture viewer only
+                // when the engine's type for it is the texture dictionary one.
+                // The viewer still validates the dictionary grammar and falls
+                // back to the Binary Inspector when it is not one.
+                let texture_dictionary = classification
+                    .as_ref()
+                    .is_some_and(|value| value.is_texture_dictionary());
                 match identified {
                     Ok(Identified::Archive(_)) => {
                         this.mark_archive(&path);
@@ -932,8 +939,6 @@ impl Explorer {
                     Ok(Identified::Unknown) if texture => {
                         crate::viewers::texture::open(path, access, cx)
                     }
-                    // A resource container may be a texture dictionary; the
-                    // viewer falls back when it is not one.
                     Ok(Identified::Unknown)
                         if capability == Some(lforge_core::classify::Capability::Archive) =>
                     {
@@ -941,7 +946,8 @@ impl Explorer {
                         this.navigate(path, cx);
                     }
                     Ok(Identified::Unknown)
-                        if capability == Some(lforge_core::classify::Capability::Resource) =>
+                        if capability == Some(lforge_core::classify::Capability::Resource)
+                            && texture_dictionary =>
                     {
                         crate::viewers::texture::open_resource(path, access, cx)
                     }

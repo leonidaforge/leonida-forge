@@ -79,6 +79,9 @@ pub struct Options {
 struct Key {
     entry_type: Option<u8>,
     identification: String,
+    /// A normalised shape of the decoded head, so unrelated payloads are not
+    /// merged into one bucket and pointer values are not split into thousands.
+    variant: String,
     storage: String,
     transform: bool,
     payload: &'static str,
@@ -91,6 +94,9 @@ struct Key {
 #[derive(Debug, Default)]
 struct Bucket {
     entries: u64,
+    /// Every archive the combination was seen in, for the exact count.
+    archive_count: BTreeSet<String>,
+    /// A bounded representative set of archive names.
     archives: BTreeSet<String>,
     samples: Vec<Value>,
 }
@@ -99,8 +105,14 @@ struct Engine<'a> {
     options: &'a Options,
     cancel: &'a AtomicBool,
     archives: u64,
+    roots_opened: u64,
     entries: u64,
     spooled: u64,
+    decoded: u64,
+    undecoded: u64,
+    structures: u64,
+    assets: u64,
+    unresolved: u64,
     buckets: BTreeMap<Key, Bucket>,
     types: BTreeMap<Option<u8>, u64>,
     failures: Vec<Value>,
@@ -115,8 +127,14 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
         options,
         cancel,
         archives: 0,
+        roots_opened: 0,
         entries: 0,
         spooled: 0,
+        decoded: 0,
+        undecoded: 0,
+        structures: 0,
+        assets: 0,
+        unresolved: 0,
         buckets: BTreeMap::new(),
         types: BTreeMap::new(),
         failures: Vec::new(),
@@ -237,6 +255,7 @@ impl Engine<'_> {
             self.cancel,
         )?;
         self.archives += 1;
+        self.roots_opened += 1;
         let alternates = Alternates::resolve(&root.path, &opened.metadata);
         let sources = alternates.sources().to_vec();
         self.walk(&opened, &sources, &[], &root.name, 0, out)
@@ -433,9 +452,25 @@ impl Engine<'_> {
         payload_len: Option<u64>,
     ) {
         *self.types.entry(classification.entry_type).or_default() += 1;
+        if classification.payload.name() == "decoded" {
+            self.decoded += 1;
+        } else {
+            self.undecoded += 1;
+        }
+        let claims = classification.identification.claims();
+        if claims.structure == lforge_core::classify::Confidence::Verified {
+            self.structures += 1;
+        }
+        if claims.asset == lforge_core::classify::Confidence::Verified {
+            self.assets += 1;
+        }
+        if matches!(classification.identification, Identification::Unrecognised) {
+            self.unresolved += 1;
+        }
         let key = Key {
             entry_type: classification.entry_type,
             identification: identification_label(&classification.identification),
+            variant: header_variant(classification, head),
             storage: classification
                 .storage
                 .as_ref()
@@ -446,7 +481,7 @@ impl Engine<'_> {
                 .storage
                 .is_some_and(|storage| storage.transform),
             payload: classification.payload.name(),
-            confidence: classification.identification.confidence().name(),
+            confidence: classification.identification.claims().structure.name(),
             capability: classification.capability.name(),
             extension: classification
                 .extension()
@@ -455,6 +490,8 @@ impl Engine<'_> {
         };
         let bucket = self.buckets.entry(key).or_default();
         bucket.entries += 1;
+        // Exact archive count; the names stay a bounded representative set.
+        bucket.archive_count.insert(archive.to_string());
         if bucket.archives.len() < SAMPLE_ARCHIVES {
             bucket.archives.insert(archive.to_string());
         }
@@ -476,13 +513,15 @@ impl Engine<'_> {
                 json!({
                     "type": key.entry_type,
                     "identification": key.identification,
+                    "variant": key.variant,
                     "storage": key.storage,
                     "transform": key.transform,
                     "payload": key.payload,
-                    "confidence": key.confidence,
+                    "structure": key.confidence,
                     "capability": key.capability,
                     "extension": key.extension,
                     "entries": bucket.entries,
+                    "archive_count": bucket.archive_count.len(),
                     "archives": bucket.archives.iter().collect::<Vec<_>>(),
                     "samples": bucket.samples,
                 })
@@ -502,6 +541,20 @@ impl Engine<'_> {
             "entries": self.entries,
             "spooled_bytes": self.spooled,
             "stopped": self.stopped,
+            "coverage": {
+                "roots_discovered": roots.len(),
+                "roots_opened": self.roots_opened,
+                "archives_opened": self.archives,
+                "nested_archives_opened": self.archives.saturating_sub(self.roots_opened),
+                "failed_archives": self.failures.len(),
+                "entries_enumerated": self.entries,
+                "entries_probed": self.entries,
+                "entries_decoded": self.decoded,
+                "entries_undecoded": self.undecoded,
+                "structures_verified": self.structures,
+                "assets_verified": self.assets,
+                "unresolved_formats": self.unresolved,
+            },
             "types": types,
             "combinations": combinations,
             "failures": self.failures,
@@ -532,10 +585,57 @@ fn identification_label(identification: &Identification) -> String {
     }
 }
 
+/// A normalised shape of the decoded head.
+///
+/// The point is to keep unrelated payloads apart without splitting on every
+/// pointer, length or count. A format is already discriminated by its
+/// recogniser. A resource keeps its segment and the 32-bit word at `+0x10`,
+/// which is where observed families differ. Anything else is placed by what the
+/// first bytes look like.
+fn header_variant(classification: &Classification, head: &[u8]) -> String {
+    match &classification.identification {
+        Identification::Format { format, .. } => format!("format:{}", format.id),
+        Identification::Resource { header, .. } => {
+            let word = head
+                .get(0x10..0x14)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .unwrap_or(0);
+            format!("resource:s{}:{word:08x}", header.segment)
+        }
+        Identification::Xml { root, .. } => match root {
+            Some(root) => format!("xml:{root}"),
+            None => "xml:unvalidated".to_string(),
+        },
+        Identification::Signature { signature, .. } => format!("signature:{signature:?}"),
+        Identification::Unrecognised => {
+            let first = head.get(..8).unwrap_or(head);
+            if first.is_empty() {
+                "empty".to_string()
+            } else if first.iter().all(|byte| *byte == 0) {
+                "zeros".to_string()
+            } else if first
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+            {
+                "text".to_string()
+            } else {
+                let mut label = String::from("binary:");
+                for byte in first.iter().take(4) {
+                    use std::fmt::Write as _;
+                    let _ = write!(label, "{byte:02x}");
+                }
+                label
+            }
+        }
+    }
+}
+
 fn describe(classification: &Classification) -> Value {
     let storage = classification.storage;
+    let claims = classification.identification.claims();
     json!({
         "type": classification.entry_type,
+        "native_extension": classification.native_extension(),
         "storage": storage.as_ref().map(Storage::label),
         "mode": storage.map(|storage| storage.mode),
         "encoding": storage.and_then(|storage| storage.encoding),
@@ -543,11 +643,17 @@ fn describe(classification: &Classification) -> Value {
         "payload": classification.payload.name(),
         "identification": identification_label(&classification.identification),
         "format": classification.format_id(),
-        "confidence": classification.identification.confidence().name(),
+        "claims": {
+            "signature": claims.signature.name(),
+            "structure": claims.structure.name(),
+            "asset": claims.asset.name(),
+        },
         "capability": classification.capability.name(),
         "capability_reason": classification.capability.reason(),
         "extension": classification.extension(),
+        "extension_provenance": classification.extension.provenance(),
         "extension_verified": classification.extension.verified(),
+        "conflict": classification.conflict,
         "reason": classification.reason,
     })
 }

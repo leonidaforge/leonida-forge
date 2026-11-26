@@ -99,9 +99,11 @@ fn an_entry_is_classified_by_its_payload_and_not_by_its_type() {
     // Type 0 is also the archive type, and this row holds an archive.
     let psin_row = combination(summary, 0, "format:psin");
     assert_eq!(psin_row["capability"], "structural");
-    assert_eq!(psin_row["extension"], "-");
+    // Type 0 is registered as `rpf`, so the engine's extension is what the
+    // classification applies even though the payload is a `PSIN`.
+    assert_eq!(psin_row["extension"], "rpf");
     // The `PSIN` recogniser walks the payload's framing from the head.
-    assert_eq!(psin_row["confidence"], "verified");
+    assert_eq!(psin_row["structure"], "verified");
     // Four entries, and the nested archive was not entered: no depth growth.
     assert_eq!(resident_entries(summary), 4);
 }
@@ -116,7 +118,7 @@ fn resident_entries(summary: &Value) -> u64 {
 }
 
 #[test]
-fn a_resource_header_is_named_and_left_without_an_extension() {
+fn a_resource_header_is_a_container_and_the_type_names_the_extension() {
     let temp = tempfile::tempdir().unwrap();
     let mut row = spec(&resource());
     row.type_id = 88;
@@ -125,8 +127,10 @@ fn a_resource_header_is_named_and_left_without_an_extension() {
     let records = records(&census(&path, &[]));
     let resource = combination(summary(&records), 88, "resource:segment-5");
     assert_eq!(resource["capability"], "resource");
-    assert_eq!(resource["extension"], "-");
-    assert_eq!(resource["confidence"], "probable");
+    // Type 88 is registered as `zsm`, so the extension is known without
+    // reading the page map the header points at.
+    assert_eq!(resource["extension"], "zsm");
+    assert_eq!(resource["structure"], "unknown");
     let sample = &resource["samples"][0];
     assert_eq!(
         sample["head"],
@@ -233,8 +237,9 @@ fn one_record_per_entry_is_written_on_request() {
     assert_eq!(entry["chain"], "rows.rpf!0");
     assert_eq!(entry["classification"]["format"], "psin");
     assert_eq!(entry["classification"]["capability"], "structural");
-    assert_eq!(entry["classification"]["extension"], Value::Null);
-    assert_eq!(entry["classification"]["extension_verified"], false);
+    assert_eq!(entry["classification"]["extension"], "rpf");
+    assert_eq!(entry["classification"]["extension_provenance"], "native");
+    assert_eq!(entry["classification"]["extension_verified"], true);
 }
 
 #[test]
