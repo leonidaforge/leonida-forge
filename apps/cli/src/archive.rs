@@ -233,6 +233,9 @@ pub enum Command {
         /// Whether the payload is readable: true or false
         #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
         readable: Option<bool>,
+        /// Whether the row carries the payload transform: true or false
+        #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
+        transformed: Option<bool>,
         /// A case-insensitive substring of an archive's path under the search
         /// root
         #[arg(long)]
@@ -485,6 +488,7 @@ pub fn run(command: Command) -> Result<(), String> {
             type_id,
             extension,
             readable,
+            transformed,
             archive,
             offset,
             limit,
@@ -500,6 +504,7 @@ pub fn run(command: Command) -> Result<(), String> {
             type_id,
             extension,
             readable,
+            transformed,
             archive,
             offset,
             limit,

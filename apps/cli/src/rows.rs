@@ -417,6 +417,7 @@ pub struct SearchOptions {
     pub type_id: Option<u8>,
     pub extension: Option<String>,
     pub readable: Option<bool>,
+    pub transformed: Option<bool>,
     pub archive: Option<String>,
     pub max_depth: usize,
     pub max_archives: usize,
@@ -470,6 +471,11 @@ fn matches(
         if state.readable != readable {
             return false;
         }
+    }
+    if let Some(transformed) = options.transformed
+        && matches!(entry.payload_transform, Ok(true)) != transformed
+    {
+        return false;
     }
     if let Some(name) = &options.name {
         let needle = name.to_ascii_lowercase();

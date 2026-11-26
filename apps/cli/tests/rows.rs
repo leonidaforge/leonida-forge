@@ -65,6 +65,46 @@ fn reports_the_payload_transform_cipher_descriptor() {
 }
 
 #[test]
+fn searches_by_payload_transform_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut transformed = spec(b"transformed row");
+    transformed.transform = true;
+    let plain = spec(b"plain row");
+    let path = write_archive(
+        temp.path(),
+        "transform-search.rpf",
+        &assemble(&[transformed, plain], &[]),
+    );
+    let path = path.to_str().unwrap();
+
+    let yes = json(&lforge(&[
+        "archive",
+        "search",
+        path,
+        "--transformed",
+        "true",
+        "--json",
+    ]));
+    assert_eq!(yes["matched"], 1);
+    assert_eq!(yes["rows"][0]["row"], 0);
+    assert_eq!(yes["rows"][0]["payload_transform"], true);
+
+    let no = json(&lforge(&[
+        "archive",
+        "search",
+        path,
+        "--transformed",
+        "false",
+        "--json",
+    ]));
+    assert_eq!(no["matched"], 1);
+    assert_eq!(no["rows"][0]["row"], 1);
+
+    let all = json(&lforge(&["archive", "search", path, "--json"]));
+    assert_eq!(all["matched"], 2);
+}
+
+#[test]
 fn lists_rows_with_names_types_and_readability() {
     let temp = tempfile::tempdir().unwrap();
     let path = archive(temp.path());
