@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
 
-use super::test_support::{build, entry};
+use super::test_support::{build, entry, entry_tiled};
 use super::{Status, Store, is_store};
 
 fn source(bytes: &[u8]) -> Source {
@@ -60,6 +60,26 @@ fn bc1_decodes_a_solid_block() {
     let bytes = build(&[block], &[entry(4, 4, 71, 2, 1)]);
     let store = open(&bytes);
     let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+    assert_eq!((image.width, image.height), (4, 4));
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 0, 0, 255]);
+    }
+}
+
+#[test]
+fn a_tiled_rds5_level_is_deswizzled_from_its_4k_tile() {
+    // One solid BC1 block at the first element of a 4 KiB tile. The rest of
+    // the tile is padding, which the deswizzle drops.
+    let mut tiled = vec![0u8; 0x1000];
+    tiled[..8].copy_from_slice(&[0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    let bytes = build(&[tiled], &[entry_tiled(4, 4, 71, 2, 1, 1)]);
+    let store = open(&bytes);
+    let level = store
+        .level(0, 0, &AtomicBool::new(false))
+        .expect("tiled level");
+    assert!(level.swizzled);
+    assert_eq!(level.data.len(), 8);
+    let image = level.decode().unwrap();
     assert_eq!((image.width, image.height), (4, 4));
     for pixel in image.rgba.as_chunks::<4>().0 {
         assert_eq!(pixel, &[255, 0, 0, 255]);
@@ -262,6 +282,60 @@ fn bc7_decodes_a_solid_mode6_block() {
     for pixel in image.rgba.as_chunks::<4>().0 {
         assert_eq!(pixel, &[255, 255, 255, 255]);
     }
+}
+
+fn embedded_resource(
+    width: u16,
+    height: u16,
+    format: u8,
+    swizzle: u8,
+    mips: u16,
+    graphics: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    let mut system = vec![0u8; 0x100];
+    // A plausible drawable texture record.
+    system[0x0E..0x10].copy_from_slice(&8u16.to_le_bytes());
+    system[0x18..0x20].copy_from_slice(&0x6000_0000u64.to_le_bytes());
+    system[0x30..0x38].copy_from_slice(&0x5000_0080u64.to_le_bytes());
+    system[0x38..0x3A].copy_from_slice(&width.to_le_bytes());
+    system[0x3A..0x3C].copy_from_slice(&height.to_le_bytes());
+    system[0x3F] = format;
+    system[0x40] = swizzle;
+    system[0x42..0x44].copy_from_slice(&mips.to_le_bytes());
+    // Name record with the 64-bit store key.
+    system[0x88..0x90].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_le_bytes());
+    (system, graphics.to_vec())
+}
+
+#[test]
+fn an_embedded_one_row_bc1_texture_is_valid() {
+    let block = [
+        0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    let (system, graphics) = embedded_resource(5, 1, 71, 0, 1, &block);
+    let textures = super::embedded_textures(&system, &graphics);
+    assert_eq!(textures.len(), 1, "the record is found");
+    assert_eq!((textures[0].info.width, textures[0].info.height), (5, 1));
+    assert!(textures[0].info.status.is_decodable());
+    let level = super::decode_embedded(&graphics, &textures[0], 0, &AtomicBool::new(false))
+        .expect("one-row block decodes");
+    assert_eq!((level.width, level.height), (5, 1));
+    assert_eq!(level.data.len(), 16);
+    let image = level.decode().unwrap();
+    assert_eq!((image.width, image.height), (5, 1));
+}
+
+#[test]
+fn an_embedded_rgba_record_is_reconstructed() {
+    let pixels = rgba_pixels();
+    let (system, graphics) = embedded_resource(2, 2, 28, 0, 1, &pixels);
+    let textures = super::embedded_textures(&system, &graphics);
+    assert_eq!(textures.len(), 1);
+    let level = super::decode_embedded(&graphics, &textures[0], 0, &AtomicBool::new(false))
+        .expect("embedded RGBA decodes");
+    assert_eq!(level.data, pixels);
+    assert_eq!(level.decode().unwrap().rgba, pixels);
 }
 
 #[test]

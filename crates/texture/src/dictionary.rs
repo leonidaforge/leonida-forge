@@ -7,7 +7,7 @@ use lforge_binary::{Source, read_at};
 use lforge_rage9::dictionary;
 
 use super::{
-    Codec, Error, Image, LevelInfo, MAX_EDGE, MAX_PIXELS, Status, TextureInfo, decode,
+    Codec, Error, Image, LevelInfo, MAX_EDGE, MAX_PIXELS, SourceLevel, Status, TextureInfo,
     pixel_format, swizzle,
 };
 
@@ -62,15 +62,15 @@ impl DictionaryStore {
         self.graphics_len
     }
 
-    /// Decodes one stored level. Only layer zero exists for the sampled
+    /// Reconstructs one stored level. Only layer zero exists for the sampled
     /// dictionaries.
-    pub fn decode(
+    pub fn level(
         &self,
         index: u32,
         level: u32,
         layer: u32,
         cancel: &AtomicBool,
-    ) -> Result<Image, Error> {
+    ) -> Result<SourceLevel, Error> {
         if layer != 0 {
             return Err(Error::Invalid(format!(
                 "texture {index} has no array layer {layer}"
@@ -120,20 +120,32 @@ impl DictionaryStore {
             .format
             .codec
             .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
-        // A tiled allocation stores a padded 4 KiB tile grid; the decoder
-        // wants the unpadded row-major elements.
-        let bytes = if info.tile_mode != 0 {
+        // A tiled allocation stores a padded 4 KiB tile grid; the renderer
+        // and decoder want the unpadded row-major elements.
+        let swizzled = info.tile_mode != 0;
+        let bytes = if swizzled {
             swizzle::deswizzle(&bytes, level_info.width, level_info.height, codec)?
         } else {
             bytes
         };
-        let rgba = decode::decode(codec, &bytes, level_info.width, level_info.height)?;
-        Ok(Image {
+        Ok(SourceLevel {
             width: level_info.width,
             height: level_info.height,
             level,
-            rgba,
+            format: info.format,
+            data: bytes,
+            swizzled,
         })
+    }
+
+    pub fn decode(
+        &self,
+        index: u32,
+        level: u32,
+        layer: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Image, Error> {
+        self.level(index, level, layer, cancel)?.decode()
     }
 
     pub fn thumbnail(
@@ -197,7 +209,7 @@ fn texture_info(record: &dictionary::Record) -> TextureInfo {
     }
 }
 
-fn classify(
+pub(crate) fn classify(
     record: &dictionary::Record,
     format: super::PixelFormat,
     extent: u64,
@@ -275,7 +287,7 @@ fn classify(
 /// it is a level count or a maximum index. Treating allocation padding as
 /// another level would fabricate data, so additional levels are not exposed
 /// until a real multi-level layout is validated.
-fn stored_levels(
+pub(crate) fn stored_levels(
     codec: Codec,
     width: u32,
     height: u32,

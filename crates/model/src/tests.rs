@@ -1,5 +1,5 @@
 use super::*;
-use crate::dictionary::SlotState;
+use lforge_rage9::dictionary::SlotState;
 
 fn vertex_buffer() -> VertexBuffer {
     VertexBuffer {
@@ -210,6 +210,7 @@ fn build(shader: &Shader, provider: &dyn TextureProvider) -> (Material, Scene, V
     let material = {
         let mut context = MaterialContext {
             provider,
+            graphics: &[],
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
             external_indices: &mut external_indices,
@@ -235,24 +236,26 @@ fn a_missing_texture_is_a_fallback_with_a_diagnostic() {
     );
 }
 
-struct OneTexture(Texture);
+struct OneTexture(SourceLevel);
 
 impl TextureProvider for OneTexture {
     fn resolve(&self, _reference: &TextureReference) -> TextureResolution {
-        TextureResolution::Resolved(self.0.clone())
+        TextureResolution::Resolved(ResolvedTexture {
+            level: self.0.clone(),
+            source: "test".into(),
+        })
     }
 }
 
 #[test]
 fn a_resolved_texture_is_bound_once_and_deduplicated() {
-    let texture = Texture {
-        name: "synthetic".into(),
+    let texture = SourceLevel {
         width: 1,
         height: 1,
-        format: lforge_scene::TextureFormat::Rgba8Unorm,
-        source_mip_levels: 1,
+        level: 0,
+        format: lforge_texture::pixel_format(28),
         data: vec![255, 255, 255, 255],
-        source: "test".into(),
+        swizzled: false,
     };
     let mut scene = Scene::new();
     let mut diagnostics = Vec::new();
@@ -264,6 +267,7 @@ fn a_resolved_texture_is_bound_once_and_deduplicated() {
     let (material, second) = {
         let mut context = MaterialContext {
             provider: &provider,
+            graphics: &[],
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
             external_indices: &mut external,
@@ -290,4 +294,117 @@ fn alpha_buckets_and_double_sided_are_read_from_the_shader_record() {
     assert_eq!(alpha_mode(&shader(0x40)), AlphaMode::Blend);
     let (material, _, _) = build(&shader(0x04), &NoTextures);
     assert!(material.double_sided);
+}
+
+fn shader_with_parameters(hashes: &[u32]) -> Shader {
+    let mut shader = shader(0);
+    shader.texture_parameters = hashes.len() as u8;
+    shader.total_parameters = hashes.len() as u16;
+    shader.slots = hashes.len() as u32;
+    shader.bound_slots = hashes.len() as u32;
+    shader.parameters = hashes
+        .iter()
+        .enumerate()
+        .map(|(index, &name_hash)| drawable::Parameter {
+            index: index as u16,
+            name_hash,
+            packed: 0,
+            class: 0,
+            slot: index as u32,
+            texture: true,
+        })
+        .collect();
+    shader.slot_states = hashes
+        .iter()
+        .enumerate()
+        .map(|(index, _)| drawable::Slot {
+            index: index as u16,
+            state: SlotState::Bound,
+            key: Some(0x0123_4567_89AB_CDEF + index as u64),
+            hash32: Some(0x1122_3344),
+        })
+        .collect();
+    shader
+}
+
+#[test]
+fn specular_tex_fills_the_sampled_slot_and_tex2_stays_distinct() {
+    let level = SourceLevel {
+        width: 1,
+        height: 1,
+        level: 0,
+        format: lforge_texture::pixel_format(28),
+        data: vec![255, 255, 255, 255],
+        swizzled: false,
+    };
+    let provider = OneTexture(level);
+    let mut scene = Scene::new();
+    let mut diagnostics = Vec::new();
+    let embedded = HashMap::new();
+    let mut embedded_indices = HashMap::new();
+    let mut external_indices = HashMap::new();
+    let shader = shader_with_parameters(&[SPECULAR_TEX2, SPECULAR_TEX]);
+    let material = {
+        let mut context = MaterialContext {
+            provider: &provider,
+            graphics: &[],
+            embedded: &embedded,
+            embedded_indices: &mut embedded_indices,
+            external_indices: &mut external_indices,
+            scene: &mut scene,
+            diagnostics: &mut diagnostics,
+        };
+        build_material(&shader, 0, &mut context)
+    };
+    assert_eq!(material.specular, Some(1));
+    assert_eq!(
+        material
+            .bindings
+            .iter()
+            .map(|binding| binding.semantic)
+            .collect::<Vec<_>>(),
+        vec![TextureSemantic::Specular2, TextureSemantic::Specular]
+    );
+    assert!(!material.missing_texture);
+}
+
+#[test]
+fn geometry_completeness_distinguishes_complete_from_partial() {
+    assert_eq!(
+        geometry_completeness(0, 1, 0, 3, 3, 0),
+        GeometryCompleteness::Complete
+    );
+    assert!(matches!(
+        geometry_completeness(0x80, 1, 0, 3, 3, 0),
+        GeometryCompleteness::Partial { .. }
+    ));
+    assert!(matches!(
+        geometry_completeness(0, 2, 0, 3, 3, 0),
+        GeometryCompleteness::Partial { .. }
+    ));
+    assert!(matches!(
+        geometry_completeness(0, 1, 1, 3, 3, 0),
+        GeometryCompleteness::Partial { .. }
+    ));
+    assert!(matches!(
+        geometry_completeness(0, 1, 0, 3, 2, 1),
+        GeometryCompleteness::Partial { .. }
+    ));
+    assert!(matches!(
+        geometry_completeness(0, 1, 0, 3, 2, 0),
+        GeometryCompleteness::Partial { .. }
+    ));
+}
+
+#[test]
+fn texture_completeness_is_separate_from_geometry() {
+    assert_eq!(texture_completeness(0, true), TextureCompleteness::Complete);
+    assert_eq!(
+        texture_completeness(0, false),
+        TextureCompleteness::NotReferenced
+    );
+    assert_eq!(
+        texture_completeness(2, true),
+        TextureCompleteness::Partial { missing: 2 }
+    );
 }

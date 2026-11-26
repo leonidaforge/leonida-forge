@@ -12,16 +12,20 @@
 mod cache;
 mod decode;
 mod dictionary;
+mod embedded;
 mod format;
 mod image;
+mod set;
 mod swizzle;
 #[cfg(test)]
 mod tests;
 
 pub use cache::ImageCache;
 pub use dictionary::DictionaryStore;
+pub use embedded::{EmbeddedTexture, decode_embedded, embedded_textures};
 pub use format::{Codec, PixelFormat, pixel_format};
 pub use image::Image;
+pub use set::StoreSet;
 
 use std::fmt;
 use std::io::{self, Read, Seek};
@@ -123,6 +127,46 @@ pub struct LevelInfo {
     pub offset: u64,
 }
 
+/// One source level after storage reconstruction, before pixel decoding.
+///
+/// Block-compressed data is row-major blocks, already untiled. The renderer
+/// can upload it directly when the graphics backend samples that format;
+/// otherwise [`SourceLevel::decode`] produces RGBA8 through the shared CPU
+/// decoder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLevel {
+    pub width: u32,
+    pub height: u32,
+    pub level: u32,
+    pub format: PixelFormat,
+    /// Row-major blocks for a compressed format, texels otherwise.
+    pub data: Vec<u8>,
+    /// Whether the source allocation was stored in 4 KiB tiles and has been
+    /// reconstructed to row-major before this value was returned.
+    pub swizzled: bool,
+}
+
+impl SourceLevel {
+    pub fn codec(&self) -> Option<Codec> {
+        self.format.codec
+    }
+
+    /// Decodes the reconstructed source to RGBA8.
+    pub fn decode(&self) -> Result<Image, Error> {
+        let codec = self
+            .format
+            .codec
+            .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
+        let rgba = decode::decode(codec, &self.data, self.width, self.height)?;
+        Ok(Image {
+            width: self.width,
+            height: self.height,
+            level: self.level,
+            rgba,
+        })
+    }
+}
+
 /// Metadata for one descriptor, without image data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureInfo {
@@ -193,13 +237,14 @@ impl TextureStore {
         self.textures().is_empty()
     }
 
-    pub fn decode(
+    /// Reconstructs one source level without decoding it to RGBA8.
+    pub fn level(
         &self,
         index: u32,
         level: u32,
         layer: u32,
         cancel: &AtomicBool,
-    ) -> Result<Image, Error> {
+    ) -> Result<SourceLevel, Error> {
         match self {
             TextureStore::Rds5(store) => {
                 if layer != 0 {
@@ -207,10 +252,20 @@ impl TextureStore {
                         "texture {index} has no array layer {layer}"
                     )));
                 }
-                store.decode(index, level, cancel)
+                store.level(index, level, cancel)
             }
-            TextureStore::Dictionary(store) => store.decode(index, level, layer, cancel),
+            TextureStore::Dictionary(store) => store.level(index, level, layer, cancel),
         }
+    }
+
+    pub fn decode(
+        &self,
+        index: u32,
+        level: u32,
+        layer: u32,
+        cancel: &AtomicBool,
+    ) -> Result<Image, Error> {
+        self.level(index, level, layer, cancel)?.decode()
     }
 
     pub fn thumbnail(
@@ -295,9 +350,10 @@ impl Store {
         self.container.version
     }
 
-    /// Decodes one level of one texture. The work runs on the caller's thread;
-    /// pass a cancellation flag when it runs on a background thread.
-    pub fn decode(&self, index: u32, level: u32, cancel: &AtomicBool) -> Result<Image, Error> {
+    /// Reconstructs one level of one texture without decoding pixels. The
+    /// work runs on the caller's thread; pass a cancellation flag when it runs
+    /// on a background thread.
+    pub fn level(&self, index: u32, level: u32, cancel: &AtomicBool) -> Result<SourceLevel, Error> {
         let info = self
             .textures
             .get(index as usize)
@@ -354,23 +410,35 @@ impl Store {
                 bytes.len()
             )));
         }
+        let start = offset as usize;
         let codec = info
             .format
             .codec
             .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
-        let start = offset as usize;
-        let rgba = decode::decode(
-            codec,
-            &bytes[start..start + len as usize],
-            level_info.width,
-            level_info.height,
-        )?;
-        Ok(Image {
+        let swizzled = info.tile_mode != 0;
+        let data = if swizzled {
+            swizzle::deswizzle(
+                &bytes[start..start + len as usize],
+                level_info.width,
+                level_info.height,
+                codec,
+            )?
+        } else {
+            bytes[start..start + len as usize].to_vec()
+        };
+        Ok(SourceLevel {
             width: level_info.width,
             height: level_info.height,
             level,
-            rgba,
+            format: info.format,
+            data,
+            swizzled,
         })
+    }
+
+    /// Decodes one level to RGBA8.
+    pub fn decode(&self, index: u32, level: u32, cancel: &AtomicBool) -> Result<Image, Error> {
+        self.level(index, level, cancel)?.decode()
     }
 
     /// Decodes a level and scales it into a thumbnail.
@@ -403,10 +471,15 @@ fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Erro
         Ok(range) => (range.virtual_len, None),
         Err(err) => (0, Some(err.to_string())),
     };
-    let level0_len = format
-        .codec
-        .filter(|_| encoded_len > 0)
-        .map(|codec| codec.level_len(entry.width(), entry.height()));
+    let level0_len = format.codec.filter(|_| encoded_len > 0).map(|codec| {
+        if entry.tile_mode() != 0 {
+            // A tiled allocation stores whole 4 KiB tiles; level 0 is the
+            // padded grid, not the unpadded row-major size.
+            swizzle::padded_len(codec, entry.width(), entry.height())
+        } else {
+            codec.level_len(entry.width(), entry.height())
+        }
+    });
     let (status, levels) = classify(entry, format, encoded_len, level0_len);
     TextureInfo {
         index: entry.index,

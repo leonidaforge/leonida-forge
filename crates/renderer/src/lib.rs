@@ -178,6 +178,46 @@ struct Target {
     padded_bytes_per_row: u32,
 }
 
+/// A caller-owned GPU render target. Rendering into it never reads pixels
+/// back; the caller can use the colour texture with its own device or copy it
+/// later. Create it through [`Renderer::create_target`] so it belongs to the
+/// renderer's device.
+pub struct GpuTarget {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    color: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+}
+
+impl GpuTarget {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    /// The colour texture. It is owned by this target and stays alive while
+    /// the target does.
+    pub fn color_texture(&self) -> &wgpu::Texture {
+        &self.color
+    }
+
+    pub fn depth_view(&self) -> &wgpu::TextureView {
+        &self.depth_view
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
 pub(crate) struct FallbackTextures {
     white: texture::GpuTexture,
     normal: texture::GpuTexture,
@@ -360,6 +400,158 @@ impl Renderer {
         )
     }
 
+    fn update_camera(&self, camera: &OrbitCamera, width: u32, height: u32) {
+        let aspect = width as f32 / height as f32;
+        let uniforms = CameraUniform {
+            view_projection: camera.view_projection(aspect).to_cols_array_2d(),
+            camera_position: camera.eye().extend(1.0).to_array(),
+            light_direction: Vec3::new(-0.4, -0.7, -0.6).normalize().extend(0.0).into(),
+        };
+        self.queue
+            .write_buffer(&self.camera, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    fn encode_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        scene: &GpuScene,
+        camera: &OrbitCamera,
+        background: Background,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(background.clear()),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        let camera_position = camera.eye();
+        let mut order: Vec<usize> = (0..scene.primitives.len()).collect();
+        order.sort_by(|&a, &b| {
+            let a_primitive = &scene.primitives[a];
+            let b_primitive = &scene.primitives[b];
+            let a_blend =
+                scene.materials[a_primitive.material].alpha_mode == lforge_scene::AlphaMode::Blend;
+            let b_blend =
+                scene.materials[b_primitive.material].alpha_mode == lforge_scene::AlphaMode::Blend;
+            a_blend.cmp(&b_blend).then_with(|| {
+                if a_blend {
+                    let da = (a_primitive.center - camera_position).length_squared();
+                    let db = (b_primitive.center - camera_position).length_squared();
+                    db.total_cmp(&da)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+        });
+        let mut last_pipeline = None;
+        for index in order {
+            let primitive = &scene.primitives[index];
+            let material = &scene.materials[primitive.material];
+            let pipeline = if material.alpha_mode == lforge_scene::AlphaMode::Blend {
+                &self.pipelines.blend
+            } else if material.double_sided {
+                &self.pipelines.opaque_double_sided
+            } else {
+                &self.pipelines.opaque
+            };
+            if last_pipeline != Some(pipeline as *const _) {
+                pass.set_pipeline(pipeline);
+                last_pipeline = Some(pipeline as *const _);
+            }
+            pass.set_bind_group(1, &material.bind_group, &[]);
+            pass.set_vertex_buffer(0, primitive.vertices.slice(..));
+            pass.set_index_buffer(primitive.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..primitive.index_count, 0, 0..1);
+        }
+    }
+
+    /// Creates a GPU target owned by this renderer's device. The colour
+    /// format is the renderer's sRGB target format.
+    pub fn create_target(&self, width: u32, height: u32) -> Result<GpuTarget, Error> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(Error::Target(format!(
+                "{width} x {height} is outside 1..={max}"
+            )));
+        }
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu target color"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpu target depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        Ok(GpuTarget {
+            width,
+            height,
+            format: COLOR_FORMAT,
+            color,
+            depth_view: depth.create_view(&Default::default()),
+        })
+    }
+
+    /// Renders an uploaded scene into a caller-owned GPU target. No GPU-to-CPU
+    /// readback occurs.
+    pub fn render_to_target(
+        &self,
+        scene: &GpuScene,
+        camera: &OrbitCamera,
+        target: &GpuTarget,
+        background: Background,
+    ) -> Result<(), Error> {
+        let color_view = target.color.create_view(&Default::default());
+        self.update_camera(camera, target.width, target.height);
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.encode_scene(
+            &mut encoder,
+            &color_view,
+            &target.depth_view,
+            scene,
+            camera,
+            background,
+        );
+        self.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
     /// Renders one frame of an uploaded scene and reads the pixels back.
     pub fn render(
         &mut self,
@@ -380,82 +572,18 @@ impl Renderer {
             self.target = Some(create_target(&self.device, width, height));
         }
         let target = self.target.as_ref().expect("target was just created");
-        let aspect = width as f32 / height as f32;
-        let uniforms = CameraUniform {
-            view_projection: camera.view_projection(aspect).to_cols_array_2d(),
-            camera_position: camera.eye().extend(1.0).to_array(),
-            light_direction: Vec3::new(-0.4, -0.7, -0.6).normalize().extend(0.0).into(),
-        };
-        self.queue
-            .write_buffer(&self.camera, 0, bytemuck::bytes_of(&uniforms));
+        self.update_camera(camera, width, height);
 
         let color_view = target.color.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(background.clear()),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &target.depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            let camera_position = camera.eye();
-            let mut order: Vec<usize> = (0..scene.primitives.len()).collect();
-            order.sort_by(|&a, &b| {
-                let a_primitive = &scene.primitives[a];
-                let b_primitive = &scene.primitives[b];
-                let a_blend = scene.materials[a_primitive.material].alpha_mode
-                    == lforge_scene::AlphaMode::Blend;
-                let b_blend = scene.materials[b_primitive.material].alpha_mode
-                    == lforge_scene::AlphaMode::Blend;
-                a_blend.cmp(&b_blend).then_with(|| {
-                    if a_blend {
-                        let da = (a_primitive.center - camera_position).length_squared();
-                        let db = (b_primitive.center - camera_position).length_squared();
-                        db.total_cmp(&da)
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                })
-            });
-            let mut last_pipeline = None;
-            for index in order {
-                let primitive = &scene.primitives[index];
-                let material = &scene.materials[primitive.material];
-                let pipeline = if material.alpha_mode == lforge_scene::AlphaMode::Blend {
-                    &self.pipelines.blend
-                } else if material.double_sided {
-                    &self.pipelines.opaque_double_sided
-                } else {
-                    &self.pipelines.opaque
-                };
-                if last_pipeline != Some(pipeline as *const _) {
-                    pass.set_pipeline(pipeline);
-                    last_pipeline = Some(pipeline as *const _);
-                }
-                pass.set_bind_group(1, &material.bind_group, &[]);
-                pass.set_vertex_buffer(0, primitive.vertices.slice(..));
-                pass.set_index_buffer(primitive.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..primitive.index_count, 0, 0..1);
-            }
-        }
+        self.encode_scene(
+            &mut encoder,
+            &color_view,
+            &target.depth_view,
+            scene,
+            camera,
+            background,
+        );
         encoder.copy_texture_to_buffer(
             target.color.as_image_copy(),
             wgpu::TexelCopyBufferInfo {

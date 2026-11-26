@@ -118,25 +118,28 @@ fn decode_rgba8(texture: &Texture) -> Result<Vec<u8>, Error> {
             texture.name
         )));
     }
-    let mut image = vec![0u32; width * height];
-    let result = match texture.format {
+    let rgba = match texture.format {
         TextureFormat::Bc1Unorm | TextureFormat::Bc1UnormSrgb => {
-            texture2ddecoder::decode_bc1(&texture.data, width, height, &mut image)
+            decode_blocks(texture, 8, Channels::Rgba, |block, out| {
+                bcdec_rs::bc1(block, out, 16)
+            })?
         }
         TextureFormat::Bc3Unorm | TextureFormat::Bc3UnormSrgb => {
-            texture2ddecoder::decode_bc3(&texture.data, width, height, &mut image)
+            decode_blocks(texture, 16, Channels::Rgba, |block, out| {
+                bcdec_rs::bc3(block, out, 16)
+            })?
         }
-        TextureFormat::Bc4Unorm => {
-            texture2ddecoder::decode_bc4(&texture.data, width, height, &mut image)
-        }
-        TextureFormat::Bc5Unorm => {
-            texture2ddecoder::decode_bc5(&texture.data, width, height, &mut image)
-        }
-        TextureFormat::Bc6hUf16 => {
-            texture2ddecoder::decode_bc6_unsigned(&texture.data, width, height, &mut image)
-        }
+        TextureFormat::Bc4Unorm => decode_blocks(texture, 8, Channels::Red, |block, out| {
+            bcdec_rs::bc4(block, out, 4, false)
+        })?,
+        TextureFormat::Bc5Unorm => decode_blocks(texture, 16, Channels::RedGreen, |block, out| {
+            bcdec_rs::bc5(block, out, 8, false)
+        })?,
+        TextureFormat::Bc6hUf16 => decode_bc6h(texture)?,
         TextureFormat::Bc7Unorm | TextureFormat::Bc7UnormSrgb => {
-            texture2ddecoder::decode_bc7(&texture.data, width, height, &mut image)
+            decode_blocks(texture, 16, Channels::Rgba, |block, out| {
+                bcdec_rs::bc7(block, out, 16)
+            })?
         }
         other => {
             return Err(Error::Texture(format!(
@@ -145,22 +148,128 @@ fn decode_rgba8(texture: &Texture) -> Result<Vec<u8>, Error> {
             )));
         }
     };
-    result.map_err(|reason| Error::Texture(format!("{}: {reason}", texture.name)))?;
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for pixel in image {
-        let r = ((pixel >> 16) & 0xFF) as u8;
-        let g = ((pixel >> 8) & 0xFF) as u8;
-        let mut b = (pixel & 0xFF) as u8;
-        let a = ((pixel >> 24) & 0xFF) as u8;
-        if texture.format == TextureFormat::Bc5Unorm {
-            // BC5 leaves blue at zero; reconstruct the tangent-space z
-            // component of the normal map the format usually stores.
-            let x = r as f32 / 127.5 - 1.0;
-            let y = g as f32 / 127.5 - 1.0;
-            let z = (1.0 - x * x - y * y).max(0.0).sqrt();
-            b = ((z * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Ok(rgba)
+}
+
+#[derive(Clone, Copy)]
+enum Channels {
+    Red,
+    RedGreen,
+    Rgba,
+}
+
+impl Channels {
+    fn byte_len(self) -> usize {
+        match self {
+            Channels::Red => 1,
+            Channels::RedGreen => 2,
+            Channels::Rgba => 4,
         }
-        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+}
+
+fn decode_blocks(
+    texture: &Texture,
+    block_len: usize,
+    channels: Channels,
+    decode: impl Fn(&[u8], &mut [u8]),
+) -> Result<Vec<u8>, Error> {
+    let width = texture.width as usize;
+    let height = texture.height as usize;
+    let blocks_x = width.div_ceil(4);
+    let blocks_y = height.div_ceil(4);
+    let need = blocks_x * blocks_y * block_len;
+    if texture.data.len() < need {
+        return Err(Error::Texture(format!(
+            "{}: the compressed level needs {need} bytes but holds {}",
+            texture.name,
+            texture.data.len()
+        )));
+    }
+    let mut rgba = vec![0u8; width * height * 4];
+    let stride = channels.byte_len();
+    let mut block = vec![0u8; 16 * stride];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let at = (by * blocks_x + bx) * block_len;
+            decode(&texture.data[at..at + block_len], &mut block);
+            for i in 0..16 {
+                let x = bx * 4 + i % 4;
+                let y = by * 4 + i / 4;
+                if x >= width || y >= height {
+                    continue;
+                }
+                let source = i * stride;
+                let target = (y * width + x) * 4;
+                match channels {
+                    Channels::Rgba => {
+                        rgba[target..target + 4].copy_from_slice(&block[source..source + 4]);
+                    }
+                    Channels::Red => {
+                        let value = block[source];
+                        rgba[target] = value;
+                        rgba[target + 1] = value;
+                        rgba[target + 2] = value;
+                        rgba[target + 3] = 255;
+                    }
+                    Channels::RedGreen => {
+                        let r = block[source];
+                        let g = block[source + 1];
+                        // BC5 leaves blue unset; reconstruct the tangent-space
+                        // z component of the normal map the format stores.
+                        let x = r as f32 / 127.5 - 1.0;
+                        let y = g as f32 / 127.5 - 1.0;
+                        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+                        rgba[target] = r;
+                        rgba[target + 1] = g;
+                        rgba[target + 2] =
+                            ((z * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+                        rgba[target + 3] = 255;
+                    }
+                }
+            }
+        }
+    }
+    Ok(rgba)
+}
+
+fn decode_bc6h(texture: &Texture) -> Result<Vec<u8>, Error> {
+    let width = texture.width as usize;
+    let height = texture.height as usize;
+    let blocks_x = width.div_ceil(4);
+    let blocks_y = height.div_ceil(4);
+    let need = blocks_x * blocks_y * 16;
+    if texture.data.len() < need {
+        return Err(Error::Texture(format!(
+            "{}: the compressed level needs {need} bytes but holds {}",
+            texture.name,
+            texture.data.len()
+        )));
+    }
+    let mut rgba = vec![0u8; width * height * 4];
+    let mut block = [0u16; 16 * 3];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let at = (by * blocks_x + bx) * 16;
+            bcdec_rs::bc6h_half(&texture.data[at..at + 16], &mut block, 4 * 3, false);
+            for i in 0..16 {
+                let x = bx * 4 + i % 4;
+                let y = by * 4 + i / 4;
+                if x >= width || y >= height {
+                    continue;
+                }
+                let target = (y * width + x) * 4;
+                for channel in 0..3 {
+                    let value = half::f16::from_bits(block[i * 3 + channel]).to_f32();
+                    rgba[target + channel] = if value.is_finite() {
+                        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+                    } else {
+                        0
+                    };
+                }
+                rgba[target + 3] = 255;
+            }
+        }
     }
     Ok(rgba)
 }

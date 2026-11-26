@@ -358,3 +358,32 @@ fn an_empty_scene_is_reported() {
     let err = renderer.upload_scene(&scene).expect_err("empty scene");
     assert!(err.to_string().contains("primitive"));
 }
+
+#[test]
+fn renders_into_a_gpu_target_without_readback() {
+    let Some(renderer) = renderer() else {
+        return;
+    };
+    let scene = colored_scene();
+    let camera = OrbitCamera::framing(scene.bounds, 1.0);
+    let target = renderer.create_target(48, 32).expect("target");
+    assert_eq!(target.size(), (48, 32));
+    assert_eq!(target.width(), 48);
+    assert_eq!(target.height(), 32);
+    let gpu = renderer.upload_scene(&scene).expect("upload");
+    // A GPU-only render has no Frame result: it never copies to the CPU.
+    renderer
+        .render_to_target(&gpu, &camera, &target, Background::DARK)
+        .expect("render to target");
+    assert_eq!(target.color_texture().width(), 48);
+    assert_eq!(target.color_texture().height(), 32);
+}
+
+#[test]
+fn a_zero_sized_gpu_target_is_rejected() {
+    let Some(renderer) = renderer() else {
+        return;
+    };
+    assert!(renderer.create_target(0, 16).is_err());
+    assert!(renderer.create_target(16, 0).is_err());
+}

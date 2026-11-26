@@ -34,6 +34,14 @@ pub fn entry(width: u32, height: u32, format: u8, kind: u8, page: u32) -> [u32; 
     [w0, w1, page, 0]
 }
 
+/// The same descriptor with a non-zero tile mode. `1..=3` is a 4 KiB tile
+/// grid; `0` is the non-tiled path in the current viewer.
+pub fn entry_tiled(width: u32, height: u32, format: u8, kind: u8, page: u32, tile: u8) -> [u32; 4] {
+    let mut words = entry(width, height, format, kind, page);
+    words[1] |= u32::from(tile) << 24;
+    words
+}
+
 /// Builds a store with one zlib block per descriptor. The entries must point
 /// at the first page of their block.
 pub fn build(blocks: &[Vec<u8>], entries: &[[u32; 4]]) -> Vec<u8> {

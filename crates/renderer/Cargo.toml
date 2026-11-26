@@ -10,7 +10,8 @@ publish.workspace = true
 [dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+half.workspace = true
 lforge-scene.workspace = true
 pollster.workspace = true
-texture2ddecoder = "0.1"
+bcdec_rs.workspace = true
 wgpu.workspace = true

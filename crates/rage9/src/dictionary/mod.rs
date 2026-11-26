@@ -277,6 +277,63 @@ pub fn is_dictionary(system: &[u8]) -> bool {
     parse(system, 0, &Limits::default()).is_ok()
 }
 
+/// Reads one `0x70`-byte texture record at `at` in the system segment.
+/// `extent` is the allocation length when the caller knows it; the record
+/// itself only stores the allocation start. This is the same record shape a
+/// texture dictionary uses, exposed for a texture embedded in another
+/// resource.
+pub fn record_at(system: &[u8], at: u32, index: u32, extent: Option<u64>) -> Result<Record, Error> {
+    let base = at as usize;
+    let end = u64::from(at)
+        .checked_add(RECORD_LEN)
+        .ok_or_else(|| Error::Invalid(format!("record {index} overflows")))?;
+    if end > system.len() as u64 {
+        return Err(Error::Invalid(format!(
+            "record {index} at system +{at:#x} needs {RECORD_LEN} bytes, past the {} byte system segment",
+            system.len()
+        )));
+    }
+    let graphics_at = graphics_at(u64_at(system, base + 0x18).unwrap_or(0));
+    let name_at = system_at(u64_at(system, base + 0x30).unwrap_or(0));
+    let (name_variant, name_hash, name, name_check) = match name_at {
+        Some(name) => read_name(system, name),
+        None => (
+            NameVariant::Pointer,
+            None,
+            None,
+            NameCheck::NotChecked("no name record"),
+        ),
+    };
+    Ok(Record {
+        index,
+        at,
+        units: u32_at(system, base + 0x08).unwrap_or(0),
+        word_0c: u32_at(system, base + 0x0C).unwrap_or(0),
+        word_10: u64_at(system, base + 0x10).unwrap_or(0),
+        graphics_at,
+        extent,
+        name_at,
+        width: u16_at(system, base + 0x38).unwrap_or(0),
+        height: u16_at(system, base + 0x3A).unwrap_or(0),
+        format_id: system.get(base + 0x3F).copied().unwrap_or(0),
+        swizzle: system.get(base + 0x40).copied().unwrap_or(0),
+        mip_word: u16_at(system, base + 0x42).unwrap_or(0),
+        mip_levels: u16_at(system, base + 0x42).unwrap_or(0) & MIP_LEVEL_MASK,
+        neutral: [
+            u64::from(u16_at(system, base + 0x3C).unwrap_or(0)),
+            u64::from(system.get(base + 0x3E).copied().unwrap_or(0)),
+            u64::from(u16_at(system, base + 0x40).unwrap_or(0)),
+            u64::from(u16_at(system, base + 0x46).unwrap_or(0)),
+            u64_at(system, base + 0x48).unwrap_or(0),
+            u64_at(system, base + 0x60).unwrap_or(0),
+        ],
+        name_variant,
+        name_hash,
+        name,
+        name_check,
+    })
+}
+
 /// Parses a dictionary. `graphics_len` is the length of the graphics
 /// segment; allocation bounds are checked against it but no graphics byte is
 /// read.
@@ -412,7 +469,6 @@ pub fn parse(system: &[u8], graphics_len: u64, limits: &Limits) -> Result<Report
 
     let mut records = Vec::with_capacity(pointers.len());
     for (ix, &at) in pointers.iter().enumerate() {
-        let base = at as usize;
         let extent = (starts[ix] != u32::MAX).then(|| {
             let start = u64::from(starts[ix]);
             let next = distinct
@@ -422,44 +478,7 @@ pub fn parse(system: &[u8], graphics_len: u64, limits: &Limits) -> Result<Report
                 .unwrap_or(graphics_len);
             next.saturating_sub(start)
         });
-        let name_at = system_at(u64_at(system, base + 0x30).unwrap_or(0));
-        let (name_variant, name_hash, name, name_check) = match name_at {
-            Some(name) => read_name(system, name),
-            None => (
-                NameVariant::Pointer,
-                None,
-                None,
-                NameCheck::NotChecked("no name record"),
-            ),
-        };
-        records.push(Record {
-            index: ix as u32,
-            at,
-            units: u32_at(system, base + 0x08).unwrap_or(0),
-            word_0c: u32_at(system, base + 0x0C).unwrap_or(0),
-            word_10: u64_at(system, base + 0x10).unwrap_or(0),
-            graphics_at: (starts[ix] != u32::MAX).then_some(starts[ix]),
-            extent,
-            name_at,
-            width: u16_at(system, base + 0x38).unwrap_or(0),
-            height: u16_at(system, base + 0x3A).unwrap_or(0),
-            format_id: system.get(base + 0x3F).copied().unwrap_or(0),
-            swizzle: system.get(base + 0x40).copied().unwrap_or(0),
-            mip_word: u16_at(system, base + 0x42).unwrap_or(0),
-            mip_levels: u16_at(system, base + 0x42).unwrap_or(0) & MIP_LEVEL_MASK,
-            neutral: [
-                u64::from(u16_at(system, base + 0x3C).unwrap_or(0)),
-                u64::from(system.get(base + 0x3E).copied().unwrap_or(0)),
-                u64::from(u16_at(system, base + 0x40).unwrap_or(0)),
-                u64::from(u16_at(system, base + 0x46).unwrap_or(0)),
-                u64_at(system, base + 0x48).unwrap_or(0),
-                u64_at(system, base + 0x60).unwrap_or(0),
-            ],
-            name_variant,
-            name_hash,
-            name,
-            name_check,
-        });
+        records.push(record_at(system, at, ix as u32, extent)?);
     }
 
     Ok(Report {

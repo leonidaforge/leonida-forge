@@ -303,3 +303,45 @@ pub(crate) fn texture_context_label(info: &TextureInfo) -> String {
         info.format.id
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lforge_texture::StoreSet;
+
+    /// Manual census over the real `.ttpf` stores below a game installation.
+    /// The baseline is the recorded 912-descriptor store. The test reads only
+    /// caller-supplied paths and is ignored by default.
+    #[test]
+    #[ignore = "requires LF_TEST_GAME_ROOT"]
+    fn rds5_census_matches_the_recorded_baseline() {
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let ttdb = Path::new(&root).join("data").join("ttdb");
+        let set = StoreSet::scan(&ttdb).expect("scan the texture stores");
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut found = None;
+        for store_index in 0..set.len() {
+            let store = set.open(store_index).expect("open a store");
+            if store.textures().len() != 912 {
+                continue;
+            }
+            let mut decodable = 0usize;
+            let mut decoded = 0usize;
+            for (index, info) in store.textures().iter().enumerate() {
+                if !info.status.is_decodable() {
+                    continue;
+                }
+                decodable += 1;
+                if store.level(index as u32, 0, &cancel).is_ok() {
+                    decoded += 1;
+                }
+            }
+            found = Some((decodable, decoded));
+            break;
+        }
+        let (decodable, decoded) = found.expect("the 912-descriptor store");
+        eprintln!("total=912 decodable={decodable} decoded={decoded}");
+        assert_eq!(decodable, 886);
+        assert_eq!(decoded, 872);
+    }
+}

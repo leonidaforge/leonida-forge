@@ -20,6 +20,8 @@ struct Summary {
     textures: usize,
     vertices: usize,
     triangles: usize,
+    completeness: lforge_model::ModelCompleteness,
+    exact_layout: bool,
 }
 
 enum State {
@@ -66,28 +68,46 @@ impl ModelViewer {
                             textures: scene.textures.len(),
                             vertices: scene.vertex_count(),
                             triangles: scene.triangle_count(),
+                            completeness: loaded.completeness.clone(),
+                            exact_layout: loaded.exact_layout,
                         };
-                        let diagnostics = scene
-                            .diagnostics
-                            .iter()
-                            .map(|diagnostic| {
-                                let mut line = String::new();
-                                if let Some(mesh) = &diagnostic.mesh {
-                                    line.push_str(mesh);
-                                    line.push_str(": ");
-                                }
-                                if let Some(material) = &diagnostic.material {
-                                    line.push_str(material);
-                                    line.push_str(": ");
-                                }
-                                if let Some(reference) = &diagnostic.reference {
-                                    line.push_str(reference);
-                                    line.push_str(": ");
-                                }
-                                line.push_str(&diagnostic.reason);
-                                line
-                            })
-                            .collect();
+                        let mut lines: Vec<String> = loaded.completeness.notes.to_vec();
+                        if let lforge_model::GeometryCompleteness::Partial { reason } =
+                            &loaded.completeness.geometry
+                        {
+                            lines.push(format!("Partial geometry: {reason}"));
+                        }
+                        if let lforge_model::TextureCompleteness::Partial { missing } =
+                            loaded.completeness.textures
+                        {
+                            lines.push(format!(
+                                "Partial textures: {missing} material(s) use a fallback"
+                            ));
+                        }
+                        if !loaded.exact_layout {
+                            lines.push(
+                                "The system/graphics boundary was inferred; no native page metadata was available."
+                                    .into(),
+                            );
+                        }
+                        lines.extend(scene.diagnostics.iter().map(|diagnostic| {
+                            let mut line = String::new();
+                            if let Some(mesh) = &diagnostic.mesh {
+                                line.push_str(mesh);
+                                line.push_str(": ");
+                            }
+                            if let Some(material) = &diagnostic.material {
+                                line.push_str(material);
+                                line.push_str(": ");
+                            }
+                            if let Some(reference) = &diagnostic.reference {
+                                line.push_str(reference);
+                                line.push_str(": ");
+                            }
+                            line.push_str(&diagnostic.reason);
+                            line
+                        }));
+                        let diagnostics = lines;
                         this.name = loaded.name;
                         this.state = State::Ready {
                             viewport,
@@ -222,8 +242,25 @@ impl ModelViewer {
                     }
                     RendererStatus::Failed(err) => format!("Renderer error: {err}"),
                 };
+                let geometry = match &summary.completeness.geometry {
+                    lforge_model::GeometryCompleteness::Complete => "complete geometry",
+                    lforge_model::GeometryCompleteness::Partial { .. } => "partial geometry",
+                    lforge_model::GeometryCompleteness::Unsupported { .. } => {
+                        "unsupported geometry"
+                    }
+                };
+                let layout = if summary.exact_layout {
+                    "native page layout"
+                } else {
+                    "inferred boundary"
+                };
+                let textures = match &summary.completeness.textures {
+                    lforge_model::TextureCompleteness::Complete => "complete textures",
+                    lforge_model::TextureCompleteness::Partial { .. } => "partial textures",
+                    lforge_model::TextureCompleteness::NotReferenced => "no texture references",
+                };
                 let left = format!(
-                    "{} meshes  ·  {} materials  ·  {} textures  ·  {} vertices  ·  {} triangles",
+                    "{geometry}  ·  {textures}  ·  {layout}  ·  {} meshes  ·  {} materials  ·  {} textures  ·  {} vertices  ·  {} triangles",
                     summary.meshes,
                     summary.materials,
                     summary.textures,

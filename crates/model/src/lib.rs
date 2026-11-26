@@ -1,6 +1,6 @@
 //! Decoding of a drawable resource into renderer-independent scene data.
 //!
-//! The structural walk comes from [`crate::drawable`]. This module adds the
+//! The structural walk comes from [`lforge_rage9::drawable`]. This module adds the
 //! parts the research established after that walk: the mesh-blob stream table,
 //! the position quantiser and its axis rotation, octahedral normals, UVs,
 //! tangents, meshlet indices, and the shader texture references. Geometry is
@@ -12,14 +12,15 @@
 //! never substitutes a texture whose key merely looks similar.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::AtomicBool;
 
 use glam::Vec3;
+use lforge_rage9::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};
 use lforge_scene::{
     AlphaMode, Diagnostic, Material, Mesh, Primitive, Scene, Texture, TextureBinding,
-    TextureSemantic, Vertex,
+    TextureFormat, TextureSemantic, Vertex,
 };
-
-use crate::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};
+use lforge_texture::{Codec, EmbeddedTexture, SourceLevel, decode_embedded, embedded_textures};
 
 /// Largest vertex or index count accepted from one geometry.
 const MAX_VERTICES: usize = 8 << 20;
@@ -67,15 +68,51 @@ pub struct TextureReference {
     pub material: String,
 }
 
+/// A source level and where it came from, before the model-specific
+/// conversion to a drawable texture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTexture {
+    pub level: SourceLevel,
+    pub source: String,
+}
+
 /// How an external texture resolved.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextureResolution {
     Missing,
-    Resolved(Texture),
+    Resolved(ResolvedTexture),
     /// More than one store or descriptor carries the key.
     Ambiguous(Vec<String>),
     /// The reference was found but its bytes could not be decoded.
     Failed(String),
+}
+
+fn texture_from_source(level: SourceLevel, source: String) -> Result<Texture, String> {
+    let format = match (level.codec(), level.format.srgb) {
+        (Some(Codec::Rgba8), false) => TextureFormat::Rgba8Unorm,
+        (Some(Codec::Rgba8), true) => TextureFormat::Rgba8UnormSrgb,
+        (Some(Codec::R16Float), _) => TextureFormat::R16Float,
+        (Some(Codec::Bc1), false) => TextureFormat::Bc1Unorm,
+        (Some(Codec::Bc1), true) => TextureFormat::Bc1UnormSrgb,
+        (Some(Codec::Bc3), false) => TextureFormat::Bc3Unorm,
+        (Some(Codec::Bc3), true) => TextureFormat::Bc3UnormSrgb,
+        (Some(Codec::Bc4), _) => TextureFormat::Bc4Unorm,
+        (Some(Codec::Bc5), _) => TextureFormat::Bc5Unorm,
+        (Some(Codec::Bc7), false) => TextureFormat::Bc7Unorm,
+        (Some(Codec::Bc7), true) => TextureFormat::Bc7UnormSrgb,
+        (None, _) => return Err("the texture format has no pixel layout".into()),
+    };
+    let texture = Texture {
+        name: source.clone(),
+        width: level.width,
+        height: level.height,
+        format,
+        source_mip_levels: 1,
+        data: level.data,
+        source,
+    };
+    texture.validate()?;
+    Ok(texture)
 }
 
 /// The asset layer implements this over the texture stores it can reach.
@@ -93,12 +130,47 @@ impl TextureProvider for NoTextures {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeometryCompleteness {
+    /// The resource's highest populated LOD was decoded from the root drawable
+    /// and the structural walk reported no issues.
+    Complete,
+    /// A supported drawable was decoded, but the resource holds additional
+    /// members, a non-root root was selected, or the structural walk reported
+    /// issues.
+    Partial { reason: String },
+    /// The resource is not a supported drawable.
+    Unsupported { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextureCompleteness {
+    /// Every material texture reference resolved and reconstructed.
+    Complete,
+    /// At least one material uses a fallback.
+    Partial { missing: usize },
+    /// No material binds a texture.
+    NotReferenced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCompleteness {
+    pub geometry: GeometryCompleteness,
+    pub textures: TextureCompleteness,
+    /// System offset of the selected drawable root.
+    pub selected_root: usize,
+    pub selected_name: Option<String>,
+    pub notes: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedModel {
     pub scene: Scene,
     pub report: Report,
     /// The LOD slot that was decoded; 0 is the highest quality present.
     pub lod: usize,
+    /// Geometry and texture completeness are separate properties.
+    pub completeness: ModelCompleteness,
 }
 
 /// Whether the resource has the header and LOD chain of a drawable at zero.
@@ -171,7 +243,7 @@ pub fn split_resource(bytes: &[u8]) -> Option<ResourceSplit> {
     let mut fallback = None;
     for (split, support) in ranked.into_iter().take(64) {
         let (system, graphics) = bytes.split_at(split);
-        if crate::resource::page_map_offset(system).is_none() {
+        if lforge_rage9::resource::page_map_offset(system).is_none() {
             continue;
         }
         if drawable::is_drawable(system, graphics) {
@@ -198,7 +270,7 @@ pub fn decode(
     graphics: &[u8],
     provider: &dyn TextureProvider,
 ) -> Result<DecodedModel, Error> {
-    let (_root, report) = find_drawable_root(system, graphics)
+    let (root, report, candidates) = find_drawable_root(system, graphics)
         .ok_or_else(|| Error::new("the resource holds no drawable root"))?;
     let lod_index = report
         .lod
@@ -206,6 +278,7 @@ pub fn decode(
         .position(|slot| !slot.models.is_empty())
         .ok_or_else(|| Error::new("the drawable has no populated LOD"))?;
     let lod = &report.lod[lod_index];
+    let expected_geometries: usize = lod.models.iter().map(|model| model.geometries.len()).sum();
     let mut scene = Scene::new();
     let mut diagnostics: Vec<Diagnostic> = report
         .issues
@@ -213,9 +286,9 @@ pub fn decode(
         .map(|issue| Diagnostic::new(issue.to_string()))
         .collect();
 
-    let embedded: HashMap<u64, Texture> = crate::texture_store::embedded_textures(system, graphics)
+    let embedded: HashMap<u64, EmbeddedTexture> = embedded_textures(system, graphics)
         .into_iter()
-        .map(|texture| (texture.hash, texture.texture))
+        .map(|texture| (texture.key, texture))
         .collect();
     let mut embedded_indices: HashMap<u64, Option<usize>> = HashMap::new();
     let mut external_indices: HashMap<u64, Option<usize>> = HashMap::new();
@@ -225,6 +298,7 @@ pub fn decode(
     if let Some(group) = &report.shader_group {
         let mut context = MaterialContext {
             provider,
+            graphics,
             embedded: &embedded,
             embedded_indices: &mut embedded_indices,
             external_indices: &mut external_indices,
@@ -244,6 +318,8 @@ pub fn decode(
         scene.materials.push(Material::default());
     }
 
+    let mut decoded_geometries = 0usize;
+    let mut geometry_failures = 0usize;
     for (model_index, model) in lod.models.iter().enumerate() {
         let mut mesh = Mesh::new(format!(
             "{} model {model_index}",
@@ -264,8 +340,10 @@ pub fn decode(
                 Ok(mut primitive) => {
                     primitive.material = material;
                     mesh.primitives.push(primitive);
+                    decoded_geometries += 1;
                 }
                 Err(reason) => {
+                    geometry_failures += 1;
                     diagnostics.push(Diagnostic::new(reason).with_mesh(mesh.name.clone()));
                 }
             }
@@ -281,10 +359,43 @@ pub fn decode(
     scene.diagnostics.extend(diagnostics);
     let validation = scene.validate();
     scene.diagnostics.extend(validation);
+
+    let missing_textures = scene
+        .materials
+        .iter()
+        .filter(|material| material.missing_texture)
+        .count();
+    let referenced = scene
+        .materials
+        .iter()
+        .any(|material| !material.bindings.is_empty());
+    let textures = texture_completeness(missing_textures, referenced);
+    let selected_name = report.header.name_text.clone();
+    let mut notes = vec![format!("drawable root at system +{root:#x}")];
+    if candidates > 1 {
+        notes.push(format!(
+            "{candidates} drawable roots resolved; one was selected"
+        ));
+    }
+    let geometry = geometry_completeness(
+        root,
+        candidates,
+        report.issues.len(),
+        expected_geometries,
+        decoded_geometries,
+        geometry_failures,
+    );
     Ok(DecodedModel {
         scene,
         report,
         lod: lod_index,
+        completeness: ModelCompleteness {
+            geometry,
+            textures,
+            selected_root: root,
+            selected_name,
+            notes,
+        },
     })
 }
 
@@ -292,12 +403,13 @@ pub fn decode(
 /// fragment or a drawable dictionary can hold member drawables elsewhere in
 /// the system segment; the best member is the one with the most populated
 /// LOD levels and geometries.
-fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report)> {
+fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report, usize)> {
     if let Some(report) = drawable::inspect(system, graphics) {
-        return Some((0, report));
+        return Some((0, report, 1));
     }
     type RootScore = (usize, usize, usize, usize, usize);
     let mut best: Option<(usize, Report, RootScore)> = None;
+    let mut candidates = 0usize;
     let mut examined = 0usize;
     let last = system.len().saturating_sub(0xC0);
     for root in (0..=last).step_by(8) {
@@ -326,6 +438,7 @@ fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report)>
         let Some(report) = drawable::inspect_at(system, graphics, root) else {
             continue;
         };
+        candidates += 1;
         let populated = report
             .lod
             .iter()
@@ -364,7 +477,7 @@ fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report)>
             best = Some((root, report, score));
         }
     }
-    best.map(|(root, report, _)| (root, report))
+    best.map(|(root, report, _)| (root, report, candidates.max(1)))
 }
 
 fn used_shader_indices(
@@ -393,9 +506,52 @@ fn read_shader_index(system: &[u8], model: &drawable::Model, geometry: usize) ->
     u16_at(system, at).map(usize::from)
 }
 
+fn geometry_completeness(
+    root: usize,
+    candidates: usize,
+    issues: usize,
+    expected_geometries: usize,
+    decoded_geometries: usize,
+    geometry_failures: usize,
+) -> GeometryCompleteness {
+    if root == 0
+        && candidates <= 1
+        && issues == 0
+        && geometry_failures == 0
+        && decoded_geometries == expected_geometries
+    {
+        return GeometryCompleteness::Complete;
+    }
+    let reason = if root != 0 {
+        format!(
+            "selected drawable root at system +{root:#x}; other fragment or dictionary members were not assembled"
+        )
+    } else if candidates > 1 {
+        format!("{candidates} drawable roots resolved; one was selected")
+    } else if issues > 0 {
+        format!("the structural walk reported {issues} issue(s)")
+    } else if geometry_failures > 0 {
+        format!("{geometry_failures} geometry record(s) could not be decoded")
+    } else {
+        format!("decoded {decoded_geometries} of {expected_geometries} geometries")
+    };
+    GeometryCompleteness::Partial { reason }
+}
+
+fn texture_completeness(missing: usize, referenced: bool) -> TextureCompleteness {
+    if missing > 0 {
+        TextureCompleteness::Partial { missing }
+    } else if referenced {
+        TextureCompleteness::Complete
+    } else {
+        TextureCompleteness::NotReferenced
+    }
+}
+
 struct MaterialContext<'a> {
     provider: &'a dyn TextureProvider,
-    embedded: &'a HashMap<u64, Texture>,
+    graphics: &'a [u8],
+    embedded: &'a HashMap<u64, EmbeddedTexture>,
     embedded_indices: &'a mut HashMap<u64, Option<usize>>,
     external_indices: &'a mut HashMap<u64, Option<usize>>,
     scene: &'a mut Scene,
@@ -409,6 +565,7 @@ fn build_material(
 ) -> Material {
     let MaterialContext {
         provider,
+        graphics,
         embedded,
         embedded_indices,
         external_indices,
@@ -426,7 +583,7 @@ fn build_material(
     };
     let mut missing = false;
     for slot in &shader.slot_states {
-        if slot.state != crate::dictionary::SlotState::Bound {
+        if slot.state != lforge_rage9::dictionary::SlotState::Bound {
             continue;
         }
         let Some(key) = slot.key.filter(|key| *key != 0) else {
@@ -447,10 +604,30 @@ fn build_material(
             match embedded_indices.get(&key) {
                 Some(index) => *index,
                 None => {
-                    let index = scene.textures.len();
-                    scene.textures.push(texture.clone());
-                    embedded_indices.insert(key, Some(index));
-                    Some(index)
+                    let result = decode_embedded(graphics, texture, 0, &AtomicBool::new(false))
+                        .map_err(|err| err.to_string())
+                        .and_then(|level| {
+                            texture_from_source(level, format!("embedded: {}", texture.info().name))
+                        });
+                    let index = match result {
+                        Ok(texture) => {
+                            let index = scene.textures.len();
+                            scene.textures.push(texture);
+                            Some(index)
+                        }
+                        Err(reason) => {
+                            diagnostics.push(
+                                Diagnostic::new(format!(
+                                    "embedded texture could not be decoded: {reason}"
+                                ))
+                                .with_material(name.clone())
+                                .with_reference(format!("0x{key:016X}")),
+                            );
+                            None
+                        }
+                    };
+                    embedded_indices.insert(key, index);
+                    index
                 }
             }
         } else {
@@ -484,9 +661,24 @@ fn build_material(
                         );
                         None
                     }
-                    TextureResolution::Resolved(texture) => {
-                        scene.textures.push(texture);
-                        Some(scene.textures.len() - 1)
+                    TextureResolution::Resolved(resolved) => {
+                        match texture_from_source(resolved.level, resolved.source) {
+                            Ok(texture) => {
+                                let index = scene.textures.len();
+                                scene.textures.push(texture);
+                                Some(index)
+                            }
+                            Err(reason) => {
+                                diagnostics.push(
+                                    Diagnostic::new(format!(
+                                        "texture could not be converted: {reason}"
+                                    ))
+                                    .with_material(name.clone())
+                                    .with_reference(format!("0x{key:016X}")),
+                                );
+                                None
+                            }
+                        }
                     }
                 })
         };
@@ -499,6 +691,8 @@ fn build_material(
             texture: texture_index,
             semantic,
         });
+        // Preview policy: the single sampled specular slot prefers SpecularTex.
+        // SpecularTex2 stays a distinct binding. Engine sampling is unverified.
         match semantic {
             TextureSemantic::Diffuse if material.diffuse.is_none() => {
                 material.diffuse = Some(texture_index);

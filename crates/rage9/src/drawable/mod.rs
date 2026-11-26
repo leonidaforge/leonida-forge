@@ -1440,20 +1440,6 @@ fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// A printable ASCII string starting at `at` and ending at a NUL. Longer than
-/// 256 bytes without a terminator, any non-printable byte or a non-ASCII byte
-/// yields nothing, so a pointer that does not carry a name is not guessed.
-fn ascii_string(bytes: &[u8], at: usize) -> Option<String> {
-    const MAX: usize = 256;
-    let tail = bytes.get(at..)?;
-    let end = tail.iter().take(MAX).position(|&byte| byte == 0)?;
-    let text = tail.get(..end)?;
-    if text.is_empty() || text.iter().any(|&byte| !(0x20..=0x7E).contains(&byte)) {
-        return None;
-    }
-    std::str::from_utf8(text).ok().map(str::to_owned)
-}
-
 fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
 }
