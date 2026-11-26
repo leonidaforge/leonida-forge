@@ -802,6 +802,7 @@ impl Native {
             location.map(|l| l.logical_len),
             None,
         );
+        entry.resource_type = location.map(|l| l.type_id);
         entry.type_name = match location {
             Some(l) if l.type_id == names::RPF_TYPE => "RPF9 entry, type 0 (rpf)".to_string(),
             Some(l) => format!("RPF9 entry, type {}", l.type_id),
@@ -1026,6 +1027,11 @@ impl Native {
 
     pub fn raw_source(&self, archive: &Archive, inner: &Path) -> Option<Source> {
         self.raw(archive, inner).ok()
+    }
+
+    /// The chunk table of the row at `inner`, when it is a chunked row.
+    pub fn chunks(&self, inner: &Path) -> Option<ChunkTable> {
+        self.row(inner)?.chunks.as_ref().ok().cloned().flatten()
     }
 
     pub fn file_prefix(&self, inner: &Path) -> Option<PathBuf> {

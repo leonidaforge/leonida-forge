@@ -11,7 +11,7 @@ use gpui::{
     App, Bounds, Pixels, SharedString, Size, TitlebarOptions, Window, WindowBounds, WindowOptions,
     div, prelude::*, px, rgb, size,
 };
-use lforge_texture::{Store, TextureInfo};
+use lforge_texture::{DictionaryStore, Store, TextureInfo, TextureStore};
 
 pub use dictionary::TextureDictionaryViewer;
 pub use preview::ImagePreview;
@@ -27,6 +27,16 @@ pub const THUMBNAIL_SIZE: u32 = 96;
 pub const PREVIEW_CACHE_BYTES: usize = 96 * 1024 * 1024;
 
 pub fn open(path: PathBuf, access: Access, cx: &mut App) {
+    open_loaded(path, access, false, cx);
+}
+
+/// Tries to open a native texture dictionary. A resource that is not a
+/// dictionary keeps its existing Binary Inspector behaviour.
+pub fn open_resource(path: PathBuf, access: Access, cx: &mut App) {
+    open_loaded(path, access, true, cx);
+}
+
+fn open_loaded(path: PathBuf, access: Access, fallback_inspector: bool, cx: &mut App) {
     let load_path = path.clone();
     let load_access = access.clone();
     let load = cx.background_spawn(async move { load_store(&load_path, &load_access) });
@@ -35,14 +45,22 @@ pub fn open(path: PathBuf, access: Access, cx: &mut App) {
         cx.update(|cx| match result {
             Ok(store) if store.len() == 1 => open_single(store, path, 0, cx),
             Ok(store) => open_dictionary(store, path, cx),
-            Err(err) => open_failed(path, err, cx),
+            Err(LoadError::NotTexture) if fallback_inspector => {
+                crate::explorer::open_binary_inspector(path, access, cx)
+            }
+            Err(LoadError::NotTexture) => open_failed(
+                path,
+                "this file is not a texture store or a RAGE texture dictionary".to_string(),
+                cx,
+            ),
+            Err(LoadError::Message(err)) => open_failed(path, err, cx),
         });
     })
     .detach();
 }
 
 /// Opens one entry of an already parsed store in the single-image viewer.
-pub fn open_entry(store: Store, index: u32, path: PathBuf, cx: &mut App) {
+pub fn open_entry(store: TextureStore, index: u32, path: PathBuf, cx: &mut App) {
     let title = format!("{} - Texture", file_name(&path));
     let options = window_options(title, size(px(960.), px(720.)), cx);
     if let Err(err) = cx.open_window(options, |window, cx| {
@@ -55,11 +73,11 @@ pub fn open_entry(store: Store, index: u32, path: PathBuf, cx: &mut App) {
     }
 }
 
-fn open_single(store: Store, path: PathBuf, index: u32, cx: &mut App) {
+fn open_single(store: TextureStore, path: PathBuf, index: u32, cx: &mut App) {
     open_entry(store, index, path, cx);
 }
 
-fn open_dictionary(store: Store, path: PathBuf, cx: &mut App) {
+fn open_dictionary(store: TextureStore, path: PathBuf, cx: &mut App) {
     let title = format!("{} - Texture Dictionary", file_name(&path));
     let options = window_options(title, size(px(1180.), px(760.)), cx);
     if let Err(err) = cx.open_window(options, |window, cx| {
@@ -85,9 +103,31 @@ fn open_failed(path: PathBuf, message: String, cx: &mut App) {
     }
 }
 
-fn load_store(path: &Path, access: &Access) -> Result<Store, String> {
-    let file = files::open_binary_with(path, access).map_err(|err| err.to_string())?;
-    Store::open(file.source).map_err(|err| err.to_string())
+enum LoadError {
+    NotTexture,
+    Message(String),
+}
+
+fn load_store(path: &Path, access: &Access) -> Result<TextureStore, LoadError> {
+    let file =
+        files::open_binary_with(path, access).map_err(|err| LoadError::Message(err.to_string()))?;
+    let head = lforge_binary::read_at(&mut file.source.clone(), 0, 16).unwrap_or_default();
+    if lforge_texture::is_store(&head) {
+        return Store::open(file.source)
+            .map(TextureStore::Rds5)
+            .map_err(|err| LoadError::Message(err.to_string()));
+    }
+    // A type-5 resource that is not a texture dictionary keeps its Binary
+    // Inspector behaviour, so a page split we cannot establish is not a
+    // texture error either.
+    let Ok(Some(split)) = files::resource_split_with(path, access, &file.source) else {
+        return Err(LoadError::NotTexture);
+    };
+    match DictionaryStore::open(file.source, split.system_len) {
+        Ok(store) => Ok(TextureStore::Dictionary(store)),
+        Err(lforge_texture::Error::NotDictionary(_)) => Err(LoadError::NotTexture),
+        Err(err) => Err(LoadError::Message(err.to_string())),
+    }
 }
 
 pub(crate) fn render_image(
@@ -126,6 +166,7 @@ pub(crate) fn metadata_rows(
 ) -> Vec<(&'static str, SharedString)> {
     let mut rows = vec![
         ("Name", SharedString::from(info.name())),
+        ("Container", SharedString::from(info.container)),
         ("Key", SharedString::from(format!("0x{:016X}", info.key))),
         ("Dimensions", SharedString::from(info.dimensions())),
         (

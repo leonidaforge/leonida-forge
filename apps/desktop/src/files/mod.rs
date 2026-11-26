@@ -45,6 +45,8 @@ pub struct Entry {
     pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     pub type_name: String,
+    /// The native RPF row type, when the entry comes from a native archive.
+    pub resource_type: Option<u8>,
     /// Format-specific properties for the preview pane. Entries that have
     /// them also bring their own type name.
     pub details: Vec<(&'static str, String)>,
@@ -71,6 +73,7 @@ impl Entry {
             size,
             modified,
             type_name,
+            resource_type: None,
             details: Vec::new(),
             order: None,
             last: false,
@@ -246,6 +249,38 @@ pub fn read_with(path: &Path, access: &Access) -> io::Result<Vec<u8>> {
             Ok(bytes)
         }
     }
+}
+
+/// The system/graphics split of a decoded native RAGE resource.
+pub use lforge_rage9::rpf::resource::PageSplit;
+
+/// Finds the page split of the decoded native resource at `path`. `source` is
+/// the decoded payload returned by [`open_binary_with`]. `None` when the entry
+/// is not a chunked native RAGE resource.
+pub fn resource_split_with(
+    path: &Path,
+    access: &Access,
+    source: &Source,
+) -> io::Result<Option<PageSplit>> {
+    let Location::Inside(container, inner) = archive::locate_prepared_with(path, access)? else {
+        return Ok(None);
+    };
+    if container.format != archive::Format::Rpf9 {
+        return Ok(None);
+    }
+    let Some(chunks) = rpf::chunks(&container, &inner)? else {
+        return Ok(None);
+    };
+    let mut source = source.clone();
+    let len = source.len();
+    lforge_rage9::rpf::resource::page_split(
+        &mut source,
+        len,
+        &chunks,
+        lforge_rage9::rpf::RESOURCE_SYSTEM_LIMIT,
+    )
+    .map(Some)
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
 /// A file opened for random access, possibly extracted from an archive.

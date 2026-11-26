@@ -882,6 +882,9 @@ impl Explorer {
         let texture = entry
             .extension()
             .is_some_and(|extension| extension == "ttpf");
+        // A type-5 resource may be a texture dictionary. Opening it as one
+        // falls back to the Binary Inspector when it is not.
+        let resource = entry.resource_type == Some(5);
         let access = self.access();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
@@ -898,6 +901,9 @@ impl Explorer {
                 Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
                 Ok(Identified::Unknown) if texture => {
                     crate::viewers::texture::open(path, access, cx)
+                }
+                Ok(Identified::Unknown) if resource => {
+                    crate::viewers::texture::open_resource(path, access, cx)
                 }
                 Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
                 Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
@@ -2037,7 +2043,7 @@ fn export_outcome(result: io::Result<u64>, caveat: Option<&str>, dest: &Path) ->
 }
 
 /// Opens any regular file, including archive entries and images, as bytes.
-fn open_binary_inspector(path: PathBuf, access: Access, cx: &mut App) {
+pub(crate) fn open_binary_inspector(path: PathBuf, access: Access, cx: &mut App) {
     let mut options = window_options(&window_title(&path), size(px(1200.), px(760.)), cx);
     options.window_min_size = Some(size(px(720.), px(420.)));
     if let Err(err) = cx.open_window(options, |window, cx| {

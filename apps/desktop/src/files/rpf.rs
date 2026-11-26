@@ -827,6 +827,14 @@ pub fn raw_source(archive: &Archive, inner: &Path) -> io::Result<Option<lforge_b
     }
 }
 
+/// The chunk table of a native row, when it is stored in chunks.
+pub fn chunks(archive: &Archive, inner: &Path) -> io::Result<Option<rpf::metadata::ChunkTable>> {
+    match contents(archive)? {
+        Contents::Native(native) => Ok(native.chunks(inner)),
+        Contents::Recovered(..) => Ok(None),
+    }
+}
+
 /// Explains where the contents of an archive folder come from. Returns
 /// `None` until the archive is indexed.
 pub fn describe(archive: &Archive, inner: &Path) -> Option<String> {

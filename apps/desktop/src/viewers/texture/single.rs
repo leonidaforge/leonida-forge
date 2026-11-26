@@ -8,7 +8,7 @@ use gpui::{
     Context, Entity, FocusHandle, KeyDownEvent, Render, Task, Window, div, prelude::*, px, rgb,
 };
 
-use lforge_texture::Store;
+use lforge_texture::TextureStore;
 
 use super::{
     ImagePreview, file_name, initial_window_size, metadata_panel, render_image,
@@ -23,7 +23,7 @@ const METADATA_HEIGHT: f32 = 210.;
 
 pub struct TextureViewer {
     path: PathBuf,
-    store: Option<Store>,
+    store: Option<TextureStore>,
     info: Option<lforge_texture::TextureInfo>,
     index: u32,
     level: u32,
@@ -39,7 +39,7 @@ pub struct TextureViewer {
 
 impl TextureViewer {
     pub fn new(
-        store: Store,
+        store: TextureStore,
         index: u32,
         path: PathBuf,
         _window: &mut Window,
@@ -130,7 +130,7 @@ impl TextureViewer {
         let task = cx.spawn(async move |this, cx| {
             let decoded = cx
                 .background_spawn(async move {
-                    match store.decode(index, level, &cancel) {
+                    match store.decode(index, level, 0, &cancel) {
                         Ok(image) => render_image(image).map(Some),
                         Err(lforge_texture::Error::Cancelled) => Ok(None),
                         Err(err) => Err(err.to_string()),

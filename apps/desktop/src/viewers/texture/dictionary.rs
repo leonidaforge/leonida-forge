@@ -12,7 +12,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, ScrollStrategy, Task, UniformListScrollHandle,
     Window, div, img, prelude::*, px, rgb, uniform_list,
 };
-use lforge_texture::{ImageCache, Store, TextureInfo};
+use lforge_texture::{ImageCache, TextureInfo, TextureStore};
 
 use super::{
     ImagePreview, PREVIEW_CACHE_BYTES, THUMBNAIL_SIZE, file_name, metadata_panel, render_image,
@@ -43,7 +43,7 @@ struct Thumbnail {
 
 pub struct TextureDictionaryViewer {
     path: PathBuf,
-    store: Store,
+    store: TextureStore,
     textures: Vec<TextureInfo>,
     selected: usize,
     level: u32,
@@ -64,7 +64,12 @@ pub struct TextureDictionaryViewer {
 }
 
 impl TextureDictionaryViewer {
-    pub fn new(store: Store, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: TextureStore,
+        path: PathBuf,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let textures = store.textures().to_vec();
         let selected = textures
             .iter()
@@ -165,7 +170,7 @@ impl TextureDictionaryViewer {
         let task = cx.spawn(async move |this, cx| {
             let decoded = cx
                 .background_spawn(async move {
-                    match store.decode(index, level, &cancel) {
+                    match store.decode(index, level, 0, &cancel) {
                         Ok(image) => {
                             let cached = Arc::new(image.clone());
                             let (width, height) = (image.width, image.height);
@@ -449,7 +454,7 @@ impl TextureDictionaryViewer {
                     .flex_1()
                     .min_w_0()
                     .gap_0p5()
-                    .child(div().truncate().child(info.name()))
+                    .child(div().truncate().child(info.name().to_string()))
                     .child(
                         div()
                             .text_xs()

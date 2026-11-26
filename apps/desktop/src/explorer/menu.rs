@@ -126,9 +126,10 @@ impl Explorer {
                     .selected_entry()
                     .filter(|entry| {
                         entry.kind == EntryKind::File
-                            && entry.extension().as_deref() == Some("ttpf")
+                            && (entry.extension().as_deref() == Some("ttpf")
+                                || entry.resource_type == Some(5))
                     })
-                    .map(|entry| entry.path.clone());
+                    .map(|entry| (entry.path.clone(), entry.resource_type == Some(5)));
                 let exporting = self.exporting();
                 let exportable = self
                     .selected_entry()
@@ -169,10 +170,22 @@ impl Explorer {
                             texture.is_some(),
                             None,
                         )
-                        .when_some(texture, |el, path| {
+                        .when_some(texture, |el, (path, resource)| {
                             el.on_click(self.menu_action(
                                 move |this, _, cx| {
-                                    crate::viewers::texture::open(path.clone(), this.access(), cx)
+                                    if resource {
+                                        crate::viewers::texture::open_resource(
+                                            path.clone(),
+                                            this.access(),
+                                            cx,
+                                        )
+                                    } else {
+                                        crate::viewers::texture::open(
+                                            path.clone(),
+                                            this.access(),
+                                            cx,
+                                        )
+                                    }
                                 },
                                 cx,
                             ))
@@ -343,8 +356,9 @@ impl Explorer {
                 let open = entry.clone();
                 let path = entry.path.clone();
                 let texture = (entry.kind == EntryKind::File
-                    && entry.extension().as_deref() == Some("ttpf"))
-                .then(|| entry.path.clone());
+                    && (entry.extension().as_deref() == Some("ttpf")
+                        || entry.resource_type == Some(5)))
+                .then(|| (entry.path.clone(), entry.resource_type == Some(5)));
                 let exporting = self.exporting();
                 let exportable = (entry.kind == EntryKind::File).then(|| entry.clone());
                 panel
@@ -353,16 +367,24 @@ impl Explorer {
                             self.menu_action(move |this, _, cx| this.open_entry(&open, cx), cx),
                         ),
                     )
-                    .when_some(texture, |el, path| {
+                    .when_some(texture, |el, (path, resource)| {
                         el.child(
                             ui::menu_item("open-texture", "Open as Texture", false, true, None)
                                 .on_click(self.menu_action(
                                     move |this, _, cx| {
-                                        crate::viewers::texture::open(
-                                            path.clone(),
-                                            this.access(),
-                                            cx,
-                                        )
+                                        if resource {
+                                            crate::viewers::texture::open_resource(
+                                                path.clone(),
+                                                this.access(),
+                                                cx,
+                                            )
+                                        } else {
+                                            crate::viewers::texture::open(
+                                                path.clone(),
+                                                this.access(),
+                                                cx,
+                                            )
+                                        }
                                     },
                                     cx,
                                 )),
