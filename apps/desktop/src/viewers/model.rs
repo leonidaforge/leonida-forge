@@ -84,6 +84,17 @@ impl ModelViewer {
                                 "Partial textures: {missing} material(s) use a fallback"
                             ));
                         }
+                        let unresolved = loaded
+                            .texture_bindings
+                            .iter()
+                            .filter(|binding| binding.texture.is_none())
+                            .count();
+                        if unresolved > 0 {
+                            lines.push(format!(
+                                "{unresolved} of {} texture binding(s) are unresolved",
+                                loaded.texture_bindings.len()
+                            ));
+                        }
                         if !loaded.exact_layout {
                             lines.push(
                                 "The system/graphics boundary was inferred; no native page metadata was available."
@@ -243,8 +254,8 @@ impl ModelViewer {
                     RendererStatus::Failed(err) => format!("Renderer error: {err}"),
                 };
                 let geometry = match &summary.completeness.geometry {
-                    lforge_model::GeometryCompleteness::Complete => "complete geometry",
-                    lforge_model::GeometryCompleteness::Partial { .. } => "partial geometry",
+                    lforge_model::GeometryCompleteness::Complete => "complete selected LOD",
+                    lforge_model::GeometryCompleteness::Partial { .. } => "partial selected LOD",
                     lforge_model::GeometryCompleteness::Unsupported { .. } => {
                         "unsupported geometry"
                     }

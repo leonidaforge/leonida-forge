@@ -309,6 +309,129 @@ mod tests {
     use super::*;
     use lforge_texture::StoreSet;
 
+    /// Manual native-dictionary regression for the tiled BC7 sample.
+    #[test]
+    #[ignore = "requires LF_TEST_TEXTURES_ARCHIVE and LF_TEST_EXECUTABLE"]
+    fn native_tiled_texture_regression() {
+        let archive = std::env::var("LF_TEST_TEXTURES_ARCHIVE").expect("LF_TEST_TEXTURES_ARCHIVE");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            crate::files::Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let archive = Path::new(&archive);
+        crate::files::archive::prepare_with(
+            archive,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare textures.rpf");
+        let folder = archive.join("textures");
+        let entries = crate::files::list_with(&folder, &access).expect("list rows");
+        let dictionary = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "Row 00009")
+            })
+            .expect("level_design.rpf row 9");
+        crate::files::archive::prepare_with(
+            &dictionary.path,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare level_design.rpf");
+        let rows = crate::files::list_with(&dictionary.path, &access).expect("list rows");
+        let row = rows
+            .iter()
+            .find(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "Row 00001")
+            })
+            .expect("the 0x2F3EE2D573D62231 resource");
+        let file = crate::files::open_binary_with(&row.path, &access).expect("open dictionary");
+        let split = crate::files::resource_split_with(&row.path, &access, &file.source)
+            .expect("page split")
+            .expect("native split");
+        let store = DictionaryStore::open(file.source, split.system_len).expect("dictionary");
+        let target = store.textures().get(3).expect("the tiled BC7 sample");
+        assert_eq!((target.width, target.height), (1920, 1080));
+        assert_eq!(target.format.id, 98);
+        assert_eq!(target.tile_mode, 5);
+        let out = std::path::Path::new(
+            "E:/source/leonidaforge/analysis/model-viewer/final-review/native-textures",
+        );
+        std::fs::create_dir_all(out).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let level = store
+            .level(target.index, 0, 0, &cancel)
+            .expect("tiled BC7 level");
+        let image = level.decode().expect("decode");
+        image::RgbaImage::from_raw(image.width, image.height, image.rgba)
+            .expect("rgba")
+            .save(out.join("helicopter-1920x1080.png"))
+            .expect("save");
+
+        // The UI sibling is resource row 2 of the other nested row 7.
+        let nested = archive.join("Unnamed Entries");
+        let entries = crate::files::list_with(&nested, &access).expect("list rows");
+        let dictionary = entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "Row 00007")
+            })
+            .expect("the row 7 nested archive");
+        crate::files::archive::prepare_with(
+            &dictionary.path,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare row 7 nested archive");
+        let rows = crate::files::list_with(&dictionary.path, &access).expect("list row 7");
+        let row = rows
+            .iter()
+            .find(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "Row 00002")
+            })
+            .expect("the 1024x512 UI dictionary");
+        let file = crate::files::open_binary_with(&row.path, &access).expect("open UI dictionary");
+        let split = crate::files::resource_split_with(&row.path, &access, &file.source)
+            .expect("page split")
+            .expect("native split");
+        let store = DictionaryStore::open(file.source, split.system_len).expect("UI dictionary");
+        let ui = store
+            .textures()
+            .iter()
+            .find(|texture| {
+                (texture.width, texture.height) == (1024, 512) && texture.format.id == 98
+            })
+            .expect("a 1024x512 UI texture");
+        let level = store.level(ui.index, 0, 0, &cancel).expect("UI level");
+        let image = level.decode().expect("decode");
+        image::RgbaImage::from_raw(image.width, image.height, image.rgba)
+            .expect("rgba")
+            .save(out.join("ui-1024x512.png"))
+            .expect("save");
+    }
+
     /// Manual census over the real `.ttpf` stores below a game installation.
     /// The baseline is the recorded 912-descriptor store. The test reads only
     /// caller-supplied paths and is ignored by default.
@@ -343,5 +466,31 @@ mod tests {
         eprintln!("total=912 decodable={decodable} decoded={decoded}");
         assert_eq!(decodable, 886);
         assert_eq!(decoded, 872);
+
+        let folder = std::path::Path::new(
+            "E:/source/leonidaforge/analysis/model-viewer/final-review/native-textures",
+        );
+        std::fs::create_dir_all(folder).unwrap();
+        for store_index in 0..set.len() {
+            let store = set.open(store_index).expect("open a store");
+            let Some(ui) = store.textures().iter().find(|texture| {
+                (texture.width, texture.height) == (1024, 512)
+                    && matches!(texture.format.id, 98 | 99)
+                    && texture.tile_mode != 0
+            }) else {
+                continue;
+            };
+            let level = store.level(ui.index, 0, &cancel).expect("UI level");
+            let image = level.decode().expect("decode");
+            image::RgbaImage::from_raw(image.width, image.height, image.rgba)
+                .expect("rgba")
+                .save(folder.join("ui-1024x512.png"))
+                .expect("save");
+            eprintln!(
+                "UI texture: store {store_index} index {} key {:#018x}",
+                ui.index, ui.key
+            );
+            break;
+        }
     }
 }

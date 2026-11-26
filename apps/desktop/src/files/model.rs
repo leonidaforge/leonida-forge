@@ -19,11 +19,16 @@ const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
 
 static STORES: LazyLock<Mutex<HashMap<PathBuf, Arc<StoreSet>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Serializes segment materialization so several open model windows cannot
+/// each hold a 256 MiB source copy at the same time. Decoded scenes are
+/// separate allocations owned by their viewers.
+static SOURCE_LOAD: Mutex<()> = Mutex::new(());
 
 pub struct LoadedModel {
     pub name: String,
     pub scene: Scene,
     pub completeness: decoded::ModelCompleteness,
+    pub texture_bindings: Vec<decoded::TextureBindingReport>,
     /// Whether the system/graphics boundary came from native page metadata or
     /// from the controlled standalone-resource inference.
     pub exact_layout: bool,
@@ -122,6 +127,7 @@ pub fn load(path: &Path, access: &Access, gta_root: Option<&Path>) -> Result<Loa
 }
 
 fn read_resource(path: &Path, access: &Access) -> Result<ResourceBytes, String> {
+    let _materializing = SOURCE_LOAD.lock().unwrap_or_else(|err| err.into_inner());
     let binary = super::open_binary_with(path, access)
         .map_err(|err| format!("could not open the resource: {err}"))?;
     let source = binary.source;
@@ -201,6 +207,7 @@ fn finish(
         name,
         scene: decoded.scene,
         completeness: decoded.completeness,
+        texture_bindings: decoded.texture_bindings,
         exact_layout,
     })
 }
@@ -280,7 +287,7 @@ mod tests {
             loaded_rows += 1;
             eprintln!(
                 "{}: {} meshes, {} materials, {} textures, {} diagnostics",
-                entry.path.display(),
+                loaded.name,
                 loaded.scene.meshes.len(),
                 loaded.scene.materials.len(),
                 loaded.scene.textures.len(),
@@ -306,5 +313,94 @@ mod tests {
         assert!(loaded_rows > 0, "no type 2 row decoded");
         assert_eq!(complete_rows + partial_rows, loaded_rows);
         eprintln!("{loaded_rows} model(s): {complete_rows} complete, {partial_rows} partial");
+    }
+
+    #[test]
+    #[ignore = "requires LF_TEST_LEVELS_ARCHIVE, LF_TEST_EXECUTABLE and LF_TEST_GAME_ROOT"]
+    fn loads_a_model_through_the_original_nested_archive() {
+        let archive = std::env::var("LF_TEST_LEVELS_ARCHIVE").expect("LF_TEST_LEVELS_ARCHIVE");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let game_root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let archive = Path::new(&archive);
+        crate::files::archive::prepare_with(
+            archive,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare levels.rpf");
+        let folder = archive
+            .join("levels")
+            .join("americas")
+            .join("props")
+            .join("furniture");
+        let rows = crate::files::list_with(&folder, &access).expect("list furniture");
+        let nested = rows
+            .iter()
+            .find(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "Row 00005")
+            })
+            .expect("am_ornaments row 5");
+        eprintln!(
+            "nested archive: {} [{}]",
+            nested.path.display(),
+            nested.type_name
+        );
+        crate::files::archive::prepare_with(
+            &nested.path,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare nested archive");
+        let entries = crate::files::list_with(&nested.path, &access).expect("list nested");
+        let model = entries
+            .iter()
+            .find(|entry| entry.type_name.starts_with("RPF9 entry, type 2"))
+            .expect("a type 2 row in am_ornaments");
+        eprintln!("model row: {} [{}]", model.path.display(), model.type_name);
+        let loaded = load(&model.path, &access, Some(Path::new(&game_root))).expect("load");
+        assert!(loaded.exact_layout);
+        assert!(!loaded.scene.meshes.is_empty());
+        eprintln!(
+            "{}: {} meshes, {} materials, {} textures, {} triangles",
+            loaded.name,
+            loaded.scene.meshes.len(),
+            loaded.scene.materials.len(),
+            loaded.scene.textures.len(),
+            loaded.scene.triangle_count()
+        );
+    }
+
+    #[test]
+    fn an_oversized_standalone_resource_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_MODEL_BYTES + 1).unwrap();
+        let err = load(&path, &Access::none(), None)
+            .err()
+            .expect("the oversized resource is rejected");
+        assert!(err.contains("inference limit"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_segment_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("short.bin");
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        let source = lforge_binary::Source::open(&path).unwrap();
+        let err = read_exact(&source, 0, 8).unwrap_err();
+        assert!(err.contains("segment"), "{err}");
     }
 }
