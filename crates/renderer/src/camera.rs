@@ -53,6 +53,15 @@ impl OrbitCamera {
             target: bounds.center(),
             ..Self::default()
         };
+        // A flat panel is nearly invisible from the default three-quarter
+        // view; look across its thin axis instead.
+        let size = bounds.size();
+        if size.y < size.x.min(size.z) * 0.2 {
+            camera.yaw = FRAC_PI_2;
+            camera.pitch = 0.15;
+        } else if size.z < size.x.min(size.y) * 0.2 {
+            camera.pitch = 1.2;
+        }
         let fov_x = 2.0 * ((camera.fov_y * 0.5).tan() * aspect).atan();
         let limiting = camera.fov_y.min(fov_x).max(1f32.to_radians());
         // A small margin keeps the silhouette off the viewport edges.

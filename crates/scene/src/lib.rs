@@ -33,12 +33,22 @@ pub struct Primitive {
 }
 
 impl Primitive {
-    /// Drops triangles with an index outside the vertex buffer.
+    /// Drops triangles with an index outside the vertex buffer or with
+    /// repeated corners. A trailing partial triangle is dropped as well.
     pub fn validate_indices(&mut self) -> usize {
         let len = self.vertices.len() as u32;
         let before = self.indices.len() / 3;
-        self.indices.retain(|&index| index < len);
-        self.indices.truncate(self.indices.len() / 3 * 3);
+        let mut valid = Vec::with_capacity(self.indices.len());
+        for triangle in self.indices.as_chunks::<3>().0 {
+            if triangle.iter().all(|index| *index < len)
+                && triangle[0] != triangle[1]
+                && triangle[1] != triangle[2]
+                && triangle[0] != triangle[2]
+            {
+                valid.extend_from_slice(triangle);
+            }
+        }
+        self.indices = valid;
         before - self.indices.len() / 3
     }
 }
@@ -264,7 +274,7 @@ impl Texture {
             TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => Some(self.data.clone()),
             TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => {
                 let mut out = self.data.clone();
-                for pixel in out.chunks_exact_mut(4) {
+                for pixel in out.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                 }
                 Some(out)
@@ -546,7 +556,7 @@ mod tests {
     #[test]
     fn surface_bytes_round_up_to_whole_blocks() {
         assert_eq!(TextureFormat::Bc1Unorm.surface_bytes(1, 1), Some(8));
-        assert_eq!(TextureFormat::Bc7Unorm.surface_bytes(5, 9), Some(64));
+        assert_eq!(TextureFormat::Bc7Unorm.surface_bytes(5, 9), Some(96));
         assert_eq!(TextureFormat::Rgba8Unorm.surface_bytes(3, 2), Some(24));
     }
 

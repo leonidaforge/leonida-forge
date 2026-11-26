@@ -110,7 +110,7 @@ impl Frame {
     /// The same pixels as BGRA8, the order GPUI's `RenderImage` expects.
     pub fn to_bgra8(&self) -> Vec<u8> {
         let mut out = self.pixels.clone();
-        for pixel in out.chunks_exact_mut(4) {
+        for pixel in out.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
         out
