@@ -346,6 +346,13 @@ impl Render for ImagePreview {
             .bg(rgb(theme::VIEWPORT))
             .on_scroll(cx.listener(Self::scroll))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_drag))
+            .on_mouse_move(
+                cx.listener(|this, event: &MouseMoveEvent, _, cx| this.drag_to(event.position, cx)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.end_drag(cx)),
+            )
             .child(
                 canvas(
                     move |bounds, _, _| {
