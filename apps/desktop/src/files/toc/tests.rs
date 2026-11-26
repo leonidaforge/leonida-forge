@@ -39,6 +39,8 @@ pub(crate) struct Spec {
     pub logical: Option<u64>,
     /// The chunk table value.
     pub chunks: Option<Vec<u8>>,
+    /// The payload-transform field's value, which is its cipher descriptor.
+    pub transform: Option<Vec<u8>>,
     pub source: Option<u32>,
 }
 
@@ -53,6 +55,7 @@ pub(crate) fn spec(payload: &[u8], type_id: u8) -> Spec {
         bad_hash: false,
         logical: None,
         chunks: None,
+        transform: None,
         source: None,
     }
 }
@@ -63,8 +66,8 @@ pub(crate) fn native_rpf(rows: &[Spec]) -> Vec<u8> {
 }
 
 /// [`native_rpf`] with `B` sub-block 3 listing `companions`, names and
-/// identifiers. Columns: name hash, name key, A location record, chunk table
-/// and read source, then the payloads.
+/// identifiers. Columns: name hash, name key, A location record, chunk table,
+/// payload transform and read source, then the payloads.
 pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec<u8> {
     let n = rows.len();
     assert!(n < 0xFE);
@@ -73,12 +76,27 @@ pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec
         .filter_map(|row| row.chunks.as_ref().map(Vec::len))
         .max()
         .unwrap_or(8);
+    let transform_width = rows
+        .iter()
+        .filter_map(|row| row.transform.as_ref().map(Vec::len))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     let columns = [
         (keys::NAME_HASH, 0, 8),
         (keys::NAME_KEY, 8 * n, 4),
         (keys::LOCATION_A, 12 * n, 16),
         (keys::CHUNK_TABLE, 28 * n, chunk_width),
-        (keys::READ_SOURCE, (28 + chunk_width) * n, 4),
+        (
+            keys::PAYLOAD_TRANSFORM,
+            (28 + chunk_width) * n,
+            transform_width,
+        ),
+        (
+            keys::READ_SOURCE,
+            (28 + chunk_width + transform_width) * n,
+            4,
+        ),
     ];
     // One A record, for sub-block 2 or, with companions, sub-block 3.
     let b = 0x50;
@@ -87,7 +105,7 @@ pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec
     let cells = descriptors + columns.len() * 24;
     let pool = (cells + columns.len() * n).next_multiple_of(8);
     // The empty secondary area starts 8-aligned after the primary one.
-    let end = (pool + (32 + chunk_width) * n).next_multiple_of(8);
+    let end = (pool + (32 + chunk_width + transform_width) * n).next_multiple_of(8);
     let payloads = end.next_multiple_of(16);
     let mut bytes = vec![0u8; payloads];
     let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
@@ -134,6 +152,7 @@ pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec
                 cell(row.key.is_some()),
                 cell(row.location),
                 cell(row.chunks.is_some()),
+                cell(row.transform.is_some()),
                 cell(row.source.is_some()),
             ],
         );
@@ -165,9 +184,13 @@ pub(crate) fn native_rpf_with(rows: &[Spec], companions: &[(&[u8], u64)]) -> Vec
         if let Some(table) = &row.chunks {
             put(&mut bytes, pool + 28 * n + chunk_width * r, table);
         }
+        if let Some(descriptor) = &row.transform {
+            let at = pool + (28 + chunk_width) * n + transform_width * r;
+            put(&mut bytes, at, descriptor);
+        }
         put(
             &mut bytes,
-            pool + (28 + chunk_width) * n + 4 * r,
+            pool + (28 + chunk_width + transform_width) * n + 4 * r,
             &row.source.unwrap_or(u32::MAX).to_le_bytes(),
         );
         data.extend_from_slice(&row.payload);
@@ -232,6 +255,39 @@ fn opened(path: &Path) -> Archive {
         Location::Archive(archive) => archive,
         other => panic!("expected an opened archive, got {other:?}"),
     }
+}
+
+#[test]
+fn row_details_name_the_payload_transform_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("transform.rpf");
+    let mut descriptor = Vec::new();
+    descriptor.extend_from_slice(&0x1000_002Eu32.to_le_bytes());
+    descriptor.extend_from_slice(&0x11u16.to_le_bytes());
+    descriptor.extend(0..16u8);
+    fs::write(
+        &path,
+        native_rpf(&[Spec {
+            transform: Some(descriptor),
+            ..spec(&[0x11; 64], 11)
+        }]),
+    )
+    .unwrap();
+
+    let entries = files::list(&path).unwrap();
+    assert_eq!(
+        detail(&entries[0], "Payload transform"),
+        "Required, not supported"
+    );
+    assert_eq!(
+        detail(&entries[0], "Transform cipher"),
+        "type 0x11, algorithm 0x11, key id 0x1000002E"
+    );
+    assert_eq!(
+        detail(&entries[0], "Transform parameter"),
+        "000102030405060708090a0b0c0d0e0f"
+    );
+    assert!(detail(&entries[0], "Contents").starts_with("Not readable"));
 }
 
 #[test]

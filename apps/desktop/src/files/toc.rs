@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_rage9::rpf::metadata::transform::{Algorithm, CipherDescriptor};
 use lforge_rage9::rpf::metadata::verify::VerifyReport;
 use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Stored,
@@ -459,6 +460,27 @@ fn chunk_text(table: &ChunkTable) -> String {
     )
 }
 
+/// The descriptor the engine would use for a payload transform. This build does
+/// not implement its algorithm, so the value is shown, not decoded.
+fn cipher_text(cipher: &CipherDescriptor) -> String {
+    match Algorithm::of(cipher.kind) {
+        Ok(algorithm) => format!(
+            "type {:#x}, algorithm {:#x}, key id 0x{:08X}",
+            cipher.kind,
+            algorithm.id(),
+            cipher.key_id
+        ),
+        Err(_) => format!(
+            "type {:#x}, invalid cipher type, key id 0x{:08X}",
+            cipher.kind, cipher.key_id
+        ),
+    }
+}
+
+fn bytes_text(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// `Row 00042`. Tables have at most 65535 rows.
 fn row_name(row: u32) -> String {
     format!("Row {row:05}")
@@ -820,7 +842,17 @@ impl Native {
             Err(reason) => details.push(("Chunks", malformed(reason))),
         }
         match &row.payload_transform {
-            Ok(true) => details.push(("Payload transform", "Required, not supported".to_string())),
+            Ok(true) => {
+                details.push(("Payload transform", "Required, not supported".to_string()));
+                match &row.payload_cipher {
+                    Ok(Some(cipher)) => {
+                        details.push(("Transform cipher", cipher_text(cipher)));
+                        details.push(("Transform parameter", bytes_text(&cipher.parameter)));
+                    }
+                    Ok(None) => details.push(("Transform cipher", "Not stored".to_string())),
+                    Err(reason) => details.push(("Transform cipher", malformed(reason))),
+                }
+            }
             Ok(false) => {}
             Err(reason) => details.push(("Payload transform", malformed(reason))),
         }
