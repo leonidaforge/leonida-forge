@@ -43,8 +43,8 @@ const ORDER_4: &[(Axis, u8)] = &[
     (Axis::X, 1),
     (Axis::Y, 0),
     (Axis::Y, 1),
-    (Axis::X, 2),
     (Axis::Y, 2),
+    (Axis::X, 2),
     (Axis::Y, 3),
     (Axis::X, 3),
     (Axis::Y, 4),
@@ -65,13 +65,92 @@ const ORDER_2: &[(Axis, u8)] = &[
     (Axis::X, 5),
 ];
 
+const D64K_16: &[(Axis, u8)] = &[
+    (Axis::X, 0),
+    (Axis::Y, 0),
+    (Axis::X, 1),
+    (Axis::Y, 1),
+    (Axis::Y, 2),
+    (Axis::X, 2),
+    (Axis::Y, 3),
+    (Axis::X, 3),
+    (Axis::Y, 4),
+    (Axis::X, 4),
+    (Axis::Y, 5),
+    (Axis::X, 5),
+];
+
+const D64K_8: &[(Axis, u8)] = &[
+    (Axis::X, 0),
+    (Axis::Y, 0),
+    (Axis::X, 1),
+    (Axis::X, 2),
+    (Axis::Y, 1),
+    (Axis::Y, 2),
+    (Axis::X, 3),
+    (Axis::Y, 3),
+    (Axis::X, 4),
+    (Axis::Y, 4),
+    (Axis::X, 5),
+    (Axis::Y, 5),
+    (Axis::X, 6),
+];
+
+const D64K_4: &[(Axis, u8)] = &[
+    (Axis::X, 0),
+    (Axis::X, 1),
+    (Axis::Y, 0),
+    (Axis::Y, 1),
+    (Axis::X, 2),
+    (Axis::Y, 2),
+    (Axis::Y, 3),
+    (Axis::X, 3),
+    (Axis::Y, 4),
+    (Axis::X, 4),
+    (Axis::Y, 5),
+    (Axis::X, 5),
+    (Axis::Y, 6),
+    (Axis::X, 6),
+];
+
+const D64K_2: &[(Axis, u8)] = &[
+    (Axis::X, 0),
+    (Axis::X, 1),
+    (Axis::X, 2),
+    (Axis::Y, 0),
+    (Axis::Y, 1),
+    (Axis::Y, 2),
+    (Axis::X, 3),
+    (Axis::Y, 3),
+    (Axis::X, 4),
+    (Axis::Y, 4),
+    (Axis::X, 5),
+    (Axis::Y, 5),
+    (Axis::X, 6),
+    (Axis::Y, 6),
+    (Axis::X, 7),
+];
+
+/// The native tiled allocation layouts. `S4k` is the 4 KiB grid used by the
+/// sampled native dictionaries and RDS5 tile modes 1..3. `D64k` is the 64 KiB
+/// grid used by RDS5 tile mode 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Swizzle {
+    S4k,
+    D64k,
+}
+
 /// Elements per tile edge and bytes per element for one codec.
-fn geometry(codec: Codec) -> (usize, usize, usize, &'static [(Axis, u8)]) {
-    match codec {
-        Codec::Rgba8 => (32, 32, 4, ORDER_4),
-        Codec::R16Float => (64, 32, 2, ORDER_2),
-        Codec::Bc1 | Codec::Bc4 => (32, 16, 8, ORDER_8),
-        Codec::Bc3 | Codec::Bc5 | Codec::Bc7 => (16, 16, 16, ORDER_16),
+fn geometry(swizzle: Swizzle, codec: Codec) -> (usize, usize, usize, &'static [(Axis, u8)]) {
+    match (swizzle, codec) {
+        (Swizzle::S4k, Codec::Rgba8) => (32, 32, 4, ORDER_4),
+        (Swizzle::S4k, Codec::R16Float) => (64, 32, 2, ORDER_2),
+        (Swizzle::S4k, Codec::Bc1 | Codec::Bc4) => (32, 16, 8, ORDER_8),
+        (Swizzle::S4k, Codec::Bc3 | Codec::Bc5 | Codec::Bc7) => (16, 16, 16, ORDER_16),
+        (Swizzle::D64k, Codec::Rgba8) => (128, 128, 4, D64K_4),
+        (Swizzle::D64k, Codec::R16Float) => (256, 128, 2, D64K_2),
+        (Swizzle::D64k, Codec::Bc1 | Codec::Bc4) => (128, 64, 8, D64K_8),
+        (Swizzle::D64k, Codec::Bc3 | Codec::Bc5 | Codec::Bc7) => (64, 64, 16, D64K_16),
     }
 }
 
@@ -89,9 +168,9 @@ fn element_grid(codec: Codec, width: u32, height: u32) -> (usize, usize) {
 }
 
 /// Bytes a tiled allocation needs for one level, including the padding to
-/// whole 4 KiB tiles.
-pub(crate) fn padded_len(codec: Codec, width: u32, height: u32) -> u64 {
-    let (tw, th, bytes, _) = geometry(codec);
+/// whole tiles.
+pub(crate) fn padded_len(swizzle: Swizzle, codec: Codec, width: u32, height: u32) -> u64 {
+    let (tw, th, bytes, _) = geometry(swizzle, codec);
     let (ew, eh) = element_grid(codec, width, height);
     let pw = ew.div_ceil(tw) * tw;
     let ph = eh.div_ceil(th) * th;
@@ -114,12 +193,13 @@ fn element_index(lx: usize, ly: usize, order: &[(Axis, u8)]) -> usize {
 /// Reorders a tiled level into the row-major element order the decoders read.
 /// The padding tiles are dropped; the result is exactly one level.
 pub(crate) fn deswizzle(
+    swizzle: Swizzle,
     raw: &[u8],
     width: u32,
     height: u32,
     codec: Codec,
 ) -> Result<Vec<u8>, Error> {
-    let (tw, th, bytes, order) = geometry(codec);
+    let (tw, th, bytes, order) = geometry(swizzle, codec);
     let (ew, eh) = element_grid(codec, width, height);
     if ew == 0 || eh == 0 {
         return Err(Error::Invalid("the level has no elements".into()));
@@ -147,12 +227,46 @@ pub(crate) fn deswizzle(
     Ok(out)
 }
 
+/// Reorders a row-major level into the native tiled element order. Used by
+/// tests and fixtures; the viewer only deswizzles.
+#[cfg(test)]
+pub(crate) fn swizzle(
+    swizzle: Swizzle,
+    linear: &[u8],
+    width: u32,
+    height: u32,
+    codec: Codec,
+) -> Vec<u8> {
+    let (tw, th, bytes, order) = geometry(swizzle, codec);
+    let (ew, eh) = element_grid(codec, width, height);
+    let pw = ew.div_ceil(tw) * tw;
+    let ph = eh.div_ceil(th) * th;
+    let tiles_x = pw / tw;
+    let mut raw = vec![0u8; pw * ph * bytes];
+    for y in 0..eh {
+        for x in 0..ew {
+            let tile = (y / th) * tiles_x + (x / tw);
+            let element = element_index(x % tw, y % th, order);
+            let src = (y * ew + x) * bytes;
+            let dst = (tile * tw * th + element) * bytes;
+            raw[dst..dst + bytes].copy_from_slice(&linear[src..src + bytes]);
+        }
+    }
+    raw
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn swizzle(linear: &[u8], width: u32, height: u32, codec: Codec) -> Vec<u8> {
-        let (tw, th, bytes, order) = geometry(codec);
+    fn swizzle_with(
+        swizzle: Swizzle,
+        linear: &[u8],
+        width: u32,
+        height: u32,
+        codec: Codec,
+    ) -> Vec<u8> {
+        let (tw, th, bytes, order) = geometry(swizzle, codec);
         let (ew, eh) = element_grid(codec, width, height);
         let pw = ew.div_ceil(tw) * tw;
         let ph = eh.div_ceil(th) * th;
@@ -176,22 +290,24 @@ mod tests {
 
     #[test]
     fn the_element_order_is_a_bijection() {
-        for codec in [
-            Codec::Rgba8,
-            Codec::R16Float,
-            Codec::Bc1,
-            Codec::Bc3,
-            Codec::Bc4,
-            Codec::Bc5,
-            Codec::Bc7,
-        ] {
-            let (tw, th, _, order) = geometry(codec);
-            let mut seen = vec![false; tw * th];
-            for y in 0..th {
-                for x in 0..tw {
-                    let index = element_index(x, y, order);
-                    assert!(!seen[index], "{codec:?} repeats an index");
-                    seen[index] = true;
+        for swizzle in [Swizzle::S4k, Swizzle::D64k] {
+            for codec in [
+                Codec::Rgba8,
+                Codec::R16Float,
+                Codec::Bc1,
+                Codec::Bc3,
+                Codec::Bc4,
+                Codec::Bc5,
+                Codec::Bc7,
+            ] {
+                let (tw, th, _, order) = geometry(swizzle, codec);
+                let mut seen = vec![false; tw * th];
+                for y in 0..th {
+                    for x in 0..tw {
+                        let index = element_index(x, y, order);
+                        assert!(!seen[index], "{swizzle:?} {codec:?} repeats an index");
+                        seen[index] = true;
+                    }
                 }
             }
         }
@@ -234,8 +350,8 @@ mod tests {
         assert_eq!(element_index(2, 0, order), 2);
         assert_eq!(element_index(0, 1, order), 4);
         assert_eq!(element_index(0, 2, order), 8);
-        assert_eq!(element_index(4, 0, order), 16);
-        assert_eq!(element_index(0, 4, order), 32);
+        assert_eq!(element_index(4, 0, order), 32);
+        assert_eq!(element_index(0, 4, order), 16);
         assert_eq!(element_index(0, 8, order), 64);
         assert_eq!(element_index(8, 0, order), 128);
         assert_eq!(element_index(0, 16, order), 256);
@@ -244,39 +360,52 @@ mod tests {
 
     #[test]
     fn a_tiled_level_round_trips() {
-        for (codec, width, height) in [
-            (Codec::Bc7, 12, 12),
-            (Codec::Bc1, 12, 8),
-            (Codec::Bc3, 5, 9),
-            (Codec::Bc5, 65, 33),
-            (Codec::Rgba8, 40, 36),
-            (Codec::R16Float, 70, 40),
-        ] {
-            let len = codec.level_len(width, height) as usize;
-            let linear = pattern(len);
-            let raw = swizzle(&linear, width, height, codec);
-            assert_eq!(deswizzle(&raw, width, height, codec).unwrap(), linear);
+        for swizzle in [Swizzle::S4k, Swizzle::D64k] {
+            for (codec, width, height) in [
+                (Codec::Bc7, 12, 12),
+                (Codec::Bc1, 12, 8),
+                (Codec::Bc3, 5, 9),
+                (Codec::Bc5, 65, 33),
+                (Codec::Rgba8, 40, 36),
+                (Codec::R16Float, 70, 40),
+            ] {
+                let len = codec.level_len(width, height) as usize;
+                let linear = pattern(len);
+                let raw = swizzle_with(swizzle, &linear, width, height, codec);
+                assert_eq!(
+                    deswizzle(swizzle, &raw, width, height, codec).unwrap(),
+                    linear,
+                    "{swizzle:?} {codec:?} {width}x{height}"
+                );
+            }
         }
     }
 
     #[test]
     fn padding_tiles_are_dropped() {
         let raw = pattern(4096);
-        let out = deswizzle(&raw, 4, 4, Codec::Bc7).unwrap();
+        let out = deswizzle(Swizzle::S4k, &raw, 4, 4, Codec::Bc7).unwrap();
+        assert_eq!(out.len(), 16);
+        let raw = pattern(65536);
+        let out = deswizzle(Swizzle::D64k, &raw, 4, 4, Codec::Bc7).unwrap();
         assert_eq!(out.len(), 16);
     }
 
     #[test]
     fn the_padded_size_covers_whole_tiles() {
-        assert_eq!(padded_len(Codec::Bc7, 1920, 1080), 2_088_960);
-        assert_eq!(padded_len(Codec::Bc7, 1024, 512), 524_288);
-        assert_eq!(padded_len(Codec::Bc1, 1920, 1080), 1_044_480);
-        assert_eq!(padded_len(Codec::Rgba8, 4, 4), 32 * 32 * 4);
+        assert_eq!(padded_len(Swizzle::S4k, Codec::Bc7, 1920, 1080), 2_088_960);
+        assert_eq!(padded_len(Swizzle::S4k, Codec::Bc7, 1024, 512), 524_288);
+        assert_eq!(padded_len(Swizzle::S4k, Codec::Bc1, 1920, 1080), 1_044_480);
+        assert_eq!(padded_len(Swizzle::S4k, Codec::Rgba8, 4, 4), 32 * 32 * 4);
+        assert_eq!(padded_len(Swizzle::D64k, Codec::Bc7, 4, 4), 65_536);
+        assert_eq!(padded_len(Swizzle::D64k, Codec::Bc1, 4, 4), 65_536);
     }
 
     #[test]
     fn a_short_tiled_level_is_rejected() {
-        let err = deswizzle(&[0u8; 4095], 4, 4, Codec::Bc7).unwrap_err();
+        let err = deswizzle(Swizzle::S4k, &[0u8; 4095], 4, 4, Codec::Bc7).unwrap_err();
+        assert!(err.to_string().contains("tiled level"), "{err}");
+        let err = deswizzle(Swizzle::D64k, &[0u8; 65_535], 4, 4, Codec::Bc7).unwrap_err();
         assert!(err.to_string().contains("tiled level"), "{err}");
     }
 }

@@ -141,7 +141,7 @@ pub struct SourceLevel {
     pub format: PixelFormat,
     /// Row-major blocks for a compressed format, texels otherwise.
     pub data: Vec<u8>,
-    /// Whether the source allocation was stored in 4 KiB tiles and has been
+    /// Whether the source allocation was stored in native tiles and has been
     /// reconstructed to row-major before this value was returned.
     pub swizzled: bool,
 }
@@ -415,17 +415,17 @@ impl Store {
             .format
             .codec
             .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
-        let swizzled = info.tile_mode != 0;
-        let data = if swizzled {
-            swizzle::deswizzle(
-                &bytes[start..start + len as usize],
-                level_info.width,
-                level_info.height,
-                codec,
-            )?
-        } else {
-            bytes[start..start + len as usize].to_vec()
-        };
+        let swizzle = rds5_swizzle(info.tile_mode).ok_or_else(|| {
+            Error::Unsupported(format!("tile mode {} is not decoded", info.tile_mode))
+        })?;
+        let swizzled = true;
+        let data = swizzle::deswizzle(
+            swizzle,
+            &bytes[start..start + len as usize],
+            level_info.width,
+            level_info.height,
+            codec,
+        )?;
         Ok(SourceLevel {
             width: level_info.width,
             height: level_info.height,
@@ -465,6 +465,14 @@ fn rds5_format_basis(id: u8) -> &'static str {
     }
 }
 
+fn rds5_swizzle(tile_mode: u8) -> Option<swizzle::Swizzle> {
+    match tile_mode {
+        0 => Some(swizzle::Swizzle::D64k),
+        1..=3 => Some(swizzle::Swizzle::S4k),
+        _ => None,
+    }
+}
+
 fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Error>) -> TextureInfo {
     let format = pixel_format(entry.format_id());
     let (encoded_len, range_error) = match &range {
@@ -472,12 +480,12 @@ fn info(entry: &rds5::Entry, key: u64, range: Result<DescriptorRange, rds5::Erro
         Err(err) => (0, Some(err.to_string())),
     };
     let level0_len = format.codec.filter(|_| encoded_len > 0).map(|codec| {
-        if entry.tile_mode() != 0 {
-            // A tiled allocation stores whole 4 KiB tiles; level 0 is the
-            // padded grid, not the unpadded row-major size.
-            swizzle::padded_len(codec, entry.width(), entry.height())
-        } else {
-            codec.level_len(entry.width(), entry.height())
+        let swizzle = rds5_swizzle(entry.tile_mode());
+        match swizzle {
+            // A tiled allocation stores whole tiles; level 0 is the padded
+            // grid, not the unpadded row-major size.
+            Some(swizzle) => swizzle::padded_len(swizzle, codec, entry.width(), entry.height()),
+            None => codec.level_len(entry.width(), entry.height()),
         }
     });
     let (status, levels) = classify(entry, format, encoded_len, level0_len);
@@ -540,6 +548,15 @@ fn classify(
             Status::Unsupported(format!(
                 "format id {} has no established pixel layout",
                 format.id
+            )),
+            Vec::new(),
+        );
+    }
+    if rds5_swizzle(entry.tile_mode()).is_none() {
+        return (
+            Status::Unsupported(format!(
+                "tile mode {} has no established layout",
+                entry.tile_mode()
             )),
             Vec::new(),
         );

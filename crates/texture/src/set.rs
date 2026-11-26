@@ -5,6 +5,7 @@
 //! decoded, so opening a directory of large stores does not pay for every
 //! block.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ const ETPF_HEADER_LEN: u64 = 0x10;
 pub struct StoreSet {
     stores: Vec<StoreEntry>,
     paths: Vec<PathBuf>,
+    by_key: HashMap<u64, Vec<(u32, u32)>>,
 }
 
 #[derive(Debug)]
@@ -40,21 +42,44 @@ impl StoreSet {
     /// Scans `root` recursively for `.ttpf` stores. Only headers, descriptor
     /// counts and keys are read.
     pub fn scan(root: &Path) -> Result<Self, Error> {
-        let mut paths = Vec::new();
-        collect(root, 0, &mut paths)?;
-        paths.sort();
-        paths.truncate(MAX_STORES);
-        let mut stores = Vec::with_capacity(paths.len());
-        for path in &paths {
-            let (keys, count) = scan_keys(path)?;
-            stores.push(StoreEntry {
-                path: path.clone(),
-                keys,
-                count,
-                opened: Mutex::new(None),
-            });
+        let mut candidates = Vec::new();
+        collect(root, 0, &mut candidates)?;
+        candidates.sort();
+        candidates.truncate(MAX_STORES);
+        let mut stores = Vec::with_capacity(candidates.len());
+        let mut paths = Vec::with_capacity(candidates.len());
+        for path in candidates {
+            match scan_keys(&path) {
+                Ok((keys, count)) => {
+                    paths.push(path.clone());
+                    stores.push(StoreEntry {
+                        path,
+                        keys,
+                        count,
+                        opened: Mutex::new(None),
+                    });
+                }
+                Err(err) => {
+                    log::warn!("skipping texture store {}: {err}", path.display());
+                }
+            }
         }
-        Ok(Self { stores, paths })
+        let mut by_key: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
+        for (store_index, store) in stores.iter().enumerate() {
+            for (texture_index, &key) in store.keys.iter().enumerate() {
+                if key != 0 {
+                    by_key
+                        .entry(key)
+                        .or_default()
+                        .push((store_index as u32, texture_index as u32));
+                }
+            }
+        }
+        Ok(Self {
+            stores,
+            paths,
+            by_key,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -73,15 +98,15 @@ impl StoreSet {
     /// `(store index, texture index)`. The caller decides whether zero, one or
     /// several candidates are acceptable.
     pub fn find(&self, key: u64) -> Vec<(usize, u32)> {
-        let mut found = Vec::new();
-        for (store_index, store) in self.stores.iter().enumerate() {
-            for (texture_index, &candidate) in store.keys.iter().enumerate() {
-                if candidate == key {
-                    found.push((store_index, texture_index as u32));
-                }
-            }
-        }
-        found
+        self.by_key
+            .get(&key)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(store, texture)| (*store as usize, *texture))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn texture_count(&self) -> usize {

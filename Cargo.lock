@@ -2650,7 +2650,10 @@ name = "lforge-model"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "image",
+ "lforge-binary",
  "lforge-rage9",
+ "lforge-renderer",
  "lforge-scene",
  "lforge-texture",
 ]

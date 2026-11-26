@@ -30,7 +30,8 @@ fn inflated_len(block: &[u8]) -> u64 {
 /// One descriptor's four words.
 pub fn entry(width: u32, height: u32, format: u8, kind: u8, page: u32) -> [u32; 4] {
     let w0 = (width - 1) & 0x3FFF | ((height - 1) & 0x3FFF) << 14;
-    let w1 = u32::from(format) << 3 | u32::from(kind) << 20;
+    // Synthetic stores use the 4 KiB tile mode so the level fits one page.
+    let w1 = u32::from(format) << 3 | u32::from(kind) << 20 | 1 << 24;
     [w0, w1, page, 0]
 }
 
@@ -40,6 +41,16 @@ pub fn entry_tiled(width: u32, height: u32, format: u8, kind: u8, page: u32, til
     let mut words = entry(width, height, format, kind, page);
     words[1] |= u32::from(tile) << 24;
     words
+}
+
+/// Arranges row-major level bytes into the native tiled order for a synthetic
+/// descriptor with `tile`.
+pub fn tiled(data: &[u8], width: u32, height: u32, format: u8, tile: u8) -> Vec<u8> {
+    let codec = super::pixel_format(format)
+        .codec
+        .expect("a supported format");
+    let swizzle = super::rds5_swizzle(tile).expect("a supported tile mode");
+    super::swizzle::swizzle(swizzle, data, width, height, codec)
 }
 
 /// Builds a store with one zlib block per descriptor. The entries must point
@@ -53,12 +64,10 @@ pub fn build(blocks: &[Vec<u8>], entries: &[[u32; 4]]) -> Vec<u8> {
         .iter()
         .map(|block| {
             let mut bytes = block.clone();
-            // A page shorter than one virtual page is right-aligned behind a
-            // zero prelude, matching the sampled level model.
+            // A level shorter than one 4 KiB tile is padded at the end; the
+            // level data starts at tile element zero.
             if bytes.len() < 0x1000 {
-                let mut page = vec![0u8; 0x1000];
-                page[0x1000 - bytes.len()..].copy_from_slice(&bytes);
-                bytes = page;
+                bytes.resize(0x1000, 0);
             }
             bytes
         })

@@ -124,7 +124,13 @@ impl DictionaryStore {
         // and decoder want the unpadded row-major elements.
         let swizzled = info.tile_mode != 0;
         let bytes = if swizzled {
-            swizzle::deswizzle(&bytes, level_info.width, level_info.height, codec)?
+            swizzle::deswizzle(
+                swizzle::Swizzle::S4k,
+                &bytes,
+                level_info.width,
+                level_info.height,
+                codec,
+            )?
         } else {
             bytes
         };
@@ -253,7 +259,7 @@ pub(crate) fn classify(
         );
     }
     let stored_len = if record.swizzle != 0 {
-        swizzle::padded_len(codec, width, height)
+        swizzle::padded_len(swizzle::Swizzle::S4k, codec, width, height)
     } else {
         level0_len
     };
@@ -295,7 +301,7 @@ pub(crate) fn stored_levels(
     mip_count: u8,
     swizzled: bool,
 ) -> Vec<LevelInfo> {
-    let padded = swizzle::padded_len(codec, width, height);
+    let padded = swizzle::padded_len(swizzle::Swizzle::S4k, codec, width, height);
     let encoded_len = if swizzled {
         padded
     } else {

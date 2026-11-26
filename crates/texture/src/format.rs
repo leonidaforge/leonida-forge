@@ -99,6 +99,13 @@ pub fn pixel_format(id: u8) -> PixelFormat {
             srgb: false,
             detail: "16 bytes per 4 x 4 block, BC3 alpha and colour; the sampled glyphs decode after the tiled reorder",
         },
+        78 => PixelFormat {
+            id,
+            name: "BC3_SRGB",
+            codec: Some(Codec::Bc3),
+            srgb: true,
+            detail: "16 bytes per 4 x 4 block, BC3 alpha and colour; a sampled 512 x 128 record decodes coherently as BC3. sRGB follows the 77/78 pairing and DXGI numbering",
+        },
         80 => PixelFormat {
             id,
             name: "BC4",
@@ -156,7 +163,7 @@ mod tests {
 
     #[test]
     fn only_observed_formats_are_decodable() {
-        for id in [28, 29, 54, 71, 72, 77, 80, 83, 98, 99] {
+        for id in [28, 29, 54, 71, 72, 77, 78, 80, 83, 98, 99] {
             assert!(pixel_format(id).is_supported(), "{id}");
         }
         for id in [10, 87, 95, 255] {

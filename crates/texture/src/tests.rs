@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
 
-use super::test_support::{build, entry, entry_tiled};
+use super::test_support::{build, entry, entry_tiled, tiled};
 use super::{Status, Store, is_store};
 
 fn source(bytes: &[u8]) -> Source {
@@ -37,16 +37,17 @@ fn recognises_and_lists_one_rgba_texture() {
     assert_eq!((texture.width, texture.height), (2, 2));
     assert_eq!(texture.format.name, "RGBA8");
     assert_eq!(texture.status, Status::Decodable);
-    assert_eq!(texture.level0_len, Some(16));
+    assert_eq!(texture.level0_len, Some(4096));
     assert_eq!(texture.levels.len(), 1);
-    // The synthetic page holds the 2 x 2 block behind a zero prelude, as the
-    // sampled level-stream model stores a short level.
-    assert_eq!(texture.levels[0].offset, 0x1000 - 16);
+    // The synthetic page holds one 4 KiB tile and the level starts at its
+    // first element.
+    assert_eq!(texture.levels[0].offset, 0);
 }
 
 #[test]
 fn rgab8_pixels_keep_their_channels() {
-    let bytes = build(&[rgba_pixels()], &[entry(2, 2, 28, 2, 1)]);
+    let block = tiled(&rgba_pixels(), 2, 2, 28, 1);
+    let bytes = build(&[block], &[entry(2, 2, 28, 2, 1)]);
     let store = open(&bytes);
     let image = store.decode(0, 0, &AtomicBool::new(false)).expect("decode");
     assert_eq!((image.width, image.height), (2, 2));
@@ -87,6 +88,36 @@ fn a_tiled_rds5_level_is_deswizzled_from_its_4k_tile() {
 }
 
 #[test]
+fn tile_mode_zero_uses_the_64k_tile_grid() {
+    let mut tiled = vec![0u8; 0x10000];
+    tiled[..8].copy_from_slice(&[0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    let bytes = build(&[tiled], &[entry_tiled(4, 4, 71, 2, 1, 0)]);
+    let store = open(&bytes);
+    let level = store
+        .level(0, 0, &AtomicBool::new(false))
+        .expect("64 KiB tiled level");
+    assert!(level.swizzled);
+    assert_eq!(level.data.len(), 8);
+    let image = level.decode().unwrap();
+    for pixel in image.rgba.as_chunks::<4>().0 {
+        assert_eq!(pixel, &[255, 0, 0, 255]);
+    }
+}
+
+#[test]
+fn an_unestablished_tile_mode_is_unsupported() {
+    let bytes = build(&[vec![0u8; 0x1000]], &[entry_tiled(4, 4, 71, 2, 1, 9)]);
+    let store = open(&bytes);
+    let texture = &store.textures()[0];
+    assert!(
+        matches!(&texture.status, Status::Unsupported(reason) if reason.contains("tile mode 9")),
+        "{:?}",
+        texture.status
+    );
+    assert!(store.level(0, 0, &AtomicBool::new(false)).is_err());
+}
+
+#[test]
 fn bc1_keeps_the_one_bit_transparent_branch() {
     // c0 = 0, c1 = 0xFFFF, every index is 3: the transparent branch.
     let block = vec![0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
@@ -116,11 +147,13 @@ fn bc3_decodes_a_solid_block() {
         0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00,
     ];
-    let bytes = build(&[block], &[entry(4, 4, 77, 2, 1)]);
-    let store = open(&bytes);
-    let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
-    for pixel in image.rgba.as_chunks::<4>().0 {
-        assert_eq!(pixel, &[255, 0, 0, 255]);
+    for format in [77, 78] {
+        let bytes = build(std::slice::from_ref(&block), &[entry(4, 4, format, 2, 1)]);
+        let store = open(&bytes);
+        let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
+        for pixel in image.rgba.as_chunks::<4>().0 {
+            assert_eq!(pixel, &[255, 0, 0, 255], "format {format}");
+        }
     }
 }
 
@@ -144,7 +177,8 @@ fn r16_float_clamps_to_the_preview_range() {
     for value in [0.0f32, 0.5, 1.0, 2.0] {
         data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
     }
-    let bytes = build(&[data], &[entry(2, 2, 54, 2, 1)]);
+    let block = tiled(&data, 2, 2, 54, 1);
+    let bytes = build(&[block], &[entry(2, 2, 54, 2, 1)]);
     let store = open(&bytes);
     let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
     assert_eq!(
@@ -161,13 +195,35 @@ fn r16_float_maps_non_finite_and_negative_values_to_zero() {
     for value in [-1.0f32, f32::NAN, f32::INFINITY, 0.25] {
         data.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
     }
-    let bytes = build(&[data], &[entry(2, 2, 54, 2, 1)]);
+    let block = tiled(&data, 2, 2, 54, 1);
+    let bytes = build(&[block], &[entry(2, 2, 54, 2, 1)]);
     let store = open(&bytes);
     let image = store.decode(0, 0, &AtomicBool::new(false)).unwrap();
     assert_eq!(
         image.rgba,
         vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 64, 64, 64, 255]
     );
+}
+
+#[test]
+fn small_compressed_dimensions_decode() {
+    for (width, height) in [(1u32, 1u32), (4, 1), (13, 1), (4, 4), (5, 3), (17, 9)] {
+        let block = [0x00, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut linear = Vec::new();
+        for _ in 0..width.div_ceil(4) * height.div_ceil(4) {
+            linear.extend_from_slice(&block);
+        }
+        let block = tiled(&linear, width, height, 71, 1);
+        let bytes = build(&[block], &[entry(width, height, 71, 2, 1)]);
+        let store = open(&bytes);
+        let image = store
+            .decode(0, 0, &AtomicBool::new(false))
+            .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
+        assert_eq!((image.width, image.height), (width, height));
+        for pixel in image.rgba.as_chunks::<4>().0 {
+            assert_eq!(pixel, &[255, 0, 0, 255], "{width}x{height}");
+        }
+    }
 }
 
 #[test]

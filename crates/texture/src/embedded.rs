@@ -134,7 +134,13 @@ pub fn decode_embedded(
         .ok_or_else(|| Error::Unsupported("the pixel format is not supported".into()))?;
     let swizzled = info.tile_mode != 0;
     let data = if swizzled {
-        swizzle::deswizzle(&bytes, level_info.width, level_info.height, codec)?
+        swizzle::deswizzle(
+            swizzle::Swizzle::S4k,
+            &bytes,
+            level_info.width,
+            level_info.height,
+            codec,
+        )?
     } else {
         bytes
     };
