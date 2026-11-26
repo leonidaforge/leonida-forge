@@ -68,6 +68,13 @@ pub fn run(
                 stream,
                 output::MAX_OUTPUT,
             )?;
+            if bytes.len() as u64 > output::MAX_OUTPUT {
+                return Err(format!(
+                    "row {row} decodes to {} bytes, more than the {} byte output limit",
+                    bytes.len(),
+                    output::MAX_OUTPUT
+                ));
+            }
             output::write_file(output, overwrite, |writer| {
                 writer
                     .write_all(&bytes)
