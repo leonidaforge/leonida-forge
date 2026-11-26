@@ -440,17 +440,39 @@ pub fn open_metadata_cancellable(
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("cancelled".to_string());
     }
-    let mut source =
+    let source =
         Source::open(path).map_err(|err| format!("cannot open {}: {err}", path.display()))?;
-    rpf::read_header(&mut source).map_err(|err| format!("{}: {err}", path.display()))?;
+    open_metadata_at(
+        source,
+        &path.display().to_string(),
+        limit,
+        executable,
+        cancel,
+    )
+}
+
+/// [`open_metadata_cancellable`] for a source that is already open, so an
+/// archive stored inside another one is read where it lies instead of being
+/// copied. `label` names the source in failures.
+pub fn open_metadata_at(
+    source: Source,
+    label: &str,
+    limit: u64,
+    executable: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<Opened, String> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    let mut source = source;
+    rpf::read_header(&mut source).map_err(|err| format!("{label}: {err}"))?;
     // The header, and at most the A table, decide whether the stored bytes can
     // be used before all of them are read.
-    let probe =
-        Stored::probe(&mut source.clone()).map_err(|err| format!("{}: {err}", path.display()))?;
+    let probe = Stored::probe(&mut source.clone()).map_err(|err| format!("{label}: {err}"))?;
     if probe.processing.is_none() {
         let metadata = Stored::read(&mut source.clone(), limit)
             .and_then(Stored::decode)
-            .map_err(|err| format!("{}: {err}", path.display()))?;
+            .map_err(|err| format!("{label}: {err}"))?;
         return Ok(Opened {
             source,
             metadata,
@@ -463,29 +485,24 @@ pub fn open_metadata_cancellable(
             .unsupported()
             .unwrap_or_else(|| "the metadata is processed".to_string());
         return Err(format!(
-            "the table of contents of {} is not read: it is processed and requires --executable: {reason}",
-            path.display()
+            "the table of contents of {label} is not read: it is processed and requires --executable: {reason}"
         ));
     };
     let view = ExecutableView::open(executable)
         .map_err(|err| format!("cannot open {}: {err}", executable.display()))?;
     let open: OpenReport = open_authenticated(&mut source.clone(), &view, cancel)
-        .map_err(|err| format!("{}: {err}", path.display()))?;
+        .map_err(|err| format!("{label}: {err}"))?;
     let report = open.report;
     let Some(authenticated) = open.authenticated else {
         return Err(format!(
-            "the table of contents of {} is not authenticated: {} (stage {})",
-            path.display(),
-            report.outcome,
-            report.stage
+            "the table of contents of {label} is not authenticated: {} (stage {})",
+            report.outcome, report.stage
         ));
     };
     if report.outcome != VerifyOutcome::MetadataDecodedAuthenticated {
         return Err(format!(
-            "the table of contents of {} is not authenticated: {} (stage {})",
-            path.display(),
-            report.outcome,
-            report.stage
+            "the table of contents of {label} is not authenticated: {} (stage {})",
+            report.outcome, report.stage
         ));
     }
     Ok(Opened {

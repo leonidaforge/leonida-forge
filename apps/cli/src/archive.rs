@@ -343,6 +343,45 @@ pub enum Command {
         #[arg(long)]
         depth: Option<usize>,
     },
+    /// Count every entry of every reachable RPF9 archive by its classification
+    Census {
+        /// An archive file, or a directory searched recursively for .rpf files
+        path: PathBuf,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Enter archives stored inside an archive
+        #[arg(long)]
+        recursive: bool,
+        /// Also write one record per entry
+        #[arg(long)]
+        entries: bool,
+        /// Samples kept per combination
+        #[arg(long, default_value_t = 3)]
+        samples: usize,
+        /// Where to write the census. Defaults to standard output
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long)]
+        overwrite: bool,
+        /// Archives in a chain, counting the root
+        #[arg(long, default_value_t = 8)]
+        max_depth: usize,
+        /// Archives opened, roots included
+        #[arg(long, default_value_t = 4096)]
+        max_archives: u64,
+        /// Entries classified
+        #[arg(long, default_value_t = 2000000u64)]
+        max_entries: u64,
+        /// Largest nested archive copied to temporary storage
+        #[arg(long, default_value_t = 2147483648u64)]
+        max_nested_bytes: u64,
+        /// Total bytes copied to temporary storage
+        #[arg(long, default_value_t = 68719476736u64)]
+        max_spool_bytes: u64,
+    },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
     #[command(group(
@@ -393,6 +432,41 @@ pub fn run(command: Command) -> Result<(), String> {
             record,
             json,
         } => resource(&file, id, no_cache, drawable, dictionary, record, json),
+        Command::Census {
+            path,
+            executable,
+            recursive,
+            entries,
+            samples,
+            output,
+            overwrite,
+            max_depth,
+            max_archives,
+            max_entries,
+            max_nested_bytes,
+            max_spool_bytes,
+        } => {
+            let cancel = AtomicBool::new(false);
+            crate::census::run(
+                &crate::census::Options {
+                    path,
+                    executable,
+                    recursive,
+                    entries,
+                    samples,
+                    output,
+                    overwrite,
+                    limits: crate::census::Limits {
+                        max_depth,
+                        max_archives,
+                        max_entries,
+                        max_nested_bytes,
+                        max_spool_bytes,
+                    },
+                },
+                &cancel,
+            )
+        }
         Command::Metadata {
             file,
             entries,

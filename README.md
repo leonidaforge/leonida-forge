@@ -234,6 +234,22 @@ lforge names audit --research path/to/research/names --json
 
 `names index` authenticates each `.rpf` recursively and builds an in-memory index of stored keys and rows. It reports per-type counts of which key column each row populates, separately from the class the executable establishes. `names harvest` extracts bounded path-like strings from readable payloads and initialized executable sections, hashes a small set of variants, and writes local JSONL evidence for hash matches; its summary breaks matches down by source, namespace, archive and type, and reports unresolved and ambiguous keys. `names export` writes one validated LUT per namespace (`resolved.hash64.lut`, `resolved.key32.lut` when both are present) and reports which source and namespace each accepted record came from. `names audit` re-hashes every bundled LUT record, reports unverified entries, ambiguous keys, duplicate spellings and unsafe paths, and compares the bundled tables with a Research checkout's `names` directory when `--research` is given. It reads only and downloads nothing. A hash match is a candidate, not proof of the original developer filename; 32-bit matches are weaker. The LUTs embedded in the binaries are the verified mappings published in the research repository; copy a newer file beside the executable to refresh them.
 
+## RPF9 archive census
+
+`archive census` counts what every reachable entry is, instead of listing it:
+
+```sh
+lforge archive census data.rpf --executable game.exe --recursive
+lforge archive census "GAME_DIRECTORY" --executable game.exe --recursive --output census.jsonl
+lforge archive census data.rpf --executable game.exe --recursive --entries --json
+```
+
+Each entry is classified from its metadata and at most 64 decoded bytes, plus a full parse of a document up to 4 MiB when the head looks like XML. The classification keeps three properties apart: the entry's numeric type, the payload's format, and what the application can do with the bytes. A type never decides a format, and an extension is applied only when the classification establishes it: the archive's own name, `rpf` for an RPF9 payload, `xml` for a validated document. Everything else is unresolved with a reason.
+
+The document uses schema `leonida-forge.rpf9-census/1`. JSONL writes a header record, one record per combination of type, identification, storage, transform, payload state, confidence, extension and capability, then a summary; `--entries` adds one record per entry. Each combination carries the number of entries, the archives it was seen in and samples with the archive, the selector chain to the row and the first 32 bytes of the decoded head. The summary reports the archives opened, the entries classified, the per-type totals, the combinations and any archive that could not be read.
+
+`--recursive` enters an entry only when its decoded payload is an RPF9 archive. When every chunk of that entry copies its bytes, the nested archive is read at its payload offset; otherwise its payload is decoded into temporary storage first, bounded by `--max-nested-bytes` and `--max-spool-bytes`. `--max-depth`, `--max-archives` and `--max-entries` bound the run, and a run that hits one reports `stopped` rather than claiming to be complete. Classification reads a decoded chunk per entry, so a complete census of a large installation is not cheap; `--max-entries` is the honest way to bound it.
+
 ## Catalog extraction and package validation
 
 `catalog extract` reads the XML metadata documents in authenticated RPF9 rows and writes one bounded observation per source item. `catalog validate` checks a website publication package without extracting it.
