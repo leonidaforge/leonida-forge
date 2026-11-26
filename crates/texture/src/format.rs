@@ -64,7 +64,7 @@ pub fn pixel_format(id: u8) -> PixelFormat {
             id,
             name: "R16_FLOAT",
             codec: Some(Codec::R16Float),
-            detail: "one binary16 value per texel; the preview clamps to [0, 1]",
+            detail: "candidate reading: one binary16 value per texel, clamped to [0, 1]; no simple-2D sample confirms it",
         },
         71 | 72 => PixelFormat {
             id,
