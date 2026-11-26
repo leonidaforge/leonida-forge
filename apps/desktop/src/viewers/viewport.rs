@@ -2,6 +2,8 @@
 //!
 //! GPUI on Windows cannot composite textures from a foreign GPU device, so the
 //! renderer draws offscreen on its own thread and frames reach GPUI as images.
+//! The renderer itself is window-system independent and is also used for
+//! headless images.
 
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -15,11 +17,12 @@ use gpui::{
     Window, canvas, div, prelude::*, rgb, size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
-use lforge_renderer::{Frame, OrbitCamera, Renderer};
+use lforge_renderer::{Background, Frame, OrbitCamera, Renderer};
+use lforge_scene::{Aabb, Scene};
 
 use crate::ui::theme;
 
-const ORBIT_RADIANS_PER_PIXEL: f32 = 0.01;
+const ORBIT_RADIANS_PER_PIXEL: f32 = 0.008;
 const ZOOM_PER_PIXEL: f32 = 0.0025;
 const AUTO_ROTATE_RADIANS_PER_SECOND: f32 = 0.6;
 
@@ -40,22 +43,32 @@ struct Request {
     camera: OrbitCamera,
 }
 
+#[derive(Clone, Copy)]
+struct Drag {
+    button: MouseButton,
+    origin: Point<Pixels>,
+}
+
 pub struct Viewport {
     pub camera: OrbitCamera,
     pub status: RendererStatus,
     pub size: Size<DevicePixels>,
     pub auto_rotate: bool,
+    bounds: Aabb,
+    framed: bool,
     requests: Option<mpsc::Sender<Request>>,
     image: Option<Arc<RenderImage>>,
     stale_images: Vec<Arc<RenderImage>>,
-    drag_origin: Option<Point<Pixels>>,
+    drag: Option<Drag>,
     last_tick: Option<Instant>,
 }
 
 impl Viewport {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(scene: Arc<Scene>, cx: &mut Context<Self>) -> Self {
+        let bounds = scene.bounds.sanitized();
+        let camera = OrbitCamera::framing(bounds, 1.0);
         let (response_tx, mut responses) = unbounded();
-        let (requests, status) = match spawn_render_thread(response_tx) {
+        let (requests, status) = match spawn_render_thread(scene, response_tx) {
             Ok(requests) => (Some(requests), RendererStatus::Starting),
             Err(err) => (
                 None,
@@ -76,20 +89,27 @@ impl Viewport {
         .detach();
 
         Self {
-            camera: OrbitCamera::default(),
+            camera,
             status,
             size: Size::default(),
             auto_rotate: false,
+            bounds,
+            framed: false,
             requests,
             image: None,
             stale_images: Vec::new(),
-            drag_origin: None,
+            drag: None,
             last_tick: None,
         }
     }
 
     pub fn reset_camera(&mut self, cx: &mut Context<Self>) {
-        self.camera = OrbitCamera::default();
+        let aspect = if self.size.height.0 > 0 {
+            self.size.width.0 as f32 / self.size.height.0 as f32
+        } else {
+            1.0
+        };
+        self.camera = OrbitCamera::framing(self.bounds, aspect);
         self.request_frame();
         cx.notify();
     }
@@ -129,29 +149,45 @@ impl Viewport {
             size: self.size,
             camera: self.camera,
         };
-        // A send error means the render thread has exited; it reports why itself.
         if requests.send(request).is_err() {
             self.requests = None;
         }
     }
 
     fn resize(&mut self, size: Size<DevicePixels>) {
-        if self.size != size {
-            self.size = size;
-            self.request_frame();
+        if self.size == size {
+            return;
         }
+        self.size = size;
+        if !self.framed && size.width.0 > 0 && size.height.0 > 0 {
+            let aspect = size.width.0 as f32 / size.height.0 as f32;
+            self.camera = OrbitCamera::framing(self.bounds, aspect);
+            self.framed = true;
+        }
+        self.request_frame();
     }
 
-    fn drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(origin) = self.drag_origin else {
+    fn drag_to(&mut self, position: Point<Pixels>, scale_factor: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.drag else {
             return;
         };
-        self.drag_origin = Some(position);
-        let delta = position - origin;
-        self.camera.orbit(
-            -f32::from(delta.x) * ORBIT_RADIANS_PER_PIXEL,
-            f32::from(delta.y) * ORBIT_RADIANS_PER_PIXEL,
-        );
+        let delta = position - drag.origin;
+        self.drag = Some(Drag {
+            origin: position,
+            ..drag
+        });
+        match drag.button {
+            MouseButton::Left => self.camera.orbit(
+                -f32::from(delta.x) * ORBIT_RADIANS_PER_PIXEL,
+                f32::from(delta.y) * ORBIT_RADIANS_PER_PIXEL,
+            ),
+            MouseButton::Middle => {
+                let viewport_height = self.size.height.0 as f32 / scale_factor.max(0.01);
+                self.camera
+                    .pan(f32::from(delta.x), f32::from(delta.y), viewport_height);
+            }
+            _ => {}
+        }
         self.request_frame();
         cx.notify();
     }
@@ -188,7 +224,7 @@ impl Render for Viewport {
         }
 
         let message = match &self.status {
-            RendererStatus::Starting => Some("Initializing renderer…"),
+            RendererStatus::Starting => Some("Initializing renderer."),
             RendererStatus::Failed(_) => Some("Renderer unavailable"),
             RendererStatus::Ready { .. } => None,
         };
@@ -202,8 +238,28 @@ impl Render for Viewport {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, _| {
-                    this.drag_origin = Some(event.position);
+                    this.drag = Some(Drag {
+                        button: MouseButton::Left,
+                        origin: event.position,
+                    });
                 }),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, _, _| {
+                    this.drag = Some(Drag {
+                        button: MouseButton::Middle,
+                        origin: event.position,
+                    });
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag = None),
+            )
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(|this, _, _, _| this.drag = None),
             )
             .on_scroll(cx.listener(|this, event, window, cx| this.scroll(event, window, cx)))
             .child(viewport_canvas(cx.entity(), self.image.clone()))
@@ -228,7 +284,8 @@ fn viewport_canvas(
         {
             let viewport = viewport.clone();
             move |bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App| {
-                let scaled = bounds.size.scale(window.scale_factor());
+                let scale = window.scale_factor();
+                let scaled = bounds.size.scale(scale);
                 let size = size(
                     DevicePixels(scaled.width.0.round() as i32),
                     DevicePixels(scaled.height.0.round() as i32),
@@ -244,17 +301,27 @@ fn viewport_canvas(
                 log::error!("failed to paint viewport frame: {err}");
             }
 
-            // Window-level listeners keep the drag alive when the cursor leaves the viewport.
+            // Window-level listeners keep a drag alive when the cursor leaves
+            // the viewport.
             let drag_viewport = viewport.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                if phase == DispatchPhase::Bubble && event.pressed_button == Some(MouseButton::Left)
-                {
-                    drag_viewport.update(cx, |viewport, cx| viewport.drag(event.position, cx));
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    let scale = window.scale_factor();
+                    drag_viewport.update(cx, |viewport, cx| {
+                        viewport.drag_to(event.position, scale, cx)
+                    });
                 }
             });
             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
-                if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
-                    viewport.update(cx, |viewport, _| viewport.drag_origin = None);
+                if phase == DispatchPhase::Bubble {
+                    viewport.update(cx, |viewport, _| {
+                        if viewport
+                            .drag
+                            .is_some_and(|drag| drag.button == event.button)
+                        {
+                            viewport.drag = None;
+                        }
+                    });
                 }
             });
         },
@@ -263,6 +330,7 @@ fn viewport_canvas(
 }
 
 fn spawn_render_thread(
+    scene: Arc<Scene>,
     responses: UnboundedSender<Response>,
 ) -> std::io::Result<mpsc::Sender<Request>> {
     let (request_tx, requests) = mpsc::channel::<Request>();
@@ -272,7 +340,6 @@ fn spawn_render_thread(
             let mut renderer = match Renderer::new() {
                 Ok(renderer) => renderer,
                 Err(err) => {
-                    // Nothing to report to if the viewport is already gone.
                     let _ = responses.unbounded_send(Response::Failed(err.to_string()));
                     return;
                 }
@@ -282,19 +349,29 @@ fn spawn_render_thread(
                 adapter: info.name.clone(),
                 backend: info.backend.to_string(),
             };
+            let gpu_scene = match renderer.upload_scene(&scene) {
+                Ok(scene) => scene,
+                Err(err) => {
+                    let _ = responses.unbounded_send(Response::Failed(err.to_string()));
+                    return;
+                }
+            };
             if responses.unbounded_send(ready).is_err() {
                 return;
             }
 
             while let Ok(mut request) = requests.recv() {
-                // Only the latest camera and size matter; skip frames that are already stale.
+                // Only the latest camera and size matter; skip frames that are
+                // already stale.
                 while let Ok(newer) = requests.try_recv() {
                     request = newer;
                 }
                 let response = match renderer.render(
+                    &gpu_scene,
+                    &request.camera,
                     request.size.width.0 as u32,
                     request.size.height.0 as u32,
-                    &request.camera,
+                    Background::DARK,
                 ) {
                     Ok(frame) => Response::Frame(frame),
                     Err(err) => Response::Failed(err.to_string()),
@@ -309,9 +386,8 @@ fn spawn_render_thread(
 }
 
 fn to_render_image(frame: Frame) -> Arc<RenderImage> {
-    // The renderer already produces the BGRA layout that GPUI expects, so the
-    // buffer is passed through unchanged despite the `RgbaImage` type.
-    let buffer = RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+    // GPUI's RenderImage expects BGRA8; the renderer's native order is RGBA8.
+    let buffer = RgbaImage::from_raw(frame.width, frame.height, frame.to_bgra8())
         .expect("renderer returns width * height * 4 bytes");
     Arc::new(RenderImage::new([ImageFrame::new(buffer)]))
 }

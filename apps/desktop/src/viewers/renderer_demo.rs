@@ -1,7 +1,10 @@
 //! Development window for the Phase 0 cube renderer.
 
+use std::sync::Arc;
+
 use gpui::{Context, Div, Entity, FontWeight, SharedString, Window, div, prelude::*, px, rgb};
 use lforge_core::VERSION;
+use lforge_scene::{Material, Mesh, Primitive, Scene, Vertex};
 
 use super::viewport::{RendererStatus, Viewport};
 use crate::ui;
@@ -13,7 +16,8 @@ pub struct RendererDemo {
 
 impl RendererDemo {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let viewport = cx.new(Viewport::new);
+        let scene = Arc::new(demo_scene());
+        let viewport = cx.new(|cx| Viewport::new(scene, cx));
         cx.observe(&viewport, |_, _, cx| cx.notify()).detach();
         Self { viewport }
     }
@@ -137,6 +141,52 @@ impl Render for RendererDemo {
             )
             .child(self.status_bar(cx))
     }
+}
+
+fn demo_scene() -> Scene {
+    let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+        ([1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.8, 0.2, 0.2]),
+        ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.2, 0.5, 0.8]),
+        ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.8, 0.75, 0.25]),
+        ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.45, 0.45, 0.5]),
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.25, 0.7, 0.35]),
+        ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.7, 0.35, 0.75]),
+    ];
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for (normal, u, color) in faces {
+        let v = [
+            u[1] * normal[2] - u[2] * normal[1],
+            u[2] * normal[0] - u[0] * normal[2],
+            u[0] * normal[1] - u[1] * normal[0],
+        ];
+        let base = vertices.len() as u32;
+        for (su, sv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            vertices.push(Vertex {
+                position: std::array::from_fn(|i| 0.5 * (normal[i] + su * u[i] + sv * v[i])),
+                normal,
+                tangent: None,
+                uv0: [su * 0.5 + 0.5, sv * 0.5 + 0.5],
+                uv1: None,
+                color: [color[0], color[1], color[2], 1.0],
+            });
+        }
+        indices.extend([0, 1, 2, 0, 2, 3].map(|index| base + index));
+    }
+    let mut scene = Scene::new();
+    scene.materials.push(Material {
+        name: "demo".into(),
+        ..Material::default()
+    });
+    let mut mesh = Mesh::new("cube");
+    mesh.primitives.push(Primitive {
+        material: 0,
+        vertices,
+        indices,
+    });
+    scene.meshes.push(mesh);
+    scene.validate();
+    scene
 }
 
 fn panel(title: &'static str) -> Div {

@@ -35,7 +35,7 @@ use crate::settings::{Settings, ViewMode};
 use crate::ui;
 use crate::ui::assets::Icon;
 use crate::ui::theme;
-use crate::viewers::{BinaryInspector, ImageViewer, RendererDemo};
+use crate::viewers::{BinaryInspector, ImageViewer, ModelViewer, RendererDemo};
 use navigation::{History, Workspace};
 
 use preview::Thumbnail;
@@ -886,12 +886,31 @@ impl Explorer {
         // falls back to the Binary Inspector when it is not.
         let resource = entry.resource_type == Some(5);
         let access = self.access();
+        let gta_root = self.workspace.gta.clone();
+        match model_entry_kind(entry) {
+            Some(ModelEntryKind::Direct) => {
+                open_model_viewer(path, access, gta_root, cx);
+                return;
+            }
+            Some(ModelEntryKind::Sniff) => {}
+            None => {}
+        }
+        let sniff = model_entry_kind(entry).is_some();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
             async move { files::identify_with(&path, &access) }
         });
         cx.spawn(async move |this, cx| {
             let identified = identified.await;
+            let model = if sniff && matches!(&identified, Ok(Identified::Unknown)) {
+                let (path, access) = (path.clone(), access.clone());
+                cx.background_spawn(
+                    async move { files::model::is_drawable_resource(&path, &access) },
+                )
+                .await
+            } else {
+                false
+            };
             this.update(cx, |this, cx| match identified {
                 Ok(Identified::Archive(_)) => {
                     this.mark_archive(&path);
@@ -899,6 +918,7 @@ impl Explorer {
                 }
                 // Opening it explains why it is not a valid archive.
                 Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                Ok(Identified::Unknown) if model => open_model_viewer(path, access, gta_root, cx),
                 Ok(Identified::Unknown) if texture => {
                     crate::viewers::texture::open(path, access, cx)
                 }
@@ -2064,6 +2084,43 @@ fn open_image_viewer(path: PathBuf, access: Access, cx: &mut App) {
         cx.new(|cx| ImageViewer::new(path, access, window, cx))
     }) {
         log::error!("failed to open image viewer: {err:#}");
+    }
+}
+
+/// How an entry is recognised as a model. Native type 2 and type 3 rows are
+/// model resources; a recovered resource needs a content check first because
+/// the recovery tree also holds texture dictionaries and other resources.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelEntryKind {
+    Direct,
+    Sniff,
+}
+
+fn model_entry_kind(entry: &Entry) -> Option<ModelEntryKind> {
+    if entry.type_name.starts_with("RPF9 entry, type 2")
+        || entry.type_name.starts_with("RPF9 entry, type 3")
+    {
+        return Some(ModelEntryKind::Direct);
+    }
+    if entry.type_name == "RAGE resource" {
+        return Some(ModelEntryKind::Sniff);
+    }
+    // A directly accessible decoded resource has no type metadata. Sniff it
+    // by content, with a bound so opening an arbitrary large file stays cheap.
+    (entry.kind == EntryKind::File
+        && !entry.is_supported_image()
+        && entry.size.is_some_and(|size| size <= 64 << 20))
+    .then_some(ModelEntryKind::Sniff)
+}
+
+fn open_model_viewer(path: PathBuf, access: Access, gta_root: Option<PathBuf>, cx: &mut App) {
+    let mut options = window_options(&window_title(&path), size(px(1200.), px(800.)), cx);
+    options.window_min_size = Some(size(px(640.), px(420.)));
+    if let Err(err) = cx.open_window(options, |window, cx| {
+        ui::close_through_gpui(window, cx);
+        cx.new(|cx| ModelViewer::new(path, access, gta_root, window, cx))
+    }) {
+        log::error!("failed to open model viewer: {err:#}");
     }
 }
 

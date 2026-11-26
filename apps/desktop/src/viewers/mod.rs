@@ -2,10 +2,12 @@
 
 pub mod binary;
 mod image;
+mod model;
 mod renderer_demo;
 pub mod texture;
 mod viewport;
 
 pub use binary::BinaryInspector;
 pub use image::ImageViewer;
+pub use model::ModelViewer;
 pub use renderer_demo::RendererDemo;

@@ -9,6 +9,7 @@ pub mod archive;
 mod eviction;
 pub mod executable;
 pub mod images;
+pub mod model;
 pub mod rpf;
 pub mod shell;
 mod toc;
