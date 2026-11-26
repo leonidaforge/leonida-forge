@@ -218,6 +218,20 @@ lforge names audit --research path/to/research/names --json
 
 `names index` authenticates each `.rpf` recursively and builds an in-memory index of stored keys and rows. It reports per-type counts of which key column each row populates, separately from the class the executable establishes. `names harvest` extracts bounded path-like strings from readable payloads and initialized executable sections, hashes a small set of variants, and writes local JSONL evidence for hash matches; its summary breaks matches down by source, namespace, archive and type, and reports unresolved and ambiguous keys. `names export` writes one validated LUT per namespace (`resolved.hash64.lut`, `resolved.key32.lut` when both are present) and reports which source and namespace each accepted record came from. `names audit` re-hashes every bundled LUT record, reports unverified entries, ambiguous keys, duplicate spellings and unsafe paths, and compares the bundled tables with a Research checkout's `names` directory when `--research` is given. It reads only and downloads nothing. A hash match is a candidate, not proof of the original developer filename; 32-bit matches are weaker. The LUTs embedded in the binaries are the verified mappings published in the research repository; copy a newer file beside the executable to refresh them.
 
+## Catalog extraction and package validation
+
+`catalog extract` reads the XML metadata documents in authenticated RPF9 rows and writes one bounded observation per source item. `catalog validate` checks a website publication package without extracting it.
+
+```sh
+lforge catalog extract common.rpf --executable game.exe --source-id common \
+  --output observations.ndjson --report extraction.json
+lforge catalog validate catalog-export.zip --json
+```
+
+The extraction writes NDJSON to standard output unless `--output` is given. Diagnostics and summary lines go to standard error, so a consumer can parse standard output without filtering it. The observation schema is `leonida-forge.catalog-extraction/1`; the report schema is `leonida-forge.catalog-extraction-report/1`. Each observation carries the source row hash, payload SHA-256, XML root and element path. A number keeps its stored value; `unit` is null unless the element name states a unit. A missing field is absent, never defaulted. Rows behind the unsupported payload transform are counted in the report and make its status `partial`.
+
+The validation result uses schema `leonida-forge.package-validation/1`. Exit code 0 means valid, 1 means the package is invalid or the command failed, and 2 means invalid usage. Validation covers ZIP paths, entry count, sizes, compression ratio, declared SHA-256 digests, duplicate JSON keys, manifest 1.1.0 fields, the five catalog schemas, record identity uniqueness and relationship endpoints. A version 1.0.0 package without catalog data remains valid. The command never writes to the package and never extracts an entry to a directory.
+
 ## Development workflow
 
 Development is feature-driven, not research-iteration-driven.
