@@ -684,7 +684,7 @@ mod tests {
     /// `LF_TEST_ARCHIVE_DIR` a directory of `.rpf` files. A chain list resolves
     /// to the archives that directly hold the entries, so an installation-wide
     /// census can drive the survey without extracting anything.
-    fn survey_archives() -> Vec<std::path::PathBuf> {
+    pub(super) fn survey_archives() -> Vec<std::path::PathBuf> {
         if let Ok(list) = std::env::var("LF_TEST_CHAIN_LIST") {
             let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
             let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
@@ -748,7 +748,7 @@ mod tests {
     /// Each archive is listed once and its rows are indexed by number, so a
     /// chain list of hundreds of parents costs one walk per archive rather than
     /// one search per parent.
-    fn resolve_chain(
+    pub(super) fn resolve_chain(
         root: &Path,
         access: &Access,
         chain: &str,
@@ -797,7 +797,7 @@ mod tests {
     }
 
     /// Every native row of one archive, indexed by the number its path carries.
-    fn row_index(
+    pub(super) fn row_index(
         archive: &Path,
         access: &Access,
     ) -> std::collections::HashMap<usize, std::path::PathBuf> {
@@ -1558,15 +1558,15 @@ mod tests {
     /// `native` records whether the system/graphics boundary came from the
     /// archive's page metadata; the reported results always use it when it is
     /// available and never treat an inferred boundary as evidence.
-    struct SurveyRow {
-        path: std::path::PathBuf,
-        bytes: Vec<u8>,
-        system_len: usize,
-        native: bool,
+    pub(super) struct SurveyRow {
+        pub(super) path: std::path::PathBuf,
+        pub(super) bytes: Vec<u8>,
+        pub(super) system_len: usize,
+        pub(super) native: bool,
     }
 
     impl SurveyRow {
-        fn segments(&self) -> (&[u8], &[u8]) {
+        pub(super) fn segments(&self) -> (&[u8], &[u8]) {
             self.bytes.split_at(self.system_len)
         }
     }
@@ -1574,7 +1574,7 @@ mod tests {
     /// Reads every row of `type_id` in the caller-named archives and calls
     /// `visit` for each. Returns the archives listed, the rows the metadata
     /// declares, the rows read, and the rows that could not be read.
-    fn survey_rows(
+    pub(super) fn survey_rows(
         archives: &[std::path::PathBuf],
         access: &Access,
         cancel: &AtomicBool,
@@ -3804,3 +3804,9 @@ mod tests {
         assert!(rendered > 0, "no resource was rendered");
     }
 }
+
+/// The declaration survey lives beside the loader so it can reuse the archive
+/// walk. It is test-only: nothing in the application calls it.
+#[cfg(test)]
+#[path = "model_survey.rs"]
+mod survey;
