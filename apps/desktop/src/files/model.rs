@@ -3547,6 +3547,7 @@ mod tests {
         let mut read = 0usize;
         let mut with_skeleton = 0usize;
         let mut found: Vec<String> = Vec::new();
+        let mut mixed: Vec<String> = Vec::new();
         let mut samples: Vec<String> = Vec::new();
         for chain in text
             .lines()
@@ -3582,6 +3583,7 @@ mod tests {
             };
             let members = dictionary.info.drawable_members().count();
             let mut lines = Vec::new();
+            let mut bone_counts: Vec<usize> = Vec::new();
             for member in 0..members.min(member_cap) {
                 let Ok(loaded) = load_dictionary_member(
                     &entry,
@@ -3592,6 +3594,12 @@ mod tests {
                 ) else {
                     continue;
                 };
+                let bones = loaded
+                    .scene
+                    .skeleton
+                    .as_ref()
+                    .map_or(0, |skeleton| skeleton.bones.len());
+                bone_counts.push(bones);
                 let Some(skeleton) = loaded.scene.skeleton.as_ref() else {
                     continue;
                 };
@@ -3619,6 +3627,14 @@ mod tests {
                     samples.push(block);
                 }
             }
+            let bearing = bone_counts.iter().filter(|bones| **bones > 0).count();
+            if bearing > 0 && bearing < bone_counts.len() && mixed.len() < 6 {
+                // A member that carries no skeleton in the same dictionary is
+                // what a manual switch check needs, so name the counts.
+                mixed.push(format!(
+                    "{chain}: {members} member(s), bone counts {bone_counts:?}"
+                ));
+            }
         }
         eprintln!("dictionaries read: {read}, with a skeleton-bearing member: {with_skeleton}");
         for sample in samples.iter().take(6) {
@@ -3631,6 +3647,175 @@ mod tests {
         for block in found.iter().take(6) {
             eprintln!("{block}");
         }
+        eprintln!(
+            "dictionaries with both a skeleton-bearing and a skeleton-free member: {}",
+            mixed.len()
+        );
+        for line in &mixed {
+            eprintln!("{line}");
+        }
         assert!(read > 0, "no dictionary was read");
+    }
+
+    /// Renders the three verification views of each listed resource.
+    ///
+    /// Ignored by default. `LF_TEST_CHAIN_LIST` names native chains,
+    /// `LF_TEST_GAME_ROOT` and `LF_TEST_EXECUTABLE` the installation, and
+    /// `LF_RENDER_DIR` the directory the raw RGBA8 frames are written to. With
+    /// `LF_RENDER_DICTIONARY_MEMBER` set, each chain is read as a dictionary and
+    /// its member at that index is rendered. The frames are raw so this needs no
+    /// image dependency; `analysis/skeleton-bind-pose/rgba_to_png.py` turns them
+    /// into PNGs.
+    ///
+    /// The views are the plain model, the model with the skeleton overlay, and
+    /// the skeleton alone framed on its own bounds. A skeleton view must differ
+    /// from the plain view, and the plain view must be stable across two renders,
+    /// so a silently missing overlay cannot pass.
+    #[test]
+    #[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT, LF_TEST_EXECUTABLE and LF_RENDER_DIR"]
+    fn renders_skeleton_samples() {
+        let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let out = std::env::var("LF_RENDER_DIR").expect("LF_RENDER_DIR");
+        let member: Option<usize> = std::env::var("LF_RENDER_DICTIONARY_MEMBER")
+            .ok()
+            .and_then(|value| value.parse().ok());
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let root = Path::new(&root);
+        let out = Path::new(&out);
+        let text = std::fs::read_to_string(&list).expect("chain list");
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        let mut rendered = 0usize;
+        for chain in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let (scene, label) = match member {
+                Some(index_in_dictionary) => {
+                    let Some((parent_chain, row)) = chain.rsplit_once('!') else {
+                        continue;
+                    };
+                    let Ok(row) = row.parse::<usize>() else {
+                        continue;
+                    };
+                    let Some(parent) =
+                        resolve_chain(root, &access, parent_chain, &mut resolved, &mut index)
+                    else {
+                        continue;
+                    };
+                    if !index.contains_key(&parent) {
+                        index.insert(parent.clone(), row_index(&parent, &access));
+                    }
+                    let Some(entry) = index.get(&parent).and_then(|rows| rows.get(&row)).cloned()
+                    else {
+                        continue;
+                    };
+                    match load_dictionary_member(
+                        &entry,
+                        &access,
+                        Some(root),
+                        index_in_dictionary,
+                        &cancel,
+                    ) {
+                        Ok(loaded) => (loaded.scene, loaded.name),
+                        Err(err) => {
+                            eprintln!("{chain}: member {index_in_dictionary} did not load: {err}");
+                            continue;
+                        }
+                    }
+                }
+                None => match load_chain(root, &access, chain, &cancel) {
+                    Some(loaded) => (loaded.scene, loaded.name),
+                    None => {
+                        eprintln!("{chain}: did not load");
+                        continue;
+                    }
+                },
+            };
+            let Some(bones) = scene.skeleton.as_ref().map(|skeleton| skeleton.bones.len()) else {
+                eprintln!("{chain}: no skeleton");
+                continue;
+            };
+            let mut renderer = match lforge_renderer::Renderer::new() {
+                Ok(renderer) => renderer,
+                Err(err) => {
+                    eprintln!("{chain}: no renderer: {err}");
+                    continue;
+                }
+            };
+            let gpu = renderer.upload_scene(&scene).expect("upload");
+            let camera = lforge_renderer::OrbitCamera::framing(scene.bounds, 16.0 / 9.0);
+            let plain = renderer
+                .render(&gpu, &camera, 1280, 720, lforge_renderer::Background::DARK)
+                .expect("plain render");
+            let again = renderer
+                .render(&gpu, &camera, 1280, 720, lforge_renderer::Background::DARK)
+                .expect("plain render");
+            assert_eq!(
+                plain.pixels, again.pixels,
+                "{chain}: plain render is stable"
+            );
+            let overlay = renderer
+                .render_with_overlay(
+                    &gpu,
+                    &camera,
+                    1280,
+                    720,
+                    lforge_renderer::Background::DARK,
+                    lforge_renderer::Overlay::skeleton(None, true),
+                )
+                .expect("overlay render");
+            if overlay.pixels == plain.pixels {
+                // The camera frames the meshes, so an overlay that draws nothing
+                // here is only acceptable when the skeleton lies outside that
+                // frame. A skeleton inside the frame that drew no pixel is a
+                // defect, and the assertion below says so with the bounds.
+                let skeleton = scene.skeleton_bounds().unwrap_or(scene.bounds);
+                let mesh = scene.bounds;
+                let outside = skeleton.min.x > mesh.max.x
+                    || skeleton.max.x < mesh.min.x
+                    || skeleton.min.y > mesh.max.y
+                    || skeleton.max.y < mesh.min.y
+                    || skeleton.min.z > mesh.max.z
+                    || skeleton.max.z < mesh.min.z;
+                assert!(
+                    outside,
+                    "{chain}: the overlay changed no pixel although the skeleton {skeleton:?} lies inside the framed meshes {mesh:?}"
+                );
+                eprintln!(
+                    "{chain}: the skeleton lies outside the mesh bounds, so the overlay adds no pixel at this camera"
+                );
+            }
+            let mut only_gpu = renderer.upload_scene(&scene).expect("upload");
+            only_gpu.set_skeleton_visible(true);
+            for mesh in 0..scene.meshes.len() {
+                only_gpu.set_mesh_visible(mesh, false);
+            }
+            let bounds = scene.skeleton_bounds().unwrap_or(scene.bounds);
+            let only_camera = lforge_renderer::OrbitCamera::framing(bounds, 16.0 / 9.0);
+            let only = renderer
+                .render(
+                    &only_gpu,
+                    &only_camera,
+                    1280,
+                    720,
+                    lforge_renderer::Background::DARK,
+                )
+                .expect("skeleton-only render");
+            assert!(
+                only.pixels != plain.pixels,
+                "{chain}: the skeleton-only view equals the model view"
+            );
+            let stem = chain.replace(['/', '!', '\\'], "-");
+            for (suffix, frame) in [("default", &plain), ("skeleton", &overlay), ("only", &only)] {
+                let path = out.join(format!("{stem}-{suffix}.rgba"));
+                std::fs::write(&path, &frame.pixels).expect("write frame");
+            }
+            eprintln!("{chain} {label}: {bones} bone(s), wrote three 1280x720 frames");
+            rendered += 1;
+        }
+        assert!(rendered > 0, "no resource was rendered");
     }
 }
