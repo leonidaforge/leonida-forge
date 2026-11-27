@@ -211,6 +211,66 @@ struct Drag {
     origin: Point<Pixels>,
 }
 
+/// One visibility flag per scene mesh.
+///
+/// A fragment component owns a range of meshes, so a component toggle is a
+/// range write and a mesh toggle is a single write. Visibility is a drawing
+/// property only: no flag here can change a decoding or completeness verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Visibility {
+    flags: Vec<bool>,
+}
+
+impl Visibility {
+    fn new(meshes: usize) -> Self {
+        Self {
+            flags: vec![true; meshes],
+        }
+    }
+
+    fn flags(&self) -> &[bool] {
+        &self.flags
+    }
+
+    fn mesh(&self, mesh: usize) -> bool {
+        self.flags.get(mesh).copied().unwrap_or(true)
+    }
+
+    /// Whether any mesh in `meshes` is shown.
+    fn any(&self, meshes: std::ops::Range<usize>) -> bool {
+        meshes.into_iter().any(|mesh| self.mesh(mesh))
+    }
+
+    /// Writes one flag. Returns whether anything changed.
+    fn set_mesh(&mut self, mesh: usize, visible: bool) -> bool {
+        match self.flags.get_mut(mesh) {
+            Some(flag) if *flag != visible => {
+                *flag = visible;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Writes every flag in a range. Returns whether anything changed.
+    fn set_range(&mut self, meshes: std::ops::Range<usize>, visible: bool) -> bool {
+        let mut changed = false;
+        for mesh in meshes {
+            changed |= self.set_mesh(mesh, visible);
+        }
+        changed
+    }
+
+    /// Writes every flag. Returns whether anything changed.
+    fn set_all(&mut self, visible: bool) -> bool {
+        if self.flags.iter().all(|flag| *flag == visible) {
+            return false;
+        }
+        self.flags.fill(visible);
+        true
+    }
+}
+
 pub struct Viewport {
     pub camera: OrbitCamera,
     pub status: RendererStatus,
@@ -220,7 +280,7 @@ pub struct Viewport {
     scene: Arc<Scene>,
     /// Mesh visibility, one flag per scene mesh. The decoded scene is never
     /// modified; the render thread applies the flags before drawing.
-    visibility: Vec<bool>,
+    visibility: Visibility,
     framed: bool,
     requests: Option<LatestSender<Request>>,
     next_generation: u64,
@@ -234,7 +294,7 @@ pub struct Viewport {
 impl Viewport {
     pub fn new(scene: Arc<Scene>, cx: &mut Context<Self>) -> Self {
         let bounds = scene.bounds.sanitized();
-        let visibility = vec![true; scene.meshes.len()];
+        let visibility = Visibility::new(scene.meshes.len());
         let camera = OrbitCamera::framing(bounds, 1.0);
         let (responses, mut notifications) = ResponseQueue::new();
         let (requests, status) = match spawn_render_thread(scene.clone(), responses.clone()) {
@@ -280,7 +340,41 @@ impl Viewport {
 
     /// Whether scene mesh `mesh` is currently shown.
     pub fn mesh_visible(&self, mesh: usize) -> bool {
-        self.visibility.get(mesh).copied().unwrap_or(true)
+        self.visibility.mesh(mesh)
+    }
+
+    /// The scene's mesh count. Visibility is one flag per mesh, which is the
+    /// model level: a component can own several meshes.
+    pub fn mesh_count(&self) -> usize {
+        self.scene.meshes.len()
+    }
+
+    /// The display name of scene mesh `mesh`.
+    pub fn mesh_name(&self, mesh: usize) -> Option<&str> {
+        self.scene.meshes.get(mesh).map(|mesh| mesh.name.as_str())
+    }
+
+    /// The primitive count of scene mesh `mesh`.
+    pub fn mesh_primitives(&self, mesh: usize) -> usize {
+        self.scene
+            .meshes
+            .get(mesh)
+            .map(|mesh| mesh.primitives.len())
+            .unwrap_or(0)
+    }
+
+    /// Whether any mesh of one component is currently shown.
+    pub fn component_visible(&self, meshes: std::ops::Range<usize>) -> bool {
+        self.visibility.any(meshes)
+    }
+
+    /// Shows or hides one mesh. This changes drawing only: it never changes a
+    /// component's or a geometry's decoding status.
+    pub fn set_mesh_visible(&mut self, mesh: usize, visible: bool, cx: &mut Context<Self>) {
+        if self.visibility.set_mesh(mesh, visible) {
+            self.request_frame();
+            cx.notify();
+        }
     }
 
     /// Shows or hides the meshes of one component.
@@ -290,16 +384,7 @@ impl Viewport {
         visible: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut changed = false;
-        for index in meshes {
-            if let Some(flag) = self.visibility.get_mut(index)
-                && *flag != visible
-            {
-                *flag = visible;
-                changed = true;
-            }
-        }
-        if changed {
+        if self.visibility.set_range(meshes, visible) {
             self.request_frame();
             cx.notify();
         }
@@ -307,8 +392,7 @@ impl Viewport {
 
     /// Shows every component.
     pub fn show_all_components(&mut self, cx: &mut Context<Self>) {
-        if self.visibility.iter().any(|visible| !visible) {
-            self.visibility.fill(true);
+        if self.visibility.set_all(true) {
             self.request_frame();
             cx.notify();
         }
@@ -325,7 +409,7 @@ impl Viewport {
         let mut bounds = Aabb::EMPTY;
         let mut any = false;
         for (index, mesh) in self.scene.meshes.iter().enumerate() {
-            if !self.visibility.get(index).copied().unwrap_or(true) {
+            if !self.visibility.mesh(index) {
                 continue;
             }
             any = true;
@@ -396,7 +480,7 @@ impl Viewport {
             generation: self.next_generation,
             size: self.size,
             camera: self.camera,
-            visibility: Arc::new(self.visibility.clone()),
+            visibility: Arc::new(self.visibility.flags().to_vec()),
         };
         if !requests.submit(request) {
             self.requests = None;
@@ -652,6 +736,47 @@ fn to_render_image(frame: Frame) -> Arc<RenderImage> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_component_toggle_hides_every_mesh_it_owns() {
+        let mut visibility = Visibility::new(4);
+        // Two components: meshes 0..2 and 2..4.
+        assert!(visibility.set_range(0..2, false));
+        assert!(!visibility.mesh(0));
+        assert!(!visibility.mesh(1));
+        assert!(visibility.mesh(2), "the other component is untouched");
+        assert!(!visibility.any(0..2));
+        assert!(visibility.any(2..4));
+    }
+
+    #[test]
+    fn a_mesh_toggle_touches_only_that_mesh() {
+        let mut visibility = Visibility::new(3);
+        assert!(visibility.set_mesh(1, false));
+        assert!(visibility.mesh(0));
+        assert!(!visibility.mesh(1));
+        assert!(visibility.mesh(2));
+        // The component stays partly visible, so it still reports shown.
+        assert!(visibility.any(0..3));
+        assert!(
+            !visibility.set_mesh(1, false),
+            "a repeated write changes nothing"
+        );
+    }
+
+    #[test]
+    fn visibility_covers_exactly_the_scene_meshes() {
+        let mut visibility = Visibility::new(2);
+        assert_eq!(visibility.flags().len(), 2);
+        // A mesh index outside the scene never hides anything.
+        assert!(!visibility.set_mesh(9, false));
+        assert!(visibility.mesh(9), "an unknown mesh is treated as shown");
+        assert!(visibility.set_all(false));
+        assert!(
+            !visibility.set_all(false),
+            "a repeated write changes nothing"
+        );
+    }
 
     #[test]
     fn rapid_updates_keep_one_pending_state_and_return_the_latest() {

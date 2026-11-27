@@ -386,31 +386,48 @@ impl Render for ModelViewer {
     }
 }
 
-/// The fragment component list. Each row toggles one component; visibility is
-/// applied to the uploaded scene, so nothing is re-read or re-decoded.
+/// The drawable contents of a fragment.
+///
+/// Two structural levels are listed separately because they are different
+/// things: a component is one member drawable, and its meshes are that
+/// drawable's models. A component row toggles every mesh it owns; a mesh row
+/// toggles one model. Visibility is applied to the uploaded scene, so nothing
+/// is re-read or re-decoded and no completeness verdict changes.
 fn components_section(
     viewport: &Entity<Viewport>,
     fragment: &model::FragmentSummary,
     cx: &Context<ModelViewer>,
 ) -> impl IntoElement {
-    let visible: Vec<bool> = {
-        let viewport = viewport.read(cx);
-        fragment
-            .components
-            .iter()
-            .map(|component| {
-                component
-                    .meshes
-                    .clone()
-                    .any(|mesh| viewport.mesh_visible(mesh))
+    let viewport_state = viewport.read(cx);
+    let mesh_total = viewport_state.mesh_count();
+    let visible: Vec<bool> = fragment
+        .components
+        .iter()
+        .map(|component| viewport_state.component_visible(component.meshes.clone()))
+        .collect();
+    let mesh_rows: Vec<(usize, String, usize, bool)> = fragment
+        .components
+        .iter()
+        .flat_map(|component| {
+            component.meshes.clone().map(|mesh| {
+                (
+                    mesh,
+                    viewport_state
+                        .mesh_name(mesh)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("mesh {mesh}")),
+                    viewport_state.mesh_primitives(mesh),
+                    viewport_state.mesh_visible(mesh),
+                )
             })
-            .collect()
-    };
+        })
+        .collect();
+    let _ = viewport_state;
     let rows = fragment
         .components
         .iter()
         .zip(visible)
-        .map(|(component, shown)| {
+        .flat_map(|(component, shown)| {
             let meshes = component.meshes.clone();
             let label = format!(
                 "{} {}",
@@ -418,7 +435,7 @@ fn components_section(
                 component.name
             );
             let detail = format!(
-                "#{}  lod {}  {} primitives  {} vertices  {} triangles  {}  \u{00B7}  drawable +{:#x}",
+                "component #{}  lod {}  {} primitive(s)  {} vertices  {} triangles  {}  \u{00B7}  drawable +{:#x}",
                 component.index,
                 component
                     .lod
@@ -429,7 +446,7 @@ fn components_section(
                 component.status,
                 component.drawable_at
             );
-            div()
+            let component_row = div()
                 .id(("component", component.index))
                 .flex()
                 .flex_col()
@@ -455,7 +472,48 @@ fn components_section(
                         .text_xs()
                         .text_color(rgb(theme::TEXT_MUTED))
                         .child(detail),
-                )
+                );
+            let mesh_rows = mesh_rows
+                .iter()
+                .filter(|(mesh, ..)| component.meshes.contains(mesh))
+                .map(|(mesh, name, primitives, shown)| {
+                    let mesh = *mesh;
+                    let shown = *shown;
+                    div()
+                        .id(("mesh", mesh))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pl_6()
+                        .pr_3()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(theme::HOVER)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let State::Ready { viewport, .. } = &this.state else {
+                                return;
+                            };
+                            let viewport = viewport.clone();
+                            viewport.update(cx, |viewport, cx| {
+                                viewport.set_mesh_visible(mesh, !shown, cx);
+                            });
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(format!("{} mesh {}", if shown { "\u{25CF}" } else { "\u{25CB}" }, mesh)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(format!("{name}  \u{00B7}  {primitives} primitive(s)")),
+                        )
+                });
+            std::iter::once(component_row.into_any_element())
+                .chain(mesh_rows.map(|row| row.into_any_element()))
         });
     div()
         .flex()
@@ -475,7 +533,11 @@ fn components_section(
                         .text_xs()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(theme::TEXT_MUTED))
-                        .child(format!("COMPONENTS ({})", fragment.components.len())),
+                        .child(format!(
+                            "DRAWABLE CONTENTS \u{00B7} {} COMPONENT(S) \u{00B7} {} MESH(ES)",
+                            fragment.components.len(),
+                            mesh_total
+                        )),
                 )
                 .child(
                     div()
