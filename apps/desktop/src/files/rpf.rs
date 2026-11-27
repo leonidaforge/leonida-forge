@@ -1430,9 +1430,10 @@ pub(crate) mod tests {
         .unwrap();
         let rows = files::list(&path).unwrap();
         let row = &rows[0];
-        // Type 11 uses the 32-bit class, so its label is the stored key.
+        // Type 11 uses the 32-bit class, so its label is the stored key, with
+        // the extension its type declares.
         let key = format!("0x{:08X}", lforge_rage9::rpf::names::joaat(b"data"));
-        assert_eq!(row.name, key.as_str());
+        assert_eq!(row.name, format!("{key}.zmt"));
         assert_eq!(
             detail(row, "Name hash"),
             Some(format!("0x{:016X}", lforge_rage9::rpf::names::hash64(b"data")).as_str())

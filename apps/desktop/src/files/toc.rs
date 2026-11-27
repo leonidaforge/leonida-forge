@@ -300,7 +300,7 @@ struct Placement {
     /// Folder components, empty for the archive root.
     folder: Vec<String>,
     /// The visible file name, with only a confirmed extension.
-    label: String,
+    label: Resolved,
 }
 
 /// The virtual folders the verified relative paths describe.
@@ -395,7 +395,12 @@ impl Layout {
 
 /// The folder and file name a verified name describes, or `None` when it is
 /// not a safe relative path.
-fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, String)> {
+///
+/// The extension comes from the same resolver the command line uses, so a name
+/// shown here is the name shown there: an extension the resolved name already
+/// carries wins, otherwise the type's declared extension is appended, and a
+/// type that declares none gets none.
+fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, Resolved)> {
     let parts = names::relative_path(name)?;
     let (label, folder) = parts.split_last()?;
     let folder: Vec<String> = folder.iter().map(|part| (*part).to_string()).collect();
@@ -406,7 +411,50 @@ fn placement(name: &str, type_id: Option<u8>) -> Option<(Vec<String>, String)> {
     {
         return None;
     }
-    Some((folder, with_extension(label, type_id)))
+    let resolved = lforge_core::registry::file_name(label, type_id);
+    Some((folder, Resolved::new(label, resolved)))
+}
+
+/// A listed name and where its extension came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Resolved {
+    /// The name as the archive spells it, without a synthesized extension.
+    original: String,
+    /// The name to show.
+    text: String,
+    extension: Option<&'static str>,
+    source: lforge_core::registry::NameSource,
+}
+
+impl Resolved {
+    fn new(original: &str, resolved: lforge_core::registry::ResolvedFileName) -> Self {
+        Self {
+            original: original.to_string(),
+            text: resolved.text,
+            extension: resolved.extension,
+            source: resolved.source,
+        }
+    }
+
+    /// How the shown name was obtained, for the details pane.
+    fn text_note(&self) -> String {
+        match self.source {
+            lforge_core::registry::NameSource::Original => {
+                "The archive's own name, with its own extension.".to_string()
+            }
+            lforge_core::registry::NameSource::Declared => format!(
+                "Shown with `{}`, the extension the engine's type registry declares for the \
+                 type. The archive's name carries none; the extension is a naming fact, not \
+                 evidence about the payload.",
+                self.extension.unwrap_or("?")
+            ),
+            lforge_core::registry::NameSource::None => {
+                "The archive's own name. The type declares no extension, and none is \
+                 invented."
+                    .to_string()
+            }
+        }
+    }
 }
 
 /// The spelling two folder components are compared by: the engine folds ASCII
@@ -501,17 +549,6 @@ fn not_found() -> io::Error {
         io::ErrorKind::NotFound,
         "the path does not exist in the archive",
     )
-}
-
-fn with_extension(name: &str, type_id: Option<u8>) -> String {
-    if type_id != Some(names::RPF_TYPE) {
-        return name.to_string();
-    }
-    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    if basename.contains('.') {
-        return name.to_string();
-    }
-    format!("{name}.rpf")
 }
 
 fn hex<T: std::fmt::UpperHex>(value: T, digits: usize) -> String {
@@ -710,9 +747,24 @@ impl Native {
     /// relative path ends in, else the stored key in canonical form.
     fn label(&self, index: usize) -> String {
         match &self.layout.placements[index] {
-            Some(placement) => placement.label.clone(),
+            Some(placement) => placement.label.text.clone(),
             None => self.key_label(&self.rows[index]),
         }
+    }
+
+    /// Where the label's extension came from, when it was not the archive's
+    /// own.
+    fn label_note(&self, index: usize) -> Option<String> {
+        let placement = self.layout.placements[index].as_ref()?;
+        (placement.label.source != lforge_core::registry::NameSource::Original)
+            .then(|| placement.label.text_note())
+    }
+
+    /// The name the archive spells, without an extension this build appended.
+    fn original_label(&self, index: usize) -> Option<&str> {
+        let placement = self.layout.placements[index].as_ref()?;
+        (placement.label.source != lforge_core::registry::NameSource::Original)
+            .then_some(placement.label.original.as_str())
     }
 
     /// The stored key of the row in canonical form, with only a confirmed
@@ -730,7 +782,7 @@ impl Native {
             },
         };
         match stored {
-            Some(key) => with_extension(&key.canonical(), row.type_id()),
+            Some(key) => lforge_core::registry::file_name(&key.canonical(), row.type_id()).text,
             None => row_name(row.row),
         }
     }
@@ -818,6 +870,18 @@ impl Native {
             ("Names", self.names_text(row)),
             ("Name source", self.names_source_text(row)),
         ];
+        // A name this build completed with a declared extension says so, and
+        // keeps the archive's own spelling beside it, so a synthesized name is
+        // never mistaken for one the archive stores.
+        if let Some(note) = self.label_note(index) {
+            details.push(("Extension", note));
+        }
+        if let Some(original) = self.original_label(index) {
+            details.push((
+                "Archive name",
+                format!("{original} (before the extension was added)"),
+            ));
+        }
         match &row.name_hash {
             Ok(Some(hash)) => details.push(("Name hash", hex(*hash, 16))),
             Ok(None) => {}

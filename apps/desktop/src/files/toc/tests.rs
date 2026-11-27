@@ -327,7 +327,8 @@ fn lists_entries_from_the_table_of_contents() {
     let entries = files::list(&path).unwrap();
     let expected = [
         format!("0x{:016X}.rpf", hash64(b"packs/inner")),
-        format!("0x{:016X}", hash64(b"data")),
+        // Type 5 declares `ztd`, so the name it completes is shown with it.
+        format!("0x{:016X}.ztd", hash64(b"data")),
         format!("0x{:016X}.rpf", hash64(b"packed")),
         "Row 00003".to_string(),
         "Row 00004".to_string(),
@@ -743,6 +744,92 @@ fn names_can_be_declared_for_stored_keys() {
     assert!(note.contains("0 of 1 name mappings are verified"), "{note}");
     assert!(note.contains("1 is unconfirmed"), "{note}");
     assert_eq!(detail(&entries[0], "Name hash"), format!("0x{item:016X}"));
+}
+
+#[test]
+fn a_declared_extension_is_shown_and_marked_as_synthesized() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("extensions.rpf");
+    let texture = hash64(b"data/tex");
+    let plain = joaat(b"data/thing");
+    let unobserved = hash64(b"data/nmd");
+    let spelled = hash64(b"data/already.ztd");
+    fs::write(
+        &path,
+        native_rpf(&[
+            Spec {
+                hash: Some(texture),
+                ..spec(&[1; 16], 5)
+            },
+            Spec {
+                key: Some(plain),
+                ..spec(&[2; 16], NO_TYPE)
+            },
+            Spec {
+                hash: Some(unobserved),
+                ..spec(&[3; 16], 112)
+            },
+            Spec {
+                hash: Some(spelled),
+                ..spec(&[4; 16], 5)
+            },
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        path.with_file_name("extensions.rpf.names.txt"),
+        format!(
+            "hash64:{texture:016X}\tdata/tex\n\
+             key32:{plain:08X}\tdata/thing\n\
+             hash64:{unobserved:016X}\tdata/nmd\n\
+             hash64:{spelled:016X}\tdata/already.ztd\n"
+        ),
+    )
+    .unwrap();
+
+    let folder = files::list(&path).unwrap();
+    let entries = files::list(&folder[0].path).unwrap();
+    let mut names = names_of(&entries);
+    names.sort_unstable();
+    // A name the archive does not spell with an extension takes the one its
+    // type declares: `ztd` for type 5, `znmd` for a registered type no entry of
+    // the installation uses. Type 255 declares nothing, and a name that already
+    // carries an extension keeps it.
+    assert_eq!(
+        names,
+        ["already.ztd", "nmd.znmd", "tex.ztd", "thing"],
+        "{names:?}"
+    );
+    let by_name = |name: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| panic!("no entry named {name} in {names:?}"))
+    };
+
+    // The synthesized extension is named as such, beside the archive's own
+    // spelling, so the two cannot be confused.
+    let synthesized = by_name("tex.ztd");
+    let note = detail(synthesized, "Extension");
+    assert!(note.contains("type registry"), "{note}");
+    assert!(note.contains("not evidence about the payload"), "{note}");
+    assert_eq!(
+        detail(synthesized, "Archive name"),
+        "tex (before the extension was added)"
+    );
+    // A name the archive spells with its own extension needed nothing, so it
+    // carries no note.
+    let owned = by_name("already.ztd");
+    assert!(
+        !owned.details.iter().any(|(label, _)| *label == "Extension"),
+        "{:?}",
+        owned.details
+    );
+    // A type that declares nothing says so instead of inventing an extension.
+    let bare = by_name("thing");
+    let note = detail(bare, "Extension");
+    assert!(note.contains("none is invented"), "{note}");
+    assert_eq!(bare.name, "thing");
 }
 
 #[test]
