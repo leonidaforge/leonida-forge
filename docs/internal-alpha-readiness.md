@@ -89,6 +89,12 @@ pushed.
   it, and the newest selection wins, so rapid switching cannot queue work or
   land an older result. Multi-drawable fragments and skeleton-driven placement
   are not identified.
+- Inspect the skeleton a drawable carries: the panel lists every bone with its
+  hierarchy, a name, index and key filter, the selected bone's metadata and the
+  meshes it is associated with. The overlay is off until the toggle is pressed,
+  rows are virtualized so a 596-bone skeleton stays reachable, and hiding the
+  meshes restores the per-mesh choices when they come back. A dictionary member
+  keeps its own skeleton state.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
@@ -130,6 +136,10 @@ pushed.
   path-like candidate names are display data and do not become directories.
 - Payload transforms are decoded when the executable that authenticated the metadata provides the algorithm-`0x11` key state; a stream shape the trial decoder cannot verify is refused. Compression modes beyond stored, raw DEFLATE and chunked zlib or copied chunks are refused.
 - Writing to game files. All file access is read-only by design.
+- Skeleton-driven behaviour. A decoded skeleton is shown as stored: the viewer
+  does not skin geometry, blend influences, play or blend animation, pose or
+  edit bones, and does not place geometry by a bone transform. A skeleton with a
+  non-identity bone scale is reported as unsupported rather than drawn.
 
 ## Export request handling
 

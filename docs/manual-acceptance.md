@@ -1,6 +1,6 @@
-# Manual acceptance: drawable dictionaries and fragments
+# Manual acceptance: drawable dictionaries, fragments and skeletons
 
-This page lists the exact archives, rows and expected results to check the two
+This page lists the exact archives, rows and expected results to check the three
 model features by hand. It is written for the maintainer, so every selector is
 the original native path in the release installation, not a copy.
 
@@ -82,6 +82,52 @@ reads as a resource-level drawable, so the member name decides and the note
 `the root also reads as a resource-level drawable; the member name selected the
 fragment interpretation` appears with the model notes.
 
+## Skeletons
+
+A drawable whose header carries a skeleton shows a **Skeleton** section with a
+`skeleton-toggle`, a `bone-hierarchy` list, a filter field (placeholder
+`Filter bones, indices, keys`) and a `bone-metadata` list. The overlay stays off
+until the toggle is pressed, and pressing it re-reads no resource.
+
+| Resource          | Native chain     | Declared type | Member drawable                   | Bones | Roots | Depth |
+| ----------------- | ---------------- | ------------- | --------------------------------- | ----: | ----: | ----: |
+| Tarot deck        | `levels.rpf!5!0` | 3 (`zft`)     | `prop_am_card_tarot_deck_01a.#ft` |     3 |     1 |     3 |
+| Weapon bolt       | `data.rpf!26!9`  | 3 (`zft`)     | `w_sg_goodwin_01_bolt_01_mid.#ft` |     3 |     1 |     3 |
+| Candlestick       | `levels.rpf!5!1` | 3 (`zft`)     | `prop_am_candlestick_02a.#ft`     |     4 |     1 |     4 |
+| Peacock taxidermy | `levels.rpf!5!8` | 3 (`zft`)     | `mint_peacock_taxidermy_01.#ft`   |    10 |     1 |    10 |
+| Dominator model   | `levels.rpf!21!85` | 3 (`zft`)   | `dominator9_hi.#ft`               |   386 |     1 |    19 |
+| Many roots        | `packs.rpf!26!0` | 3 (`zft`)     | `crm_rabbit_marsh_m_00.#ft`       |    98 |    10 |    15 |
+| Largest in the census | `packs.rpf!26!255` | 3 (`zft`) | `ambient_femalebody.#ft`          |   596 |    16 |    24 |
+
+The four small fragments report `complete` associations. Their vertex space is
+reported as `authored geometry matches bounds` for the candlestick (2 of 2 boxes)
+and the peacock (4 of 4); the tarot and bolt records declare no per-geometry box,
+so they report `unverified`. The dominator sample declares boxes for all 37 of
+its geometries and they match, worst delta `7.4e-5`, but its associations are
+`partial`, so its placement line stays `unverified` and names the association.
+The two large pack resources declare no box, so no panel line names their space.
+
+The largest resource is a fragment, not a dictionary member: its row is declared
+type 3 (`zft`), and the notice names the member drawable `ambient_femalebody.#ft`
+whose skeleton it holds. It is the sample for reaching bones past the old row
+caps: filter a leaf name and the 596 rows scroll to it.
+
+## A dictionary member with a skeleton
+
+`packs.rpf!9!5` is a drawable dictionary declared type 4 (`zdd`) with one member.
+Member 0 is `neckwearbowtie_mr1_000_regular_t_un_high_full.#dr` with 69 bones,
+69 roots, depth 1, `complete` associations and an `unverified` vertex space.
+
+A dictionary member carries its own skeleton: selecting another member replaces
+the bone list, the filter text, the collapse state and the selection, and a
+member without a skeleton shows no Skeleton section. No dictionary among the 400
+pack dictionaries read holds both a skeleton-bearing and a skeleton-free member,
+so the skeleton-free side of that transition is checked by opening one of the
+drawable dictionaries above (for example `data.rpf!7!0`) and confirming it has
+no Skeleton section at all.
+
+The maintainer accepted this behaviour by hand on revision `1e7100c`.
+
 ## A drawable that is not a fragment
 
 `levels.rpf!5!252` is declared type 2 (`zdr`) and opens in the **model viewer**
@@ -109,3 +155,8 @@ The earlier selector list gave `levels.rpf!5!0` for the four-member dictionary.
 That row is the tarot-deck fragment (`prop_am_card_tarot_deck_01a.#ft`). The
 four-member dictionary is `data.rpf!7!0`, as listed above. Every other selector
 in this page was re-resolved from the installation census and re-read in place.
+
+The skeleton list once called `packs.rpf!26!255` a dictionary member. That row
+is declared type 3 (`zft`), a fragment; the 596-bone member drawable is
+`ambient_femalebody.#ft`, not a dictionary member. `packs.rpf!9!5` is the
+dictionary, and it has one member rather than a member list to switch through.
