@@ -14,11 +14,19 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::AtomicBool;
 
+mod preview;
 mod vehicle;
 
+pub use preview::VehicleInfo;
+pub use preview::{
+    POLICY_VERSION, Stores, Surface, class_color, class_shading, color_for, kit_paths, load_colors,
+    load_vehicle_info, material_surface, paint_color, paint_for, parse_colors, prepare_materials,
+    shader_hash, surface, wheel_family,
+};
+
 pub use vehicle::{
-    WheelMount, append_scene, axle_axis, wheel_mounts, wheel_transform, wheel_transform_sized,
-    wheel_transform_with_axis,
+    WheelMount, WheelOptions, append_scene, attach_wheels, axle_axis, wheel_mounts,
+    wheel_transform, wheel_transform_sized, wheel_transform_with_axis,
 };
 
 use glam::Vec3;

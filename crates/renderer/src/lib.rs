@@ -32,6 +32,10 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const BYTES_PER_PIXEL: u32 = 4;
 
+/// The crate version. Callers that cache rendered pixels record it, so a
+/// renderer change invalidates the cache.
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug)]
 pub enum Error {
     Adapter(wgpu::RequestAdapterError),

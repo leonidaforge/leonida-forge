@@ -14,6 +14,7 @@ mod probe;
 mod recover;
 mod registry;
 mod rows;
+mod vehicle;
 mod verify;
 
 use std::process::ExitCode;
@@ -53,6 +54,9 @@ enum Command {
     /// Extract catalog observations and validate publication packages
     #[command(subcommand)]
     Catalog(catalog::Command),
+    /// Discover vehicle bodies and render their preview images
+    #[command(subcommand)]
+    Vehicle(vehicle::Command),
 }
 
 fn main() -> ExitCode {
@@ -84,6 +88,7 @@ fn run() -> ExitCode {
         Command::Archive(command) => report(archive::run(command)),
         Command::Names(command) => report(names::run(command)),
         Command::Catalog(command) => report(catalog::run(command)),
+        Command::Vehicle(command) => report(vehicle::run(command)),
     }
 }
 

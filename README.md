@@ -283,7 +283,25 @@ lforge catalog validate catalog-export.zip --json
 
 The extraction writes NDJSON to standard output unless `--output` is given. Diagnostics and summary lines go to standard error, so a consumer can parse standard output without filtering it. The observation schema is `leonida-forge.catalog-extraction/1`; the report schema is `leonida-forge.catalog-extraction-report/1`. Each observation carries the source row hash, payload SHA-256, XML root and element path. A number keeps its stored value; `unit` is null unless the element name states a unit. A missing field is absent, never defaulted. Nested RPF archives (type 0) are excluded before decoding and counted as `excluded`. A non-XML row above the materialization limit is classified from a 64 KiB prefix and counted as `notXml` and `prefixOnly`; only an XML document above the limit is `tooLarge`. Rows the decoder cannot read are counted by cause (`unsupportedTransform`, `unsupportedCompression`, `missingSource`, `malformedMetadata`, `decodeFailed`), with `unsupported` as the total for payload failures, and make the status `partial`. `--max-row-bytes` bounds the XML document materialized in memory (default 64 MiB); it is not an extraction limit.
 
-The validation result uses schema `leonida-forge.package-validation/1`. Exit code 0 means valid, 1 means the package is invalid or the command failed, and 2 means invalid usage. Validation covers ZIP paths, entry count, sizes, compression ratio, declared SHA-256 digests, duplicate JSON keys, manifest 1.1.0 fields, the five catalog schemas, record identity uniqueness and relationship endpoints. A version 1.0.0 package without catalog data remains valid. The command never writes to the package and never extracts an entry to a directory.
+The validation result uses schema `leonida-forge.package-validation/1`. Exit code 0 means valid, 1 means the package is invalid or the command failed, and 2 means invalid usage. Validation covers ZIP paths, entry count, sizes, compression ratio, declared SHA-256 digests, duplicate JSON keys, manifest fields, the five catalog schemas, record identity uniqueness and relationship endpoints. A version 1.0.0 package without catalog data remains valid, as does a version 1.2.0 package whose images name their record and carry a primary image and a thumbnail. The command never writes to the package and never extracts an entry to a directory.
+
+## Vehicle bodies and preview images
+
+`vehicle bodies` finds the drivable vehicle models and `vehicle previews` renders them. Neither command writes to the game installation.
+
+```sh
+lforge vehicle bodies --archive "D:/GTA VI/levels.rpf" --executable "D:/GTA VI/game_scarlett_master.exe" \
+  --names model-names.txt --output bodies.json
+lforge vehicle previews --bodies bodies.json --archive "D:/GTA VI/levels.rpf" \
+  --executable "D:/GTA VI/game_scarlett_master.exe" --textures "D:/GTA VI/data/ttdb" \
+  --colors vehicle-colors.json --output previews/
+```
+
+A vehicle body is a type 3 fragment named `<model>_hi.#ft` inside an archive that an unresolved top-level row of `levels.rpf` stores. `vehicle bodies` enters those rows, decodes the large type 3 candidates, reads the names in their headers and keeps the most detailed body per model. The document records the row numbers and the header, never an absolute path, so it can be regenerated on another machine. Names come from a text list or from a JSON array with `Name`, `modelName`, `model` or `name`.
+
+`vehicle previews` renders a 1024x1024 primary WebP and a 320x320 thumbnail per body, with transparency, and writes `previews.json` with schema `leonida-forge.vehicle-previews/1`. The manifest names the model, so the exporter resolves the record with the same function that builds the identifier. A model that decodes no mesh, or whose resource has no inferable system/graphics boundary, is reported and skipped; it never stops the run.
+
+Rendering is cached by identity. The identity covers the body digest, the material-policy revision, the shader revision, the digest of every texture store root, the paint colour, the camera framing, both output sizes and the encoder profile. A cached pair is reused only when the entry matches and both files decode at the expected size. Outputs are written through a temporary file and renamed, and the cache entry is written after both images.
 
 ## Development workflow
 

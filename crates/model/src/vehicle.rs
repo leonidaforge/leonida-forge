@@ -258,6 +258,141 @@ pub fn wheel_transform_sized(
         * Mat4::from_translation(-center)
 }
 
+/// Where a wheel kit comes from, and how large a wheel should be.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WheelOptions<'a> {
+    /// An explicit rim resource, used when no kit family is selected.
+    pub rim: Option<&'a std::path::Path>,
+    /// An explicit tyre resource, used when no kit family is selected.
+    pub tyre: Option<&'a std::path::Path>,
+    /// Root of the wheel kits, one directory per family with `rim.bin` and
+    /// `tyre.bin`.
+    pub kits: Option<&'a std::path::Path>,
+    /// Largest wheel diameter in metres, before the dump scale is applied.
+    pub diameter: f32,
+}
+
+/// Decodes the rim and tyre of the vehicle's wheel family and mounts them on
+/// every wheel bone of `scene`.
+///
+/// Nothing in the preview workflow calls this. The shared kits fit an
+/// individual arch badly, so a preview renders the body alone. The routine is
+/// kept because the placement research is reusable once an arch is measured.
+///
+/// A two-wheeled body already models its own front wheel, so it takes the tyre
+/// at every mount and the rim only at the rear, seated inside the tyre.
+pub fn attach_wheels<P: crate::TextureProvider>(
+    scene: &mut Scene,
+    provider: &P,
+    info: Option<&crate::VehicleInfo>,
+    mounts: &[WheelMount],
+    options: &WheelOptions<'_>,
+) -> Result<usize, String> {
+    let family = crate::wheel_family(info);
+    let kit = match (options.kits, family) {
+        (Some(kits), Some(family)) => crate::kit_paths(kits, family),
+        _ => None,
+    };
+    let mut rim = kit.as_ref().map(|(rim, _)| rim.as_path()).or(options.rim);
+    let mut tyre = kit
+        .as_ref()
+        .map(|(_, tyre)| tyre.as_path())
+        .or(options.tyre);
+    if family.is_none() {
+        rim = None;
+        tyre = None;
+    }
+    let body_min_z = scene.bounds.min.z;
+    let mut rim_scene = None;
+    let mut tyre_scene = None;
+    for (kind, path) in [("rim", rim), ("tyre", tyre)] {
+        let Some(path) = path else {
+            continue;
+        };
+        let bytes = std::fs::read(path).map_err(|err| format!("{kind} cannot be read: {err}"))?;
+        let split = crate::split_resource(&bytes)
+            .ok_or_else(|| format!("{kind} has no inferable resource split"))?
+            .system_len;
+        let (system, graphics) = bytes.split_at(split);
+        let mut part = if crate::is_fragment(system, graphics) {
+            crate::decode_fragment(system, graphics, provider)
+                .map_err(|err| format!("{kind} cannot be decoded: {err}"))?
+                .scene
+        } else {
+            crate::decode(system, graphics, provider)
+                .map_err(|err| format!("{kind} cannot be decoded: {err}"))?
+                .scene
+        };
+        crate::prepare_materials(
+            &mut part,
+            if kind == "rim" {
+                [0.62, 0.63, 0.65, 1.0]
+            } else {
+                [0.06, 0.06, 0.07, 1.0]
+            },
+        );
+        if kind == "rim" {
+            rim_scene = Some(part);
+        } else {
+            tyre_scene = Some(part);
+        }
+    }
+    // Four wheels arrive as one kit, so rim and tyre share a transform.
+    let two_wheeled = matches!(family, Some("bike" | "bicycle"));
+    let mut unit = Scene::default();
+    if two_wheeled {
+        if let Some(tyre) = &tyre_scene {
+            append_scene(&mut unit, tyre, Mat4::IDENTITY);
+        }
+    } else {
+        for part in [&rim_scene, &tyre_scene].into_iter().flatten() {
+            append_scene(&mut unit, part, Mat4::IDENTITY);
+        }
+    }
+    let unit_axle = axle_axis(unit.bounds);
+    let mut wheels = 0;
+    for mount in mounts {
+        let geometry = (mount.pivot.z - body_min_z) * 2.0;
+        let dump_scale = if mount.is_rear {
+            info.and_then(|info| info.wheel_scale_rear.or(info.wheel_scale))
+        } else {
+            info.and_then(|info| info.wheel_scale)
+        };
+        let diameter = if matches!(family, Some("bike" | "bicycle")) {
+            // The body already sits on its own wheels, so the mount height
+            // measures the real tyre radius.
+            let dump = dump_scale.map(|scale| scale * 1.6).unwrap_or(0.0);
+            geometry.max(dump).max(0.35).clamp(0.3, 0.7)
+        } else {
+            let dump = dump_scale.map(|scale| scale * 2.2).unwrap_or(0.0);
+            options.diameter.max(geometry).max(dump).clamp(0.22, 0.95)
+        };
+        // Two-wheeled tyres are modelled far wider than the fork allows.
+        let width = match family {
+            Some("bike") => 0.4,
+            Some("bicycle") => 0.45,
+            _ => 1.0,
+        };
+        let transform = wheel_transform_sized(&unit, mount, diameter, unit_axle, width);
+        if !unit.meshes.is_empty() {
+            append_scene(scene, &unit, transform);
+            wheels += 1;
+        }
+        if two_wheeled
+            && mount.is_rear
+            && let Some(rim_part) = &rim_scene
+        {
+            let rim_axle = axle_axis(rim_part.bounds);
+            // Seat the rim inside the tyre instead of around it.
+            let rim_transform =
+                wheel_transform_sized(rim_part, mount, diameter * 0.62, rim_axle, width);
+            append_scene(scene, rim_part, rim_transform);
+            wheels += 1;
+        }
+    }
+    Ok(wheels)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

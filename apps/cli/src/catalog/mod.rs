@@ -64,8 +64,10 @@ pub enum Command {
         /// The largest decompressed image accepted
         #[arg(long, default_value_t = 8 * 1024 * 1024)]
         max_image_bytes: u64,
-        /// The most ZIP entries accepted
-        #[arg(long, default_value_t = 256)]
+        /// The most ZIP entries accepted. A package may carry two images per vehicle, so the
+        /// default allows for the declared image limit plus the data files and the two metadata
+        /// files.
+        #[arg(long, default_value_t = 2_048)]
         max_entries: u64,
         /// The largest accepted uncompressed-to-compressed ratio above a 256 KiB floor
         #[arg(long, default_value_t = 100)]

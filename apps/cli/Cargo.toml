@@ -14,9 +14,14 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+image.workspace = true
 lforge-binary.workspace = true
 lforge-core.workspace = true
+lforge-model.workspace = true
 lforge-rage9.workspace = true
+lforge-renderer.workspace = true
+lforge-scene.workspace = true
+lforge-texture.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

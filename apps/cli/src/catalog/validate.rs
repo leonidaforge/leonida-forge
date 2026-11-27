@@ -22,7 +22,12 @@ use crate::catalog::json::{
 };
 
 pub const MANIFEST_VERSION: &str = "1.1.0";
+/// The envelope that adds the thumbnail role and the entity association.
+pub const IMAGE_MANIFEST_VERSION: &str = "1.2.0";
 pub const LEGACY_MANIFEST_VERSION: &str = "1.0.0";
+/// The most images a package may declare. A record carries a primary image and
+/// a thumbnail, so the limit counts both.
+pub const MAX_IMAGES: usize = 1_024;
 pub const CATALOG_SCHEMA_VERSION: &str = "1";
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const CHECKSUMS_FILE: &str = "checksums.json";
@@ -40,8 +45,9 @@ const CATALOG_FILES: [(&str, &str); 5] = [
 ];
 const RECORD_SCHEMA: &str = "leonidaforge.catalog.record/1";
 const RELATIONSHIP_SCHEMA: &str = "leonidaforge.catalog.relationship/1";
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-const MAX_CHECKSUMS_BYTES: u64 = 256 * 1024;
+// Two images per vehicle make the image list the largest part of the manifest.
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CHECKSUMS_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REPORTED_ISSUES: usize = 100;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const MAX_MEDIA_ID: usize = 128;
@@ -269,11 +275,14 @@ pub fn run(options: Options) -> Result<(), String> {
     };
 
     let legacy = manifest.manifest_version == LEGACY_MANIFEST_VERSION;
-    if !legacy && manifest.manifest_version != MANIFEST_VERSION {
+    if !legacy
+        && manifest.manifest_version != MANIFEST_VERSION
+        && manifest.manifest_version != IMAGE_MANIFEST_VERSION
+    {
         issues.add(
             "unsupported_manifest_version",
             format!(
-                "only manifest versions {LEGACY_MANIFEST_VERSION} and {MANIFEST_VERSION} are supported"
+                "only manifest versions {LEGACY_MANIFEST_VERSION}, {MANIFEST_VERSION} and {IMAGE_MANIFEST_VERSION} are supported"
             ),
             Some(MANIFEST_FILE),
         );
@@ -1008,8 +1017,28 @@ fn read_manifest(value: &Value, issues: &mut Issues) -> Option<Manifest> {
             );
         }
         let role = required_str(entry_object, "role", MANIFEST_FILE, issues).unwrap_or_default();
-        if role != "preview" && role != "gallery" {
+        // Version 1.2.0 added the thumbnail role; an older envelope keeps the
+        // narrower set so a 1.1.0 package cannot smuggle one in.
+        let role_allowed = match role.as_str() {
+            "preview" | "gallery" => true,
+            "thumbnail" => manifest_version == IMAGE_MANIFEST_VERSION,
+            _ => false,
+        };
+        if !role_allowed {
             issues.add("media_role", "a media role is invalid", Some(MANIFEST_FILE));
+        }
+        // A 1.2.0 image names its record; 1.1.0 named the image by it.
+        if manifest_version == IMAGE_MANIFEST_VERSION {
+            let entity =
+                required_str(entry_object, "entityId", MANIFEST_FILE, issues).unwrap_or_default();
+            if entity.is_empty()
+                || entity.len() > MAX_MEDIA_ID
+                || !entity
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                issues.add("entity_id", "an entity id is invalid", Some(MANIFEST_FILE));
+            }
         }
         let format =
             required_str(entry_object, "format", MANIFEST_FILE, issues).unwrap_or_default();
@@ -1048,7 +1077,7 @@ fn read_manifest(value: &Value, issues: &mut Issues) -> Option<Manifest> {
             height,
         });
     }
-    if images.len() > 256 {
+    if images.len() > MAX_IMAGES {
         issues.add(
             "image_count",
             "the manifest declares too many images",
