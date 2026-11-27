@@ -101,6 +101,8 @@ struct Key {
     /// from. Two entries with the same extension but different provenance are
     /// different findings.
     extension_provenance: String,
+    /// Where the investigation of this entry ends.
+    outcome: String,
 }
 
 impl Key {
@@ -116,6 +118,7 @@ impl Key {
             "capability": self.capability,
             "extension": self.extension,
             "extension_provenance": self.extension_provenance,
+            "outcome": self.outcome,
         })
     }
 
@@ -131,6 +134,7 @@ impl Key {
             capability: value["capability"].as_str()?.to_string(),
             extension: value["extension"].as_str()?.to_string(),
             extension_provenance: value["extension_provenance"].as_str()?.to_string(),
+            outcome: value["outcome"].as_str()?.to_string(),
         })
     }
 }
@@ -812,6 +816,7 @@ impl Engine<'_> {
                 .map(str::to_string)
                 .unwrap_or_else(|| "-".to_string()),
             extension_provenance: classification.extension.provenance().to_string(),
+            outcome: classification.outcome().name().to_string(),
         };
         let bucket = buckets.entry(key).or_default();
         bucket.entries += 1;
@@ -846,6 +851,7 @@ impl Engine<'_> {
                     "capability": key.capability,
                     "extension": key.extension,
                     "extension_provenance": key.extension_provenance,
+                    "outcome": key.outcome,
                     "entries": bucket.entries,
                     "archive_count": bucket.archive_count.len(),
                     "archives": bucket.archives.iter().collect::<Vec<_>>(),
@@ -858,6 +864,12 @@ impl Engine<'_> {
             .iter()
             .map(|(type_id, entries)| json!({ "type": type_id, "entries": entries }))
             .collect();
+        // Every entry has exactly one outcome, so these counts add up to the
+        // entry count.
+        let mut outcomes: BTreeMap<&str, u64> = BTreeMap::new();
+        for (key, bucket) in &self.buckets {
+            *outcomes.entry(key.outcome.as_str()).or_default() += bucket.entries;
+        }
         json!({
             "record": "summary",
             "schema": CENSUS_SCHEMA,
@@ -884,6 +896,7 @@ impl Engine<'_> {
                 "unresolved_formats": self.unresolved,
             },
             "types": types,
+            "outcomes": outcomes,
             "combinations": combinations,
             "failures": self.failures,
         })
@@ -1023,6 +1036,7 @@ fn describe(classification: &Classification) -> Value {
         },
         "capability": classification.capability.name(),
         "capability_reason": classification.capability.reason(),
+        "outcome": classification.outcome().name(),
         "extension": classification.extension(),
         "extension_provenance": classification.extension.provenance(),
         "extension_verified": classification.extension.verified(),

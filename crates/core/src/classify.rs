@@ -276,6 +276,26 @@ impl Identification {
         }
     }
 
+    /// Where the identification of a read payload ends.
+    fn outcome(&self) -> Outcome {
+        match self {
+            // A recogniser that walked the payload's own framing established
+            // the container; a magic-only match did not.
+            Identification::Format { claims, .. } => match claims.structure {
+                Confidence::Verified => Outcome::Identified,
+                _ => Outcome::PartiallyIdentified,
+            },
+            // A validated document is the whole document; one that only looks
+            // like XML was not parsed.
+            Identification::Xml { root: Some(_), .. } => Outcome::Identified,
+            Identification::Xml { root: None, .. } => Outcome::PartiallyIdentified,
+            // The container is established; what it holds is not.
+            Identification::Resource { .. } => Outcome::PartiallyIdentified,
+            Identification::Signature { .. } => Outcome::PartiallyIdentified,
+            Identification::Unrecognised => Outcome::Unresolved,
+        }
+    }
+
     /// The signature, whether or not it is a supported format.
     pub fn signature(&self) -> Signature {
         match self {
@@ -445,6 +465,59 @@ impl Classification {
     /// The format id, when a supported format was recognised.
     pub fn format_id(&self) -> Option<&'static str> {
         self.identification.format_id()
+    }
+
+    /// Where the investigation of this entry ends. Every entry has exactly one
+    /// outcome, so a census can account for all of them.
+    pub fn outcome(&self) -> Outcome {
+        match &self.payload {
+            PayloadState::NotRead => Outcome::Blocked,
+            PayloadState::TransformUnavailable => Outcome::TransformUnavailable,
+            // The transform was available and did not verify or run: the
+            // payload was never reached, but the cause is this entry rather
+            // than the absence of key state.
+            PayloadState::TransformFailed(_) => Outcome::Blocked,
+            PayloadState::Undecodable(_) => Outcome::Undecodable,
+            PayloadState::Malformed(_) => Outcome::Malformed,
+            PayloadState::Decoded => self.identification.outcome(),
+        }
+    }
+}
+
+/// The terminal outcome of investigating one entry.
+///
+/// The labels are ordered by how much was established: an outcome says what the
+/// investigation ended with, not how much effort it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Outcome {
+    /// The payload's own framing was walked and the container named.
+    Identified,
+    /// Something about the payload was established, but not the container: a
+    /// signature without structure, or a container whose contents were not read.
+    PartiallyIdentified,
+    /// The payload was read and nothing in it was recognised.
+    Unresolved,
+    /// The storage cannot be decoded.
+    Undecodable,
+    /// The payload is behind the transform and no key state is available.
+    TransformUnavailable,
+    /// The metadata describing the payload is malformed.
+    Malformed,
+    /// The payload was not read, so nothing about it is established.
+    Blocked,
+}
+
+impl Outcome {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Outcome::Identified => "identified",
+            Outcome::PartiallyIdentified => "partially-identified",
+            Outcome::Unresolved => "unresolved",
+            Outcome::Undecodable => "undecodable",
+            Outcome::TransformUnavailable => "transform-unavailable",
+            Outcome::Malformed => "malformed",
+            Outcome::Blocked => "blocked",
+        }
     }
 }
 
@@ -947,6 +1020,87 @@ mod tests {
             payload: PayloadState::Decoded,
             head: Some(&owned),
         })
+    }
+
+    /// Eight zero bytes then a segment-5 pointer: the shape of a resource header.
+    fn resource_head() -> Vec<u8> {
+        let mut bytes = vec![0u8; 8];
+        bytes.extend_from_slice(&0x5000_0310u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn every_entry_has_one_terminal_outcome() {
+        let decoded = |entry_type: Option<u8>, bytes: &[u8]| run(entry_type, None, bytes);
+        let state = |payload: PayloadState| {
+            classify(Inputs {
+                entry_type: Some(255),
+                original_extension: None,
+                storage: storage(),
+                payload,
+                head: None,
+            })
+        };
+        let cases: [(Classification, Outcome); 9] = [
+            // A recogniser that walked the framing established the container.
+            (decoded(Some(255), b"PSIN"), Outcome::Identified),
+            // The archive recogniser matches the magic only.
+            (
+                decoded(Some(0), b"9FPR\0\0\0\0"),
+                Outcome::PartiallyIdentified,
+            ),
+            // A resource header names a container, not its contents.
+            (
+                decoded(Some(88), &resource_head()),
+                Outcome::PartiallyIdentified,
+            ),
+            (decoded(Some(255), &[0u8; 8]), Outcome::Unresolved),
+            (
+                state(PayloadState::TransformUnavailable),
+                Outcome::TransformUnavailable,
+            ),
+            (
+                state(PayloadState::TransformFailed("did not verify".into())),
+                Outcome::Blocked,
+            ),
+            (
+                state(PayloadState::Undecodable("no chunk table".into())),
+                Outcome::Undecodable,
+            ),
+            (
+                state(PayloadState::Malformed("bad row".into())),
+                Outcome::Malformed,
+            ),
+            (state(PayloadState::NotRead), Outcome::Blocked),
+        ];
+        for (index, (classification, outcome)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                classification.outcome(),
+                outcome,
+                "case {index}: {:?}",
+                classification.identification
+            );
+        }
+    }
+
+    #[test]
+    fn a_validated_document_is_identified_and_an_unparsed_one_is_not() {
+        // A document is validated against the whole payload, which only the
+        // caller holding the document can supply.
+        let validated = assemble(
+            Some(255),
+            None,
+            storage(),
+            PayloadState::Decoded,
+            Identification::Xml {
+                root: Some("root".to_string()),
+                claims: Claims::signed_and_parsed(),
+            },
+        );
+        assert_eq!(validated.outcome(), Outcome::Identified);
+        // The head alone says the bytes look like XML; it cannot parse them.
+        let partial = run(Some(255), None, b"<?xml version=\"1.0\"?><root>");
+        assert_eq!(partial.outcome(), Outcome::PartiallyIdentified);
     }
 
     #[test]

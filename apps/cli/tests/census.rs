@@ -287,6 +287,33 @@ fn a_declared_extension_and_a_payload_extension_stay_apart() {
 }
 
 #[test]
+fn every_entry_has_one_outcome_in_the_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut document = spec(b"<?xml version=\"1.0\"?><root><a/></root>");
+    document.type_id = 255;
+    let mut unknown = spec(&[0u8; 24]);
+    unknown.type_id = 255;
+    let mut archive_row = spec(&archive(&psin()));
+    archive_row.type_id = 0;
+    let path = write(
+        temp.path(),
+        "outcomes.rpf",
+        &assemble(&[document, unknown, archive_row], &[]),
+    );
+
+    let records = records(&census(&path, &[]));
+    let summary = summary(&records);
+    let outcomes = summary["outcomes"].as_object().expect("outcomes");
+    let total: u64 = outcomes.values().map(|value| value.as_u64().unwrap()).sum();
+    // The counts add up to every entry, so no entry is left without an outcome.
+    assert_eq!(total, summary["entries"].as_u64().unwrap());
+    assert_eq!(outcomes["identified"], 1);
+    assert_eq!(outcomes["unresolved"], 1);
+    // A magic-only archive match is a partial identification.
+    assert_eq!(outcomes["partially-identified"], 1);
+}
+
+#[test]
 fn an_unreadable_root_is_a_failure_record() {
     let temp = tempfile::tempdir().unwrap();
     let path = write(temp.path(), "broken.rpf", &[0u8; 128]);
