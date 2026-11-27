@@ -256,6 +256,37 @@ fn the_output_is_deterministic() {
 }
 
 #[test]
+fn a_declared_extension_and_a_payload_extension_stay_apart() {
+    let temp = tempfile::tempdir().unwrap();
+    // A document under an unregistered type: the payload establishes `xml`.
+    let mut document = spec(b"<?xml version=\"1.0\"?><root><a/></root>");
+    document.type_id = 255;
+    // The same bytes under a registered type: the type declares its extension.
+    let mut typed = spec(b"<?xml version=\"1.0\"?><root><a/></root>");
+    typed.type_id = 88;
+    let path = write(
+        temp.path(),
+        "documents.rpf",
+        &assemble(&[document, typed], &[]),
+    );
+
+    let records = records(&census(&path, &[]));
+    let summary = summary(&records);
+    assert_eq!(summary["entries"], 2);
+    let combinations = summary["combinations"].as_array().unwrap();
+    let by_provenance = |provenance: &str| {
+        combinations
+            .iter()
+            .find(|combination| combination["extension_provenance"] == provenance)
+            .unwrap_or_else(|| panic!("no combination with provenance {provenance}"))
+    };
+    assert_eq!(by_provenance("payload")["extension"], "xml");
+    assert_eq!(by_provenance("payload")["entries"], 1);
+    assert_eq!(by_provenance("native")["extension"], "zsm");
+    assert_eq!(by_provenance("native")["entries"], 1);
+}
+
+#[test]
 fn an_unreadable_root_is_a_failure_record() {
     let temp = tempfile::tempdir().unwrap();
     let path = write(temp.path(), "broken.rpf", &[0u8; 128]);

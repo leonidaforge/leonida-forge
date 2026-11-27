@@ -97,6 +97,10 @@ struct Key {
     structure: String,
     capability: String,
     extension: String,
+    /// `original`, `native`, `payload` or `unresolved`: where the extension came
+    /// from. Two entries with the same extension but different provenance are
+    /// different findings.
+    extension_provenance: String,
 }
 
 impl Key {
@@ -111,6 +115,7 @@ impl Key {
             "structure": self.structure,
             "capability": self.capability,
             "extension": self.extension,
+            "extension_provenance": self.extension_provenance,
         })
     }
 
@@ -125,6 +130,7 @@ impl Key {
             structure: value["structure"].as_str()?.to_string(),
             capability: value["capability"].as_str()?.to_string(),
             extension: value["extension"].as_str()?.to_string(),
+            extension_provenance: value["extension_provenance"].as_str()?.to_string(),
         })
     }
 }
@@ -805,6 +811,7 @@ impl Engine<'_> {
                 .extension()
                 .map(str::to_string)
                 .unwrap_or_else(|| "-".to_string()),
+            extension_provenance: classification.extension.provenance().to_string(),
         };
         let bucket = buckets.entry(key).or_default();
         bucket.entries += 1;
@@ -838,6 +845,7 @@ impl Engine<'_> {
                     "structure": key.structure,
                     "capability": key.capability,
                     "extension": key.extension,
+                    "extension_provenance": key.extension_provenance,
                     "entries": bucket.entries,
                     "archive_count": bucket.archive_count.len(),
                     "archives": bucket.archives.iter().collect::<Vec<_>>(),
