@@ -4,7 +4,96 @@
 //! crate has no graphics or UI dependency, so an offscreen exporter and the
 //! desktop viewer can share one decoded scene model.
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
+
+/// One bone of a decoded skeleton, in model space.
+///
+/// The decoder resolves local transforms into model-space transforms and keeps
+/// both, because the viewer shows the local values while the overlay draws the
+/// resolved pose. `parent` indexes [`Skeleton::bones`]; a root has none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bone {
+    /// The stored name, when the resource carries one. Never invented.
+    pub name: Option<String>,
+    /// Position in the stored bone array.
+    pub index: usize,
+    pub parent: Option<usize>,
+    /// The stored 32-bit per-bone key, when the resource carries the array.
+    /// Its hash function is not established, so it is a key, not a name hash.
+    pub identifier: Option<u32>,
+    /// The stored 16-bit per-bone key.
+    pub identifier16: Option<u16>,
+    pub local_translation: Vec3,
+    pub local_rotation: Quat,
+    pub local_scale: Vec3,
+    /// Model-space rotation: the parent rotation composed with the local one.
+    pub model_rotation: Quat,
+    /// Model-space bone position.
+    pub model_position: Vec3,
+    /// The stored inverse bind matrix, when the resource carries one and it
+    /// validated against the resolved model transform.
+    pub inverse_bind: Option<Mat4>,
+}
+
+impl Bone {
+    /// The model-space transform: translation, rotation and scale.
+    pub fn model_transform(&self) -> Mat4 {
+        Mat4::from_scale_rotation_translation(
+            self.local_scale.max(Vec3::splat(f32::EPSILON)),
+            self.model_rotation,
+            self.model_position,
+        )
+    }
+}
+
+/// An optional skeleton attached to a scene.
+///
+/// A skeleton is metadata about a static pose. Nothing here deforms geometry:
+/// the decoded vertex positions are the bind pose, so a static scene draws them
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Skeleton {
+    pub bones: Vec<Bone>,
+    /// Bones without a parent, in index order.
+    pub roots: Vec<usize>,
+    /// Number of bones on the longest parent chain.
+    pub max_depth: usize,
+}
+
+impl Skeleton {
+    pub fn is_empty(&self) -> bool {
+        self.bones.is_empty()
+    }
+
+    pub fn bone(&self, index: usize) -> Option<&Bone> {
+        self.bones.get(index)
+    }
+
+    /// The model-space position of a bone.
+    pub fn bone_position(&self, index: usize) -> Option<Vec3> {
+        self.bones.get(index).map(|bone| bone.model_position)
+    }
+
+    /// Bounds of the bone positions. Empty when there are no bones.
+    pub fn bounds(&self) -> Aabb {
+        Aabb::from_points(self.bones.iter().map(|bone| bone.model_position))
+    }
+}
+
+/// Which bones one primitive's vertices reference.
+///
+/// `bones` holds validated indices into [`Skeleton::bones`]. `weighted` is true
+/// when at least one vertex blends more than one bone. `declared_bone_count` is
+/// the geometry record's own bone count, which can exceed the indices actually
+/// used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimitiveBones {
+    pub mesh: usize,
+    pub primitive: usize,
+    pub bones: Vec<usize>,
+    pub weighted: bool,
+    pub declared_bone_count: Option<u16>,
+}
 
 /// A vertex in RAGE model space (Z up, metres).
 #[repr(C)]
@@ -413,6 +502,12 @@ pub struct Scene {
     pub textures: Vec<Texture>,
     pub bounds: Aabb,
     pub diagnostics: Vec<Diagnostic>,
+    /// The optional skeleton. A scene without one is complete as a static
+    /// drawable; absence is not a decoding failure.
+    pub skeleton: Option<Skeleton>,
+    /// The bones each primitive's vertices reference, where the resource
+    /// carries a validated influence stream.
+    pub associations: Vec<PrimitiveBones>,
 }
 
 impl Default for Scene {
@@ -423,6 +518,8 @@ impl Default for Scene {
             textures: Vec::new(),
             bounds: Aabb::EMPTY,
             diagnostics: Vec::new(),
+            skeleton: None,
+            associations: Vec::new(),
         }
     }
 }
@@ -460,6 +557,12 @@ impl Scene {
             .flat_map(|mesh| &mesh.primitives)
             .map(|primitive| primitive.indices.len() / 3)
             .sum()
+    }
+
+    /// Bounds of the skeleton bones, when the scene carries one.
+    pub fn skeleton_bounds(&self) -> Option<Aabb> {
+        let bounds = self.skeleton.as_ref()?.bounds();
+        (!bounds.is_empty() && bounds.is_finite()).then_some(bounds)
     }
 
     /// Drops primitives whose material index or indices are out of range.
