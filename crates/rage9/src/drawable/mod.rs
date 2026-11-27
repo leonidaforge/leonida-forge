@@ -266,7 +266,10 @@ pub struct MaterialSummary {
 /// The header fields whose positions the research confirmed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeaderView {
-    pub page_map: u32,
+    /// The page-map word of a resource-level drawable. A drawable embedded in
+    /// a fragment or a dictionary holds zero here; the page map belongs to
+    /// the containing resource.
+    pub page_map: Option<u32>,
     pub shader_group: Option<u32>,
     pub skeleton: Option<u32>,
     pub bounds: Bounds,
@@ -437,10 +440,20 @@ pub fn is_drawable(system: &[u8], graphics: &[u8]) -> bool {
 }
 
 /// Whether a drawable header and chain start at `root` in the system segment.
-/// A fragment or a drawable dictionary can hold member drawables at offsets
-/// other than zero.
+/// A resource-level header must carry a page map; an embedded member drawable
+/// holds zero there, so use [`is_member_drawable_at`] for those.
 pub fn is_drawable_at(system: &[u8], graphics: &[u8], root: usize) -> bool {
-    let Ok(header) = HeaderView::parse_at(system, root) else {
+    header_resolves(system, graphics, root, true)
+}
+
+/// Whether an embedded member drawable starts at `root`. The page-map word is
+/// allowed to be zero, which is what a drawable inside a fragment holds.
+pub fn is_member_drawable_at(system: &[u8], graphics: &[u8], root: usize) -> bool {
+    header_resolves(system, graphics, root, false)
+}
+
+fn header_resolves(system: &[u8], graphics: &[u8], root: usize, require_page_map: bool) -> bool {
+    let Ok(header) = HeaderView::parse_at(system, root, require_page_map) else {
         return false;
     };
     header.lod_slots.iter().enumerate().any(|(slot, &value)| {
@@ -455,7 +468,7 @@ pub fn is_drawable_at(system: &[u8], graphics: &[u8], root: usize) -> bool {
 }
 
 impl HeaderView {
-    fn parse_at(system: &[u8], base: usize) -> Result<Self, Issue> {
+    fn parse_at(system: &[u8], base: usize, require_page_map: bool) -> Result<Self, Issue> {
         if base.checked_add(0xC0).is_none_or(|end| end > system.len()) {
             return Err(Issue::Missing {
                 field: "the 0xC0-byte header",
@@ -468,11 +481,24 @@ impl HeaderView {
             });
         }
         let page_map_value = u64_at(system, base + 0x08).unwrap_or(0);
-        let page_map = system_pointer(page_map_value).ok_or(Issue::Pointer {
-            field: "page map",
-            at: base + 0x08,
-            value: page_map_value,
-        })?;
+        let page_map = match system_pointer(page_map_value) {
+            Some(offset) => offset,
+            None if !require_page_map && page_map_value == 0 => {
+                // An embedded drawable carries no page map of its own.
+                return Self::parse_body(system, base, None);
+            }
+            None => {
+                return Err(Issue::Pointer {
+                    field: "page map",
+                    at: base + 0x08,
+                    value: page_map_value,
+                });
+            }
+        };
+        Self::parse_body(system, base, Some(page_map))
+    }
+
+    fn parse_body(system: &[u8], base: usize, page_map: Option<u32>) -> Result<Self, Issue> {
         let mut lod_slots = [0u64; LOD_SLOTS];
         let mut distances = [0f32; LOD_SLOTS];
         let mut flags = [0u32; LOD_SLOTS];
@@ -1248,12 +1274,32 @@ pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
     inspect_at(system, graphics, 0)
 }
 
-/// Inspects a drawable whose header starts at `root`.
+/// Inspects a drawable whose header starts at `root`. The header must carry a
+/// page map, which is the resource-level form.
 pub fn inspect_at(system: &[u8], graphics: &[u8], root: usize) -> Option<Report> {
-    let header = HeaderView::parse_at(system, root).ok()?;
     if !is_drawable_at(system, graphics, root) {
         return None;
     }
+    inspect_body(system, graphics, root, true)
+}
+
+/// Inspects a drawable embedded in a fragment or a dictionary. The page-map
+/// word is read when it is a pointer and tolerated when it is zero; the
+/// containing resource owns the page map.
+pub fn inspect_member_at(system: &[u8], graphics: &[u8], root: usize) -> Option<Report> {
+    if !is_member_drawable_at(system, graphics, root) {
+        return None;
+    }
+    inspect_body(system, graphics, root, false)
+}
+
+fn inspect_body(
+    system: &[u8],
+    graphics: &[u8],
+    root: usize,
+    require_page_map: bool,
+) -> Option<Report> {
+    let header = HeaderView::parse_at(system, root, require_page_map).ok()?;
     let mut walk = Walk::new(system, graphics);
     let mut lod = Vec::new();
     let mut empty_slots = Vec::new();

@@ -201,7 +201,7 @@ fn walks_the_verified_drawable_chain() {
     assert_eq!(report.status, "complete", "{:?}", report.issues);
     assert!(report.issues.is_empty(), "{:?}", report.issues);
 
-    assert_eq!(report.header.page_map, 0x1000);
+    assert_eq!(report.header.page_map, Some(0x1000));
     assert_eq!(report.header.shader_group, Some(0x980));
     assert_eq!(report.header.name, Some(0x1100));
     assert_eq!(report.header.bounds.radius, 1.5);
@@ -639,4 +639,26 @@ fn an_overflowing_bounds_extent_is_clamped() {
     )));
     let bounds = report.lod[0].models[0].bounds.as_ref().unwrap();
     assert!(bounds.records < 0xFF01);
+}
+
+#[test]
+fn a_member_drawable_carries_no_page_map() {
+    let (mut system, graphics) = drawable();
+    // A drawable inside a fragment holds zero in its page-map word.
+    put_u64(&mut system, 0x08, 0);
+    assert!(!is_drawable(&system, &graphics));
+    assert!(!is_drawable_at(&system, &graphics, 0));
+    assert!(inspect(&system, &graphics).is_none());
+    assert!(is_member_drawable_at(&system, &graphics, 0));
+    let report = inspect_member_at(&system, &graphics, 0).expect("a member drawable");
+    assert_eq!(report.header.page_map, None);
+    assert_eq!(report.status, "complete");
+}
+
+#[test]
+fn a_member_word_that_is_not_a_pointer_is_still_rejected() {
+    let (mut system, graphics) = drawable();
+    put_u64(&mut system, 0x08, 0x1234_5678);
+    assert!(!is_member_drawable_at(&system, &graphics, 0));
+    assert!(inspect_member_at(&system, &graphics, 0).is_none());
 }
