@@ -196,11 +196,13 @@ impl ResponseQueue {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Request {
     generation: u64,
     size: Size<DevicePixels>,
     camera: OrbitCamera,
+    /// One flag per scene mesh. Shared so a request stays cheap to clone.
+    visibility: Arc<Vec<bool>>,
 }
 
 #[derive(Clone, Copy)]
@@ -215,6 +217,10 @@ pub struct Viewport {
     pub size: Size<DevicePixels>,
     pub auto_rotate: bool,
     bounds: Aabb,
+    scene: Arc<Scene>,
+    /// Component visibility, one flag per scene mesh. The decoded scene is
+    /// never modified; the render thread applies the flags before drawing.
+    visibility: Vec<bool>,
     framed: bool,
     requests: Option<LatestSender<Request>>,
     next_generation: u64,
@@ -228,9 +234,10 @@ pub struct Viewport {
 impl Viewport {
     pub fn new(scene: Arc<Scene>, cx: &mut Context<Self>) -> Self {
         let bounds = scene.bounds.sanitized();
+        let visibility = vec![true; scene.meshes.len()];
         let camera = OrbitCamera::framing(bounds, 1.0);
         let (responses, mut notifications) = ResponseQueue::new();
-        let (requests, status) = match spawn_render_thread(scene, responses.clone()) {
+        let (requests, status) = match spawn_render_thread(scene.clone(), responses.clone()) {
             Ok(requests) => (Some(requests), RendererStatus::Starting),
             Err(err) => (
                 None,
@@ -258,6 +265,8 @@ impl Viewport {
             size: Size::default(),
             auto_rotate: false,
             bounds,
+            scene,
+            visibility,
             framed: false,
             requests,
             next_generation: 0,
@@ -269,13 +278,80 @@ impl Viewport {
         }
     }
 
+    /// Whether scene mesh `mesh` is currently shown.
+    pub fn mesh_visible(&self, mesh: usize) -> bool {
+        self.visibility.get(mesh).copied().unwrap_or(true)
+    }
+
+    /// Shows or hides the meshes of one component.
+    pub fn set_meshes_visible(
+        &mut self,
+        meshes: std::ops::Range<usize>,
+        visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for index in meshes {
+            if let Some(flag) = self.visibility.get_mut(index)
+                && *flag != visible
+            {
+                *flag = visible;
+                changed = true;
+            }
+        }
+        if changed {
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    /// Shows every component.
+    pub fn show_all_components(&mut self, cx: &mut Context<Self>) {
+        if self.visibility.iter().any(|visible| !visible) {
+            self.visibility.fill(true);
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    /// Restores the initial visibility state, which is every component shown.
+    pub fn restore_default_visibility(&mut self, cx: &mut Context<Self>) {
+        self.show_all_components(cx);
+    }
+
+    /// Bounds of the meshes that are currently shown. Falls back to the whole
+    /// scene when nothing is visible, so framing never fails.
+    fn visible_bounds(&self) -> Aabb {
+        let mut bounds = Aabb::EMPTY;
+        let mut any = false;
+        for (index, mesh) in self.scene.meshes.iter().enumerate() {
+            if !self.visibility.get(index).copied().unwrap_or(true) {
+                continue;
+            }
+            any = true;
+            for primitive in &mesh.primitives {
+                for vertex in &primitive.vertices {
+                    let point = mesh
+                        .transform
+                        .transform_point3(glam::Vec3::from(vertex.position));
+                    bounds = bounds.extend(point);
+                }
+            }
+        }
+        if any && bounds.is_finite() && !bounds.is_empty() {
+            bounds.sanitized()
+        } else {
+            self.bounds
+        }
+    }
+
     pub fn reset_camera(&mut self, cx: &mut Context<Self>) {
         let aspect = if self.size.height.0 > 0 {
             self.size.width.0 as f32 / self.size.height.0 as f32
         } else {
             1.0
         };
-        self.camera = OrbitCamera::framing(self.bounds, aspect);
+        self.camera = OrbitCamera::framing(self.visible_bounds(), aspect);
         self.request_frame();
         cx.notify();
     }
@@ -320,6 +396,7 @@ impl Viewport {
             generation: self.next_generation,
             size: self.size,
             camera: self.camera,
+            visibility: Arc::new(self.visibility.clone()),
         };
         if !requests.submit(request) {
             self.requests = None;
@@ -521,7 +598,7 @@ fn spawn_render_thread(
                 adapter: info.name.clone(),
                 backend: info.backend.to_string(),
             };
-            let gpu_scene = match renderer.upload_scene(&scene) {
+            let mut gpu_scene = match renderer.upload_scene(&scene) {
                 Ok(scene) => scene,
                 Err(err) => {
                     responses.send(Response::Failed(err.to_string()));
@@ -530,7 +607,17 @@ fn spawn_render_thread(
             };
             responses.send(ready);
 
+            let mut applied: Option<Arc<Vec<bool>>> = None;
             while let Some(request) = requests.next() {
+                if applied
+                    .as_ref()
+                    .is_none_or(|current| **current != *request.visibility)
+                {
+                    for (mesh, visible) in request.visibility.iter().enumerate() {
+                        gpu_scene.set_mesh_visible(mesh, *visible);
+                    }
+                    applied = Some(request.visibility.clone());
+                }
                 let response = match renderer.render(
                     &gpu_scene,
                     &request.camera,

@@ -2627,6 +2627,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "futures",
+ "glam",
  "gpui",
  "gpui_platform",
  "image",

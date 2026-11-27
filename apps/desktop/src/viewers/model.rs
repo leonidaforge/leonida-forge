@@ -30,6 +30,7 @@ enum State {
     Ready {
         viewport: Entity<Viewport>,
         summary: Summary,
+        fragment: Option<Box<model::FragmentSummary>>,
         diagnostics: Vec<String>,
     },
     Failed(String),
@@ -123,11 +124,45 @@ impl ModelViewer {
                             line.push_str(&diagnostic.reason);
                             line
                         }));
+                        if let Some(fragment) = &loaded.fragment {
+                            lines.push(format!(
+                                "Fragment: {} component(s); root counts at +0x30 {:?}; {} root pointer(s) reach unidentified records",
+                                fragment.components.len(),
+                                fragment.counts,
+                                fragment.unexplained
+                            ));
+                            match &fragment.completeness {
+                                lforge_model::FragmentCompleteness::SinglePrimaryDrawable => {
+                                    lines.push(
+                                        "Fragment completeness: one member drawable, fully decoded"
+                                            .into(),
+                                    );
+                                }
+                                lforge_model::FragmentCompleteness::Partial { reason } => {
+                                    lines.push(format!("Partial fragment: {reason}"));
+                                }
+                                lforge_model::FragmentCompleteness::Unsupported { reason } => {
+                                    lines.push(format!("Unsupported fragment: {reason}"));
+                                }
+                            }
+                            let unsupported = fragment
+                                .components
+                                .iter()
+                                .filter(|component| component.status != "decoded")
+                                .count();
+                            if unsupported > 0 {
+                                lines.push(format!(
+                                    "{unsupported} of {} component(s) are not fully decoded",
+                                    fragment.components.len()
+                                ));
+                            }
+                        }
                         let diagnostics = lines;
                         this.name = loaded.name;
                         this.state = State::Ready {
                             viewport,
                             summary,
+                            fragment: loaded.fragment.map(Box::new),
                             diagnostics,
                         };
                     }
@@ -178,7 +213,7 @@ impl ModelViewer {
             )
     }
 
-    fn content(&self, _cx: &Context<Self>) -> gpui::AnyElement {
+    fn content(&self, cx: &Context<Self>) -> gpui::AnyElement {
         match &self.state {
             State::Loading => ui::centered_message("Loading model.", None).into_any_element(),
             State::Failed(err) => {
@@ -187,6 +222,7 @@ impl ModelViewer {
             }
             State::Ready {
                 viewport,
+                fragment,
                 diagnostics,
                 ..
             } => {
@@ -196,50 +232,52 @@ impl ModelViewer {
                     .min_w_0()
                     .h_full()
                     .child(viewport.clone());
-                if diagnostics.is_empty() {
+                if fragment.is_none() && diagnostics.is_empty() {
                     return viewport_element.into_any_element();
                 }
-                viewport_element
-                    .child(
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w(px(DIAGNOSTICS_WIDTH))
+                    .h_full()
+                    .overflow_hidden()
+                    .bg(rgb(theme::PANEL))
+                    .border_l_1()
+                    .border_color(rgb(theme::BORDER));
+                if let Some(fragment) = fragment {
+                    panel = panel.child(components_section(viewport, fragment, cx));
+                }
+                if !diagnostics.is_empty() {
+                    panel = panel.child(
                         div()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("DIAGNOSTICS"),
+                    );
+                    panel = panel.child(
+                        div()
+                            .id("model-diagnostics")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_3()
+                            .pb_2()
                             .flex()
                             .flex_col()
-                            .flex_none()
-                            .w(px(DIAGNOSTICS_WIDTH))
-                            .h_full()
-                            .overflow_hidden()
-                            .bg(rgb(theme::PANEL))
-                            .border_l_1()
-                            .border_color(rgb(theme::BORDER))
-                            .child(
+                            .gap_1()
+                            .children(diagnostics.iter().map(|line| {
                                 div()
-                                    .px_3()
-                                    .py_2()
                                     .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("DIAGNOSTICS"),
-                            )
-                            .child(
-                                div()
-                                    .id("model-diagnostics")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .px_3()
-                                    .pb_2()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .children(diagnostics.iter().map(|line| {
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(theme::TEXT_MUTED))
-                                            .child(line.clone())
-                                    })),
-                            ),
-                    )
-                    .into_any_element()
+                                    .child(line.clone())
+                            })),
+                    );
+                }
+                viewport_element.child(panel).into_any_element()
             }
         }
     }
@@ -249,7 +287,10 @@ impl ModelViewer {
             State::Loading => ("Loading model.".to_string(), String::new()),
             State::Failed(err) => (format!("Error: {err}"), String::new()),
             State::Ready {
-                viewport, summary, ..
+                viewport,
+                summary,
+                fragment,
+                ..
             } => {
                 let viewport = viewport.read(cx);
                 let renderer = match &viewport.status {
@@ -277,7 +318,12 @@ impl ModelViewer {
                     lforge_model::TextureCompleteness::NotReferenced => "no texture references",
                 };
                 let left = format!(
-                    "{geometry}  ·  {textures}  ·  {layout}  ·  {} meshes  ·  {} materials  ·  {} textures  ·  {} vertices  ·  {} triangles",
+                    "{}{geometry}  \u{00B7}  {textures}  \u{00B7}  {layout}  \u{00B7}  {} meshes  \u{00B7}  {} materials  \u{00B7}  {} textures  \u{00B7}  {} vertices  \u{00B7}  {} triangles",
+                    if fragment.is_some() {
+                        "fragment  \u{00B7}  "
+                    } else {
+                        ""
+                    },
                     summary.meshes,
                     summary.materials,
                     summary.textures,
@@ -335,6 +381,138 @@ impl Render for ModelViewer {
             .child(div().flex().flex_1().min_h_0().child(self.content(cx)))
             .child(self.status_bar(cx))
     }
+}
+
+/// The fragment component list. Each row toggles one component; visibility is
+/// applied to the uploaded scene, so nothing is re-read or re-decoded.
+fn components_section(
+    viewport: &Entity<Viewport>,
+    fragment: &model::FragmentSummary,
+    cx: &Context<ModelViewer>,
+) -> impl IntoElement {
+    let visible: Vec<bool> = {
+        let viewport = viewport.read(cx);
+        fragment
+            .components
+            .iter()
+            .map(|component| {
+                component
+                    .meshes
+                    .clone()
+                    .any(|mesh| viewport.mesh_visible(mesh))
+            })
+            .collect()
+    };
+    let rows = fragment
+        .components
+        .iter()
+        .zip(visible)
+        .map(|(component, shown)| {
+            let meshes = component.meshes.clone();
+            let label = format!(
+                "{} {}",
+                if shown { "\u{25CF}" } else { "\u{25CB}" },
+                component.name
+            );
+            let detail = format!(
+                "#{}  lod {}  {} primitives  {} vertices  {} triangles  {}  \u{00B7}  drawable +{:#x}",
+                component.index,
+                component
+                    .lod
+                    .map_or_else(|| "-".to_string(), |lod| lod.to_string()),
+                component.primitives,
+                format_count(component.vertices),
+                format_count(component.triangles),
+                component.status,
+                component.drawable_at
+            );
+            div()
+                .id(("component", component.index))
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px_3()
+                .py_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::HOVER)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let State::Ready { viewport, .. } = &this.state else {
+                        return;
+                    };
+                    let viewport = viewport.clone();
+                    let meshes = meshes.clone();
+                    viewport.update(cx, |viewport, cx| {
+                        viewport.set_meshes_visible(meshes, !shown, cx);
+                    });
+                }))
+                .child(div().text_xs().child(label))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(detail),
+                )
+        });
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .border_b_1()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(format!("COMPONENTS ({})", fragment.components.len())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            ui::button("components-show-all", "Show All").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    let State::Ready { viewport, .. } = &this.state else {
+                                        return;
+                                    };
+                                    viewport.clone().update(cx, |viewport, cx| {
+                                        viewport.show_all_components(cx);
+                                    });
+                                },
+                            )),
+                        )
+                        .child(ui::button("components-reset", "Reset Visibility").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let State::Ready { viewport, .. } = &this.state else {
+                                    return;
+                                };
+                                viewport.clone().update(cx, |viewport, cx| {
+                                    viewport.restore_default_visibility(cx);
+                                });
+                            }),
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .id("model-components")
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px_1()
+                .py_1()
+                .children(rows),
+        )
 }
 
 fn format_count(value: usize) -> String {

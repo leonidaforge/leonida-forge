@@ -100,54 +100,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     let stores = Arc::new(StoreSet::scan(&game_root.join("data").join("ttdb"))?);
-    let decoded = model::decode(system, graphics, &Stores(stores))?;
+    // A resource may be a drawable or a fragment; both decode into one scene
+    // through the same provider, so this example covers both entry points.
+    let (scene, completeness, texture_bindings) = if model::is_fragment(system, graphics) {
+        let fragment = model::decode_fragment(system, graphics, &Stores(stores))?;
+        println!(
+            "fragment {:?}: {} component(s), completeness {:?}",
+            fragment.report.name(),
+            fragment.components.len(),
+            fragment.completeness
+        );
+        for component in &fragment.components {
+            println!(
+                "  component {} {:?} lod {:?} meshes {:?} {} primitives {} vertices {} triangles",
+                component.index,
+                component.name,
+                component.lod,
+                component.meshes,
+                component.primitives,
+                component.vertices,
+                component.triangles
+            );
+        }
+        println!(
+            "  root counts at +0x30 {:?}, {} unidentified pointer(s)",
+            fragment.report.header.counts,
+            fragment.report.header.unexplained_present()
+        );
+        let geometry = match &fragment.completeness {
+            model::FragmentCompleteness::SinglePrimaryDrawable => {
+                model::GeometryCompleteness::Complete
+            }
+            model::FragmentCompleteness::Partial { reason } => {
+                model::GeometryCompleteness::Partial {
+                    reason: reason.clone(),
+                }
+            }
+            model::FragmentCompleteness::Unsupported { reason } => {
+                model::GeometryCompleteness::Unsupported {
+                    reason: reason.clone(),
+                }
+            }
+        };
+        let missing = fragment
+            .scene
+            .materials
+            .iter()
+            .filter(|material| material.missing_texture)
+            .count();
+        let textures = if missing > 0 {
+            model::TextureCompleteness::Partial { missing }
+        } else {
+            model::TextureCompleteness::Complete
+        };
+        (
+            fragment.scene,
+            model::ModelCompleteness {
+                geometry,
+                textures,
+                selected_root: fragment.report.header.drawable as usize,
+                selected_name: fragment.report.name().map(str::to_string),
+                notes: Vec::new(),
+            },
+            fragment.texture_bindings,
+        )
+    } else {
+        let decoded = model::decode(system, graphics, &Stores(stores))?;
+        (
+            decoded.scene,
+            decoded.completeness,
+            decoded.texture_bindings,
+        )
+    };
 
     println!(
         "{}: {} meshes, {} materials, {} textures, {} vertices, {} triangles",
-        decoded
-            .completeness
-            .selected_name
-            .as_deref()
-            .unwrap_or("model"),
-        decoded.scene.meshes.len(),
-        decoded.scene.materials.len(),
-        decoded.scene.textures.len(),
-        decoded.scene.vertex_count(),
-        decoded.scene.triangle_count()
+        completeness.selected_name.as_deref().unwrap_or("model"),
+        scene.meshes.len(),
+        scene.materials.len(),
+        scene.textures.len(),
+        scene.vertex_count(),
+        scene.triangle_count()
     );
-    println!("geometry: {:?}", decoded.completeness.geometry);
-    println!("textures: {:?}", decoded.completeness.textures);
+    println!("geometry: {:?}", completeness.geometry);
+    println!("textures: {:?}", completeness.textures);
     println!(
         "texture bindings: {} total, {} unresolved, {} embedded",
-        decoded.texture_bindings.len(),
-        decoded
-            .texture_bindings
+        texture_bindings.len(),
+        texture_bindings
             .iter()
             .filter(|binding| binding.texture.is_none())
             .count(),
-        decoded
-            .texture_bindings
+        texture_bindings
             .iter()
             .filter(|binding| binding.embedded)
             .count()
     );
-    for binding in decoded
-        .texture_bindings
-        .iter()
-        .filter(|binding| binding.embedded)
-    {
+    for binding in texture_bindings.iter().filter(|binding| binding.embedded) {
         println!(
             "embedded binding: {:?} key {:#018x} texture {:?}",
             binding.semantic, binding.key64, binding.texture
         );
     }
-    for diagnostic in &decoded.scene.diagnostics {
+    for diagnostic in &scene.diagnostics {
         println!("diagnostic: {}", diagnostic.reason);
     }
 
     let mut renderer = Renderer::new()?;
-    let gpu = renderer.upload_scene(&decoded.scene)?;
-    let camera = OrbitCamera::framing(decoded.scene.bounds, 16.0 / 9.0);
+    let gpu = renderer.upload_scene(&scene)?;
+    let camera = OrbitCamera::framing(scene.bounds, 16.0 / 9.0);
     let frame = renderer.render(&gpu, &camera, 1280, 720, Background::DARK)?;
     save_rgba(&output, frame.width, frame.height, &frame.pixels)?;
     println!(

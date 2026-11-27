@@ -37,6 +37,31 @@ pub struct LoadedModel {
     /// Whether the system/graphics boundary came from native page metadata or
     /// from the controlled standalone-resource inference.
     pub exact_layout: bool,
+    /// Present when the resource was decoded as a fragment. A fragment scene
+    /// is assembled from the member drawables the root references.
+    pub fragment: Option<FragmentSummary>,
+}
+
+/// One decoded fragment component, as the component panel lists it.
+pub struct FragmentComponentInfo {
+    pub index: usize,
+    pub name: String,
+    pub drawable_at: usize,
+    pub lod: Option<usize>,
+    pub meshes: std::ops::Range<usize>,
+    pub primitives: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub status: String,
+}
+
+pub struct FragmentSummary {
+    pub components: Vec<FragmentComponentInfo>,
+    pub completeness: decoded::FragmentCompleteness,
+    /// The root's four `u16` at `+0x30`, as stored.
+    pub counts: [u16; 4],
+    /// Root pointers whose targets the research has not identified.
+    pub unexplained: usize,
 }
 
 struct Stores(Arc<StoreSet>);
@@ -211,6 +236,20 @@ pub fn load_with_cancel(
         },
         None => None,
     };
+    if decoded::is_fragment(resource.system(), resource.graphics()) {
+        let fragment = match &stores {
+            Some(provider) => {
+                decoded::decode_fragment(resource.system(), resource.graphics(), provider)
+            }
+            None => decoded::decode_fragment(
+                resource.system(),
+                resource.graphics(),
+                &decoded::NoTextures,
+            ),
+        }
+        .map_err(|err| err.to_string())?;
+        return finish_fragment(path, resource.exact, fragment);
+    }
     let decoded = match &stores {
         Some(provider) => decoded::decode(resource.system(), resource.graphics(), provider),
         None => decoded::decode(resource.system(), resource.graphics(), &decoded::NoTextures),
@@ -302,10 +341,7 @@ fn finish(
         .name_text
         .clone()
         .filter(|name| !name.is_empty())
-        .or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
+        .or_else(|| file_stem_name(path))
         .unwrap_or_else(|| "Model".to_string());
     Ok(LoadedModel {
         name,
@@ -313,7 +349,120 @@ fn finish(
         completeness: decoded.completeness,
         texture_bindings: decoded.texture_bindings,
         exact_layout,
+        fragment: None,
     })
+}
+
+fn finish_fragment(
+    path: &Path,
+    exact_layout: bool,
+    decoded: decoded::DecodedFragment,
+) -> Result<LoadedModel, String> {
+    let name = decoded
+        .report
+        .name()
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+        .or_else(|| file_stem_name(path))
+        .unwrap_or_else(|| "Fragment".to_string());
+    let missing_textures = decoded
+        .scene
+        .materials
+        .iter()
+        .filter(|material| material.missing_texture)
+        .count();
+    let referenced = decoded
+        .scene
+        .materials
+        .iter()
+        .any(|material| !material.bindings.is_empty());
+    let textures = if missing_textures > 0 {
+        decoded::TextureCompleteness::Partial {
+            missing: missing_textures,
+        }
+    } else if referenced {
+        decoded::TextureCompleteness::Complete
+    } else {
+        decoded::TextureCompleteness::NotReferenced
+    };
+    let (geometry, mut notes) = match &decoded.completeness {
+        decoded::FragmentCompleteness::SinglePrimaryDrawable => (
+            decoded::GeometryCompleteness::Complete,
+            vec![
+                "fragment: one member drawable, decoded from its highest populated LOD".to_string(),
+            ],
+        ),
+        decoded::FragmentCompleteness::Partial { reason } => (
+            decoded::GeometryCompleteness::Partial {
+                reason: reason.clone(),
+            },
+            vec![format!("fragment: {reason}")],
+        ),
+        decoded::FragmentCompleteness::Unsupported { reason } => (
+            decoded::GeometryCompleteness::Unsupported {
+                reason: reason.clone(),
+            },
+            vec![format!("fragment: {reason}")],
+        ),
+    };
+    notes.push(format!(
+        "fragment root counts at +0x30: {:?}",
+        decoded.report.header.counts
+    ));
+    if decoded.report.header.unexplained_present() > 0 {
+        notes.push(format!(
+            "{} root pointer(s) reach records whose meaning is not identified",
+            decoded.report.header.unexplained_present()
+        ));
+    }
+    let components = decoded
+        .components
+        .iter()
+        .map(|component| FragmentComponentInfo {
+            index: component.index,
+            name: component
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("component {}", component.index)),
+            drawable_at: component.drawable_at,
+            lod: component.lod,
+            meshes: component.meshes.clone(),
+            primitives: component.primitives,
+            vertices: component.vertices,
+            triangles: component.triangles,
+            status: match &component.status {
+                decoded::ComponentStatus::Decoded => "decoded".to_string(),
+                decoded::ComponentStatus::Unsupported(reason) => {
+                    format!("unsupported: {reason}")
+                }
+            },
+        })
+        .collect();
+    let fragment = FragmentSummary {
+        components,
+        completeness: decoded.completeness,
+        counts: decoded.report.header.counts,
+        unexplained: decoded.report.header.unexplained_present(),
+    };
+    Ok(LoadedModel {
+        name,
+        scene: decoded.scene,
+        completeness: decoded::ModelCompleteness {
+            geometry,
+            textures,
+            selected_root: decoded.report.header.drawable as usize,
+            selected_name: decoded.report.name().map(str::to_string),
+            notes,
+        },
+        texture_bindings: decoded.texture_bindings,
+        exact_layout,
+        fragment: Some(fragment),
+    })
+}
+
+fn file_stem_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 fn texture_stores(root: &Path) -> Result<Arc<StoreSet>, String> {
@@ -510,6 +659,74 @@ mod tests {
             loaded.scene.textures.len(),
             loaded.scene.triangle_count()
         );
+    }
+
+    /// Opens a real fragment through the shared loading path. Ignored by
+    /// default; `LF_TEST_ARCHIVE`, `LF_TEST_EXECUTABLE` and
+    /// `LF_TEST_GAME_ROOT` name the local inputs, and the archive supplies
+    /// the page metadata the split needs.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE, LF_TEST_EXECUTABLE and LF_TEST_GAME_ROOT"]
+    fn loads_a_fragment_from_a_native_type_3_row() {
+        let archive = std::env::var("LF_TEST_ARCHIVE").expect("LF_TEST_ARCHIVE");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let game_root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        crate::files::archive::prepare_with(
+            Path::new(&archive),
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .expect("prepare archive");
+        let entries = crate::files::list_with(Path::new(&archive), &access).expect("list");
+        let mut loaded_rows = 0usize;
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.type_name.starts_with("RPF9 entry, type 3"))
+            .take(3)
+        {
+            let loaded = match load_with_cancel(
+                &entry.path,
+                &access,
+                Some(Path::new(&game_root)),
+                &AtomicBool::new(false),
+            ) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    eprintln!("{}: not openable: {err}", entry.path.display());
+                    continue;
+                }
+            };
+            let fragment = loaded.fragment.as_ref().expect("a fragment summary");
+            assert!(loaded.exact_layout);
+            assert!(!fragment.components.is_empty());
+            assert!(!loaded.scene.meshes.is_empty());
+            for component in &fragment.components {
+                eprintln!(
+                    "{}: component {} {:?} lod {:?} {} vertices {} triangles {}",
+                    loaded.name,
+                    component.index,
+                    component.name,
+                    component.lod,
+                    component.vertices,
+                    component.triangles,
+                    component.status
+                );
+            }
+            assert!(fragment.components.iter().all(|component| {
+                component
+                    .meshes
+                    .clone()
+                    .all(|mesh| mesh < loaded.scene.meshes.len())
+            }));
+            loaded_rows += 1;
+        }
+        assert!(loaded_rows > 0, "no type 3 row opened as a fragment");
     }
 
     #[test]
