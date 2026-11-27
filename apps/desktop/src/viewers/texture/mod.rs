@@ -309,6 +309,13 @@ mod tests {
     use super::*;
     use lforge_texture::StoreSet;
 
+    fn output_dir() -> std::path::PathBuf {
+        std::env::var_os("LF_TEST_OUTPUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("leonida-forge-tests"))
+            .join("native-textures")
+    }
+
     /// Manual native-dictionary regression for the tiled BC7 sample.
     #[test]
     #[ignore = "requires LF_TEST_TEXTURES_ARCHIVE and LF_TEST_EXECUTABLE"]
@@ -367,10 +374,8 @@ mod tests {
         assert_eq!((target.width, target.height), (1920, 1080));
         assert_eq!(target.format.id, 98);
         assert_eq!(target.tile_mode, 5);
-        let out = std::path::Path::new(
-            "E:/source/leonidaforge/analysis/model-viewer/final-review/native-textures",
-        );
-        std::fs::create_dir_all(out).unwrap();
+        let out = output_dir();
+        std::fs::create_dir_all(&out).unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let level = store
             .level(target.index, 0, 0, &cancel)
@@ -467,10 +472,8 @@ mod tests {
         assert_eq!(decodable, 886);
         assert_eq!(decoded, 872);
 
-        let folder = std::path::Path::new(
-            "E:/source/leonidaforge/analysis/model-viewer/final-review/native-textures",
-        );
-        std::fs::create_dir_all(folder).unwrap();
+        let folder = output_dir();
+        std::fs::create_dir_all(&folder).unwrap();
         for store_index in 0..set.len() {
             let store = set.open(store_index).expect("open a store");
             let Some(ui) = store.textures().iter().find(|texture| {
