@@ -16,7 +16,10 @@ use std::sync::atomic::AtomicBool;
 
 mod vehicle;
 
-pub use vehicle::{WheelMount, append_scene, wheel_mounts, wheel_transform};
+pub use vehicle::{
+    WheelMount, append_scene, axle_axis, wheel_mounts, wheel_transform, wheel_transform_sized,
+    wheel_transform_with_axis,
+};
 
 use glam::Vec3;
 use lforge_rage9::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};

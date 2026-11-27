@@ -14,6 +14,8 @@ lforge-scene.workspace = true
 lforge-texture.workspace = true
 
 [dev-dependencies]
+glam.workspace = true
 image.workspace = true
 lforge-binary.workspace = true
 lforge-renderer.workspace = true
+serde_json.workspace = true

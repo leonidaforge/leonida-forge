@@ -165,24 +165,86 @@ pub fn append_scene(target: &mut Scene, source: &Scene, transform: Mat4) -> usiz
         }
         target.meshes.push(mesh);
     }
+    if source.bounds != lforge_scene::Aabb::EMPTY {
+        target.bounds = target
+            .bounds
+            .union(transformed_bounds(source.bounds, transform));
+    }
     target.meshes.len()
+}
+
+fn transformed_bounds(bounds: lforge_scene::Aabb, transform: Mat4) -> lforge_scene::Aabb {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for index in 0..8 {
+        let corner = Vec3::new(
+            if index & 1 == 0 {
+                bounds.min.x
+            } else {
+                bounds.max.x
+            },
+            if index & 2 == 0 {
+                bounds.min.y
+            } else {
+                bounds.max.y
+            },
+            if index & 4 == 0 {
+                bounds.min.z
+            } else {
+                bounds.max.z
+            },
+        );
+        let point = transform.transform_point3(corner);
+        min = min.min(point);
+        max = max.max(point);
+    }
+    lforge_scene::Aabb { min, max }
+}
+
+/// The source axis that should become the vehicle's X axle: the narrowest one.
+pub fn axle_axis(bounds: lforge_scene::Aabb) -> usize {
+    let size = bounds.sanitized().size();
+    if size.x <= size.y && size.x <= size.z {
+        0
+    } else if size.y <= size.x && size.y <= size.z {
+        1
+    } else {
+        2
+    }
 }
 
 /// A transform that centres a wheel on its own bounds, scales it to
 /// `diameter` metres and moves it to `mount`. The source's narrow axis becomes
 /// the vehicle's X axis (the axle).
 pub fn wheel_transform(source: &Scene, mount: &WheelMount, diameter: f32) -> Mat4 {
+    wheel_transform_with_axis(source, mount, diameter, axle_axis(source.bounds))
+}
+
+/// The same transform with an explicit axle axis. Use this when a rim and a
+/// tyre are merged first: the rim decides the axle, the combined bounds decide
+/// the diameter.
+pub fn wheel_transform_with_axis(
+    source: &Scene,
+    mount: &WheelMount,
+    diameter: f32,
+    axle: usize,
+) -> Mat4 {
+    wheel_transform_sized(source, mount, diameter, axle, 1.0)
+}
+
+/// The same transform with an extra scale along the axle. Pass `width < 1.0` to
+/// narrow a tyre whose source is wider than the vehicle needs.
+pub fn wheel_transform_sized(
+    source: &Scene,
+    mount: &WheelMount,
+    diameter: f32,
+    axle: usize,
+    width: f32,
+) -> Mat4 {
     let bounds = source.bounds.sanitized();
     let center = bounds.center();
     let size = bounds.size();
-    let axle_axis = if size.x <= size.y && size.x <= size.z {
-        0
-    } else if size.y <= size.x && size.y <= size.z {
-        1
-    } else {
-        2
-    };
-    let rotation = match axle_axis {
+    let rotation = match axle {
         0 => Mat4::IDENTITY,
         1 => Mat4::from_rotation_z(std::f32::consts::FRAC_PI_2),
         _ => Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2),
@@ -190,7 +252,7 @@ pub fn wheel_transform(source: &Scene, mount: &WheelMount, diameter: f32) -> Mat
     let scale = diameter / size.max_element().max(1e-4);
     let mirror = if mount.is_right { -1.0 } else { 1.0 };
     Mat4::from_translation(mount.pivot)
-        * Mat4::from_scale(Vec3::new(mirror, 1.0, 1.0))
+        * Mat4::from_scale(Vec3::new(mirror * width, 1.0, 1.0))
         * Mat4::from_scale(Vec3::splat(scale))
         * rotation
         * Mat4::from_translation(-center)
@@ -226,5 +288,32 @@ mod tests {
             .transform_vector3(Vec3::new(0.0, 0.0, source.bounds.size().z))
             .length();
         assert!(axle < 0.2);
+    }
+
+    #[test]
+    fn width_scale_narrows_only_the_axle() {
+        let source = Scene {
+            bounds: Aabb {
+                min: Vec3::new(-0.25, -0.5, -0.08),
+                max: Vec3::new(0.25, 0.5, 0.08),
+            },
+            ..Scene::default()
+        };
+        let mount = WheelMount {
+            bone: "wheel_lf",
+            pivot: Vec3::ZERO,
+            is_right: false,
+            is_rear: false,
+        };
+        let full = wheel_transform_with_axis(&source, &mount, 0.64, 2);
+        let narrow = wheel_transform_sized(&source, &mount, 0.64, 2, 0.5);
+        let width = |transform: Mat4| {
+            transform
+                .transform_vector3(Vec3::new(0.0, 0.0, source.bounds.size().z))
+                .length()
+        };
+        let height = |transform: Mat4| transform.transform_vector3(Vec3::Y).length();
+        assert!((width(narrow) - width(full) * 0.5).abs() < 1e-4);
+        assert!((height(narrow) - height(full)).abs() < 1e-4);
     }
 }
