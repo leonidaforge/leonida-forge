@@ -471,7 +471,11 @@ impl Classification {
     /// outcome, so a census can account for all of them.
     pub fn outcome(&self) -> Outcome {
         match &self.payload {
-            PayloadState::NotRead => Outcome::Blocked,
+            // Nothing was read, so nothing is established and nothing was
+            // blocked: this is what a metadata-only pass reports for every
+            // entry, and what a scan that ran out of budget reports for the
+            // rows it never reached.
+            PayloadState::NotRead => Outcome::NotProbed,
             PayloadState::TransformUnavailable => Outcome::TransformUnavailable,
             // The transform was available and did not verify or run: the
             // payload was never reached, but the cause is this entry rather
@@ -503,7 +507,12 @@ pub enum Outcome {
     TransformUnavailable,
     /// The metadata describing the payload is malformed.
     Malformed,
-    /// The payload was not read, so nothing about it is established.
+    /// The payload was not read, so nothing about it is established. A metadata
+    /// pass reports this, and so does a scan that stopped before reaching the
+    /// row; neither is a decoding failure and neither claims anything.
+    NotProbed,
+    /// The payload was reached and could not be read: the transform did not
+    /// verify, or the storage refused it.
     Blocked,
 }
 
@@ -516,6 +525,7 @@ impl Outcome {
             Outcome::Undecodable => "undecodable",
             Outcome::TransformUnavailable => "transform-unavailable",
             Outcome::Malformed => "malformed",
+            Outcome::NotProbed => "not-probed",
             Outcome::Blocked => "blocked",
         }
     }
@@ -1071,7 +1081,7 @@ mod tests {
                 state(PayloadState::Malformed("bad row".into())),
                 Outcome::Malformed,
             ),
-            (state(PayloadState::NotRead), Outcome::Blocked),
+            (state(PayloadState::NotRead), Outcome::NotProbed),
         ];
         for (index, (classification, outcome)) in cases.into_iter().enumerate() {
             assert_eq!(
