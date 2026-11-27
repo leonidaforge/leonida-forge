@@ -44,6 +44,8 @@ struct MaterialUniform {
     base_color: [f32; 4],
     /// bumpiness, alpha cutoff, normal map present, normal map is BC5.
     params: [f32; 4],
+    /// metalness, roughness, emissive weight, spare.
+    surface: [f32; 4],
 }
 
 #[derive(Debug)]
@@ -243,6 +245,12 @@ impl GpuScene {
                 contents: bytemuck::bytes_of(&MaterialUniform {
                     base_color: material.base_color,
                     params,
+                    surface: [
+                        material.metallic.clamp(0.0, 1.0),
+                        material.roughness.clamp(0.02, 1.0),
+                        material.emissive.max(0.0),
+                        0.0,
+                    ],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM,
             });

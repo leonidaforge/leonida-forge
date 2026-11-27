@@ -207,6 +207,12 @@ pub struct Material {
     pub double_sided: bool,
     pub bumpiness: f32,
     pub uv_set: u32,
+    /// Metalness in 0..=1. Zero is a dielectric.
+    pub metallic: f32,
+    /// Roughness in 0..=1. One is fully diffuse.
+    pub roughness: f32,
+    /// Emissive weight, zero for surfaces that do not glow.
+    pub emissive: f32,
     /// A declared texture could not be resolved. The viewer shows a checker
     /// instead of presenting the material as fully textured.
     pub missing_texture: bool,
@@ -225,6 +231,9 @@ impl Default for Material {
             double_sided: false,
             bumpiness: 1.0,
             uv_set: 0,
+            metallic: 0.0,
+            roughness: 0.6,
+            emissive: 0.0,
             missing_texture: false,
             bindings: Vec::new(),
         }
