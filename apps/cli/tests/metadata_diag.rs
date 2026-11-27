@@ -65,7 +65,7 @@ fn metadata_reports_payload_readability() {
     let state = |row: usize| listed[row]["contents"]["state"].as_str().unwrap();
     assert_eq!(state(0), "stored");
     assert_eq!(listed[0]["contents"]["readable"], true);
-    assert_eq!(state(1), "decoded");
+    assert_eq!(state(1), "validated");
     assert_eq!(state(2), "transform_key_missing");
     assert_eq!(listed[2]["contents"]["readable"], false);
     assert_eq!(listed[2]["payload_cipher"]["type"], 0x11);
@@ -78,7 +78,7 @@ fn metadata_reports_payload_readability() {
     );
     assert_eq!(state(3), "unsupported_compression");
     assert_eq!(state(4), "alternate_source");
-    assert_eq!(state(5), "decoded");
+    assert_eq!(state(5), "validated");
     assert_eq!(state(6), "malformed");
 
     let text = lforge(&[

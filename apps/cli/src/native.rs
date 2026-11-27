@@ -183,13 +183,16 @@ pub fn load_name_tables(archive: &Path, files: &[PathBuf]) -> Result<NameTables,
 }
 
 /// How an entry's contents can be read: one of the readability states. This
-/// reports storage and the available decoding capability, not a decode that
-/// was not attempted.
+/// reports storage and the framing that was validated, not a decode that was
+/// not attempted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentsState {
     /// `None` when the storage is supported but decoding was not attempted.
+    /// `true` for `stored` (the stored bytes are the contents) and for
+    /// `validated` (the chunk table and its sizes fit the entry; no chunk was
+    /// decoded).
     pub readable: Option<bool>,
-    /// `stored`, `decoded`, `transform_available`, `transform_key_missing`,
+    /// `stored`, `validated`, `transform_available`, `transform_key_missing`,
     /// `unsupported_transform`, `unsupported_compression`,
     /// `alternate_source` or `malformed`.
     pub state: &'static str,
@@ -224,7 +227,10 @@ pub fn contents_state(
     }
     match entry.payload(source, alternates) {
         Ok(_) if entry.raw_source(source, alternates).is_ok() => state(Some(true), "stored", None),
-        Ok(_) => state(Some(true), "decoded", None),
+        // The payload was opened and its chunk table validated, but no chunk
+        // was decoded. Reporting `decoded` here promised more than this call
+        // established; a corrupt zlib stream still fails extraction.
+        Ok(_) => state(Some(true), "validated", None),
         Err(Error::Encoded { .. }) if matches!(entry.payload_transform, Ok(true)) => {
             transform_state(entry, stream)
         }

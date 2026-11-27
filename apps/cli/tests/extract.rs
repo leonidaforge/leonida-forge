@@ -89,12 +89,99 @@ fn exports_an_encoding_2_chunked_entry() {
     expected.extend_from_slice(&second);
     assert_eq!(std::fs::read(&out).unwrap(), expected);
 
-    // The listing reports the same row as decodable.
+    // The listing reports the same row as validated: its chunk table and
+    // sizes fit the entry. The listing does not decode a chunk.
     let listing = lforge(&["archive", "ls", archive.to_str().unwrap(), "--json"]);
     assert!(listing.status.success(), "{}", stderr(&listing));
     let value: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
     assert_eq!(value["rows"][0]["contents"]["readable"], true);
-    assert_eq!(value["rows"][0]["contents"]["state"], "decoded");
+    assert_eq!(value["rows"][0]["contents"]["state"], "validated");
+}
+
+#[test]
+fn exports_an_encoding_4_entry_with_a_stored_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let first: Vec<u8> = (0..0x180u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let second: Vec<u8> = (0..48u32).map(|i| (i % 251) as u8).collect();
+    let (region_a, entry_a) = zlib_chunk(&first);
+    let (region_b, entry_b) = copy_chunk(&second);
+    // Resource-page encoding-4 entries hold 16 bytes before the first chunk.
+    let mut payload = vec![0u8; 16];
+    payload.extend_from_slice(&region_a);
+    payload.extend_from_slice(&region_b);
+    let row = Spec {
+        chunks: Some(chunk_value(2, 4, &[entry_a, entry_b])),
+        logical: Some((first.len() + second.len()) as u64),
+        ..spec(&payload)
+    };
+    let archive = write_archive(temp.path(), "chunked4.rpf", &assemble(&[row], &[]));
+    let out = temp.path().join("out.bin");
+
+    let output = extract(&archive, 0, &out, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert_eq!(std::fs::read(&out).unwrap(), expected);
+}
+
+#[test]
+fn a_validated_chunk_that_does_not_decode_is_not_reported_as_decoded() {
+    let temp = tempfile::tempdir().unwrap();
+    // The chunk table is consistent: one method-3 chunk of 32 stored bytes
+    // with a 100-byte logical size. The bytes are not a zlib stream, which
+    // only decoding can establish.
+    let row = Spec {
+        chunks: Some(chunk_value(1, 4, &[chunk4(100, 32, 0, 3)])),
+        logical: Some(100),
+        ..spec(&[0xA5; 32])
+    };
+    let archive = write_archive(temp.path(), "invalid-chunk.rpf", &assemble(&[row], &[]));
+    let out = temp.path().join("out.bin");
+
+    // The listing validates the framing and does not decode a chunk.
+    let listing = lforge(&["archive", "ls", archive.to_str().unwrap(), "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let value: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(value["rows"][0]["contents"]["readable"], true);
+    assert_eq!(value["rows"][0]["contents"]["state"], "validated");
+
+    // Extraction reaches the stream and fails.
+    let output = extract(&archive, 0, &out, &[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("compressed data is invalid"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn rejects_an_encoding_4_stored_prefix_of_an_unknown_length() {
+    let temp = tempfile::tempdir().unwrap();
+    let (region, entry) = zlib_chunk(b"a payload behind a 32-byte prefix");
+    let mut payload = vec![0u8; 32];
+    payload.extend_from_slice(&region);
+    let row = Spec {
+        chunks: Some(chunk_value(1, 4, &[entry])),
+        logical: Some(33),
+        ..spec(&payload)
+    };
+    let archive = write_archive(temp.path(), "prefix32.rpf", &assemble(&[row], &[]));
+
+    let listing = lforge(&["archive", "ls", archive.to_str().unwrap(), "--json"]);
+    assert!(listing.status.success(), "{}", stderr(&listing));
+    let value: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(value["rows"][0]["contents"]["readable"], false);
+    assert_eq!(value["rows"][0]["contents"]["state"], "malformed");
+    assert!(
+        value["rows"][0]["contents"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("32-byte stored prefix"),
+        "{}",
+        value["rows"][0]["contents"]["reason"]
+    );
 }
 
 #[test]
