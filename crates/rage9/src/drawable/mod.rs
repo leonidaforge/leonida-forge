@@ -41,8 +41,33 @@ pub const MAX_ARRAY: usize = 1 << 16;
 pub const BOUNDS_RECORD_LEN: u64 = 0x20;
 /// Tolerance the research used for the aggregate-union check.
 pub const AABB_TOLERANCE: f32 = 2e-3;
-/// Longest declaration table accepted.
-pub const MAX_DECLARATIONS: usize = 64;
+/// Entries of the fixed declaration table at a vertex-buffer graphics target.
+///
+/// A zero word marks an absent attribute; it does not end the table. A geometry
+/// with no second UV stores zero at slot 4 and a real blend-weight entry at
+/// slot 6.
+pub const DECLARATION_SLOTS: usize = 23;
+
+/// The declaration slot of the authored position stream.
+pub const SEMANTIC_POSITION: u32 = 0;
+/// Vertex colour.
+pub const SEMANTIC_COLOR: u32 = 1;
+/// Normal.
+pub const SEMANTIC_NORMAL: u32 = 2;
+/// First texture coordinate set.
+pub const SEMANTIC_UV0: u32 = 3;
+/// Second texture coordinate set.
+pub const SEMANTIC_UV1: u32 = 4;
+/// Four `u8` blend weights, when the declaration format is `0x26`.
+pub const SEMANTIC_BLEND_WEIGHTS: u32 = 6;
+/// Blend indices; the width and lane count come from the format and the
+/// matching layout entry.
+pub const SEMANTIC_BLEND_INDICES: u32 = 8;
+/// Tangent.
+pub const SEMANTIC_TANGENT: u32 = 11;
+/// A second position-format stream, observed on most skeleton-bearing geometry.
+/// Its role is not established, so it has no name.
+pub const SEMANTIC_SECOND_POSITION: u32 = 17;
 
 /// A structural problem. Every pointer that does not resolve produces one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,8 +223,15 @@ pub struct BoundsArray {
 }
 
 /// One declaration-table entry from the graphics prefix.
+///
+/// The entry's position in the table is its attribute semantic: slot 0 is the
+/// position stream, 1 the colour, 2 the normal, 3 and 4 the texture coordinates,
+/// 6 the blend weights, 8 the blend indices and 11 the tangent. The remaining
+/// slots have no established name. The `format` byte is a declaration format,
+/// which is a different enumeration from the layout's format byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Declaration {
+    pub slot: usize,
     pub format: u8,
     pub offset: u32,
     /// Whether the offset equals a present layout entry's offset.
@@ -315,6 +347,20 @@ pub struct VertexBuffer {
     /// Entries of the declaration table at the graphics target.
     pub declarations: Vec<Declaration>,
     pub declaration_end: Option<u64>,
+}
+
+impl VertexBuffer {
+    /// The declaration entry of one attribute semantic, when it is present.
+    pub fn declaration(&self, semantic: u32) -> Option<&Declaration> {
+        self.declarations
+            .iter()
+            .find(|entry| entry.slot as u32 == semantic)
+    }
+
+    /// The present layout entry at `offset`, when there is one.
+    pub fn attribute_at(&self, offset: u32) -> Option<&Attribute> {
+        self.attributes.iter().find(|entry| entry.offset == offset)
+    }
 }
 
 /// An index descriptor's verified fields and the range it addresses.
@@ -898,30 +944,38 @@ impl<'a> Walk<'a> {
         Some(buffer)
     }
 
-    /// Reads the declaration table at the graphics target. Each word is a
-    /// `u8` format and an offset in units of two, and a zero word ends it.
+    /// Reads the fixed 23-slot declaration table at the graphics target.
+    ///
+    /// Each word is a `u8` format in bits 0..7 and an offset in units of two in
+    /// bits 8..31. A zero word means the attribute is absent. The table has no
+    /// terminator: a geometry with no second UV stores zero at slot 4 and a real
+    /// blend-weight entry at slot 6, so stopping at the first zero would drop
+    /// the influences.
     fn declarations(&mut self, graphics: u32, buffer: &mut VertexBuffer) {
         let mut pos = u64::from(graphics);
         let size = self.graphics.len() as u64;
-        let mut ended = false;
-        for _ in 0..MAX_DECLARATIONS {
-            let word = self
+        let end = pos + 4 * DECLARATION_SLOTS as u64;
+        if end > size {
+            self.issues.push(Issue::Bounds {
+                field: "declaration table",
+                at: graphics as usize,
+                segment: Segment::Graphics,
+                offset: pos,
+                len: 4 * DECLARATION_SLOTS as u64,
+                size,
+            });
+        }
+        for slot in 0..DECLARATION_SLOTS {
+            let Some(word) = self
                 .graphics
                 .get(pos as usize..pos as usize + 4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")));
-            let Some(word) = word else {
-                self.issues.push(Issue::Arithmetic {
-                    field: "declaration table",
-                    message: format!(
-                        "the table at graphics +{graphics:#x} runs past the {size} byte graphics segment"
-                    ),
-                });
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            else {
                 return;
             };
+            pos += 4;
             if word == 0 {
-                ended = true;
-                buffer.declaration_end = Some(pos + 4);
-                break;
+                continue;
             }
             let format = (word & 0xFF) as u8;
             let offset = (word >> 8) * 2;
@@ -930,22 +984,27 @@ impl<'a> Walk<'a> {
                 self.issues.push(Issue::Arithmetic {
                     field: "declaration table",
                     message: format!(
-                        "an entry declares format {format:#04x} at offset {offset:#x}, which no present layout entry uses"
+                        "slot {slot} declares format {format:#04x} at offset {offset:#x}, which no present layout entry uses"
+                    ),
+                });
+            }
+            if u64::from(offset) >= buffer.declared_bytes {
+                self.issues.push(Issue::Arithmetic {
+                    field: "declaration table",
+                    message: format!(
+                        "slot {slot} starts at offset {offset:#x}, past the {}-byte buffer",
+                        buffer.declared_bytes
                     ),
                 });
             }
             buffer.declarations.push(Declaration {
+                slot,
                 format,
                 offset,
                 matches_layout,
             });
-            pos += 4;
         }
-        if !ended {
-            self.issues.push(Issue::Missing {
-                field: "the declaration-table terminator",
-            });
-        }
+        buffer.declaration_end = Some(end);
     }
 
     /// Reads the 52-entry layout and checks the documented arithmetic.

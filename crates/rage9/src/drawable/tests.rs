@@ -582,19 +582,53 @@ fn a_declaration_offset_that_no_layout_entry_uses_is_reported() {
 }
 
 #[test]
-fn a_missing_declaration_terminator_is_reported() {
+fn a_full_declaration_table_is_read_without_a_terminator() {
     let (system, mut graphics) = drawable();
-    // Every word of the table is non-zero for the whole window.
-    for ix in 0..MAX_DECLARATIONS {
+    // Every slot present. The table is fixed-length: a zero word means an
+    // absent attribute, not the end of the table.
+    for ix in 0..DECLARATION_SLOTS {
         put_u32(&mut graphics, 0x100 + 4 * ix, (0x80 / 2) << 8 | 0x42);
     }
     let report = inspect(&system, &graphics).unwrap();
-    assert!(report.issues.iter().any(|issue| matches!(
+    let buffer = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    assert_eq!(buffer.declarations.len(), DECLARATION_SLOTS);
+    assert_eq!(
+        buffer.declarations[DECLARATION_SLOTS - 1].slot,
+        DECLARATION_SLOTS - 1
+    );
+    assert_eq!(
+        buffer.declaration_end,
+        Some(0x100 + 4 * DECLARATION_SLOTS as u64)
+    );
+    assert!(!report.issues.iter().any(|issue| matches!(
         issue,
         Issue::Missing {
             field: "the declaration-table terminator"
         }
     )));
+}
+
+#[test]
+fn an_absent_attribute_does_not_end_the_declaration_table() {
+    let (system, mut graphics) = drawable();
+    // Slot 4 and 5 stay zero; slot 6 carries a weight form at 0x80.
+    put_u32(&mut graphics, 0x100 + 4 * 6, (0x80 / 2) << 8 | 0x26);
+    let report = inspect(&system, &graphics).unwrap();
+    let buffer = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    let slots = buffer
+        .declarations
+        .iter()
+        .map(|entry| entry.slot)
+        .collect::<Vec<_>>();
+    assert_eq!(slots, [0, 1, 6]);
+    assert_eq!(buffer.declaration(6).map(|entry| entry.format), Some(0x26));
+    assert_eq!(buffer.declaration(4), None);
 }
 
 #[test]
