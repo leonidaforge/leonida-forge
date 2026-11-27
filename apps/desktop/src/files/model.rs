@@ -1312,6 +1312,7 @@ mod tests {
         let mut split_disagreements = 0usize;
         let mut inference_outcomes: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut mismatch_samples: Vec<String> = Vec::new();
+        let mut resolved_samples: Vec<String> = Vec::new();
         let mut member_states: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut member_counts = BTreeMap::new();
         let mut unnamed_members = 0usize;
@@ -1418,16 +1419,22 @@ mod tests {
                         }
                     };
                     *inference_outcomes.entry(outcome).or_insert(0) += 1;
-                    if mismatch_samples.len() < 10 {
-                        mismatch_samples.push(format!(
-                            "{}: native {:#x}, inferred {}, {outcome}",
-                            entry.path.display(),
-                            native.unwrap_or_default(),
-                            inferred.map_or_else(
-                                || "none".to_string(),
-                                |inferred| format!("{inferred:#x}")
-                            )
-                        ));
+                    let line = format!(
+                        "{}: native {:#x}, inferred {}, {outcome}",
+                        entry.path.display(),
+                        native.unwrap_or_default(),
+                        inferred.map_or_else(
+                            || "none".to_string(),
+                            |inferred| format!("{inferred:#x}")
+                        )
+                    );
+                    // A boundary that still resolves every member is the case
+                    // that makes native metadata necessary, so it is located
+                    // independently of how many other mismatches come first.
+                    if outcome == "root form, all members resolved" {
+                        resolved_samples.push(line.clone());
+                    } else if mismatch_samples.len() < 10 {
+                        mismatch_samples.push(line);
                     }
                 }
                 if native.is_some() {
@@ -1524,6 +1531,9 @@ mod tests {
         eprintln!("inferred boundary on a disagreement: {inference_outcomes:?}");
         for line in &mismatch_samples {
             eprintln!("  mismatch: {line}");
+        }
+        for line in &resolved_samples {
+            eprintln!("  resolved: {line}");
         }
         eprintln!("member states: {member_states:?}, {unnamed_members} unnamed");
         eprintln!(
