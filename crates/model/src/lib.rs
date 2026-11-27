@@ -14,6 +14,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::AtomicBool;
 
+mod vehicle;
+
+pub use vehicle::{WheelMount, append_scene, wheel_mounts, wheel_transform};
+
 use glam::Vec3;
 use lforge_rage9::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};
 use lforge_rage9::drawable_dictionary;
