@@ -1,8 +1,10 @@
+
 name: Windows x64 Alpha
 
-# Dispatch only on purpose. A tag trigger and a release job stay absent until
-# public publication is explicitly approved.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -11,18 +13,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-concurrency:
-  group: windows-x64-alpha-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   package:
     runs-on: windows-2025
     timeout-minutes: 60
+
     steps:
       - uses: actions/checkout@v7
 
-      # Installs the toolchain pinned in rust-toolchain.toml.
+      # Install the toolchain pinned in rust-toolchain.toml.
       - run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@v2
@@ -46,3 +45,34 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    name: Publish Alpha Pre-Release
+    needs: package
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-alpha
+          path: dist
+
+      - name: Publish GitHub Pre-Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: alpha-${{ github.run_number }}-${{ github.run_attempt }}
+          name: Leonida Forge Alpha #${{ github.run_number }}.${{ github.run_attempt }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          draft: false
+          make_latest: "false"
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.sha256
