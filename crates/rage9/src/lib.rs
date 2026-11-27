@@ -15,6 +15,7 @@ pub mod rbf0;
 pub mod rds5;
 pub mod resource;
 pub mod rpf;
+pub mod skeleton;
 
 /// How much of a recovered file or resource is known to be accounted for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

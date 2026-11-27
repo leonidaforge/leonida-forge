@@ -347,6 +347,10 @@ pub struct Geometry {
     pub vertex_buffer: Option<VertexBuffer>,
     pub index: Option<IndexView>,
     pub word_30: u64,
+    /// The `u16` at `+0x2C`. It equals the skeleton's bone count on the
+    /// highest LOD of every sampled skeleton-bearing geometry and is zero on
+    /// lower LODs, so it is reported as the geometry's declared bone count.
+    pub bone_count: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -838,11 +842,17 @@ impl<'a> Walk<'a> {
         let vertex_buffer = self.pointer(base + 0x08, "vertex buffer", Segment::System)?;
         let word_30 = self.u64(base + 0x30, "geometry word")?;
         let index = self.pointer(base + 0x40, "index descriptor", Segment::System)?;
+        let bone_count = u16::from_le_bytes(
+            self.bytes(Segment::System, base + 0x2C, 2, "geometry bone count")?
+                .try_into()
+                .expect("two bytes"),
+        );
         Some(Geometry {
             at,
             vertex_buffer: self.vertex_buffer(vertex_buffer),
             index: self.index_descriptor(index),
             word_30,
+            bone_count,
         })
     }
 
