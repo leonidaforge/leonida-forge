@@ -290,10 +290,11 @@ The validation result uses schema `leonida-forge.package-validation/1`. Exit cod
 `vehicle bodies` finds the drivable vehicle models and `vehicle previews` renders them. Neither command writes to the game installation.
 
 ```sh
-lforge vehicle bodies --archive "D:/GTA VI/levels.rpf" --executable "D:/GTA VI/game_scarlett_master.exe" \
+cd /path/to/game
+lforge vehicle bodies --archive levels.rpf --executable game_scarlett_master.exe \
   --names model-names.txt --output bodies.json
-lforge vehicle previews --bodies bodies.json --archive "D:/GTA VI/levels.rpf" \
-  --executable "D:/GTA VI/game_scarlett_master.exe" --textures "D:/GTA VI/data/ttdb" \
+lforge vehicle previews --bodies bodies.json --archive levels.rpf \
+  --executable game_scarlett_master.exe --textures data/ttdb \
   --colors vehicle-colors.json --output previews/
 ```
 
