@@ -1,6 +1,18 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/model", "crates/renderer", "crates/rage9", "crates/scene", "crates/text", "crates/texture"]
+members = [
+    "apps/cli",
+    "apps/desktop",
+    "crates/binary",
+    "crates/core",
+    "crates/model",
+    "crates/rage9",
+    "crates/renderer",
+    "crates/scene",
+    "crates/text",
+    "crates/texture",
+    "examples/skinning-consumer",
+]
 
 [workspace.package]
 version = "0.1.0"

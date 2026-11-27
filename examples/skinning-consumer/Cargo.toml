@@ -1,0 +1,15 @@
+[package]
+name = "skinning-consumer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+glam.workspace = true
+image.workspace = true
+lforge-model.workspace = true
+lforge-renderer.workspace = true
+lforge-scene.workspace = true
