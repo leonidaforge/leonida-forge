@@ -766,6 +766,7 @@ mod tests {
             chunks: Ok(None),
             payload_transform: Ok(false),
             payload_cipher: Ok(None),
+            payload_range: Ok(None),
             read_source: Ok(None),
             payload_end: None,
         }

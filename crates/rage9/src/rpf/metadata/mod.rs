@@ -22,7 +22,7 @@ pub use companion::{Companion, Companions, Status as CompanionStatus};
 pub use entry::{Entry, Field};
 pub(crate) use payload::PayloadSource;
 pub use payload::{Payload, StreamTransform};
-use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource};
+use transform::{Algorithm, Cipher, CipherDescriptor, CipherSource, StreamRange};
 
 mod companion;
 mod entry;
@@ -997,6 +997,30 @@ pub enum StoredPrefixError {
     Unsupported { prefix: u64 },
 }
 
+impl std::fmt::Display for StoredPrefixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoredPrefixError::Overflow => f.write_str("its chunk sizes overflow"),
+            StoredPrefixError::ChunksOverrun {
+                stored_end,
+                stored_len,
+            } => write!(
+                f,
+                "its chunks take {stored_end} stored bytes, more than its {stored_len}"
+            ),
+            StoredPrefixError::PrefixOverrun { prefix, stored_len } => write!(
+                f,
+                "its {prefix}-byte stored prefix does not fit in its {stored_len} stored bytes"
+            ),
+            StoredPrefixError::Unsupported { prefix } => {
+                write!(f, "its chunks leave a {prefix}-byte stored prefix")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoredPrefixError {}
+
 impl ChunkTable {
     /// The bytes stored before chunk 0, from the entry's stored size and the
     /// sum of the chunk stored sizes.
@@ -1249,6 +1273,21 @@ impl Metadata {
                 "the payload transform descriptor of row {row} is {} bytes, shorter than {}",
                 value.len(),
                 CipherDescriptor::LEN
+            ))
+        })
+    }
+
+    /// The stored range the payload transform of `row` covers, from the
+    /// stream fields of the same descriptor. `None` if the row has no
+    /// transform field.
+    pub fn payload_transform_range(&self, row: u32) -> Result<Option<StreamRange>, Error> {
+        let Some(value) = self.field(row, keys::PAYLOAD_TRANSFORM)? else {
+            return Ok(None);
+        };
+        StreamRange::parse(value).map(Some).ok_or_else(|| {
+            invalid(format!(
+                "the payload transform descriptor of row {row} is {} bytes and does not describe a usable stream range",
+                value.len()
             ))
         })
     }

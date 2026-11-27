@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use flate2::{Decompress, FlushDecompress, Status};
 use lforge_binary::Source;
 
-use super::transform::{BLOCK_LEN, BlockDecrypt};
+use super::transform::{BLOCK_LEN, BlockDecrypt, StreamRange};
 use super::{Chunk, ChunkTable, Error, StoredPrefixError, invalid};
 
 /// Stored bytes read per decoder step.
@@ -35,96 +35,79 @@ const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
 /// For reads that cannot be cancelled.
 static NEVER: AtomicBool = AtomicBool::new(false);
 
-/// The verified payload-transform regions, in stored bytes.
-pub(crate) const LEADING: u64 = 2048;
-const BUFFER: u64 = 9216;
-const BUFFER_STEP: u64 = 8192;
-const BUFFER_PREFIX: u64 = 1024;
-
 /// The counter-mode keystream of an authenticated payload transform. The
-/// covered range is the descriptor-dependent partial range or, where the first
-/// zlib chunk verifies it, the whole stored range.
+/// covered range is read from the descriptor's stream fields.
 #[derive(Clone)]
 pub struct StreamTransform {
     parameter: [u8; BLOCK_LEN],
     block: Arc<dyn BlockDecrypt + Send + Sync>,
-    model: StreamModel,
+    range: StreamRange,
+    /// The stored-payload offset where transform coordinate 0 begins. It is
+    /// the stored prefix before the first chunk, so the prefix neither moves
+    /// the counter nor lies in the descriptor's range.
+    base: u64,
+    /// The length of the transformed stream, which the trailing region is
+    /// measured from.
+    stream_len: u64,
 }
 
 impl StreamTransform {
-    pub fn new(parameter: [u8; BLOCK_LEN], block: Arc<dyn BlockDecrypt + Send + Sync>) -> Self {
-        Self {
-            parameter,
-            block,
-            model: StreamModel::Partial,
-        }
-    }
-
-    pub(crate) fn with_model(
+    pub(crate) fn new(
         parameter: [u8; BLOCK_LEN],
         block: Arc<dyn BlockDecrypt + Send + Sync>,
-        model: StreamModel,
+        range: StreamRange,
+        base: u64,
+        stream_len: u64,
     ) -> Self {
         Self {
             parameter,
             block,
-            model,
+            range,
+            base,
+            stream_len,
         }
     }
 
     fn apply(&self, buf: &mut [u8], absolute: u64) {
-        apply_transform(buf, absolute, self.parameter, &*self.block, self.model);
+        let skip = self.base.saturating_sub(absolute).min(buf.len() as u64);
+        let (_, rest) = buf.split_at_mut(skip as usize);
+        let origin = absolute + skip - self.base;
+        apply_transform(
+            rest,
+            origin,
+            self.stream_len,
+            self.parameter,
+            &*self.block,
+            self.range,
+        );
     }
 }
 
-/// Applies the verified payload-transform regions to `buf`, which starts at
-/// `origin` within the entry's stored range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StreamModel {
-    /// The verified first-2048 and later-buffer regions.
-    Partial,
-    /// The whole stored range, used only for a single-chunk stream where the
-    /// verified regions do not verify it.
-    Whole,
-}
-
+/// Applies the payload-transform range to `buf`, which starts at `origin`
+/// within a stream of `stream_len` bytes.
 pub(crate) fn apply_transform(
     buf: &mut [u8],
     origin: u64,
+    stream_len: u64,
     parameter: [u8; BLOCK_LEN],
     block: &dyn BlockDecrypt,
-    model: StreamModel,
+    range: StreamRange,
 ) {
-    if model == StreamModel::Whole {
-        if buf.is_empty() {
-            return;
-        }
-        let end = origin + buf.len() as u64;
-        let first = origin / BLOCK_LEN as u64;
-        let last = (end - 1) / BLOCK_LEN as u64;
-        for index in first..=last {
-            let start = index * BLOCK_LEN as u64;
-            let from = start.max(origin);
-            let to = (start + BLOCK_LEN as u64).min(end);
-            let mut counter = add_be(parameter, index);
-            block.decrypt_block(&mut counter);
-            for offset in from..to {
-                buf[(offset - origin) as usize] ^= counter[(offset - start) as usize];
-            }
-        }
-        return;
-    }
     if buf.is_empty() {
         return;
     }
-    let end = origin + buf.len() as u64;
+    let Some(end) = origin.checked_add(buf.len() as u64) else {
+        return;
+    };
     let first = origin / BLOCK_LEN as u64;
     let last = (end - 1) / BLOCK_LEN as u64;
     for index in first..=last {
         let start = index * BLOCK_LEN as u64;
         let from = start.max(origin);
         let to = (start + BLOCK_LEN as u64).min(end);
-        if !is_transformed(from) {
+        // The engine transforms whole blocks: a block is in or out by its
+        // start, and a partially covered block is transformed as a whole.
+        if !range.covers(start, stream_len) {
             continue;
         }
         let mut counter = add_be(parameter, index);
@@ -141,7 +124,7 @@ impl std::fmt::Debug for StreamTransform {
     }
 }
 
-fn add_be(counter: [u8; BLOCK_LEN], value: u64) -> [u8; BLOCK_LEN] {
+pub(crate) fn add_be(counter: [u8; BLOCK_LEN], value: u64) -> [u8; BLOCK_LEN] {
     let mut out = counter;
     let mut carry = value;
     for byte in out.iter_mut().rev() {
@@ -150,28 +133,6 @@ fn add_be(counter: [u8; BLOCK_LEN], value: u64) -> [u8; BLOCK_LEN] {
         carry = (carry >> 8) + (total >> 8);
     }
     out
-}
-
-pub(crate) fn is_transformed(offset: u64) -> bool {
-    offset < LEADING || (offset >= BUFFER && (offset - BUFFER) % BUFFER_STEP < BUFFER_PREFIX)
-}
-
-/// Whether `[start, end)` holds a byte above the leading region that the
-/// partial rule leaves in plaintext, which the whole-range rule transforms.
-/// Such a verified chunk proves which rule applies.
-pub(crate) fn separates_models(start: u64, end: u64) -> bool {
-    let mut at = start.max(LEADING);
-    while at < end {
-        if !is_transformed(at) {
-            return true;
-        }
-        at = if at < BUFFER {
-            BUFFER
-        } else {
-            BUFFER + (at - BUFFER) / BUFFER_STEP * BUFFER_STEP + BUFFER_PREFIX
-        };
-    }
-    false
 }
 
 /// Stored bytes, with the payload transform applied on read when present.
@@ -717,14 +678,19 @@ mod tests {
     }
 
     fn transform(parameter: [u8; BLOCK_LEN]) -> StreamTransform {
-        StreamTransform::new(parameter, Arc::new(Toy))
+        StreamTransform::new(parameter, Arc::new(Toy), common(), 0, u64::MAX)
+    }
+
+    /// The shape `+0x18 = +0x20 = 0x400`, `+0x28 = 0x1C00`, `+0x30 = 0`.
+    fn common() -> StreamRange {
+        StreamRange::from_parts(0x800, 0x1C00, 0x400, 0x2000, 0).unwrap()
     }
 
     #[test]
     fn transform_covers_only_the_verified_regions() {
         let original = vec![0u8; 30_000];
         let mut data = original.clone();
-        apply_transform(&mut data, 0, [0u8; BLOCK_LEN], &Toy, StreamModel::Partial);
+        apply_transform(&mut data, 0, 30_000, [0u8; BLOCK_LEN], &Toy, common());
         let ranges = [0..2048, 9216..10_240, 17_408..18_432, 25_600..26_624];
         for range in &ranges {
             assert!(
@@ -746,10 +712,31 @@ mod tests {
     fn transform_origin_keeps_the_counter_relative_to_the_entry() {
         let parameter = [0x11; BLOCK_LEN];
         let mut full = vec![0u8; 20_000];
-        apply_transform(&mut full, 0, parameter, &Toy, StreamModel::Partial);
+        apply_transform(&mut full, 0, 20_000, parameter, &Toy, common());
         let mut tail = vec![0u8; 10_784];
-        apply_transform(&mut tail, 9_216, parameter, &Toy, StreamModel::Partial);
+        apply_transform(&mut tail, 9_216, 20_000, parameter, &Toy, common());
         assert_eq!(&tail[..], &full[9_216..]);
+    }
+
+    #[test]
+    fn a_window_starting_inside_a_block_transforms_the_same_bytes() {
+        // Leading region 0x108, then 0x10 bytes every 0x108. A window that
+        // starts at 0x110 begins inside a block whose start 0x100 is covered
+        // and whose in-window position is not: the block still belongs to the
+        // range, because coverage is decided by the block start.
+        let range = StreamRange::from_parts(0x108, 0xF8, 0x10, 0x108, 0).unwrap();
+        let parameter = [0x5A; BLOCK_LEN];
+        let mut full = vec![0u8; 4_096];
+        apply_transform(&mut full, 0, 4_096, parameter, &Toy, range);
+        for origin in [0x100u64, 0x104, 0x110, 0x118, 0x200] {
+            let mut window = vec![0u8; 512];
+            apply_transform(&mut window, origin, 4_096, parameter, &Toy, range);
+            assert_eq!(
+                &window[..],
+                &full[origin as usize..origin as usize + 512],
+                "window at {origin:#x} differs from the full read"
+            );
+        }
     }
 
     #[test]
@@ -764,7 +751,8 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let parameter = [0x33; BLOCK_LEN];
         let mut stored = compressed.clone();
-        apply_transform(&mut stored, 0, parameter, &Toy, StreamModel::Partial);
+        let stored_len = stored.len() as u64;
+        apply_transform(&mut stored, 0, stored_len, parameter, &Toy, common());
 
         let temp = tempfile::NamedTempFile::new().unwrap();
         let mut file = temp.as_file();
@@ -926,7 +914,8 @@ mod tests {
         let b = vec![0xA5u8; 8_000];
         let (ca, cb) = (zlib(&a), zlib(&b));
         let mut stored = [ca.clone(), cb.clone()].concat();
-        apply_transform(&mut stored, 0, parameter, &Toy, StreamModel::Partial);
+        let stored_len = stored.len() as u64;
+        apply_transform(&mut stored, 0, stored_len, parameter, &Toy, common());
         let (_temp, source) = chunk_file(&stored);
         let table = two_chunk_table(&a, &ca, &b, &cb);
         let mut payload = Payload::chunked(

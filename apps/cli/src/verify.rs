@@ -62,6 +62,50 @@ impl Default for Limits {
     }
 }
 
+/// Which stored representation a verification pass selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Storage {
+    Chunked(u8),
+    RawDeflate,
+    Stored,
+}
+
+impl Storage {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "chunked-2" => Storage::Chunked(2),
+            "chunked-3" => Storage::Chunked(3),
+            "chunked-4" => Storage::Chunked(4),
+            "raw-deflate" => Storage::RawDeflate,
+            "stored" => Storage::Stored,
+            _ => return None,
+        })
+    }
+
+    fn matches(self, entry: &Entry) -> bool {
+        let chunks = entry.chunks.as_ref().ok().and_then(|value| value.as_ref());
+        let mode = entry
+            .location
+            .as_ref()
+            .ok()
+            .and_then(|value| value.as_ref())
+            .map(|location| location.mode);
+        match self {
+            Storage::Chunked(encoding) => chunks.is_some_and(|table| table.encoding == encoding),
+            Storage::RawDeflate => chunks.is_none() && mode == Some(1),
+            Storage::Stored => chunks.is_none() && mode == Some(0),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Storage::Chunked(encoding) => format!("chunked-{encoding}"),
+            Storage::RawDeflate => "raw-deflate".to_string(),
+            Storage::Stored => "stored".to_string(),
+        }
+    }
+}
+
 pub struct Options {
     /// An archive, or a directory searched for `.rpf` files.
     pub path: PathBuf,
@@ -72,6 +116,11 @@ pub struct Options {
     pub executable: Option<PathBuf>,
     /// The chunk encoding whose entries are decoded in full.
     pub encoding: u8,
+    /// A stored representation to select instead of `encoding`.
+    pub storage: Option<Storage>,
+    /// Whether to select only rows with, or only rows without, the payload
+    /// transform.
+    pub transform: Option<bool>,
     pub recursive: bool,
     pub limits: Limits,
     pub output: Option<PathBuf>,
@@ -121,6 +170,7 @@ struct Engine<'a> {
     writer: Box<dyn Write>,
     /// `(temporary, target)`, present when writing to a file.
     publish: Option<(PathBuf, PathBuf)>,
+    storage: Storage,
     archives: u64,
     roots: u64,
     entries: u64,
@@ -148,6 +198,9 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
             options.encoding
         ));
     }
+    let storage = options
+        .storage
+        .unwrap_or(Storage::Chunked(options.encoding));
     // An entered archive lives in a temporary file, which must outlive the run.
     let mut entered = None;
     let roots = if options.enters.is_empty() {
@@ -190,6 +243,7 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
         cancel,
         writer,
         publish,
+        storage,
         archives: 0,
         roots: 0,
         entries: 0,
@@ -226,8 +280,9 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
     }
     if engine.tally.failed != 0 {
         return Err(format!(
-            "{} entry/entries of encoding {} could not be decoded; every one is recorded",
-            engine.tally.failed, options.encoding
+            "{} entry/entries of {} could not be decoded; every one is recorded",
+            engine.tally.failed,
+            engine.storage.label()
         ));
     }
     Ok(())
@@ -346,6 +401,17 @@ impl Engine<'_> {
         self.cancel.load(Ordering::Relaxed)
     }
 
+    /// Whether `entry` belongs to the selected storage and transform state.
+    fn selected(&self, entry: &Entry) -> bool {
+        if !self.storage.matches(entry) {
+            return false;
+        }
+        match self.options.transform {
+            None => true,
+            Some(want) => matches!(&entry.payload_transform, Ok(have) if *have == want),
+        }
+    }
+
     /// Flushes the stream and publishes the temporary file under its target.
     fn finish(&mut self) -> Result<(), String> {
         self.writer.flush().map_err(|err| err.to_string())?;
@@ -384,6 +450,8 @@ impl Engine<'_> {
             "root": self.options.path.display().to_string(),
             "archives": roots.iter().map(|root| root.name.clone()).collect::<Vec<_>>(),
             "encoding": self.options.encoding,
+            "storage": self.storage.label(),
+            "transform": self.options.transform,
             "recursive": self.options.recursive,
             "limits": {
                 "max_depth": self.options.limits.max_depth,
@@ -464,7 +532,7 @@ impl Engine<'_> {
             let mut nested_chain = chain.to_vec();
             nested_chain.push(entry.row);
             let selector = selector(name, &nested_chain);
-            if encoding_of(entry) == Some(self.options.encoding) {
+            if self.selected(entry) {
                 self.verify(opened, alternates, entry, &selector, depth)?;
             }
             if !self.options.recursive || depth + 1 >= self.options.limits.max_depth {
@@ -610,22 +678,29 @@ impl Engine<'_> {
                     .sum()
             })
             .unwrap_or(0);
-        let prefix_len = stored_size
-            .map(|stored| stored.saturating_sub(stored_sum))
-            .unwrap_or(0);
+        // Only a chunk table can leave a stored prefix. Without one the
+        // stored bytes are a single stream, not framing.
+        let prefix_len = match (stored_size, chunks) {
+            (Some(stored), Some(_)) => stored.saturating_sub(stored_sum),
+            _ => 0,
+        };
         let prefix = self.read_prefix(entry, opened, alternates, prefix_len);
         let methods: Vec<u8> = chunks
             .map(|chunks| chunks.chunks.iter().map(|chunk| chunk.method).collect())
             .unwrap_or_default();
         Tally::count(&mut self.tally.by_prefix, prefix_len.to_string());
-        Tally::count(
-            &mut self.tally.by_methods,
-            methods
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+        if methods.is_empty() {
+            Tally::count(&mut self.tally.by_methods, "none");
+        } else {
+            Tally::count(
+                &mut self.tally.by_methods,
+                methods
+                    .iter()
+                    .map(u8::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
 
         let mut head = Vec::new();
         let mut hasher = Sha256::new();
@@ -728,6 +803,27 @@ impl Engine<'_> {
             "logical_size": logical_size,
             "mode": mode,
             "transform": matches!(entry.payload_transform, Ok(true)),
+            "transform_descriptor": {
+                "cipher": match &entry.payload_cipher {
+                    Ok(None) => Value::Null,
+                    Ok(Some(cipher)) => json!({
+                        "key_id": format!("0x{:08X}", cipher.key_id),
+                        "type": cipher.kind,
+                    }),
+                    Err(reason) => json!({ "malformed": reason }),
+                },
+                "range": match &entry.payload_range {
+                    Ok(None) => Value::Null,
+                    Ok(Some(range)) => json!({
+                        "leading": range.leading(),
+                        "gap": range.gap(),
+                        "length": range.length(),
+                        "step": range.step(),
+                        "tail": range.tail(),
+                    }),
+                    Err(reason) => json!({ "malformed": reason }),
+                },
+            },
             "read_source": match &entry.read_source {
                 Ok(None) => json!("main"),
                 Ok(Some(index)) => json!(index),
@@ -807,16 +903,6 @@ impl Engine<'_> {
         bytes.truncate(read);
         Some(hex(&bytes))
     }
-}
-
-/// The chunk encoding of a row, from its metadata alone.
-fn encoding_of(entry: &Entry) -> Option<u8> {
-    entry
-        .chunks
-        .as_ref()
-        .ok()
-        .and_then(|value| value.as_ref())
-        .map(|table| table.encoding)
 }
 
 fn selector(archive: &str, chain: &[u32]) -> String {

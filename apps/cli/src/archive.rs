@@ -421,6 +421,14 @@ pub enum Command {
         /// The chunk encoding to decode in full
         #[arg(long, default_value_t = 4)]
         encoding: u8,
+        /// A stored representation to select instead of --encoding
+        #[arg(long, value_name = "STORAGE", value_parser = [
+            "chunked-2", "chunked-3", "chunked-4", "raw-deflate", "stored"
+        ])]
+        storage: Option<String>,
+        /// Only rows with this payload-transform state
+        #[arg(long, value_name = "BOOL")]
+        transform: Option<bool>,
         /// Enter archives stored inside an archive
         #[arg(long)]
         recursive: bool,
@@ -503,6 +511,8 @@ pub fn run(command: Command) -> Result<(), String> {
             enters,
             executable,
             encoding,
+            storage,
+            transform,
             recursive,
             output,
             overwrite,
@@ -520,6 +530,14 @@ pub fn run(command: Command) -> Result<(), String> {
                     enters,
                     executable,
                     encoding,
+                    storage: storage
+                        .as_deref()
+                        .map(|value| {
+                            crate::verify::Storage::parse(value)
+                                .ok_or_else(|| format!("unknown storage {value}"))
+                        })
+                        .transpose()?,
+                    transform,
                     recursive,
                     output,
                     overwrite,

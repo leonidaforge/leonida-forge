@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use lforge_binary::Source;
 
-use super::transform::CipherDescriptor;
+use super::transform::{CipherDescriptor, StreamRange};
 use super::{
     ChunkTable, Error, Location, Metadata, Payload, PayloadSource, StreamTransform, invalid,
 };
@@ -28,6 +28,9 @@ pub struct Entry {
     /// The descriptor the payload transform initializes its cipher with, when
     /// the row carries one.
     pub payload_cipher: Field<CipherDescriptor>,
+    /// The stored range the payload transform covers, from the descriptor's
+    /// stream fields.
+    pub payload_range: Field<StreamRange>,
     /// The alternate source the payload is read through. `None` for the main
     /// source.
     pub read_source: Field<u32>,
@@ -50,6 +53,7 @@ impl Entry {
             location: metadata.location_record(row).map_err(reason),
             name_hash: metadata.name_hash(row).map_err(reason),
             name_key: metadata.name_key(row).map_err(reason),
+            payload_range: metadata.payload_transform_range(row).map_err(reason),
             chunks: metadata.chunk_table(row).map_err(reason),
             payload_transform: metadata.payload_transform(row).map_err(reason),
             payload_cipher: metadata.payload_cipher(row).map_err(reason),

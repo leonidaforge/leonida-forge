@@ -104,6 +104,127 @@ pub fn static_kind(index: u8) -> u16 {
     }
 }
 
+/// The stored range a payload transform covers, from the stream fields of the
+/// entry's transform descriptor.
+///
+/// The descriptor carries four `u64` fields, at `+0x18`, `+0x20`, `+0x28` and
+/// `+0x30`. Writing `a`, `b`, `c` and `t` for those fields, the covered stored
+/// positions of a stream of `len` bytes are
+///
+/// - every position below `a + b`,
+/// - the first `b` bytes of each later buffer, where the buffers start at
+///   `a + b + c` and repeat every `b + c` bytes, and
+/// - the last `t` bytes of the stream.
+///
+/// The `a = 0` shapes cover a contiguous range from 0: `c = 0` makes the
+/// buffers abut. Positions are relative to the first chunk byte, so the
+/// stored 16-byte prefix of encoding 2 is outside the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamRange {
+    leading: u64,
+    gap: u64,
+    length: u64,
+    step: u64,
+    tail: u64,
+}
+
+impl StreamRange {
+    /// The shortest descriptor value that holds all four stream fields.
+    pub const MIN_LEN: usize = 0x38;
+
+    /// `None` when the value is shorter than the stream fields or the fields
+    /// describe no range at all.
+    pub fn parse(value: &[u8]) -> Option<Self> {
+        let a = u64_at(value, 0x18)?;
+        let b = u64_at(value, 0x20)?;
+        let c = u64_at(value, 0x28)?;
+        let t = u64_at(value, 0x30)?;
+        let leading = a.checked_add(b)?;
+        let step = b.checked_add(c)?;
+        if step == 0 {
+            return None;
+        }
+        Some(Self {
+            leading,
+            gap: c,
+            length: b,
+            step,
+            tail: t,
+        })
+    }
+
+    /// Whether the stored position `offset` of a stream of `stream_len` bytes
+    /// is transformed.
+    pub fn covers(&self, offset: u64, stream_len: u64) -> bool {
+        if self.tail != 0 && offset >= stream_len.saturating_sub(self.tail) {
+            return true;
+        }
+        if offset < self.leading {
+            return true;
+        }
+        let Some(after_leading) = offset.checked_sub(self.leading) else {
+            return false;
+        };
+        let Some(from_first) = after_leading.checked_sub(self.gap) else {
+            return false;
+        };
+        from_first % self.step < self.length
+    }
+
+    /// The length of the leading region.
+    pub fn leading(&self) -> u64 {
+        self.leading
+    }
+
+    /// The gap between the leading region and the first later buffer.
+    pub fn gap(&self) -> u64 {
+        self.gap
+    }
+
+    /// The length of each later buffer.
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    /// The distance between later buffer starts.
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    /// The length of the trailing region.
+    pub fn tail(&self) -> u64 {
+        self.tail
+    }
+
+    /// Whether the range covers every stored position.
+    pub fn is_whole(&self) -> bool {
+        self.gap == 0 && self.length == self.step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        leading: u64,
+        gap: u64,
+        length: u64,
+        step: u64,
+        tail: u64,
+    ) -> Option<Self> {
+        (step != 0).then_some(Self {
+            leading,
+            gap,
+            length,
+            step,
+            tail,
+        })
+    }
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let low = u32_at(bytes, offset)?;
+    let high = u32_at(bytes, offset.checked_add(4)?)?;
+    Some(u64::from(low) | (u64::from(high) << 32))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algorithm {
     /// Algorithm 0. Every operation succeeds without touching the data.
