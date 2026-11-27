@@ -59,18 +59,21 @@ impl AssociationCompleteness {
     }
 }
 
-/// Whether the static representation needed a placement transform.
+/// What the decoder can say about the space the authored geometry sits in.
 ///
-/// The decoder never moves geometry by a bone transform. The sampled resources
-/// store vertex positions in the pose the viewer draws, so their skeletons are
-/// presentation metadata. That is recorded here rather than presented as a
-/// supported placement mechanism, and no rule for a bone-local vertex space is
-/// claimed.
+/// The decoder never moves geometry by a bone transform, and no rule for a
+/// bone-local vertex space is claimed. The only positive evidence available is
+/// the box the record itself declares for a geometry: when the decoded vertices
+/// agree with it, the vertices and the record describe the same space. That is
+/// still not proof that no later stage places the geometry, so the verdict names
+/// the comparison rather than a conclusion about placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementCompleteness {
-    /// Geometry is drawn exactly as stored; nothing was placed.
-    NotRequired,
-    /// A required placement is not established for this resource.
+    /// Authored vertices match the box the record declares for every decoded
+    /// geometry. Nothing was placed, and the record agrees with the vertices it
+    /// ships, but a later placement stage is not ruled out.
+    AuthoredGeometryMatchesBounds,
+    /// The stored coordinate space is not established for this resource.
     Unverified { reason: String },
     /// A placement was applied, with the reason recorded.
     Applied { reason: String },
@@ -79,7 +82,9 @@ pub enum PlacementCompleteness {
 impl PlacementCompleteness {
     pub fn name(&self) -> &'static str {
         match self {
-            PlacementCompleteness::NotRequired => "not required",
+            PlacementCompleteness::AuthoredGeometryMatchesBounds => {
+                "authored geometry matches bounds"
+            }
             PlacementCompleteness::Unverified { .. } => "unverified",
             PlacementCompleteness::Applied { .. } => "applied",
         }

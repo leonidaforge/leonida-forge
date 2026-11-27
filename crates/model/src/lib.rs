@@ -168,7 +168,7 @@ pub struct ModelCompleteness {
     pub skeleton: SkeletonCompleteness,
     /// Which bones the primitives reference, where the resource establishes it.
     pub associations: AssociationCompleteness,
-    /// Whether the static representation needed a placement transform.
+    /// What the decoded vertices say about the space they are stored in.
     pub placement: PlacementCompleteness,
     /// System offset of the selected drawable root.
     pub selected_root: usize,
@@ -648,7 +648,7 @@ fn build_scene(
                 bounds_checked - bounds_matched
             ),
         },
-        _ => PlacementCompleteness::NotRequired,
+        _ => PlacementCompleteness::AuthoredGeometryMatchesBounds,
     };
     if bounds_checked > 0 {
         scene.diagnostics.push(Diagnostic::new(format!(

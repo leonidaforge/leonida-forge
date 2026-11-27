@@ -204,8 +204,7 @@ impl ModelViewer {
                             }
                         }
                         match &loaded.completeness.placement {
-                            lforge_model::PlacementCompleteness::NotRequired => {}
-
+                            lforge_model::PlacementCompleteness::AuthoredGeometryMatchesBounds => {}
                             lforge_model::PlacementCompleteness::Unverified { reason } => {
                                 lines.push(format!("Static placement unverified: {reason}"));
                             }
