@@ -51,6 +51,26 @@ pub struct PoseFrame {
     pub influence: bool,
 }
 
+impl PoseFrame {
+    /// The verified reference pose, sent once when pose mode is left so the
+    /// overlay and the joint matrices return to the authored skeleton.
+    pub fn reference(skeleton: &Skeleton) -> Result<Self, PoseError> {
+        let pose = Pose::reference(skeleton);
+        let matrices = SkinningMatrices::build(skeleton, &pose)?;
+        Ok(Self {
+            revision: 0,
+            matrices: matrices.matrices().to_vec(),
+            bone_positions: skeleton
+                .bones
+                .iter()
+                .map(|bone| bone.model_position)
+                .collect(),
+            active: false,
+            influence: false,
+        })
+    }
+}
+
 /// Pose mode state of one viewer. UI-independent so it can be tested without a
 /// window.
 #[derive(Debug, Clone)]

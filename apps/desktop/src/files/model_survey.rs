@@ -1308,3 +1308,221 @@ fn reports_deformation_support() {
         }
     }
 }
+
+/// Renders the verified deformation of one chain to PNG files and compares the
+/// GPU skinning probe with the CPU reference on the same vertices.
+///
+/// Ignored by default. `LF_TEST_CHAIN`, `LF_TEST_GAME_ROOT`,
+/// `LF_TEST_EXECUTABLE` and `LF_TEST_OUTPUT` name the inputs. `LF_TEST_BONE`
+/// selects the posed bone (default: the bone with the largest total weight) and
+/// `LF_TEST_DEGREES` the rotation about model Z (default 40).
+#[test]
+#[ignore = "requires LF_TEST_CHAIN, LF_TEST_GAME_ROOT, LF_TEST_EXECUTABLE and LF_TEST_OUTPUT"]
+fn renders_the_verified_deformation() {
+    use lforge_renderer::{Background, OrbitCamera, Overlay, Renderer, SkinProbeVertex};
+    use lforge_scene::{Pose, SkinningMatrices, deform_primitive};
+
+    let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+    let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+    let chain = std::env::var("LF_TEST_CHAIN").expect("LF_TEST_CHAIN");
+    let output = std::path::PathBuf::from(std::env::var("LF_TEST_OUTPUT").expect("LF_TEST_OUTPUT"));
+    let degrees: f32 = std::env::var("LF_TEST_DEGREES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40.0);
+    let access = Access::with(Arc::new(
+        Executable::open(Path::new(&executable)).expect("executable"),
+    ));
+    let cancel = AtomicBool::new(false);
+    let mut scene =
+        super::tests::load_chain(Path::new(&root), &access, &chain, &cancel).expect("chain");
+    scene.scene.recompute_bounds();
+    let skeleton = scene.scene.skeleton.clone().expect("skeleton");
+    let bones = skeleton.bones.len();
+
+    // The primitive with the widest influence set is the interesting one: it
+    // proves blending rather than a single-bone attachment.
+    let entry = scene
+        .scene
+        .influences
+        .iter()
+        .filter(|entry| entry.influences.deformable())
+        .max_by_key(|entry| {
+            let vertices = scene.scene.meshes[entry.mesh].primitives[entry.primitive]
+                .vertices
+                .len();
+            (entry.influences.max_influences, vertices)
+        })
+        .expect("a deformable primitive");
+    let mesh_index = entry.mesh;
+    let primitive_index = entry.primitive;
+    let mut totals = BTreeMap::<usize, f32>::new();
+    for lanes in &entry.influences.per_vertex {
+        for influence in lanes {
+            if influence.weight > 0.0 {
+                *totals.entry(usize::from(influence.bone)).or_default() += influence.weight;
+            }
+        }
+    }
+    let bone = std::env::var("LF_TEST_BONE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            totals
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(bone, _)| *bone)
+        })
+        .expect("a bone to pose");
+
+    let mut pose = Pose::new(bones);
+    pose.set_rotation(bone, glam::Quat::from_rotation_z(degrees.to_radians()))
+        .expect("rotation");
+    let matrices = SkinningMatrices::build(&skeleton, &pose).expect("matrices");
+    let posed = pose.globals(&skeleton).expect("globals");
+    let positions: Vec<glam::Vec3> = posed.iter().map(|bone| bone.model_position).collect();
+
+    let primitive = &scene.scene.meshes[mesh_index].primitives[primitive_index];
+    let cpu = deform_primitive(primitive, &entry.influences, &matrices).expect("cpu deformation");
+    let mut displacement = 0.0f32;
+    for (index, vertex) in primitive.vertices.iter().enumerate() {
+        displacement = displacement.max(
+            (glam::Vec3::from(cpu.positions[index]) - glam::Vec3::from(vertex.position)).length(),
+        );
+    }
+    let mut moved = 0usize;
+    for (index, vertex) in primitive.vertices.iter().enumerate() {
+        if (glam::Vec3::from(cpu.positions[index]) - glam::Vec3::from(vertex.position)).length()
+            > 1e-6
+        {
+            moved += 1;
+        }
+    }
+    eprintln!(
+        "{chain} {}: pose bone {bone} ({}) {degrees} deg about Z; primitive {mesh_index}/{primitive_index}: {} vertices, {} moved, max displacement {displacement:.6} m, collapsed normals {}",
+        scene.name,
+        skeleton.bones[bone]
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("#{bone}")),
+        primitive.vertices.len(),
+        moved,
+        cpu.collapsed_normals
+    );
+
+    let probe_vertices: Vec<SkinProbeVertex> = primitive
+        .vertices
+        .iter()
+        .zip(&entry.influences.per_vertex)
+        .map(|(vertex, lanes)| {
+            let mut joints = [0u32; 4];
+            let mut weights = [0.0f32; 4];
+            for (lane, influence) in lanes.iter().enumerate() {
+                joints[lane] = u32::from(influence.bone);
+                weights[lane] = influence.weight;
+            }
+            SkinProbeVertex {
+                position: vertex.position,
+                normal: vertex.normal,
+                tangent: vertex.tangent.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                joints,
+                weights,
+                mode: 0,
+            }
+        })
+        .collect();
+
+    let mut renderer = Renderer::new().expect("renderer");
+    let gpu = renderer.upload_scene(&scene.scene).expect("upload");
+    let mut gpu = gpu;
+    let samples = renderer
+        .probe_skinning(matrices.matrices(), &probe_vertices)
+        .expect("probe");
+    let mut worst = 0.0f32;
+    for (index, sample) in samples.iter().enumerate() {
+        worst = worst.max(
+            (glam::Vec3::from(cpu.positions[index]) - glam::Vec3::from(sample.position)).length(),
+        );
+    }
+    eprintln!(
+        "  GPU probe matches the CPU reference on {} vertices, worst error {worst:.3e} m",
+        samples.len()
+    );
+    assert!(
+        worst < 1e-4,
+        "the GPU must match the CPU reference, worst {worst}"
+    );
+
+    let (width, height) = (900u32, 700u32);
+    let reference_bounds = scene.scene.bounds.sanitized();
+    let deformed_bounds = scene
+        .scene
+        .posed_bounds(&pose)
+        .expect("posed bounds")
+        .map_or(reference_bounds, |bounds| bounds.sanitized());
+    let camera = OrbitCamera::framing(
+        reference_bounds.union(deformed_bounds.extend(positions[bone])),
+        width as f32 / height as f32,
+    );
+    std::fs::create_dir_all(&output).expect("output directory");
+
+    renderer
+        .update_pose(&mut gpu, matrices.matrices(), &positions)
+        .expect("pose upload");
+    gpu.set_skeleton_selected(Some(bone));
+    let overlay = Overlay {
+        visible: true,
+        selected: Some(bone),
+        depth_independent: true,
+    };
+    let slug: String = chain
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let names = [
+        "1-authored",
+        "2-posed",
+        "3-posed-overlay",
+        "4-influence-view",
+        "5-reset",
+    ];
+    let reference = Pose::reference(&skeleton);
+    let reference_matrices = SkinningMatrices::build(&skeleton, &reference).expect("reference");
+    let reference_positions: Vec<glam::Vec3> = reference
+        .globals(&skeleton)
+        .expect("reference globals")
+        .iter()
+        .map(|bone| bone.model_position)
+        .collect();
+    let settings = [
+        (false, false, Overlay::NONE),
+        (true, false, Overlay::NONE),
+        (true, false, overlay),
+        (true, true, overlay),
+        (false, false, overlay),
+    ];
+    for (index, (active, view, overlay)) in settings.into_iter().enumerate() {
+        if index == settings.len() - 1 {
+            // The last frame restores the reference skeleton, as leaving pose
+            // mode does in the viewer.
+            renderer
+                .update_pose(
+                    &mut gpu,
+                    reference_matrices.matrices(),
+                    &reference_positions,
+                )
+                .expect("reference upload");
+        }
+        gpu.set_pose_active(active);
+        gpu.set_influence_view(view);
+        let frame = renderer
+            .render_with_overlay(&gpu, &camera, width, height, Background::DARK, overlay)
+            .expect("render");
+        let path = output.join(format!("{slug}-{}.png", names[index]));
+        image::RgbaImage::from_raw(width, height, frame.rgba8().to_vec())
+            .expect("rgba")
+            .save(&path)
+            .expect("write png");
+        eprintln!("  wrote {}", path.display());
+    }
+}

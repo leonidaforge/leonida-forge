@@ -315,6 +315,8 @@ pub struct Viewport {
     /// Pose mode state. `None` keeps the ordinary authored inspection path.
     pose: Option<PoseSession>,
     pose_cache: Option<Arc<PoseFrame>>,
+    /// The reference frame that restores the authored skeleton after pose mode.
+    pose_restore: Option<Arc<PoseFrame>>,
     framed: bool,
     requests: Option<LatestSender<Request>>,
     next_generation: u64,
@@ -366,6 +368,7 @@ impl Viewport {
             selected_bone: None,
             pose: None,
             pose_cache: None,
+            pose_restore: None,
             framed: false,
             requests,
             next_generation: 0,
@@ -517,6 +520,7 @@ impl Viewport {
             .map_or(0, |skeleton| skeleton.bones.len());
         self.pose = Some(PoseSession::new(bones));
         self.pose_cache = None;
+        self.pose_restore = None;
         self.request_frame();
         cx.notify();
     }
@@ -525,6 +529,14 @@ impl Viewport {
     pub fn exit_pose_mode(&mut self, cx: &mut Context<Self>) {
         if self.pose.take().is_some() {
             self.pose_cache = None;
+            // The joint matrices and the overlay lines still hold the last
+            // pose, so one reference frame restores them.
+            self.pose_restore = self
+                .scene
+                .skeleton
+                .as_ref()
+                .and_then(|skeleton| PoseFrame::reference(skeleton).ok())
+                .map(Arc::new);
             self.request_frame();
             cx.notify();
         }
@@ -788,7 +800,7 @@ impl Viewport {
         if self.size.width.0 <= 0 || self.size.height.0 <= 0 {
             return;
         }
-        let pose = self.pose_frame();
+        let pose = self.pose_frame().or_else(|| self.pose_restore.clone());
         let Some(requests) = &self.requests else {
             return;
         };

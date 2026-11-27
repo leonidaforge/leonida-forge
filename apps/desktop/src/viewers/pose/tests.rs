@@ -3,7 +3,7 @@
 use glam::{Quat, Vec3};
 use lforge_scene::{Bone, Skeleton};
 
-use super::{PoseDisplay, PoseSession, ROTATION_STEP_DEGREES, TRANSLATION_STEP};
+use super::{PoseDisplay, PoseFrame, PoseSession, ROTATION_STEP_DEGREES, TRANSLATION_STEP};
 
 fn skeleton(bones: Vec<(Option<usize>, Vec3, Quat)>) -> Skeleton {
     let mut out: Vec<Bone> = Vec::new();
@@ -159,4 +159,14 @@ fn a_rotation_reaches_a_full_turn_without_unbounded_angles() {
     }
     let angle = session.rotation_degrees(0).unwrap()[0];
     assert!((-180.0..=180.0).contains(&angle), "{angle}");
+}
+
+#[test]
+fn the_reference_frame_restores_the_authored_skeleton() {
+    let skeleton = reference_skeleton();
+    let frame = PoseFrame::reference(&skeleton).unwrap();
+    assert!(!frame.active);
+    assert!(!frame.influence);
+    assert_eq!(frame.matrices.len(), skeleton.bones.len());
+    assert_eq!(frame.bone_positions[1], Vec3::new(0.0, 2.0, 0.0));
 }
