@@ -5,6 +5,7 @@ pub mod adat;
 pub mod catalog;
 pub mod dictionary;
 pub mod drawable;
+pub mod drawable_dictionary;
 pub mod edup;
 pub mod fragment;
 pub mod gfx;
