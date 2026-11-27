@@ -633,7 +633,22 @@ impl Engine<'_> {
         let mut status = "decoded";
         let mut error_category = None;
         let mut error_message = None;
-        match entry.payload(&opened.source, alternates) {
+        let opened_payload = || -> Result<_, (String, &'static str)> {
+            if matches!(entry.payload_transform, Ok(true))
+                && let Some(stream) = opened.stream.as_ref()
+            {
+                let transform = stream
+                    .stream_transform(entry, &opened.source, alternates)
+                    .map_err(|err| (format!("row {}: {err}", entry.row), "transform"))?;
+                return entry
+                    .transformed_payload(&opened.source, alternates, transform)
+                    .map_err(|err| (err.to_string(), payload_category(&err)));
+            }
+            entry
+                .payload(&opened.source, alternates)
+                .map_err(|err| (err.to_string(), payload_category(&err)))
+        };
+        match opened_payload() {
             Ok(mut payload) => {
                 let mut buffer = vec![0u8; COPY_BUFFER];
                 loop {
@@ -670,10 +685,10 @@ impl Engine<'_> {
                     ));
                 }
             }
-            Err(err) => {
+            Err((message, category)) => {
                 status = "failed";
-                error_category = Some(payload_category(&err));
-                error_message = Some(err.to_string());
+                error_category = Some(category);
+                error_message = Some(message);
             }
         }
         if status == "decoded" {
