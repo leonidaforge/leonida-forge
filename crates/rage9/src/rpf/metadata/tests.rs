@@ -2277,6 +2277,111 @@ mod decoding {
     }
 
     #[test]
+    fn encoding_4_chunks_start_after_a_stored_prefix_when_the_sizes_leave_one() {
+        let first = data(0x120, 40);
+        let second = data(0x80, 41);
+        let (stored, table, expected) = chunked(4, &[(3, first), (3, second)]);
+        // Without a stored prefix, the chunks start at the payload offset.
+        let (source, entries) =
+            open(&[chunked_spec(stored.clone(), table.clone(), expected.len())]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), expected);
+
+        // A 16-byte stored prefix leaves the chunk sizes 16 bytes short of the
+        // entry's stored size. Only the length is part of the container.
+        let mut prefixed = vec![0u8; 16];
+        prefixed.extend(stored);
+        prefixed[..16].fill(0x5A);
+        let (source, entries) = open(&[chunked_spec(prefixed, table, expected.len())]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_encoding_4_rows_with_an_unknown_stored_prefix() {
+        let (stored, table, expected) = chunked(4, &[(3, data(0x80, 42))]);
+        let mut prefixed = vec![0u8; 32];
+        prefixed.extend(stored);
+        let (source, entries) = open(&[chunked_spec(prefixed, table, expected.len())]);
+        let reason = match entries[0].payload(&source, &[]) {
+            Err(Error::Invalid(reason)) => reason,
+            other => panic!("{:?}", other.map(|p| p.len())),
+        };
+        assert!(reason.contains("32-byte stored prefix"), "{reason}");
+    }
+
+    #[test]
+    fn decodes_encoding_4_with_every_chunk_method_and_a_mid_stream_copy() {
+        let chunks = [
+            (3, data(0x1000, 50)),
+            (0, data(0x30, 51)),
+            (1, data(0x20, 52)),
+            (2, data(0x40, 53)),
+            (3, data(0x2000, 54)),
+            (0, data(0x18, 55)),
+            (3, data(0x400, 56)),
+        ];
+        let (mut stored, table, expected) = chunked(4, &chunks);
+        let mut prefixed = vec![0u8; 16];
+        prefixed.append(&mut stored);
+        let (source, entries) = open(&[chunked_spec(prefixed, table, expected.len())]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), expected);
+    }
+
+    #[test]
+    fn rejects_encoding_4_streams_with_a_bad_checksum() {
+        let original = data(0x2000, 57);
+        let mut stream = zlib(&original);
+        *stream.last_mut().unwrap() ^= 1;
+        let stored_len = stream.len().next_multiple_of(16);
+        let mut stored = vec![0u8; 16];
+        stored.extend_from_slice(&stream);
+        stored.resize(16 + stored_len, 0xA5);
+        let entry = chunk_entry(4, original.len(), stream.len(), stored_len, 3);
+        let table = chunk_value(8, 1, 4, &[entry]);
+        let (source, entries) = open(&[chunked_spec(stored, table, original.len())]);
+        let message = invalid_data(contents(&entries[0], &source));
+        assert!(message.contains("invalid"), "{message}");
+    }
+
+    #[test]
+    fn rejects_truncated_encoding_4_stored_chunks() {
+        let (stored, table, expected) = chunked(4, &[(3, data(0x100, 58)), (3, data(0x80, 59))]);
+        let (source, entries) = open(&[chunked_spec(
+            stored[..stored.len() - 16].to_vec(),
+            table,
+            expected.len(),
+        )]);
+        let reason = match entries[0].payload(&source, &[]) {
+            Err(Error::Invalid(reason)) => reason,
+            other => panic!("{:?}", other.map(|p| p.len())),
+        };
+        assert!(reason.contains("more than its"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_an_encoding_4_chunk_that_produces_excess_output() {
+        let original = data(0x200, 60);
+        let stream = zlib(&original);
+        let stored_len = stream.len().next_multiple_of(16);
+        let mut stored = vec![0u8; 16];
+        stored.extend_from_slice(&stream);
+        stored.resize(16 + stored_len, 0u8);
+        // The chunk declares half the bytes the stream holds.
+        let entry = chunk_entry(4, 0x100, stream.len(), stored_len, 3);
+        let table = chunk_value(8, 1, 4, &[entry]);
+        let (source, entries) = open(&[chunked_spec(stored, table, 0x100)]);
+        let message = invalid_data(contents(&entries[0], &source));
+        assert!(message.contains("more than the declared"), "{message}");
+    }
+
+    #[test]
+    fn decodes_a_short_encoding_4_copy_chunk() {
+        let payload = data(15, 61);
+        let (stored, table, expected) = chunked(4, &[(0, payload)]);
+        let (source, entries) = open(&[chunked_spec(stored, table, expected.len())]);
+        assert_eq!(contents(&entries[0], &source).unwrap(), expected);
+    }
+
+    #[test]
     fn rejects_invalid_encoding_2_streams() {
         let original = data(0x2000, 32);
         let mut stream = zlib(&original);

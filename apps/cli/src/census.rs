@@ -1248,7 +1248,7 @@ const ZLIB_METHOD: u8 = 3;
 /// bytes can be read where they lie. `None` when any chunk is compressed,
 /// padded or shorter than it is stored, and for storage that is not a sequence
 /// of chunks.
-fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
+pub(crate) fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
     if matches!(entry.payload_transform, Ok(true)) {
         return None;
     }
@@ -1278,10 +1278,16 @@ fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
     if logical != location.logical_len {
         return None;
     }
-    let prefix = if table.encoding == 2 {
-        ENCODING_2_PREFIX
-    } else {
-        0
+    // Encoding 2 always starts its chunks after a 16-byte prefix. Encoding 4
+    // stores the same prefix for resource-page payloads and none otherwise,
+    // so what the stored size leaves after the chunks is the prefix.
+    let prefix = match table.encoding {
+        2 => ENCODING_2_PREFIX,
+        4 => location.stored_len.checked_sub(stored)?,
+        _ => 0,
     };
+    if !matches!(prefix, 0 | ENCODING_2_PREFIX) {
+        return None;
+    }
     Some((location.payload_offset.checked_add(prefix)?, stored))
 }

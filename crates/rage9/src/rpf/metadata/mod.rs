@@ -1234,6 +1234,19 @@ impl Metadata {
     /// The chunk table. Its entries are addressed relative to the value and
     /// must lie in the same pool.
     pub fn chunk_table(&self, row: u32) -> Result<Option<ChunkTable>, Error> {
+        let Some((encoding, entries)) = self.chunk_entries(row)? else {
+            return Ok(None);
+        };
+        let chunks = entries
+            .into_iter()
+            .filter_map(|entry| Chunk::decode(entry, encoding))
+            .collect();
+        Ok(Some(ChunkTable { encoding, chunks }))
+    }
+
+    /// The raw `u64` entries of the chunk table, and its encoding. The bit
+    /// fields are decoded by [`Chunk::decode`].
+    pub fn chunk_entries(&self, row: u32) -> Result<Option<(u8, Vec<u64>)>, Error> {
         let Some(column) = self.column(keys::CHUNK_TABLE) else {
             return Ok(None);
         };
@@ -1270,13 +1283,15 @@ impl Metadata {
             .bytes
             .get(start..end)
             .ok_or_else(|| invalid("chunk entries outside the metadata"))?;
-        let chunks = entries
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .filter_map(|entry| Chunk::decode(u64::from_le_bytes(*entry), encoding))
-            .collect();
-        Ok(Some(ChunkTable { encoding, chunks }))
+        Ok(Some((
+            encoding,
+            entries
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|entry| u64::from_le_bytes(*entry))
+                .collect(),
+        )))
     }
 }
 

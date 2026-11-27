@@ -33,8 +33,10 @@ const ZLIB_METHOD: u8 = 3;
 /// chunk table measures only the chunks: on real rows their stored sizes sum
 /// to exactly 16 less than the entry's stored size, and the first zlib stream
 /// starts at offset 16. The prefix's meaning is not established, but its
-/// length is the same on every observed entry. It is skipped only for
-/// encoding 2; encodings 3 and 4 start their chunks at offset 0.
+/// length is the same on every observed entry. Encoding 4 stores the same
+/// prefix for resource-page payloads and none otherwise; there the stored size
+/// leaves the prefix, which is checked against these two lengths. Encoding 3
+/// starts its chunks at offset 0.
 const ENCODING_2_PREFIX: u64 = 16;
 /// Zlib chunks up to this size are kept in memory while they are read.
 /// Larger ones are kept in a temporary file.
@@ -496,11 +498,30 @@ impl Payload {
         table: &ChunkTable,
     ) -> Result<Self, Error> {
         let malformed = |what: String| invalid(format!("entry {row}: {what}"));
-        let prefix = if table.encoding == 2 {
-            ENCODING_2_PREFIX
-        } else {
-            0
+        let sum_stored = table.chunks.iter().try_fold(0u64, |sum, chunk| {
+            sum.checked_add(u64::from(chunk.stored_len))
+        });
+        let sum_stored = sum_stored.ok_or_else(|| malformed("its chunk sizes overflow".into()))?;
+        // Encoding 2 always carries the 16-byte prefix. Encoding 4 carries it
+        // only when the payload is stored as resource pages, so the prefix is
+        // whatever the stored size leaves after the chunks. The observed
+        // lengths are 0 and 16; any other value means the table and the
+        // location record disagree, not that a new prefix exists.
+        let prefix = match table.encoding {
+            2 => ENCODING_2_PREFIX,
+            4 => stored.len().checked_sub(sum_stored).ok_or_else(|| {
+                malformed(format!(
+                    "its chunks take {sum_stored} stored bytes, more than its {}",
+                    stored.len()
+                ))
+            })?,
+            _ => 0,
         };
+        if !matches!(prefix, 0 | ENCODING_2_PREFIX) {
+            return Err(malformed(format!(
+                "its chunks leave a {prefix}-byte stored prefix"
+            )));
+        }
         if prefix > stored.len() {
             return Err(malformed(format!(
                 "its {prefix}-byte stored prefix does not fit in its {} stored bytes",
