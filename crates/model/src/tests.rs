@@ -130,8 +130,15 @@ fn quad_graphics() -> Vec<u8> {
 fn decodes_a_synthetic_quad() {
     let graphics = quad_graphics();
     let mut diagnostics = Vec::new();
-    let primitive = decode_mesh(&graphics, &vertex_buffer(), &index_view(), &mut diagnostics)
-        .expect("quad decodes");
+    let (primitive, influence) = decode_mesh(
+        &graphics,
+        &vertex_buffer(),
+        &index_view(),
+        None,
+        &mut diagnostics,
+    )
+    .expect("quad decodes");
+    assert!(influence.is_none());
     assert_eq!(primitive.vertices.len(), 4);
     assert_eq!(primitive.indices, [0, 1, 2, 0, 2, 3]);
     assert_eq!(primitive.vertices[1].position, [1.0, 0.0, 0.0]);
@@ -149,8 +156,14 @@ fn an_index_outside_the_vertex_buffer_is_dropped() {
     let remap = 0x100 + 0x24 + 3 * 2;
     graphics[remap..remap + 2].copy_from_slice(&99u16.to_le_bytes());
     let mut diagnostics = Vec::new();
-    let primitive = decode_mesh(&graphics, &vertex_buffer(), &index_view(), &mut diagnostics)
-        .expect("one triangle remains");
+    let (primitive, _) = decode_mesh(
+        &graphics,
+        &vertex_buffer(),
+        &index_view(),
+        None,
+        &mut diagnostics,
+    )
+    .expect("one triangle remains");
     assert_eq!(primitive.indices, [0, 1, 2]);
     assert!(diagnostics.iter().any(|d| d.reason.contains("dropped")));
 }

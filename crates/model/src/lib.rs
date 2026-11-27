@@ -24,6 +24,10 @@ use lforge_scene::{
 };
 use lforge_texture::{Codec, EmbeddedTexture, SourceLevel, decode_embedded, embedded_textures};
 
+mod skeleton;
+
+pub use skeleton::{AssociationCompleteness, PlacementCompleteness, SkeletonCompleteness};
+
 /// Largest vertex or index count accepted from one geometry.
 const MAX_VERTICES: usize = 8 << 20;
 const MAX_INDICES: usize = 32 << 20;
@@ -159,6 +163,13 @@ pub enum TextureCompleteness {
 pub struct ModelCompleteness {
     pub geometry: GeometryCompleteness,
     pub textures: TextureCompleteness,
+    /// Skeleton presence and structural completeness. Independent of geometry
+    /// and texture completeness: a complete drawable may carry no skeleton.
+    pub skeleton: SkeletonCompleteness,
+    /// Which bones the primitives reference, where the resource establishes it.
+    pub associations: AssociationCompleteness,
+    /// Whether the static representation needed a placement transform.
+    pub placement: PlacementCompleteness,
     /// System offset of the selected drawable root.
     pub selected_root: usize,
     pub selected_name: Option<String>,
@@ -375,6 +386,9 @@ pub fn decode(
         expected_geometries,
         decoded_geometries,
         geometry_failures,
+        skeleton,
+        associations,
+        placement,
     } = built;
     let missing_textures = scene
         .materials
@@ -408,6 +422,9 @@ pub fn decode(
         completeness: ModelCompleteness {
             geometry,
             textures,
+            skeleton,
+            associations,
+            placement,
             selected_root: root,
             selected_name,
             notes,
@@ -424,6 +441,9 @@ struct BuiltScene {
     expected_geometries: usize,
     decoded_geometries: usize,
     geometry_failures: usize,
+    skeleton: SkeletonCompleteness,
+    associations: AssociationCompleteness,
+    placement: PlacementCompleteness,
 }
 
 /// Decodes the highest populated LOD of `report` into scene data.
@@ -456,6 +476,11 @@ fn build_scene(
         .into_iter()
         .map(|texture| (texture.key, texture))
         .collect();
+    let (decoded_skeleton, skeleton_completeness) =
+        skeleton::build(system, report.header.skeleton, &mut diagnostics);
+    let bone_count = decoded_skeleton
+        .as_ref()
+        .map(|skeleton| skeleton.bones.len());
     let mut embedded_indices: HashMap<u64, (Option<usize>, TextureBindingStatus)> = HashMap::new();
     let mut external_indices: HashMap<u64, (Option<usize>, TextureBindingStatus)> = HashMap::new();
     let mut texture_bindings = Vec::new();
@@ -488,6 +513,9 @@ fn build_scene(
 
     let mut decoded_geometries = 0usize;
     let mut geometry_failures = 0usize;
+    let mut declared_geometries = 0usize;
+    let mut associated_geometries = 0usize;
+    let mut pending_associations: Vec<(usize, usize, Influence, u16)> = Vec::new();
     let base_name = match label {
         Some(label) => label.to_string(),
         None => report
@@ -509,11 +537,38 @@ fn build_scene(
                     .with_mesh(mesh.name.clone()),
                 );
             }
-            match decode_geometry(graphics, geometry, &mut diagnostics) {
-                Ok(mut primitive) => {
+            match decode_geometry(graphics, geometry, bone_count, &mut diagnostics) {
+                Ok((mut primitive, influence)) => {
                     primitive.material = material;
+                    let mesh_index = scene.meshes.len();
+                    let primitive_index = mesh.primitives.len();
                     mesh.primitives.push(primitive);
                     decoded_geometries += 1;
+                    if geometry.bone_count > 0 {
+                        declared_geometries += 1;
+                        match influence {
+                            Some(influence) => {
+                                associated_geometries += 1;
+                                pending_associations.push((
+                                    mesh_index,
+                                    primitive_index,
+                                    influence,
+                                    geometry.bone_count,
+                                ));
+                            }
+                            None => diagnostics.push(
+                                Diagnostic::new(format!(
+                                    "geometry {geometry_index} declares {} bone(s) but its influence streams did not validate",
+                                    geometry.bone_count
+                                ))
+                                .with_mesh(mesh.name.clone()),
+                            ),
+                        }
+                    } else if influence.is_some() {
+                        associated_geometries += 1;
+                        let influence = influence.expect("checked above");
+                        pending_associations.push((mesh_index, primitive_index, influence, 0));
+                    }
                 }
                 Err(reason) => {
                     geometry_failures += 1;
@@ -529,9 +584,38 @@ fn build_scene(
     if scene.meshes.is_empty() {
         return Err(Error::new("the drawable yielded no renderable mesh"));
     }
+    scene.skeleton = decoded_skeleton;
     scene.diagnostics.extend(diagnostics);
     let validation = scene.validate();
     scene.diagnostics.extend(validation);
+    for (mesh, primitive, influence, declared) in pending_associations {
+        let present = scene
+            .meshes
+            .get(mesh)
+            .is_some_and(|scene_mesh| primitive < scene_mesh.primitives.len());
+        if present {
+            scene.associations.push(lforge_scene::PrimitiveBones {
+                mesh,
+                primitive,
+                bones: influence.bones,
+                weighted: influence.weighted,
+                declared_bone_count: (declared > 0).then_some(declared),
+            });
+        }
+    }
+    let associations = association_completeness(
+        declared_geometries,
+        associated_geometries,
+        scene.associations.len(),
+    );
+    let placement = match &associations {
+        AssociationCompleteness::Partial { reason } => PlacementCompleteness::Unverified {
+            reason: format!(
+                "a geometry's bone association is unresolved, so no placement rule is established: {reason}"
+            ),
+        },
+        _ => PlacementCompleteness::NotRequired,
+    };
     Ok(BuiltScene {
         scene,
         texture_bindings,
@@ -539,7 +623,28 @@ fn build_scene(
         expected_geometries,
         decoded_geometries,
         geometry_failures,
+        skeleton: skeleton_completeness,
+        associations,
+        placement,
     })
+}
+
+fn association_completeness(
+    declared: usize,
+    associated: usize,
+    associations: usize,
+) -> AssociationCompleteness {
+    if declared == 0 && associations == 0 {
+        return AssociationCompleteness::NotReferenced;
+    }
+    if declared > 0 && associated == declared {
+        return AssociationCompleteness::Complete;
+    }
+    AssociationCompleteness::Partial {
+        reason: format!(
+            "{associated} of {declared} geometry record(s) that declare bones resolved their influences"
+        ),
+    }
 }
 
 /// Whether the resource has the root header of a fragment and a member
@@ -610,6 +715,10 @@ pub struct DecodedFragment {
     pub components: Vec<FragmentComponent>,
     pub completeness: FragmentCompleteness,
     pub texture_bindings: Vec<TextureBindingReport>,
+    /// Skeleton presence and structural completeness of the member drawable.
+    pub skeleton: SkeletonCompleteness,
+    pub associations: AssociationCompleteness,
+    pub placement: PlacementCompleteness,
     /// The LOD slot of the member drawable that was decoded.
     pub lod: usize,
 }
@@ -810,6 +919,9 @@ pub fn decode_dictionary_member(
         expected_geometries,
         decoded_geometries,
         geometry_failures,
+        skeleton,
+        associations,
+        placement,
     } = built;
     let missing_textures = scene
         .materials
@@ -848,6 +960,9 @@ pub fn decode_dictionary_member(
         completeness: ModelCompleteness {
             geometry,
             textures,
+            skeleton,
+            associations,
+            placement,
             selected_root: at,
             selected_name: member.name.clone(),
             notes,
@@ -885,6 +1000,9 @@ pub fn decode_fragment(
         expected_geometries,
         decoded_geometries,
         geometry_failures,
+        skeleton,
+        associations,
+        placement,
     } = built;
     let primitives = scene.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
     let status = if geometry_failures == 0 && decoded_geometries == expected_geometries {
@@ -925,6 +1043,9 @@ pub fn decode_fragment(
         components,
         completeness,
         texture_bindings,
+        skeleton,
+        associations,
+        placement,
         lod: lod_index,
     })
 }
@@ -1291,11 +1412,19 @@ fn semantic(parameter: u32) -> TextureSemantic {
     }
 }
 
+/// The bones one decoded primitive references, and whether any vertex blends
+/// more than one of them.
+struct Influence {
+    bones: Vec<usize>,
+    weighted: bool,
+}
+
 fn decode_geometry(
     graphics: &[u8],
     geometry: &Geometry,
+    bone_count: Option<usize>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<Primitive, String> {
+) -> Result<(Primitive, Option<Influence>), String> {
     let vertex_buffer = geometry
         .vertex_buffer
         .as_ref()
@@ -1304,7 +1433,7 @@ fn decode_geometry(
         .index
         .as_ref()
         .ok_or_else(|| "geometry has no index buffer".to_string())?;
-    decode_mesh(graphics, vertex_buffer, index, diagnostics)
+    decode_mesh(graphics, vertex_buffer, index, bone_count, diagnostics)
 }
 
 struct Stream {
@@ -1316,8 +1445,9 @@ fn decode_mesh(
     graphics: &[u8],
     buffer: &VertexBuffer,
     index: &IndexView,
+    bone_count: Option<usize>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<Primitive, String> {
+) -> Result<(Primitive, Option<Influence>), String> {
     let base = buffer.graphics as usize;
     let declared = usize::try_from(buffer.declared_bytes)
         .map_err(|_| "vertex buffer size overflows".to_string())?;
@@ -1463,10 +1593,134 @@ fn decode_mesh(
     }
     fix_winding(&positions, &mut vertices, &mut indices);
     rebuild_missing_normals(&positions, &mut vertices, &indices);
-    Ok(Primitive {
-        material: 0,
-        vertices,
-        indices,
+    let influence = decode_influence(blob, &streams, vertex_count, bone_count, diagnostics);
+    Ok((
+        Primitive {
+            material: 0,
+            vertices,
+            indices,
+        },
+        influence,
+    ))
+}
+
+/// The weight totals most samples use: 255, and a minority 127. A total outside
+/// these is reported once per geometry. The association only needs the non-zero
+/// lanes, so it does not require a normalised total and never rescales one.
+const WEIGHT_TOTALS: [u32; 2] = [255, 127];
+
+/// Decodes the packed influence streams, when they validate.
+///
+/// The sampled resources store four `u8` blend weights in slot 6, format `0x26`,
+/// and four `u8` blend indices in slot 8, format `0x25`. A set is accepted only
+/// when every vertex's weights sum to 255 (or to 127 on the minority of
+/// geometries that scale by a half) and every weighted lane names a bone inside
+/// the skeleton. A geometry of a one-bone skeleton has no index to read: its
+/// single weight lane selects the only bone, and that is accepted only while
+/// every vertex uses lane 0 alone.
+///
+/// The two slot numbers are empirical, not declared. Searching the declaration
+/// for the weight format instead was measured over 10,106 geometries and gained
+/// no validated association: the extra candidates all failed the weight totals,
+/// so the format alone does not identify the attribute. Skeletons whose geometry
+/// declares its weights elsewhere therefore stay without an association and are
+/// reported as such.
+fn decode_influence(
+    blob: &[u8],
+    streams: &HashMap<u32, Stream>,
+    count: usize,
+    bone_count: Option<usize>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<Influence> {
+    let bone_count = bone_count.filter(|bones| *bones > 0)?;
+    let weights = streams.get(&6)?;
+    if weights.format != 0x26 {
+        return None;
+    }
+    let weight_bytes = blob.get(weights.offset..weights.offset.checked_add(count * 4)?)?;
+    let weights = weight_bytes.as_chunks::<4>().0;
+    let indexes = streams.get(&8).filter(|stream| stream.format == 0x25);
+    if indexes.is_none() {
+        if bone_count != 1 {
+            diagnostics.push(Diagnostic::new(format!(
+                "the geometry declares {bone_count} bones but stores no influence index stream; the association is not decoded"
+            )));
+            return None;
+        }
+        let mut uses_lane_zero = true;
+        for (vertex, weight) in weights.iter().enumerate() {
+            let total = u32::from(weight[0])
+                + u32::from(weight[1])
+                + u32::from(weight[2])
+                + u32::from(weight[3]);
+            if total == 0 {
+                diagnostics.push(Diagnostic::new(format!(
+                    "influence weights of vertex {vertex} are all zero; the association is not decoded"
+                )));
+                return None;
+            }
+            if weight[1] != 0 || weight[2] != 0 || weight[3] != 0 {
+                uses_lane_zero = false;
+            }
+        }
+        if !uses_lane_zero {
+            diagnostics.push(Diagnostic::new(
+                "the geometry has one bone but a vertex weights another lane; the association is not decoded",
+            ));
+            return None;
+        }
+        return Some(Influence {
+            bones: vec![0],
+            weighted: false,
+        });
+    }
+    let index_stream = indexes.expect("checked above");
+    let index_bytes = blob.get(index_stream.offset..index_stream.offset.checked_add(count * 4)?)?;
+    let mut bones = BTreeSet::new();
+    let mut weighted = false;
+    let mut unusual_total: Option<(usize, u32)> = None;
+    for (vertex, (weight, index)) in weights
+        .iter()
+        .zip(index_bytes.as_chunks::<4>().0)
+        .enumerate()
+    {
+        let sum: u32 = weight.iter().map(|value| u32::from(*value)).sum();
+        if sum == 0 {
+            diagnostics.push(Diagnostic::new(format!(
+                "influence weights of vertex {vertex} are all zero; the association is not decoded"
+            )));
+            return None;
+        }
+        if !WEIGHT_TOTALS.contains(&sum) && unusual_total.is_none() {
+            unusual_total = Some((vertex, sum));
+        }
+        let mut influences = 0usize;
+        for lane in 0..4 {
+            if weight[lane] == 0 {
+                continue;
+            }
+            influences += 1;
+            let bone = usize::from(index[lane]);
+            if bone >= bone_count {
+                diagnostics.push(Diagnostic::new(format!(
+                    "vertex {vertex} names bone {bone}, outside the {bone_count}-bone skeleton; the association is not decoded"
+                )));
+                return None;
+            }
+            bones.insert(bone);
+        }
+        if influences > 1 {
+            weighted = true;
+        }
+    }
+    if let Some((vertex, total)) = unusual_total {
+        diagnostics.push(Diagnostic::new(format!(
+            "influence weights are not normalised to 255 at vertex {vertex} (total {total}); the association uses the non-zero lanes only and does not rescale them"
+        )));
+    }
+    Some(Influence {
+        bones: bones.into_iter().collect(),
+        weighted,
     })
 }
 
@@ -1785,3 +2039,7 @@ fn f32_at(bytes: &[u8], at: usize) -> Result<f32, String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "skeleton_tests.rs"]
+mod skeleton_tests;

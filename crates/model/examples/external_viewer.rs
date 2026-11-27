@@ -1,19 +1,25 @@
 //! An external consumer of the model, texture and renderer crates.
 //!
 //! This example does not use the desktop application or GPUI. It loads one
-//! extracted native drawable resource, resolves its external textures from a
-//! game installation's `.ttpf` stores, reports completeness, renders RGBA8
-//! images at two sizes, and renders once into a GPU target without readback.
+//! extracted native drawable or fragment resource, resolves its external
+//! textures from a game installation's `.ttpf` stores, reports skeleton,
+//! association and placement completeness, renders RGBA8 images at two sizes,
+//! and renders once into a GPU target without readback.
 //!
 //! Usage:
 //!   cargo run -p lforge-model --example external_viewer -- \
-//!     <resource.bin> <game-root> <output.png>
+//!     <resource.bin> <game-root> <output.png> [system-length] \
+//!     [--skeleton <overlay.png>] [--bones-only <only.png>]
+//!
+//! `system-length` is the caller's resource layout information; without it the
+//! boundary is inferred. The two optional images are written only where the
+//! caller names them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lforge_model::{self as model, TextureProvider, TextureReference, TextureResolution};
-use lforge_renderer::{Background, OrbitCamera, Renderer};
+use lforge_renderer::{Background, OrbitCamera, Overlay, Renderer};
 use lforge_texture::StoreSet;
 
 struct Stores(Arc<StoreSet>);
@@ -75,10 +81,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resource = PathBuf::from(args.next().ok_or("missing resource path")?);
     let game_root = PathBuf::from(args.next().ok_or("missing game root")?);
     let output = PathBuf::from(args.next().ok_or("missing output png")?);
-    let exact_system_len = args
-        .next()
-        .map(|value| value.to_string_lossy().parse::<usize>())
-        .transpose()?;
+    let mut exact_system_len = None;
+    let mut skeleton_output = None;
+    let mut bones_only_output = None;
+    while let Some(argument) = args.next() {
+        let argument = argument.to_string_lossy().into_owned();
+        match argument.as_str() {
+            "--skeleton" => {
+                skeleton_output =
+                    Some(PathBuf::from(args.next().ok_or("--skeleton needs a path")?));
+            }
+            "--bones-only" => {
+                bones_only_output = Some(PathBuf::from(
+                    args.next().ok_or("--bones-only needs a path")?,
+                ));
+            }
+            other => {
+                if exact_system_len.is_some() {
+                    return Err(format!("unexpected argument {other}").into());
+                }
+                let value = match other
+                    .strip_prefix("0x")
+                    .or_else(|| other.strip_prefix("0X"))
+                {
+                    Some(hex) => usize::from_str_radix(hex, 16)?,
+                    None => other.parse::<usize>()?,
+                };
+                exact_system_len = Some(value);
+            }
+        }
+    }
 
     let bytes = std::fs::read(&resource)?;
     let (split, exact) = match exact_system_len {
@@ -158,6 +190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             model::ModelCompleteness {
                 geometry,
                 textures,
+                skeleton: fragment.skeleton.clone(),
+                associations: fragment.associations.clone(),
+                placement: fragment.placement.clone(),
                 selected_root: fragment.report.header.drawable as usize,
                 selected_name: fragment.report.name().map(str::to_string),
                 notes: Vec::new(),
@@ -184,6 +219,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("geometry: {:?}", completeness.geometry);
     println!("textures: {:?}", completeness.textures);
+    println!("skeleton: {:?}", completeness.skeleton);
+    println!("bone associations: {:?}", completeness.associations);
+    println!("static placement: {:?}", completeness.placement);
+    match scene.skeleton.as_ref() {
+        Some(skeleton) => {
+            println!(
+                "bones: {} ({} named), {} root(s), depth {}",
+                skeleton.bones.len(),
+                skeleton
+                    .bones
+                    .iter()
+                    .filter(|bone| bone.name.is_some())
+                    .count(),
+                skeleton.roots.len(),
+                skeleton.max_depth
+            );
+            println!(
+                "inverse-bind records: {}",
+                skeleton
+                    .bones
+                    .iter()
+                    .filter(|bone| bone.inverse_bind.is_some())
+                    .count()
+            );
+            for bone in skeleton.bones.iter().take(16) {
+                println!(
+                    "  bone {} name {:?} parent {:?} model position {:?} local translation {:?}",
+                    bone.index, bone.name, bone.parent, bone.model_position, bone.local_translation
+                );
+            }
+            if skeleton.bones.len() > 16 {
+                println!("  ... {} more", skeleton.bones.len() - 16);
+            }
+        }
+        None => println!("bones: none"),
+    }
+    for association in &scene.associations {
+        println!(
+            "association: mesh {} primitive {} bones {:?} weighted {} declared {:?}",
+            association.mesh,
+            association.primitive,
+            association.bones,
+            association.weighted,
+            association.declared_bone_count
+        );
+    }
     println!(
         "texture bindings: {} total, {} unresolved, {} embedded",
         texture_bindings.len(),
@@ -237,6 +318,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let again = renderer.render(&gpu, &camera, 1280, 720, Background::DARK)?;
     assert_eq!(again.pixels, frame.pixels, "repeated rendering is stable");
     println!("repeated rendering: stable");
+
+    if let Some(path) = skeleton_output {
+        let overlay = renderer.render_with_overlay(
+            &gpu,
+            &camera,
+            1280,
+            720,
+            Background::DARK,
+            Overlay::skeleton(None, true),
+        )?;
+        save_rgba(&path, overlay.width, overlay.height, &overlay.pixels)?;
+        println!("wrote skeleton overlay {}", path.display());
+    }
+    if let Some(path) = bones_only_output {
+        let mut skeleton_scene = renderer.upload_scene(&scene)?;
+        skeleton_scene.set_skeleton_visible(true);
+        for mesh in 0..scene.meshes.len() {
+            skeleton_scene.set_mesh_visible(mesh, false);
+        }
+        let bounds = scene.skeleton_bounds().unwrap_or(scene.bounds);
+        let camera = OrbitCamera::framing(bounds, 16.0 / 9.0);
+        let only = renderer.render(&skeleton_scene, &camera, 1280, 720, Background::DARK)?;
+        save_rgba(&path, only.width, only.height, &only.pixels)?;
+        println!("wrote skeleton-only view {}", path.display());
+    }
     Ok(())
 }
 
