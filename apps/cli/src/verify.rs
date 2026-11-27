@@ -83,13 +83,15 @@ impl Storage {
     }
 
     fn matches(self, entry: &Entry) -> bool {
-        let chunks = entry.chunks.as_ref().ok().and_then(|value| value.as_ref());
-        let mode = entry
-            .location
-            .as_ref()
-            .ok()
-            .and_then(|value| value.as_ref())
-            .map(|location| location.mode);
+        let chunks = match &entry.chunks {
+            Ok(value) => value.as_ref(),
+            Err(_) => return false,
+        };
+        let mode = match &entry.location {
+            Ok(Some(location)) => Some(location.mode),
+            Ok(None) => None,
+            Err(_) => return false,
+        };
         match self {
             Storage::Chunked(encoding) => chunks.is_some_and(|table| table.encoding == encoding),
             Storage::RawDeflate => chunks.is_none() && mode == Some(1),
@@ -678,10 +680,11 @@ impl Engine<'_> {
                     .sum()
             })
             .unwrap_or(0);
-        // Only a chunk table can leave a stored prefix. Without one the
-        // stored bytes are a single stream, not framing.
+        // The stored-prefix rule is the decoder's, so the report cannot drift
+        // from what a read does with the same row. Without a chunk table the
+        // stored bytes are one stream and there is no prefix.
         let prefix_len = match (stored_size, chunks) {
-            (Some(stored), Some(_)) => stored.saturating_sub(stored_sum),
+            (Some(stored), Some(table)) => table.stored_prefix(stored).unwrap_or(0),
             _ => 0,
         };
         let prefix = self.read_prefix(entry, opened, alternates, prefix_len);
