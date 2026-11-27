@@ -267,3 +267,144 @@ fn an_unreadable_root_is_a_failure_record() {
     assert_eq!(summary["entries"], 0);
     assert_eq!(summary["failures"].as_array().unwrap().len(), 1);
 }
+
+/// The journal lines written so far.
+fn journal(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a journal record"))
+        .collect()
+}
+
+fn journalled(path: &Path, identity: &str) -> Vec<String> {
+    let journal = path.to_str().unwrap().to_string();
+    let identity = identity.to_string();
+    vec![
+        "--journal".to_string(),
+        journal,
+        "--journal-identity".to_string(),
+        identity,
+    ]
+}
+
+fn with(journal: &[String], extra: &[&str]) -> Vec<String> {
+    let mut all = journal.to_vec();
+    all.extend(extra.iter().map(|value| value.to_string()));
+    all
+}
+
+fn strings(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn a_journalled_archive_is_not_counted_twice() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(
+        temp.path(),
+        "resumed.rpf",
+        &assemble(&[spec(&psin()), spec(&resource())], &[]),
+    );
+    let log = temp.path().join("run.journal.jsonl");
+    let args = journalled(&log, "run-1");
+
+    let first = records(&census(&path, &strings(&with(&args, &[]))));
+    let second = records(&census(&path, &strings(&with(&args, &[]))));
+    assert_eq!(summary(&first)["entries"], 2);
+    assert_eq!(summary(&second)["entries"], 2);
+    assert_eq!(summary(&first)["resumed_archives"], 0);
+    assert_eq!(summary(&second)["resumed_archives"], 1);
+    assert_eq!(
+        summary(&first)["combinations"],
+        summary(&second)["combinations"]
+    );
+
+    let lines = journal(&log);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["complete"], true);
+    assert_eq!(lines[0]["archive"], "resumed.rpf");
+    assert_eq!(lines[0]["tally"]["entries"], 2);
+}
+
+#[test]
+fn a_journal_from_another_identity_is_not_this_run_progress() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(
+        temp.path(),
+        "crossed.rpf",
+        &assemble(&[spec(&psin()), spec(&resource())], &[]),
+    );
+    let log = temp.path().join("run.journal.jsonl");
+
+    let first = census(&path, &strings(&journalled(&log, "build-a")));
+    let second = census(&path, &strings(&journalled(&log, "build-b")));
+    // A different identity means the archive is walked again, and counted
+    // once: the earlier record is not this run's progress.
+    assert_eq!(first.stdout, second.stdout);
+    let lines = journal(&log);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["identity"], "build-b");
+}
+
+#[test]
+fn an_archive_that_stopped_short_is_walked_again() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(
+        temp.path(),
+        "short.rpf",
+        &assemble(&[spec(&psin()), spec(&resource())], &[]),
+    );
+    let log = temp.path().join("run.journal.jsonl");
+    let args = journalled(&log, "run-1");
+
+    let stopped = records(&census(
+        &path,
+        &strings(&with(&args, &["--max-entries", "1"])),
+    ));
+    assert_eq!(summary(&stopped)["stopped"], "max_entries");
+    assert_eq!(journal(&log)[0]["complete"], false);
+
+    // The same run continues with room to finish: the partial record is not
+    // reused as a completed archive.
+    let resumed = records(&census(&path, &strings(&with(&args, &[]))));
+    assert_eq!(summary(&resumed)["entries"], 2);
+    assert_eq!(summary(&resumed)["stopped"], Value::Null);
+    assert_eq!(journal(&log).last().unwrap()["complete"], true);
+}
+
+#[test]
+fn a_finished_nested_archive_survives_an_interrupted_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let inner = assemble(&[spec(&psin()), spec(&psin())], &[]);
+    let mut archive_row = spec(&inner);
+    archive_row.type_id = 0;
+    let path = write(
+        temp.path(),
+        "nested.rpf",
+        &assemble(&[archive_row, spec(&psin()), spec(&resource())], &[]),
+    );
+    let log = temp.path().join("run.journal.jsonl");
+    let args = journalled(&log, "run-1");
+
+    // The nested archive finishes, then the entry limit stops the root.
+    let stopped = records(&census(
+        &path,
+        &strings(&with(&args, &["--recursive", "--max-entries", "4"])),
+    ));
+    assert_eq!(summary(&stopped)["stopped"], "max_entries");
+    assert_eq!(summary(&stopped)["entries"], 4);
+    let names: Vec<String> = journal(&log)
+        .iter()
+        .map(|line| line["archive"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["nested.rpf!0", "nested.rpf"]);
+    assert_eq!(journal(&log)[0]["complete"], true);
+    assert_eq!(journal(&log)[1]["complete"], false);
+
+    // The resumed run reuses the finished nested archive and finishes the
+    // root: five rows in total, each counted once.
+    let resumed = records(&census(&path, &strings(&with(&args, &["--recursive"]))));
+    assert_eq!(summary(&resumed)["entries"], 5);
+    assert_eq!(summary(&resumed)["archives"], 2);
+}

@@ -8,6 +8,7 @@
 //! its bytes are stored as they are and through temporary storage otherwise.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -75,6 +76,11 @@ pub struct Options {
     /// Where to write the census. Defaults to standard output.
     pub output: Option<PathBuf>,
     pub overwrite: bool,
+    /// A journal that records each completed archive, so an interrupted run
+    /// resumes without counting an archive twice. The identity string binds the
+    /// journal to one build, mode, rule set and set of limits.
+    pub journal: Option<PathBuf>,
+    pub journal_identity: String,
 }
 
 /// One counted combination of entry properties.
@@ -87,14 +93,44 @@ struct Key {
     variant: String,
     storage: String,
     transform: bool,
-    payload: &'static str,
-    confidence: &'static str,
-    capability: &'static str,
+    payload: String,
+    structure: String,
+    capability: String,
     extension: String,
 }
 
+impl Key {
+    fn to_json(&self) -> Value {
+        json!({
+            "type": self.entry_type,
+            "identification": self.identification,
+            "variant": self.variant,
+            "storage": self.storage,
+            "transform": self.transform,
+            "payload": self.payload,
+            "structure": self.structure,
+            "capability": self.capability,
+            "extension": self.extension,
+        })
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            entry_type: value["type"].as_u64().and_then(|id| u8::try_from(id).ok()),
+            identification: value["identification"].as_str()?.to_string(),
+            variant: value["variant"].as_str()?.to_string(),
+            storage: value["storage"].as_str()?.to_string(),
+            transform: value["transform"].as_bool()?,
+            payload: value["payload"].as_str()?.to_string(),
+            structure: value["structure"].as_str()?.to_string(),
+            capability: value["capability"].as_str()?.to_string(),
+            extension: value["extension"].as_str()?.to_string(),
+        })
+    }
+}
+
 /// What one combination has seen.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct Bucket {
     entries: u64,
     /// Every archive the combination was seen in, for the exact count.
@@ -104,13 +140,179 @@ struct Bucket {
     samples: Vec<Value>,
 }
 
+impl Bucket {
+    fn to_json(&self) -> Value {
+        json!({
+            "entries": self.entries,
+            "archive_count": self.archive_count.iter().collect::<Vec<_>>(),
+            "archives": self.archives.iter().collect::<Vec<_>>(),
+            "samples": self.samples,
+        })
+    }
+
+    fn from_json(value: &Value) -> Option<Self> {
+        let list = |key: &str| -> Vec<String> {
+            value[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        };
+        Some(Self {
+            entries: value["entries"].as_u64()?,
+            archive_count: list("archive_count").into_iter().collect(),
+            archives: list("archives").into_iter().collect(),
+            samples: value["samples"].as_array().cloned().unwrap_or_default(),
+        })
+    }
+}
+
+/// The per-entry counters of one archive, before they are folded into the run.
+#[derive(Debug, Clone, Default)]
+struct Tally {
+    entries: u64,
+    probed: u64,
+    decoded: u64,
+    undecoded: u64,
+    structures: u64,
+    containers: u64,
+    declared: u64,
+    unresolved: u64,
+}
+
+impl Tally {
+    fn to_json(&self) -> Value {
+        json!({
+            "entries": self.entries,
+            "probed": self.probed,
+            "decoded": self.decoded,
+            "undecoded": self.undecoded,
+            "structures": self.structures,
+            "containers": self.containers,
+            "declared": self.declared,
+            "unresolved": self.unresolved,
+        })
+    }
+
+    fn from_json(value: &Value) -> Self {
+        let number = |key: &str| value[key].as_u64().unwrap_or(0);
+        Self {
+            entries: number("entries"),
+            probed: number("probed"),
+            decoded: number("decoded"),
+            undecoded: number("undecoded"),
+            structures: number("structures"),
+            containers: number("containers"),
+            declared: number("declared"),
+            unresolved: number("unresolved"),
+        }
+    }
+}
+
+/// A journal of completed archives.
+///
+/// Each line is one archive's contribution, written and flushed before the run
+/// moves on, so an interruption loses at most the archive in flight. A line
+/// that carries a different identity is ignored: a journal from another build,
+/// scan mode, rule set or limit set is not this run's progress.
+struct Journal {
+    path: PathBuf,
+    identity: String,
+    done: BTreeMap<String, (Vec<(Key, Bucket)>, Tally)>,
+}
+
+impl Journal {
+    fn open(path: &Path, identity: &str) -> Self {
+        let mut done: BTreeMap<String, (Vec<(Key, Bucket)>, Tally)> = BTreeMap::new();
+        if let Ok(text) = fs::read_to_string(path) {
+            for line in text.lines() {
+                let Ok(record) = serde_json::from_str::<Value>(line) else {
+                    // A truncated last line is an interrupted write, not a
+                    // result.
+                    continue;
+                };
+                if record["identity"].as_str() != Some(identity) {
+                    continue;
+                }
+                let Some(chain) = record["archive"].as_str() else {
+                    continue;
+                };
+                // A record without its tally is unusable: the archive's rows
+                // would be counted but its entries would not. A record from a
+                // run that stopped mid-archive describes work that did not
+                // finish, so the archive is walked again.
+                if !record["tally"].is_object() || record["complete"].as_bool() != Some(true) {
+                    continue;
+                }
+                let tally = Tally::from_json(&record["tally"]);
+                let mut rows = Vec::new();
+                for row in record["rows"].as_array().into_iter().flatten() {
+                    let (Some(key), Some(bucket)) =
+                        (Key::from_json(&row["key"]), Bucket::from_json(row))
+                    else {
+                        continue;
+                    };
+                    rows.push((key, bucket));
+                }
+                done.insert(chain.to_string(), (rows, tally));
+            }
+        }
+        Self {
+            path: path.to_path_buf(),
+            identity: identity.to_string(),
+            done,
+        }
+    }
+
+    fn rows(&self, chain: &str) -> Option<&(Vec<(Key, Bucket)>, Tally)> {
+        self.done.get(chain)
+    }
+
+    /// Appends and flushes one archive's contribution.
+    fn append(
+        &self,
+        chain: &str,
+        buckets: &BTreeMap<Key, Bucket>,
+        tally: &Tally,
+        complete: bool,
+    ) -> Result<(), String> {
+        let mut rows = Vec::new();
+        for (key, bucket) in buckets {
+            let mut row = bucket.to_json();
+            row["key"] = key.to_json();
+            rows.push(row);
+        }
+        let record = json!({
+            "identity": self.identity,
+            "archive": chain,
+            "complete": complete,
+            "tally": tally.to_json(),
+            "rows": rows,
+        });
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|err| format!("cannot open the journal: {err}"))?;
+        writeln!(file, "{record}").map_err(|err| format!("cannot write the journal: {err}"))?;
+        file.flush()
+            .map_err(|err| format!("cannot flush the journal: {err}"))?;
+        file.sync_data()
+            .map_err(|err| format!("cannot sync the journal: {err}"))
+    }
+}
+
 struct Engine<'a> {
     options: &'a Options,
     cancel: &'a AtomicBool,
+    journal: Option<Journal>,
     archives: u64,
+    resumed: u64,
     roots_opened: u64,
     entries: u64,
     spooled: u64,
+    probed: u64,
     decoded: u64,
     undecoded: u64,
     structures: u64,
@@ -130,10 +332,16 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
     let mut engine = Engine {
         options,
         cancel,
+        journal: options
+            .journal
+            .as_ref()
+            .map(|path| Journal::open(path, &options.journal_identity)),
         archives: 0,
+        resumed: 0,
         roots_opened: 0,
         entries: 0,
         spooled: 0,
+        probed: 0,
         decoded: 0,
         undecoded: 0,
         structures: 0,
@@ -279,11 +487,28 @@ impl Engine<'_> {
             self.stop("cancelled");
             return Ok(());
         }
+        // An archive already journalled by this run contributes its recorded
+        // rows instead of being walked again.
+        let recorded = self
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.rows(name))
+            .cloned();
+        if let Some((rows, tally)) = recorded {
+            for (key, bucket) in &rows {
+                self.apply(key, bucket);
+            }
+            self.fold(&tally);
+            self.resumed += 1;
+            return Ok(());
+        }
+        let mut buckets: BTreeMap<Key, Bucket> = BTreeMap::new();
+        let mut tally = Tally::default();
         let rows: Vec<Entry> = opened.metadata.entries().collect();
         for entry in &rows {
-            if self.entries >= self.options.limits.max_entries {
+            if self.entries + tally.entries >= self.options.limits.max_entries {
                 self.stop("max_entries");
-                return Ok(());
+                break;
             }
             if self.cancelled() {
                 self.stop("cancelled");
@@ -310,11 +535,13 @@ impl Engine<'_> {
             } else {
                 classify::classify_entry_with_evidence(entry, None, &context)
             };
-            self.entries += 1;
             let mut nested_chain = chain.to_vec();
             nested_chain.push(entry.row);
             let selector = selector(name, &nested_chain);
-            self.count(
+            Self::count(
+                &mut buckets,
+                &mut tally,
+                self.options.samples,
                 &classification,
                 name,
                 &selector,
@@ -345,7 +572,7 @@ impl Engine<'_> {
             }
             if self.archives >= self.options.limits.max_archives {
                 self.stop("max_archives");
-                return Ok(());
+                break;
             }
             match self.enter_nested(entry, opened, alternates, &selector) {
                 Ok(nested) => {
@@ -371,7 +598,54 @@ impl Engine<'_> {
                 }
             }
         }
+        self.merge(&buckets, &tally);
+        if let Some(journal) = self.journal.as_ref() {
+            // A stopped archive keeps its rows but is never resumed as done.
+            let complete = self.stopped.is_none();
+            journal.append(name, &buckets, &tally, complete)?;
+        }
         Ok(())
+    }
+
+    /// Folds one archive's contribution into the run, exactly once.
+    fn merge(&mut self, buckets: &BTreeMap<Key, Bucket>, tally: &Tally) {
+        for (key, bucket) in buckets {
+            self.apply(key, bucket);
+        }
+        self.fold(tally);
+    }
+
+    /// Adds one combination's rows, without its counters.
+    fn apply(&mut self, key: &Key, bucket: &Bucket) {
+        *self.types.entry(key.entry_type).or_default() += bucket.entries;
+        let samples = self.options.samples;
+        let existing = self.buckets.entry(key.clone()).or_default();
+        existing.entries += bucket.entries;
+        existing
+            .archive_count
+            .extend(bucket.archive_count.iter().cloned());
+        for archive in &bucket.archives {
+            if existing.archives.len() < SAMPLE_ARCHIVES {
+                existing.archives.insert(archive.clone());
+            }
+        }
+        for sample in &bucket.samples {
+            if existing.samples.len() < samples {
+                existing.samples.push(sample.clone());
+            }
+        }
+    }
+
+    /// Adds one archive's counters.
+    fn fold(&mut self, tally: &Tally) {
+        self.entries += tally.entries;
+        self.probed += tally.probed;
+        self.decoded += tally.decoded;
+        self.undecoded += tally.undecoded;
+        self.structures += tally.structures;
+        self.containers += tally.containers;
+        self.declared += tally.declared;
+        self.unresolved += tally.unresolved;
     }
 
     fn transform(
@@ -465,35 +739,46 @@ impl Engine<'_> {
         Source::from_file(file).map_err(|err| format!("row {}: {err}", entry.row))
     }
 
+    /// Adds one entry to an archive's own map and counters, so the archive's
+    /// contribution can be folded in and journalled as a unit.
+    #[allow(clippy::too_many_arguments)]
     fn count(
-        &mut self,
+        buckets: &mut BTreeMap<Key, Bucket>,
+        tally: &mut Tally,
+        samples: usize,
         classification: &Classification,
         archive: &str,
         selector: &str,
         head: &[u8],
         payload_len: Option<u64>,
     ) {
-        *self.types.entry(classification.entry_type).or_default() += 1;
+        tally.entries += 1;
         match classification.payload.name() {
-            "decoded" => self.decoded += 1,
+            "decoded" => {
+                tally.probed += 1;
+                tally.decoded += 1;
+            }
             "not-read" => {}
-            _ => self.undecoded += 1,
+            _ => {
+                tally.probed += 1;
+                tally.undecoded += 1;
+            }
         }
         let claims = classification.identification.claims();
         if claims.structure == lforge_core::classify::Confidence::Verified {
-            self.structures += 1;
+            tally.structures += 1;
         }
         if matches!(
             classification.identification,
             Identification::Resource { .. }
         ) {
-            self.containers += 1;
+            tally.containers += 1;
         }
         if classification.declared_asset().is_some() {
-            self.declared += 1;
+            tally.declared += 1;
         }
         if matches!(classification.identification, Identification::Unrecognised) {
-            self.unresolved += 1;
+            tally.unresolved += 1;
         }
         let key = Key {
             entry_type: classification.entry_type,
@@ -508,22 +793,27 @@ impl Engine<'_> {
             transform: classification
                 .storage
                 .is_some_and(|storage| storage.transform),
-            payload: classification.payload.name(),
-            confidence: classification.identification.claims().structure.name(),
-            capability: classification.capability.name(),
+            payload: classification.payload.name().to_string(),
+            structure: classification
+                .identification
+                .claims()
+                .structure
+                .name()
+                .to_string(),
+            capability: classification.capability.name().to_string(),
             extension: classification
                 .extension()
                 .map(str::to_string)
                 .unwrap_or_else(|| "-".to_string()),
         };
-        let bucket = self.buckets.entry(key).or_default();
+        let bucket = buckets.entry(key).or_default();
         bucket.entries += 1;
         // Exact archive count; the names stay a bounded representative set.
         bucket.archive_count.insert(archive.to_string());
         if bucket.archives.len() < SAMPLE_ARCHIVES {
             bucket.archives.insert(archive.to_string());
         }
-        if bucket.samples.len() < self.options.samples {
+        if bucket.samples.len() < samples {
             bucket.samples.push(json!({
                 "archive": archive,
                 "chain": selector,
@@ -545,7 +835,7 @@ impl Engine<'_> {
                     "storage": key.storage,
                     "transform": key.transform,
                     "payload": key.payload,
-                    "structure": key.confidence,
+                    "structure": key.structure,
                     "capability": key.capability,
                     "extension": key.extension,
                     "entries": bucket.entries,
@@ -566,6 +856,7 @@ impl Engine<'_> {
             "root": roots.first().map(|root| root.name.clone()),
             "roots": roots.len(),
             "archives": self.archives,
+            "resumed_archives": self.resumed,
             "entries": self.entries,
             "spooled_bytes": self.spooled,
             "stopped": self.stopped,
@@ -576,7 +867,7 @@ impl Engine<'_> {
                 "nested_archives_opened": self.archives.saturating_sub(self.roots_opened),
                 "failed_archives": self.failures.len(),
                 "entries_enumerated": self.entries,
-                "entries_probed": self.entries,
+                "entries_probed": self.probed,
                 "entries_decoded": self.decoded,
                 "entries_undecoded": self.undecoded,
                 "structures_verified": self.structures,

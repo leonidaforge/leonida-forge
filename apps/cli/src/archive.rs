@@ -384,6 +384,12 @@ pub enum Command {
         /// Total bytes copied to temporary storage
         #[arg(long, default_value_t = 68719476736u64)]
         max_spool_bytes: u64,
+        /// A journal of completed archives, so an interrupted run resumes
+        #[arg(long)]
+        journal: Option<PathBuf>,
+        /// Binds the journal to one build, mode, rule set and limit set
+        #[arg(long, default_value = "")]
+        journal_identity: String,
     },
     /// Print the engine's type-to-extension registry for all 256 ids
     Registry {
@@ -456,6 +462,8 @@ pub fn run(command: Command) -> Result<(), String> {
             max_entries,
             max_nested_bytes,
             max_spool_bytes,
+            journal,
+            journal_identity,
         } => {
             let cancel = AtomicBool::new(false);
             crate::census::run(
@@ -475,6 +483,8 @@ pub fn run(command: Command) -> Result<(), String> {
                         max_nested_bytes,
                         max_spool_bytes,
                     },
+                    journal,
+                    journal_identity,
                 },
                 &cancel,
             )
