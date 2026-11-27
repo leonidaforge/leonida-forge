@@ -3,8 +3,16 @@
 //! Enumeration and member decoding are separate: opening the window reads the
 //! resource once and releases it, and each member selection reads it again
 //! through the shared loader. An idle window therefore holds no model source
-//! memory, and a slow selection cannot replace a newer one because results are
-//! matched against the selection generation.
+//! memory.
+//!
+//! Member loads are bounded by [`MemberSelection`]: at most one load runs, at
+//! most one selection waits, and a result is applied only while its generation
+//! is current. Rapid selection changes therefore start at most one extra load,
+//! and a slow load can never replace a newer choice.
+//!
+//! The window retains one decoded member and one viewport. Applying a member
+//! replaces both, so the previous scene and its GPU buffers are dropped with the
+//! previous viewport, and `Drop` cancels whatever is still running.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,32 +73,77 @@ enum MemberLoad {
     Failed(String),
 }
 
-/// Which member load the viewer may apply, and the cancellation flag of the
-/// load that is running.
+/// One requested member load.
+#[derive(Clone, Debug)]
+struct Selection {
+    generation: u64,
+    index: usize,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Schedules member loads for one viewer.
 ///
-/// It is separate from the window so the scheduling rules can be tested
-/// without a GPUI context: beginning a selection cancels the previous one, a
-/// result is applied only while its generation is current, and closing rejects
-/// every later result.
+/// The bound is structural, not hopeful: at most one load runs, and at most one
+/// selection waits behind it. A selection that arrives while a load is running
+/// cancels that load and replaces any earlier waiting selection, so the newest
+/// choice always wins and the queue cannot grow with the click rate.
+///
+/// It is separate from the window so the scheduling rules can be tested without
+/// a GPUI context: a result is applied only while its generation is current,
+/// and closing rejects every later request and result.
 #[derive(Debug, Default)]
 struct MemberSelection {
     generation: u64,
-    cancel: Arc<AtomicBool>,
+    active: Option<Selection>,
+    pending: Option<Selection>,
     closed: bool,
 }
 
 impl MemberSelection {
-    /// Starts a selection: cancels whatever was running and returns the
-    /// generation and flag the new load must use. A closed window never starts
-    /// work, so it hands back the cancelled flag and the current generation.
-    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+    /// Requests `index`. `Some` returns the load to start now; `None` means the
+    /// request was queued behind the running load, or refused because the
+    /// window closed.
+    fn begin(&mut self, index: usize) -> Option<Selection> {
         if self.closed {
-            return (self.generation, self.cancel.clone());
+            return None;
         }
-        self.cancel.store(true, Ordering::Relaxed);
-        self.cancel = Arc::new(AtomicBool::new(false));
         self.generation = self.generation.wrapping_add(1);
-        (self.generation, self.cancel.clone())
+        let selection = Selection {
+            generation: self.generation,
+            index,
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        if self.active.is_none() {
+            self.active = Some(selection.clone());
+            return Some(selection);
+        }
+        if let Some(active) = &self.active {
+            active.cancel.store(true, Ordering::Relaxed);
+        }
+        // The replaced selection was never started, so its flag needs nothing
+        // but dropping: no task awaits it.
+        self.pending = Some(selection);
+        None
+    }
+
+    /// Reports that the load of `generation` finished, applied or not, and
+    /// returns the waiting selection to start next.
+    fn finish(&mut self, generation: u64) -> Option<Selection> {
+        let completes_active = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation);
+        if !completes_active {
+            return None;
+        }
+        self.active = None;
+        if self.closed {
+            self.pending = None;
+            return None;
+        }
+        let next = self.pending.take()?;
+        self.active = Some(next.clone());
+        Some(next)
     }
 
     /// Whether a result of `generation` may be applied now.
@@ -101,7 +154,20 @@ impl MemberSelection {
     /// Rejects further results and stops the running load.
     fn close(&mut self) {
         self.closed = true;
-        self.cancel.store(true, Ordering::Relaxed);
+        for selection in [&self.active, &self.pending].into_iter().flatten() {
+            selection.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pending = None;
+    }
+
+    #[cfg(test)]
+    fn active_index(&self) -> Option<usize> {
+        self.active.as_ref().map(|active| active.index)
+    }
+
+    #[cfg(test)]
+    fn pending_index(&self) -> Option<usize> {
+        self.pending.as_ref().map(|pending| pending.index)
     }
 }
 
@@ -118,7 +184,6 @@ pub struct DictionaryViewer {
     gta_root: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     _load: Task<()>,
-    _member_task: Option<Task<()>>,
 }
 
 impl DictionaryViewer {
@@ -179,22 +244,32 @@ impl DictionaryViewer {
             gta_root,
             cancel,
             _load: task,
-            _member_task: None,
         }
     }
 
-    /// Selects one member. A newer selection supersedes the pending one: the
-    /// previous load is cancelled, its task is dropped, and its result, should
-    /// it still arrive, is rejected by generation.
+    /// Selects one member. A newer selection supersedes the running one: that
+    /// load is cancelled, the newest choice waits behind it, and a result is
+    /// applied only while its generation is current.
     fn load_member(&mut self, index: usize, cx: &mut Context<Self>) {
-        let (generation, cancel) = self.selection.begin();
         self.selected = index;
         self.member = MemberLoad::Loading;
         cx.notify();
+        if let Some(selection) = self.selection.begin(index) {
+            self.spawn_member(selection, cx);
+        }
+    }
+
+    /// Runs one member load. The task is detached, so the scheduler — not a
+    /// task handle that has to be replaced — is what bounds the work to one
+    /// load at a time.
+    fn spawn_member(&self, selection: Selection, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let access = self.access.clone();
         let gta_root = self.gta_root.clone();
-        let task = cx.spawn(async move |this, cx| {
+        let generation = selection.generation;
+        let index = selection.index;
+        let cancel = selection.cancel.clone();
+        cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
                     model::load_dictionary_member(
@@ -207,11 +282,27 @@ impl DictionaryViewer {
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.apply_member(generation, index, loaded, cx)
+                this.complete_member(generation, index, loaded, cx)
             })
             .ok();
-        });
-        self._member_task = Some(task);
+        })
+        .detach();
+    }
+
+    /// Applies or discards one finished load, then starts the waiting
+    /// selection if there is one.
+    fn complete_member(
+        &mut self,
+        generation: u64,
+        index: usize,
+        loaded: Result<model::LoadedMember, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.selection.finish(generation);
+        self.apply_member(generation, index, loaded, cx);
+        if let Some(next) = next {
+            self.spawn_member(next, cx);
+        }
     }
 
     fn apply_member(
@@ -747,59 +838,138 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rapid_switching_cancels_every_superseded_load_and_keeps_the_last() {
+    fn rapid_selection_keeps_one_load_running_and_one_waiting() {
         let mut selection = MemberSelection::default();
-        let (first, first_cancel) = selection.begin();
-        assert!(!first_cancel.load(Ordering::Relaxed));
-        let (second, second_cancel) = selection.begin();
-        assert!(
-            first_cancel.load(Ordering::Relaxed),
-            "a superseded load is cancelled"
+        let first = selection.begin(0).expect("the first selection starts");
+        assert!(selection.begin(4).is_none(), "a second selection waits");
+        assert!(selection.begin(7).is_none(), "a third replaces it");
+        assert_eq!(selection.active_index(), Some(0), "one load is running");
+        assert_eq!(
+            selection.pending_index(),
+            Some(7),
+            "the newest choice is the only one queued"
         );
-        assert!(!second_cancel.load(Ordering::Relaxed));
-        let (third, third_cancel) = selection.begin();
-        assert!(second_cancel.load(Ordering::Relaxed));
-        assert!(!third_cancel.load(Ordering::Relaxed));
-        // Only the newest selection may apply a result.
-        assert!(!selection.accept(first));
-        assert!(!selection.accept(second));
-        assert!(selection.accept(third));
+        assert!(
+            first.cancel.load(Ordering::Relaxed),
+            "the running load is asked to stop"
+        );
+        assert!(
+            !selection.accept(first.generation),
+            "its result is obsolete"
+        );
+        let started = selection
+            .finish(first.generation)
+            .expect("the waiting selection starts when the load reports back");
+        assert_eq!(started.index, 7);
+        assert_eq!(selection.active_index(), Some(7));
+        assert_eq!(selection.pending_index(), None);
+        assert!(selection.accept(started.generation));
+    }
+
+    #[test]
+    fn a_click_burst_leaves_one_running_load_and_one_waiting_selection() {
+        let mut selection = MemberSelection::default();
+        let running = selection.begin(0).expect("the first selection starts");
+        for index in 1..200 {
+            assert!(
+                selection.begin(index).is_none(),
+                "no click starts a second load while one runs"
+            );
+        }
+        assert_eq!(
+            selection.active_index(),
+            Some(0),
+            "the bound is one running load"
+        );
+        assert_eq!(
+            selection.pending_index(),
+            Some(199),
+            "the queue holds one selection, the newest"
+        );
+        assert!(running.cancel.load(Ordering::Relaxed));
+
+        // Draining the handover shows that the burst collapsed to one selection.
+        let mut started = Vec::new();
+        let mut handover = selection.finish(running.generation);
+        while let Some(next) = handover {
+            started.push(next.index);
+            handover = selection.finish(next.generation);
+        }
+        assert_eq!(
+            started,
+            vec![199],
+            "the burst collapsed to the newest choice"
+        );
+        assert_eq!(selection.active_index(), None);
     }
 
     #[test]
     fn a_stale_result_cannot_replace_the_selected_member() {
         let mut selection = MemberSelection::default();
-        let (stale, _) = selection.begin();
-        let (current, _) = selection.begin();
-        assert!(!selection.accept(stale));
-        assert!(selection.accept(current));
-    }
-
-    #[test]
-    fn a_failed_member_can_be_followed_by_a_successful_one() {
-        let mut selection = MemberSelection::default();
-        let (failed, _) = selection.begin();
-        // The failed load produced no result to apply; the next selection is
-        // still accepted, so one unsupported member does not stop the window.
-        let (next, next_cancel) = selection.begin();
-        assert!(selection.accept(next));
-        assert!(!next_cancel.load(Ordering::Relaxed));
-        assert!(!selection.accept(failed));
-    }
-
-    #[test]
-    fn closing_stops_the_running_load_and_rejects_later_results() {
-        let mut selection = MemberSelection::default();
-        let (generation, cancel) = selection.begin();
-        selection.close();
-        assert!(cancel.load(Ordering::Relaxed), "the running load stops");
+        let stale = selection.begin(1).expect("the first selection starts");
+        assert!(selection.begin(2).is_none());
+        assert!(!selection.accept(stale.generation));
+        let current = selection
+            .finish(stale.generation)
+            .expect("the waiting selection starts");
         assert!(
-            !selection.accept(generation),
+            selection.accept(current.generation),
+            "the newest selection is the one the viewer applies"
+        );
+        assert!(!selection.accept(stale.generation));
+    }
+
+    #[test]
+    fn a_failed_load_still_starts_the_waiting_selection() {
+        let mut selection = MemberSelection::default();
+        let failed = selection.begin(3).expect("the first selection starts");
+        assert!(selection.begin(5).is_none());
+        // A failed load applies nothing, but the handover happens regardless.
+        let next = selection
+            .finish(failed.generation)
+            .expect("the waiting selection starts");
+        assert_eq!(next.index, 5);
+        assert!(selection.accept(next.generation));
+    }
+
+    #[test]
+    fn only_the_running_generation_hands_over() {
+        let mut selection = MemberSelection::default();
+        let running = selection.begin(0).expect("the first selection starts");
+        assert!(selection.begin(1).is_none());
+        assert!(
+            selection
+                .finish(running.generation.wrapping_sub(1))
+                .is_none(),
+            "a foreign generation does not start a second load"
+        );
+        assert_eq!(selection.active_index(), Some(0));
+        assert_eq!(selection.pending_index(), Some(1));
+    }
+
+    #[test]
+    fn closing_stops_the_running_and_the_waiting_load() {
+        let mut selection = MemberSelection::default();
+        let running = selection.begin(0).expect("the first selection starts");
+        assert!(selection.begin(1).is_none());
+        selection.close();
+        assert!(
+            running.cancel.load(Ordering::Relaxed),
+            "the running load stops"
+        );
+        assert!(
+            !selection.accept(running.generation),
             "a result that arrives after close is ignored"
         );
-        let (later, later_cancel) = selection.begin();
-        assert!(!selection.accept(later));
-        assert!(later_cancel.load(Ordering::Relaxed));
+        assert!(
+            selection.finish(running.generation).is_none(),
+            "a closed window starts nothing"
+        );
+        assert_eq!(selection.pending_index(), None, "the queue is dropped");
+        assert!(
+            selection.begin(2).is_none(),
+            "a closed window accepts nothing"
+        );
     }
 
     #[test]
