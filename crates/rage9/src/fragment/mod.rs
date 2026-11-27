@@ -172,28 +172,31 @@ pub fn is_fragment_name(report: &drawable::Report) -> bool {
 }
 
 /// Inspects a fragment. `None` when the resource does not have the root shape,
-/// when it is a resource-level drawable itself, or when the member-drawable
-/// slot does not resolve to a member drawable.
+/// or when the member-drawable slot does not resolve to a member drawable.
 ///
 /// Recognition is structural. The member name's `#ft` suffix is reported in
 /// [`Report::named_fragment`] but is not required: the declared resource type
 /// selects the candidate and the structure decides, so a fragment whose member
 /// carries another suffix is still the fragment its structure says it is.
+///
+/// A resource-level drawable also starts with a zero word and a page map, and
+/// its `+0x50` LOD slots can coincide with a fragment root's other records, so
+/// the suffix is used here as a tie-breaker only: a member named as a fragment
+/// is one, and an unnamed member must not also read as a drawable at zero.
 pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
     let header = header(system).ok()?;
-    // A resource-level drawable also starts with a zero word and a page map;
-    // its `+0x18` is the skeleton slot. A drawable is not a fragment.
-    if drawable::is_drawable_at(system, graphics, 0) {
-        return None;
-    }
     let at = header.drawable as usize;
     if at.checked_add(0xC0).is_none_or(|end| end > system.len()) {
         return None;
     }
     let drawable = drawable::inspect_member_at(system, graphics, at)?;
+    let named_fragment = is_fragment_name(&drawable);
+    if !named_fragment && drawable::is_drawable_at(system, graphics, 0) {
+        return None;
+    }
     Some(Report {
         header,
-        named_fragment: is_fragment_name(&drawable),
+        named_fragment,
         issues: drawable
             .issues
             .iter()
