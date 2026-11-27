@@ -65,12 +65,52 @@ enum MemberLoad {
     Failed(String),
 }
 
+/// Which member load the viewer may apply, and the cancellation flag of the
+/// load that is running.
+///
+/// It is separate from the window so the scheduling rules can be tested
+/// without a GPUI context: beginning a selection cancels the previous one, a
+/// result is applied only while its generation is current, and closing rejects
+/// every later result.
+#[derive(Debug, Default)]
+struct MemberSelection {
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    closed: bool,
+}
+
+impl MemberSelection {
+    /// Starts a selection: cancels whatever was running and returns the
+    /// generation and flag the new load must use. A closed window never starts
+    /// work, so it hands back the cancelled flag and the current generation.
+    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        if self.closed {
+            return (self.generation, self.cancel.clone());
+        }
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        self.generation = self.generation.wrapping_add(1);
+        (self.generation, self.cancel.clone())
+    }
+
+    /// Whether a result of `generation` may be applied now.
+    fn accept(&self, generation: u64) -> bool {
+        !self.closed && generation == self.generation
+    }
+
+    /// Rejects further results and stops the running load.
+    fn close(&mut self) {
+        self.closed = true;
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 pub struct DictionaryViewer {
     name: String,
     state: State,
     member: MemberLoad,
     selected: usize,
-    generation: u64,
+    selection: MemberSelection,
     search: Entity<ui::text_field::TextField>,
     list_scroll: UniformListScrollHandle,
     path: PathBuf,
@@ -131,7 +171,7 @@ impl DictionaryViewer {
             state: State::Loading,
             member: MemberLoad::None,
             selected: 0,
-            generation: 0,
+            selection: MemberSelection::default(),
             search,
             list_scroll: UniformListScrollHandle::new(),
             path,
@@ -144,18 +184,16 @@ impl DictionaryViewer {
     }
 
     /// Selects one member. A newer selection supersedes the pending one: the
-    /// previous task is dropped and its result, should it still arrive, is
-    /// rejected by generation.
+    /// previous load is cancelled, its task is dropped, and its result, should
+    /// it still arrive, is rejected by generation.
     fn load_member(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
+        let (generation, cancel) = self.selection.begin();
         self.selected = index;
         self.member = MemberLoad::Loading;
         cx.notify();
         let path = self.path.clone();
         let access = self.access.clone();
         let gta_root = self.gta_root.clone();
-        let cancel = self.cancel.clone();
         let task = cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
@@ -183,8 +221,8 @@ impl DictionaryViewer {
         loaded: Result<model::LoadedMember, String>,
         cx: &mut Context<Self>,
     ) {
-        if generation != self.generation {
-            // A newer selection is already pending; this result is obsolete.
+        if !self.selection.accept(generation) {
+            // A newer selection is already pending, or the window closed.
             return;
         }
         match loaded {
@@ -632,6 +670,7 @@ impl DictionaryViewer {
 impl Drop for DictionaryViewer {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.selection.close();
     }
 }
 
@@ -701,4 +740,73 @@ fn format_count(value: usize) -> String {
         out.push(character);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rapid_switching_cancels_every_superseded_load_and_keeps_the_last() {
+        let mut selection = MemberSelection::default();
+        let (first, first_cancel) = selection.begin();
+        assert!(!first_cancel.load(Ordering::Relaxed));
+        let (second, second_cancel) = selection.begin();
+        assert!(
+            first_cancel.load(Ordering::Relaxed),
+            "a superseded load is cancelled"
+        );
+        assert!(!second_cancel.load(Ordering::Relaxed));
+        let (third, third_cancel) = selection.begin();
+        assert!(second_cancel.load(Ordering::Relaxed));
+        assert!(!third_cancel.load(Ordering::Relaxed));
+        // Only the newest selection may apply a result.
+        assert!(!selection.accept(first));
+        assert!(!selection.accept(second));
+        assert!(selection.accept(third));
+    }
+
+    #[test]
+    fn a_stale_result_cannot_replace_the_selected_member() {
+        let mut selection = MemberSelection::default();
+        let (stale, _) = selection.begin();
+        let (current, _) = selection.begin();
+        assert!(!selection.accept(stale));
+        assert!(selection.accept(current));
+    }
+
+    #[test]
+    fn a_failed_member_can_be_followed_by_a_successful_one() {
+        let mut selection = MemberSelection::default();
+        let (failed, _) = selection.begin();
+        // The failed load produced no result to apply; the next selection is
+        // still accepted, so one unsupported member does not stop the window.
+        let (next, next_cancel) = selection.begin();
+        assert!(selection.accept(next));
+        assert!(!next_cancel.load(Ordering::Relaxed));
+        assert!(!selection.accept(failed));
+    }
+
+    #[test]
+    fn closing_stops_the_running_load_and_rejects_later_results() {
+        let mut selection = MemberSelection::default();
+        let (generation, cancel) = selection.begin();
+        selection.close();
+        assert!(cancel.load(Ordering::Relaxed), "the running load stops");
+        assert!(
+            !selection.accept(generation),
+            "a result that arrives after close is ignored"
+        );
+        let (later, later_cancel) = selection.begin();
+        assert!(!selection.accept(later));
+        assert!(later_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn counts_are_grouped_for_display() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1000), "1,000");
+        assert_eq!(format_count(12_480), "12,480");
+    }
 }
