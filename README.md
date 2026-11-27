@@ -294,6 +294,10 @@ Low-effort, AI-generated pull requests submitted without meaningful human review
 
 **AI can assist your work. It should not replace your judgment.**
 
+## Community
+
+Questions, help and development discussion happen in the [Leonida Forge Discord](https://discord.gg/PJgVZCuWGf).
+
 ## License
 
 Leonida Forge is licensed under the GNU General Public License v3.0 or later (`GPL-3.0-or-later`). See [LICENSE.md](LICENSE.md).
