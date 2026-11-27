@@ -1177,7 +1177,9 @@ impl Renderer {
         drop(mapped);
         readback.unmap();
         Ok(values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|values| ProbeSample {
                 position: [values[0][0], values[0][1], values[0][2]],
                 normal: [values[1][0], values[1][1], values[1][2]],

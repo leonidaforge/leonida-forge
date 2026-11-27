@@ -234,7 +234,7 @@ fn byte_index(
         max = max.max(value);
     }
     let mut histogram = histogram.into_iter().collect::<Vec<_>>();
-    histogram.sort_by(|a, b| b.1.cmp(&a.1));
+    histogram.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     histogram.truncate(8);
     Some(ByteIndexFacts {
         width,
@@ -417,6 +417,7 @@ fn palette_facts(
 }
 
 /// Reads one geometry the way the survey needs it.
+#[allow(clippy::too_many_arguments)]
 fn geometry_facts(
     system: &[u8],
     graphics: &[u8],
@@ -767,7 +768,7 @@ fn surveys_vertex_declarations() {
     );
     eprintln!("groups: {}", totals.groups.len());
     let mut groups = totals.groups.iter().collect::<Vec<_>>();
-    groups.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+    groups.sort_by_key(|entry| std::cmp::Reverse(entry.1.0));
     for (key, (count, sample)) in groups {
         eprintln!("{count:6} x {key}\n         e.g. {sample}");
     }
@@ -1134,7 +1135,7 @@ fn verifies_index_bone_proximity() {
                     }
                     let mut sums: std::collections::BTreeMap<u32, (glam::Vec3, f32)> =
                         std::collections::BTreeMap::new();
-                    for vertex in 0..count {
+                    for (vertex, position) in positions.iter().enumerate().take(count) {
                         let at = indexes_at + vertex * width;
                         let stored = match width {
                             1 => u32::from(blob[at]),
@@ -1147,7 +1148,7 @@ fn verifies_index_bone_proximity() {
                             ]),
                         };
                         let entry = sums.entry(stored).or_insert((glam::Vec3::ZERO, 0.0));
-                        entry.0 += positions[vertex];
+                        entry.0 += *position;
                         entry.1 += 1.0;
                     }
                     for (stored, (sum, weight)) in sums {

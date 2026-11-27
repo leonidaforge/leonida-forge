@@ -105,8 +105,7 @@ pub fn decode(
     let weights = buffer.declaration(SEMANTIC_BLEND_WEIGHTS);
     let indices = buffer.declaration(SEMANTIC_BLEND_INDICES);
     let form = indices.and_then(|declaration| index_form(buffer, declaration));
-    if indices.is_some() && form.is_none() {
-        let declaration = indices.expect("checked above");
+    if let Some(declaration) = indices.filter(|_| form.is_none()) {
         return InfluenceDecode::Unsupported {
             reason: format!(
                 "the blend-index declaration (format {:#04x}) does not match a supported encoding",

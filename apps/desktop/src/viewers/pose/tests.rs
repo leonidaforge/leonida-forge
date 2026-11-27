@@ -105,7 +105,7 @@ fn resetting_one_bone_keeps_the_rest_and_reset_all_returns_to_reference() {
     session.adjust_rotation(0, 0, 1).unwrap();
     session.adjust_translation(2, 1, 1).unwrap();
     session.reset_bone(0).unwrap();
-    assert!(session.is_reference() == false);
+    assert!(!session.is_reference());
     assert_eq!(session.rotation_degrees(0), Some([0.0; 3]));
     assert_ne!(session.translation(2), Some(Vec3::ZERO));
     session.reset_all();
