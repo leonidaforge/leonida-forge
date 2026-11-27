@@ -99,11 +99,29 @@ impl BonePanel {
                 .iter()
                 .map(|bone| bone_matches(bone, &filter))
                 .collect();
+            // A bone belongs to the filter result when it matches, when an
+            // ancestor matches, or when a descendant does. The descendant half
+            // is one pass from the deepest bones upwards: scanning the array per
+            // row made a 596-bone skeleton cost tens of milliseconds per frame.
+            let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); count];
+            for (index, bone) in skeleton.bones.iter().enumerate() {
+                if let Some(parent) = bone.parent
+                    && let Some(list) = children_of.get_mut(parent)
+                {
+                    list.push(index);
+                }
+            }
+            let mut order: Vec<usize> = (0..count).collect();
+            order.sort_by_key(|index| std::cmp::Reverse(depth[*index]));
+            let mut selected: Vec<bool> = matches.clone();
+            for &index in &order {
+                if !selected[index] && children_of[index].iter().any(|child| selected[*child]) {
+                    selected[index] = true;
+                }
+            }
             (0..count)
                 .map(|index| {
-                    matches[index]
-                        || ancestors(index, skeleton).any(|parent| matches[parent])
-                        || descendants(index, skeleton).any(|child| matches[child])
+                    selected[index] || ancestors(index, skeleton).any(|parent| matches[parent])
                 })
                 .collect()
         };
@@ -252,25 +270,6 @@ fn ancestors(index: usize, skeleton: &Skeleton) -> impl Iterator<Item = usize> +
         current = skeleton.bones.get(parent).and_then(|bone| bone.parent);
         Some(parent)
     })
-}
-
-fn descendants(index: usize, skeleton: &Skeleton) -> impl Iterator<Item = usize> + '_ {
-    let mut stack = vec![index];
-    let mut found = Vec::new();
-    let mut steps = 0usize;
-    while let Some(current) = stack.pop() {
-        for (child, bone) in skeleton.bones.iter().enumerate() {
-            if bone.parent == Some(current) {
-                steps += 1;
-                if steps > skeleton.bones.len() {
-                    break;
-                }
-                found.push(child);
-                stack.push(child);
-            }
-        }
-    }
-    found.into_iter()
 }
 
 #[cfg(test)]
