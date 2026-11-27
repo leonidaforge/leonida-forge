@@ -454,3 +454,47 @@ fn format_78_maps_to_bc3_srgb() {
     let texture = texture_from_source(level, "format 78".into()).unwrap();
     assert_eq!(texture.format, TextureFormat::Bc3UnormSrgb);
 }
+
+#[test]
+fn a_non_fragment_is_not_decoded_as_one() {
+    let system = vec![0u8; 0x200];
+    let graphics = vec![0u8; 0x100];
+    assert!(!is_fragment(&system, &graphics));
+    assert!(decode_fragment(&system, &graphics, &NoTextures).is_err());
+}
+
+/// Manual verification against a real installation. The test is ignored by
+/// default and reads only caller-supplied paths.
+///
+/// `LF_TEST_FRAGMENT` is one decoded fragment resource and
+/// `LF_TEST_FRAGMENT_SPLIT` its system-segment length in bytes.
+#[test]
+#[ignore = "requires LF_TEST_FRAGMENT and LF_TEST_FRAGMENT_SPLIT"]
+fn a_real_fragment_decodes_into_assembled_components() {
+    let path = std::env::var("LF_TEST_FRAGMENT").expect("LF_TEST_FRAGMENT");
+    let split: usize = std::env::var("LF_TEST_FRAGMENT_SPLIT")
+        .expect("LF_TEST_FRAGMENT_SPLIT")
+        .parse()
+        .expect("a byte count");
+    let bytes = std::fs::read(path).expect("the fragment resource");
+    let (system, graphics) = bytes.split_at(split);
+    assert!(is_fragment(system, graphics));
+    let decoded = decode_fragment(system, graphics, &NoTextures).expect("a decoded fragment");
+    assert!(!decoded.components.is_empty());
+    assert_eq!(decoded.components.len(), 1);
+    let component = &decoded.components[0];
+    assert_eq!(
+        component.drawable_at,
+        decoded.report.header.drawable as usize
+    );
+    assert!(component.vertices > 0);
+    assert!(decoded.scene.bounds.is_finite());
+    eprintln!(
+        "{}: {} vertices, {} triangles, {} material(s), geometry {:?}",
+        component.name.as_deref().unwrap_or("fragment"),
+        component.vertices,
+        component.triangles,
+        decoded.scene.materials.len(),
+        decoded.completeness
+    );
+}

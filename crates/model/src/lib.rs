@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 
 use glam::Vec3;
 use lforge_rage9::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};
+use lforge_rage9::fragment;
 use lforge_scene::{
     AlphaMode, Diagnostic, Material, Mesh, Primitive, Scene, Texture, TextureBinding,
     TextureFormat, TextureSemantic, Vertex,
@@ -299,6 +300,77 @@ pub fn decode(
 ) -> Result<DecodedModel, Error> {
     let (root, report, candidates) = find_drawable_root(system, graphics)
         .ok_or_else(|| Error::new("the resource holds no drawable root"))?;
+    let built = build_scene(system, graphics, provider, &report, None)?;
+    let BuiltScene {
+        scene,
+        texture_bindings,
+        lod_index,
+        expected_geometries,
+        decoded_geometries,
+        geometry_failures,
+    } = built;
+    let missing_textures = scene
+        .materials
+        .iter()
+        .filter(|material| material.missing_texture)
+        .count();
+    let referenced = scene
+        .materials
+        .iter()
+        .any(|material| !material.bindings.is_empty());
+    let textures = texture_completeness(missing_textures, referenced);
+    let selected_name = report.header.name_text.clone();
+    let mut notes = vec![format!("drawable root at system +{root:#x}")];
+    if candidates > 1 {
+        notes.push(format!(
+            "{candidates} drawable roots resolved; one was selected"
+        ));
+    }
+    let geometry = geometry_completeness(
+        root,
+        candidates,
+        report.issues.len(),
+        expected_geometries,
+        decoded_geometries,
+        geometry_failures,
+    );
+    Ok(DecodedModel {
+        scene,
+        report,
+        lod: lod_index,
+        completeness: ModelCompleteness {
+            geometry,
+            textures,
+            selected_root: root,
+            selected_name,
+            notes,
+        },
+        texture_bindings,
+    })
+}
+
+/// The scene one drawable report yields, before a completeness verdict.
+struct BuiltScene {
+    scene: Scene,
+    texture_bindings: Vec<TextureBindingReport>,
+    lod_index: usize,
+    expected_geometries: usize,
+    decoded_geometries: usize,
+    geometry_failures: usize,
+}
+
+/// Decodes the highest populated LOD of `report` into scene data.
+///
+/// `label` prefixes the mesh names, so a caller that assembles several
+/// drawables keeps their meshes distinguishable. A resource-level drawable
+/// passes `None` and keeps the historical mesh names.
+fn build_scene(
+    system: &[u8],
+    graphics: &[u8],
+    provider: &dyn TextureProvider,
+    report: &Report,
+    label: Option<&str>,
+) -> Result<BuiltScene, Error> {
     let lod_index = report
         .lod
         .iter()
@@ -349,11 +421,16 @@ pub fn decode(
 
     let mut decoded_geometries = 0usize;
     let mut geometry_failures = 0usize;
+    let base_name = match label {
+        Some(label) => label.to_string(),
+        None => report
+            .header
+            .name_text
+            .clone()
+            .unwrap_or_else(|| "drawable".to_string()),
+    };
     for (model_index, model) in lod.models.iter().enumerate() {
-        let mut mesh = Mesh::new(format!(
-            "{} model {model_index}",
-            report.header.name_text.as_deref().unwrap_or("drawable")
-        ));
+        let mut mesh = Mesh::new(format!("{base_name} model {model_index}"));
         for (geometry_index, geometry) in model.geometries.iter().enumerate() {
             let shader_index = read_shader_index(system, model, geometry_index).unwrap_or(0);
             let material = shader_materials.get(&shader_index).copied().unwrap_or(0);
@@ -388,51 +465,156 @@ pub fn decode(
     scene.diagnostics.extend(diagnostics);
     let validation = scene.validate();
     scene.diagnostics.extend(validation);
-
-    let missing_textures = scene
-        .materials
-        .iter()
-        .filter(|material| material.missing_texture)
-        .count();
-    let referenced = scene
-        .materials
-        .iter()
-        .any(|material| !material.bindings.is_empty());
-    let textures = texture_completeness(missing_textures, referenced);
-    let selected_name = report.header.name_text.clone();
-    let mut notes = vec![format!("drawable root at system +{root:#x}")];
-    if candidates > 1 {
-        notes.push(format!(
-            "{candidates} drawable roots resolved; one was selected"
-        ));
-    }
-    let geometry = geometry_completeness(
-        root,
-        candidates,
-        report.issues.len(),
+    Ok(BuiltScene {
+        scene,
+        texture_bindings,
+        lod_index,
         expected_geometries,
         decoded_geometries,
         geometry_failures,
-    );
-    Ok(DecodedModel {
+    })
+}
+
+/// Whether the resource has the root header of a fragment and a member
+/// drawable named as a fragment.
+pub fn is_fragment(system: &[u8], graphics: &[u8]) -> bool {
+    fragment::inspect(system, graphics).is_some()
+}
+
+/// What happened to one fragment component.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComponentStatus {
+    /// Every geometry record of the selected LOD decoded.
+    Decoded,
+    /// The drawable was reached but some geometry records did not decode.
+    Unsupported(String),
+}
+
+/// One renderable component of a fragment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentComponent {
+    /// The order this component was enumerated in.
+    pub index: usize,
+    /// The member drawable's name, as the resource stores it.
+    pub name: Option<String>,
+    /// System offset of the member drawable.
+    pub drawable_at: usize,
+    /// The LOD slot that was decoded, when one was populated.
+    pub lod: Option<usize>,
+    /// The meshes this component contributed, as scene mesh indices.
+    pub meshes: std::ops::Range<usize>,
+    pub primitives: usize,
+    pub vertices: usize,
+    pub triangles: usize,
+    pub status: ComponentStatus,
+}
+
+/// Fragment completeness for the selected static representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentCompleteness {
+    /// The verified fragment variant: the root references one member drawable,
+    /// that drawable's highest populated LOD decoded, and the structural walk
+    /// reported no issue.
+    ///
+    /// The root also stores pointers at `+0x10`, `+0x20` and `+0x28` whose
+    /// targets are not identified, so this verdict covers the assembled
+    /// geometry only; it is not a claim about other fragment variants, damage
+    /// states or physics data.
+    SinglePrimaryDrawable,
+    /// Part of the fragment was decoded.
+    Partial { reason: String },
+    /// The resource is not a supported fragment.
+    Unsupported { reason: String },
+}
+
+/// A decoded fragment: one assembled scene plus the components it came from.
+#[derive(Debug, Clone)]
+pub struct DecodedFragment {
+    pub scene: Scene,
+    pub report: fragment::Report,
+    pub components: Vec<FragmentComponent>,
+    pub completeness: FragmentCompleteness,
+    pub texture_bindings: Vec<TextureBindingReport>,
+    /// The LOD slot of the member drawable that was decoded.
+    pub lod: usize,
+}
+
+/// Decodes a supported fragment into one assembled scene.
+///
+/// Only the member drawable the root references is assembled. The verified
+/// samples hold exactly one such reference; the root's other pointers are
+/// reported uninterpreted instead of being scanned for more drawables.
+pub fn decode_fragment(
+    system: &[u8],
+    graphics: &[u8],
+    provider: &dyn TextureProvider,
+) -> Result<DecodedFragment, Error> {
+    let report = fragment::inspect(system, graphics)
+        .ok_or_else(|| Error::new("the resource is not a supported fragment"))?;
+    let name = report.name().map(str::to_string);
+    let built = build_scene(
+        system,
+        graphics,
+        provider,
+        &report.drawable,
+        name.as_deref(),
+    )?;
+    let BuiltScene {
+        scene,
+        texture_bindings,
+        lod_index,
+        expected_geometries,
+        decoded_geometries,
+        geometry_failures,
+    } = built;
+    let primitives = scene.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
+    let status = if geometry_failures == 0 && decoded_geometries == expected_geometries {
+        ComponentStatus::Decoded
+    } else {
+        ComponentStatus::Unsupported(format!(
+            "{geometry_failures} of {expected_geometries} geometry record(s) did not decode"
+        ))
+    };
+    let components = vec![FragmentComponent {
+        index: 0,
+        name,
+        drawable_at: report.header.drawable as usize,
+        lod: Some(lod_index),
+        meshes: 0..scene.meshes.len(),
+        primitives,
+        vertices: scene.vertex_count(),
+        triangles: scene.triangle_count(),
+        status: status.clone(),
+    }];
+    let completeness = if !report.issues.is_empty() {
+        FragmentCompleteness::Partial {
+            reason: format!(
+                "the member drawable's structural walk reported {} issue(s)",
+                report.issues.len()
+            ),
+        }
+    } else if status != ComponentStatus::Decoded {
+        FragmentCompleteness::Partial {
+            reason: "the member drawable yielded fewer geometries than it declares".to_string(),
+        }
+    } else {
+        FragmentCompleteness::SinglePrimaryDrawable
+    };
+    Ok(DecodedFragment {
         scene,
         report,
-        lod: lod_index,
-        completeness: ModelCompleteness {
-            geometry,
-            textures,
-            selected_root: root,
-            selected_name,
-            notes,
-        },
+        components,
+        completeness,
         texture_bindings,
+        lod: lod_index,
     })
 }
 
 /// Finds the best drawable root. A simple drawable starts at zero. A
-/// fragment or a drawable dictionary can hold member drawables elsewhere in
-/// the system segment; the best member is the one with the most populated
-/// LOD levels and geometries.
+/// fragment or a drawable dictionary holds its member drawables elsewhere in
+/// the system segment; those carry no page map of their own, so the scan
+/// accepts both header forms and the best member is the one with the most
+/// populated LOD levels and geometries.
 fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report, usize)> {
     if let Some(report) = drawable::inspect(system, graphics) {
         return Some((0, report, 1));
@@ -446,12 +628,6 @@ fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report, 
         if u64_at(system, root) != Some(0) {
             continue;
         }
-        let Some(page_map) = u64_at(system, root + 8) else {
-            continue;
-        };
-        if page_map >> 28 != 5 {
-            continue;
-        }
         let Some(lod) = u64_at(system, root + 0x50) else {
             continue;
         };
@@ -462,10 +638,21 @@ fn find_drawable_root(system: &[u8], graphics: &[u8]) -> Option<(usize, Report, 
         if examined > 4096 {
             break;
         }
-        if !drawable::is_drawable_at(system, graphics, root) {
+        let page_map = u64_at(system, root + 8).unwrap_or(0);
+        let resource_level = page_map >> 28 == 5;
+        let accepted = if resource_level {
+            drawable::is_drawable_at(system, graphics, root)
+        } else {
+            drawable::is_member_drawable_at(system, graphics, root)
+        };
+        if !accepted {
             continue;
         }
-        let Some(report) = drawable::inspect_at(system, graphics, root) else {
+        let Some(report) = (if resource_level {
+            drawable::inspect_at(system, graphics, root)
+        } else {
+            drawable::inspect_member_at(system, graphics, root)
+        }) else {
             continue;
         };
         candidates += 1;
