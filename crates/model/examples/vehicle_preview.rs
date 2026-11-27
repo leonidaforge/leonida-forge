@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p lforge-model --example vehicle_preview -- \
-//!     <resource> [--textures <dir>] --out <dir> [--name <name>] \
+//!     <resource> [--textures <dir>]... --out <dir> [--name <name>] \
 //!     [--size <edge>] [--thumb <edge>]
 //! ```
 //!
@@ -20,7 +20,7 @@ use lforge_model as model;
 
 struct Options {
     resource: PathBuf,
-    textures: Option<PathBuf>,
+    textures: Vec<PathBuf>,
     output: PathBuf,
     name: String,
     model: Option<String>,
@@ -47,7 +47,7 @@ fn usage() -> ! {
 fn parse() -> Options {
     let mut args = std::env::args_os().skip(1);
     let resource = PathBuf::from(args.next().unwrap_or_else(|| usage()));
-    let mut textures = None;
+    let mut textures = Vec::new();
     let mut output = None;
     let mut name = None;
     let mut model = None;
@@ -92,7 +92,9 @@ fn parse() -> Options {
                     .parse()
                     .unwrap_or_else(|_| panic!("--wheel-diameter is not a number"))
             }
-            "--textures" => textures = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--textures" => {
+                textures.push(PathBuf::from(args.next().unwrap_or_else(|| usage())))
+            }
             "--out" => output = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--name" => {
                 name = Some(
@@ -154,31 +156,38 @@ fn parse() -> Options {
     }
 }
 
-struct Stores(lforge_texture::StoreSet);
+/// Every texture store the caller supplied. A body texture usually lives in the
+/// drawable's own dictionary while paint lives in a pack dictionary, so a
+/// preview needs several roots at once.
+struct Stores(Vec<lforge_texture::StoreSet>);
 
 impl model::TextureProvider for Stores {
     fn resolve(&self, reference: &model::TextureReference) -> model::TextureResolution {
-        let matches = self.0.find(reference.key64);
-        match matches.as_slice() {
+        let mut hits = Vec::new();
+        for (sets, set) in self.0.iter().enumerate() {
+            for (store_index, index) in set.find(reference.key64) {
+                hits.push((sets, store_index, index));
+            }
+        }
+        match hits.as_slice() {
             [] => model::TextureResolution::Missing,
-            [(store_index, index)] => {
-                let (store_index, index) = (*store_index, *index);
-                let store = match self.0.open(store_index) {
+            [(sets, store_index, index)] => {
+                let (sets, store_index, index) = (*sets, *store_index, *index);
+                let store = match self.0[sets].open(store_index) {
                     Ok(store) => store,
                     Err(err) => return model::TextureResolution::Failed(err.to_string()),
                 };
                 match store.level(index, 0, &AtomicBool::new(false)) {
                     Ok(level) => model::TextureResolution::Resolved(model::ResolvedTexture {
                         level,
-                        source: format!("{store_index}#{index}"),
+                        source: format!("{sets}/{store_index}#{index}"),
                     }),
                     Err(err) => model::TextureResolution::Failed(err.to_string()),
                 }
             }
             _ => model::TextureResolution::Ambiguous(
-                matches
-                    .iter()
-                    .map(|(store, index)| format!("{store}#{index}"))
+                hits.iter()
+                    .map(|(sets, store, index)| format!("{sets}/{store}#{index}"))
                     .collect(),
             ),
         }
@@ -558,13 +567,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !model::is_fragment(system, graphics) {
         return Err("the resource is not a fragment".into());
     }
-    let stores = match &options.textures {
-        Some(root) => Some(Stores(
+    let mut sets = Vec::new();
+    for root in &options.textures {
+        sets.push(
             lforge_texture::StoreSet::scan(root)
                 .map_err(|err| format!("could not scan {}: {err}", root.display()))?,
-        )),
-        None => None,
-    };
+        );
+    }
+    let stores = (!sets.is_empty()).then_some(Stores(sets));
     let decoded = match &stores {
         Some(stores) => model::decode_fragment(system, graphics, stores)?,
         None => model::decode_fragment(system, graphics, &model::NoTextures)?,
