@@ -218,8 +218,8 @@ pub struct Viewport {
     pub auto_rotate: bool,
     bounds: Aabb,
     scene: Arc<Scene>,
-    /// Component visibility, one flag per scene mesh. The decoded scene is
-    /// never modified; the render thread applies the flags before drawing.
+    /// Mesh visibility, one flag per scene mesh. The decoded scene is never
+    /// modified; the render thread applies the flags before drawing.
     visibility: Vec<bool>,
     framed: bool,
     requests: Option<LatestSender<Request>>,

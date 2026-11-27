@@ -35,7 +35,7 @@ use crate::settings::{Settings, ViewMode};
 use crate::ui;
 use crate::ui::assets::Icon;
 use crate::ui::theme;
-use crate::viewers::{BinaryInspector, ImageViewer, ModelViewer, RendererDemo};
+use crate::viewers::{BinaryInspector, DictionaryViewer, ImageViewer, ModelViewer, RendererDemo};
 use navigation::{History, Workspace};
 
 use preview::Thumbnail;
@@ -885,15 +885,37 @@ impl Explorer {
         let entry_type = entry.resource_type;
         let access = self.access();
         let gta_root = self.workspace.gta.clone();
-        match model_entry_kind(entry) {
-            Some(ModelEntryKind::Direct) => {
-                open_model_viewer(path, access, gta_root, cx);
-                return;
-            }
-            Some(ModelEntryKind::Sniff) => {}
-            None => {}
+        let kind = model_entry_kind(entry);
+        if kind == Some(ModelEntryKind::Direct) {
+            // A declared model row. The declared type selects the candidate;
+            // the decoded segments decide which viewer opens, so a type-4 row
+            // that is not a dictionary still opens as what it holds.
+            let (path, access) = (path.clone(), access.clone());
+            let root = gta_root.clone();
+            cx.spawn(async move |this, cx| {
+                let classified = cx
+                    .background_spawn({
+                        let (path, access) = (path.clone(), access.clone());
+                        async move {
+                            files::model::classify_resource(&path, &access, &AtomicBool::new(false))
+                        }
+                    })
+                    .await;
+                this.update(cx, |_, cx| match classified {
+                    Ok(kind) => open_model_kind(kind, path, access, root, cx),
+                    // The model viewer reports why the resource does not
+                    // decode, which is more useful than the byte view.
+                    Err(err) => {
+                        log::warn!("{}: {err}", path.display());
+                        open_model_viewer(path, access, root, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
         }
-        let sniff = model_entry_kind(entry).is_some();
+        let sniff = kind.is_some();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
             async move { files::identify_with(&path, &access) }
@@ -904,16 +926,20 @@ impl Explorer {
             let (path, access) = (path.clone(), access.clone());
             async move { files::classify_with(&path, &access, entry_type) }
         });
+        // A declared model row, or a resource whose content may be one, is
+        // decoded so the viewer can open what the structure actually holds.
+        let model = sniff.then(|| {
+            let (path, access) = (path.clone(), access.clone());
+            cx.background_spawn(async move {
+                files::model::classify_resource(&path, &access, &AtomicBool::new(false)).ok()
+            })
+        });
         cx.spawn(async move |this, cx| {
-            let (identified, classified) = (identified.await, classified.await);
-            let model = if sniff && matches!(&identified, Ok(Identified::Unknown)) {
-                let (path, access) = (path.clone(), access.clone());
-                cx.background_spawn(
-                    async move { files::model::is_drawable_resource(&path, &access) },
-                )
-                .await
-            } else {
-                false
+            let identified = identified.await;
+            let classified = classified.await;
+            let model = match model {
+                Some(model) => model.await,
+                None => None,
             };
             this.update(cx, |this, cx| {
                 let classification = classified.as_ref().cloned();
@@ -933,8 +959,10 @@ impl Explorer {
                     // Opening it explains why it is not a valid archive.
                     Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
                     // A drawable resource is a model before it is a container.
-                    Ok(Identified::Unknown) if model => {
-                        open_model_viewer(path, access, gta_root, cx)
+                    Ok(Identified::Unknown) if model.is_some() => {
+                        if let Some(model) = model {
+                            open_model_kind(model, path, access, gta_root, cx);
+                        }
                     }
                     Ok(Identified::Unknown) if texture => {
                         crate::viewers::texture::open(path, access, cx)
@@ -2114,9 +2142,10 @@ fn open_image_viewer(path: PathBuf, access: Access, cx: &mut App) {
     }
 }
 
-/// How an entry is recognised as a model. Native type 2 and type 3 rows are
-/// model resources; a recovered resource needs a content check first because
-/// the recovery tree also holds texture dictionaries and other resources.
+/// How an entry is recognised as a model. Native type 2 (drawable), type 3
+/// (fragment) and type 4 (drawable dictionary) rows are model resources; a
+/// recovered resource needs a content check first because the recovery tree
+/// also holds texture dictionaries and other resources.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelEntryKind {
     Direct,
@@ -2126,6 +2155,7 @@ enum ModelEntryKind {
 fn model_entry_kind(entry: &Entry) -> Option<ModelEntryKind> {
     if entry.type_name.starts_with("RPF9 entry, type 2")
         || entry.type_name.starts_with("RPF9 entry, type 3")
+        || entry.type_name.starts_with("RPF9 entry, type 4")
     {
         return Some(ModelEntryKind::Direct);
     }
@@ -2148,6 +2178,37 @@ fn open_model_viewer(path: PathBuf, access: Access, gta_root: Option<PathBuf>, c
         cx.new(|cx| ModelViewer::new(path, access, gta_root, window, cx))
     }) {
         log::error!("failed to open model viewer: {err:#}");
+    }
+}
+
+/// Opens the viewer that matches the structure the resource turned out to
+/// hold. A dictionary gets its own member-selection window; a drawable and a
+/// fragment share the model viewer.
+fn open_model_kind(
+    kind: files::model::ResourceKind,
+    path: PathBuf,
+    access: Access,
+    gta_root: Option<PathBuf>,
+    cx: &mut App,
+) {
+    match kind {
+        files::model::ResourceKind::Dictionary => {
+            open_dictionary_viewer(path, access, gta_root, cx)
+        }
+        files::model::ResourceKind::Drawable | files::model::ResourceKind::Fragment => {
+            open_model_viewer(path, access, gta_root, cx)
+        }
+    }
+}
+
+fn open_dictionary_viewer(path: PathBuf, access: Access, gta_root: Option<PathBuf>, cx: &mut App) {
+    let mut options = window_options(&window_title(&path), size(px(1280.), px(800.)), cx);
+    options.window_min_size = Some(size(px(760.), px(460.)));
+    if let Err(err) = cx.open_window(options, |window, cx| {
+        ui::close_through_gpui(window, cx);
+        cx.new(|cx| DictionaryViewer::new(path, access, gta_root, window, cx))
+    }) {
+        log::error!("failed to open drawable dictionary viewer: {err:#}");
     }
 }
 

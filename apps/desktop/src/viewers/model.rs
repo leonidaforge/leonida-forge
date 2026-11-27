@@ -126,8 +126,11 @@ impl ModelViewer {
                         }));
                         if let Some(fragment) = &loaded.fragment {
                             lines.push(format!(
-                                "Fragment: {} component(s); root counts at +0x30 {:?}; {} root pointer(s) reach unidentified records",
-                                fragment.components.len(),
+                                "Fragment: {}; root counts at +0x30 {:?}; {} root pointer(s) reach unidentified records",
+                                match fragment.components.len() {
+                                    1 => "one component, the member drawable".to_string(),
+                                    count => format!("{count} components"),
+                                },
                                 fragment.counts,
                                 fragment.unexplained
                             ));
