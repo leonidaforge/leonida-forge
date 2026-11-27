@@ -10,6 +10,11 @@ use serde_json::{Value, json};
 /// The build the table was read from.
 pub const SOURCE_BUILD: &str = "e95020b2";
 
+/// SHA-256 of the executable the table was read from, so a reader can compare
+/// it with the executable in front of them. The table is not verified against
+/// any other build.
+pub const SOURCE_SHA256: &str = "e95020b2fa4a721db3df59fdecf75621730ac559d8835252f6c3b658d5a08993";
+
 /// Schema of the registry document.
 pub const REGISTRY_SCHEMA: &str = "leonida-forge.rpf9-type-registry/1";
 
@@ -44,11 +49,19 @@ pub fn run(json_output: bool) -> Result<(), String> {
         .iter()
         .filter(|entry| entry["registered"] == json!(true))
         .count();
+    // Registered ids and extension strings are not the same count: two ids
+    // share one extension in this build.
+    let extensions: std::collections::BTreeSet<&str> = ids
+        .iter()
+        .filter_map(|entry| entry["extension"].as_str())
+        .collect();
     let document = json!({
         "schema": REGISTRY_SCHEMA,
         "source_build": SOURCE_BUILD,
+        "source_sha256": SOURCE_SHA256,
         "unregistered_ids": u8::MAX as usize + 1 - registered,
         "registered_ids": registered,
+        "distinct_extensions": extensions.len(),
         "ids": ids,
     });
     if json_output {
