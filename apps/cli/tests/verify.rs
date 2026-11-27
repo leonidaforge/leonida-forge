@@ -74,6 +74,49 @@ fn verifies_encoding_4_with_and_without_a_stored_prefix() {
     );
     assert_eq!(entries[1]["chunk_table"]["stored_prefix"], 0);
     assert_eq!(entries[0]["verification"]["logical_size_matched"], true);
+    assert_eq!(
+        entries[0]["verification"]["integrity"],
+        "zlib-adler32-and-copy"
+    );
+}
+
+#[test]
+fn replaces_an_existing_output_only_when_asked() {
+    let temp = tempfile::tempdir().unwrap();
+    let (region, entry) = zlib_chunk(b"data");
+    let row = Spec {
+        chunks: Some(chunk_value(1, 4, &[entry])),
+        logical: Some(4),
+        ..spec(&region)
+    };
+    let archive = write_archive(temp.path(), "one.rpf", &assemble(&[row], &[]));
+    let output = temp.path().join("verify.jsonl");
+    std::fs::write(&output, "old\n").unwrap();
+
+    let refused = lforge(&[
+        "archive",
+        "verify",
+        archive.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(!refused.status.success());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "old\n");
+
+    let replaced = lforge(&[
+        "archive",
+        "verify",
+        archive.to_str().unwrap(),
+        "--encoding",
+        "4",
+        "--output",
+        output.to_str().unwrap(),
+        "--overwrite",
+    ]);
+    assert!(replaced.status.success(), "{}", stderr(&replaced));
+    let (entries, summary) = records(&output);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(summary["candidates"], 1);
 }
 
 #[test]

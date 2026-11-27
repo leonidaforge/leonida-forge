@@ -316,6 +316,31 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
+/// Renames `temporary` to `target`. Windows refuses to replace an existing
+/// file with `rename`, so an overwrite removes the target first; elsewhere the
+/// rename itself is atomic.
+fn publish(temporary: &Path, target: &Path, overwrite: bool) -> Result<(), String> {
+    match fs::rename(temporary, target) {
+        Ok(()) => Ok(()),
+        Err(err) if overwrite && err.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(target)
+                .map_err(|err| format!("cannot replace {}: {err}", target.display()))?;
+            fs::rename(temporary, target).map_err(|err| {
+                format!(
+                    "cannot publish {} as {}: {err}",
+                    temporary.display(),
+                    target.display()
+                )
+            })
+        }
+        Err(err) => Err(format!(
+            "cannot publish {} as {}: {err}",
+            temporary.display(),
+            target.display()
+        )),
+    }
+}
+
 impl Engine<'_> {
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
@@ -331,13 +356,11 @@ impl Engine<'_> {
             &mut self.writer,
             Box::new(std::io::sink()),
         ));
-        fs::rename(&temporary, &target).map_err(|err| {
-            format!(
-                "cannot publish {} as {}: {err}",
-                temporary.display(),
-                target.display()
-            )
-        })
+        let published = publish(&temporary, &target, self.options.overwrite);
+        if published.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        published
     }
 
     fn stop(&mut self, limit: &'static str) {
@@ -713,8 +736,12 @@ impl Engine<'_> {
                 "logical_size_matched": status == "decoded" && logical_size == Some(decoded_bytes),
                 "integrity": if status != "decoded" {
                     Value::Null
+                } else if methods.is_empty() {
+                    json!("sizes")
                 } else if methods.iter().all(|method| *method == 3) {
                     json!("zlib-adler32")
+                } else if methods.contains(&3) {
+                    json!("zlib-adler32-and-copy")
                 } else {
                     json!("sizes-and-copy")
                 },
