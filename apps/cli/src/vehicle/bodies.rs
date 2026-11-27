@@ -50,6 +50,8 @@ pub struct Association {
     pub row: u32,
     pub header: String,
     pub logical_size: u64,
+    /// The row's stored 64-bit name hash, when the table carries one.
+    pub row_hash64: Option<String>,
     /// Higher is a more detailed body: `_hi` over `_mid` over the base name.
     pub rank: u8,
 }
@@ -202,6 +204,10 @@ pub fn discover(
                     row: inner.row,
                     header,
                     logical_size: inner_location.logical_len,
+                    row_hash64: match &inner.name_hash {
+                        Ok(Some(hash)) => Some(format!("0x{hash:016X}")),
+                        _ => None,
+                    },
                     rank,
                 };
                 match best.get(&candidate.model) {
@@ -240,6 +246,7 @@ fn write(output: &Path, bodies: &Bodies, archive: &Path, json_output: bool) -> R
                 "row": association.row,
                 "header": association.header,
                 "logical_size": association.logical_size,
+                "row_hash_64": association.row_hash64,
             }))
             .collect::<Vec<Value>>(),
     });
@@ -314,6 +321,10 @@ pub fn read(path: &Path) -> Result<Bodies, String> {
             row,
             header: header.to_string(),
             logical_size,
+            row_hash64: entry
+                .get("row_hash_64")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             rank: header_rank(header),
         });
     }
