@@ -5,12 +5,13 @@
 //! The renderer itself is window-system independent and is also used for
 //! headless images.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use futures::StreamExt;
-use futures::channel::mpsc::{UnboundedSender, unbounded};
+use futures::channel::mpsc::{Receiver, Sender, channel};
 use gpui::{
     App, Bounds, Context, Corners, DevicePixels, DispatchPhase, Entity, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollEvent, Size,
@@ -134,6 +135,67 @@ enum Response {
     Failed(String),
 }
 
+/// A bounded completed-response queue. At most one frame is retained: a newer
+/// completed frame replaces the queued one. Lifecycle messages are never
+/// coalesced away.
+struct ResponseQueue {
+    pending: Mutex<VecDeque<Response>>,
+    notify: Mutex<Sender<()>>,
+}
+
+const MAX_PENDING_RESPONSES: usize = 4;
+
+impl ResponseQueue {
+    fn new() -> (Arc<Self>, Receiver<()>) {
+        let (notify, receiver) = channel(1);
+        (
+            Arc::new(Self {
+                pending: Mutex::new(VecDeque::new()),
+                notify: Mutex::new(notify),
+            }),
+            receiver,
+        )
+    }
+
+    fn send(&self, response: Response) {
+        let mut pending = self.pending.lock().unwrap_or_else(|err| err.into_inner());
+        if matches!(response, Response::Frame { .. })
+            && let Some(index) = pending
+                .iter()
+                .position(|queued| matches!(queued, Response::Frame { .. }))
+        {
+            pending.remove(index);
+        }
+        if pending.len() >= MAX_PENDING_RESPONSES
+            && let Some(index) = pending
+                .iter()
+                .position(|queued| matches!(queued, Response::Frame { .. }))
+                .or_else(|| (!pending.is_empty()).then_some(0))
+        {
+            pending.remove(index);
+        }
+        pending.push_back(response);
+        drop(pending);
+        let mut notify = self.notify.lock().unwrap_or_else(|err| err.into_inner());
+        let _ = notify.try_send(());
+    }
+
+    fn take(&self) -> Option<Response> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .len()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Request {
     generation: u64,
@@ -167,8 +229,8 @@ impl Viewport {
     pub fn new(scene: Arc<Scene>, cx: &mut Context<Self>) -> Self {
         let bounds = scene.bounds.sanitized();
         let camera = OrbitCamera::framing(bounds, 1.0);
-        let (response_tx, mut responses) = unbounded();
-        let (requests, status) = match spawn_render_thread(scene, response_tx) {
+        let (responses, mut notifications) = ResponseQueue::new();
+        let (requests, status) = match spawn_render_thread(scene, responses.clone()) {
             Ok(requests) => (Some(requests), RendererStatus::Starting),
             Err(err) => (
                 None,
@@ -177,12 +239,14 @@ impl Viewport {
         };
 
         cx.spawn(async move |this, cx| {
-            while let Some(response) = responses.next().await {
-                if this
-                    .update(cx, |this, cx| this.handle_response(response, cx))
-                    .is_err()
-                {
-                    break;
+            while notifications.next().await.is_some() {
+                while let Some(response) = responses.take() {
+                    if this
+                        .update(cx, |this, cx| this.handle_response(response, cx))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         })
@@ -439,7 +503,7 @@ fn viewport_canvas(
 
 fn spawn_render_thread(
     scene: Arc<Scene>,
-    responses: UnboundedSender<Response>,
+    responses: Arc<ResponseQueue>,
 ) -> std::io::Result<LatestSender<Request>> {
     let (request_tx, requests) = LatestSender::<Request>::new();
     thread::Builder::new()
@@ -448,7 +512,7 @@ fn spawn_render_thread(
             let mut renderer = match Renderer::new() {
                 Ok(renderer) => renderer,
                 Err(err) => {
-                    let _ = responses.unbounded_send(Response::Failed(err.to_string()));
+                    responses.send(Response::Failed(err.to_string()));
                     return;
                 }
             };
@@ -460,13 +524,11 @@ fn spawn_render_thread(
             let gpu_scene = match renderer.upload_scene(&scene) {
                 Ok(scene) => scene,
                 Err(err) => {
-                    let _ = responses.unbounded_send(Response::Failed(err.to_string()));
+                    responses.send(Response::Failed(err.to_string()));
                     return;
                 }
             };
-            if responses.unbounded_send(ready).is_err() {
-                return;
-            }
+            responses.send(ready);
 
             while let Some(request) = requests.next() {
                 let response = match renderer.render(
@@ -483,7 +545,8 @@ fn spawn_render_thread(
                     Err(err) => Response::Failed(err.to_string()),
                 };
                 let failed = matches!(response, Response::Failed(_));
-                if responses.unbounded_send(response).is_err() || failed {
+                responses.send(response);
+                if failed {
                     return;
                 }
             }
@@ -532,5 +595,39 @@ mod tests {
         drop(sender);
         assert!(!state.submit(1));
         assert_eq!(state.next(), None);
+    }
+
+    #[test]
+    fn completed_responses_keep_one_frame_and_preserve_lifecycle_messages() {
+        let (queue, _notifications) = ResponseQueue::new();
+        queue.send(Response::Ready {
+            adapter: "test".into(),
+            backend: "test".into(),
+        });
+        queue.send(Response::Failed("stop".into()));
+        for generation in 0..100 {
+            queue.send(Response::Frame {
+                generation,
+                frame: Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0; 4],
+                },
+            });
+        }
+        assert!(queue.len() <= MAX_PENDING_RESPONSES);
+        let mut ready = false;
+        let mut failed = false;
+        let mut latest_frame = None;
+        while let Some(response) = queue.take() {
+            match response {
+                Response::Ready { .. } => ready = true,
+                Response::Failed(_) => failed = true,
+                Response::Frame { generation, .. } => latest_frame = Some(generation),
+            }
+        }
+        assert!(ready);
+        assert!(failed);
+        assert_eq!(latest_frame, Some(99));
     }
 }
