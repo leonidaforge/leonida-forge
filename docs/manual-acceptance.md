@@ -8,9 +8,12 @@ the original native path in the release installation, not a copy.
 
 | Item               | Value                                                                                                         |
 | ------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Release executable | `E:\source\leonidaforge\worktrees\fragment-dictionary-support\leonida-forge\target\release\leonida-forge.exe` |
+| Release executable | `target\release\leonida-forge.exe` under the repository root                                                 |
 | Game root          | `D:\GTA VI` (read only)                                                                                       |
 | Texture stores     | `D:\GTA VI\data\ttdb`                                                                                         |
+
+Build it with `cargo build --release -p lforge-desktop`; the binary is the
+`leonida-forge` target, not the `lforge` command-line tool beside it.
 
 Launch the executable, set the game root when asked, then open the root archive
 listed for a selector and descend into the nested archives it names.
