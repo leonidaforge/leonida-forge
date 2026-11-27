@@ -201,6 +201,12 @@ impl MemoryBudget {
             bytes,
         })
     }
+
+    /// Bytes currently charged to the budget.
+    #[cfg(test)]
+    fn used(&self) -> u64 {
+        *self.used.lock().unwrap_or_else(|err| err.into_inner())
+    }
 }
 
 impl Drop for MemoryPermit {
@@ -610,13 +616,15 @@ fn find_row(root: &Path, access: &Access, row: usize) -> Option<PathBuf> {
         let entries = crate::files::list_with(&folder, access).ok()?;
         for entry in &entries {
             examined += 1;
-            if examined > 8192 {
+            if examined > 65_536 {
                 return None;
             }
             if row_number(&entry.path) == Some(row) {
                 return Some(entry.path.clone());
             }
-            if depth < 3 && entry.is_container() {
+            // A row's path carries the folders its resolved name implies, so a
+            // deep folder chain is normal rather than an error.
+            if depth < 12 && entry.is_container() {
                 queue.push((entry.path.clone(), depth + 1));
             }
         }
@@ -661,9 +669,46 @@ mod tests {
     use crate::files::Executable;
 
     /// The archives a survey reads: `LF_TEST_ARCHIVE_LIST` names a file of
-    /// paths, one per line; otherwise `LF_TEST_ARCHIVE_DIR` names a directory
-    /// of `.rpf` files.
+    /// paths, `LF_TEST_CHAIN_LIST` a file of census chains (`a.rpf!5!3`), and
+    /// `LF_TEST_ARCHIVE_DIR` a directory of `.rpf` files. A chain list resolves
+    /// to the archives that directly hold the entries, so an installation-wide
+    /// census can drive the survey without extracting anything.
     fn survey_archives() -> Vec<std::path::PathBuf> {
+        if let Ok(list) = std::env::var("LF_TEST_CHAIN_LIST") {
+            let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+            let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+            let access = Access::with(Arc::new(
+                Executable::open(Path::new(&executable)).expect("executable"),
+            ));
+            let text = std::fs::read_to_string(&list).expect("chain list");
+            let mut chains = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|chain| {
+                    chain
+                        .rsplit_once('!')
+                        .map(|(parent, _)| parent.to_string())
+                        .unwrap_or_else(|| chain.to_string())
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            chains.sort();
+            let mut resolved = std::collections::BTreeMap::new();
+            let mut index: std::collections::HashMap<
+                std::path::PathBuf,
+                std::collections::HashMap<usize, std::path::PathBuf>,
+            > = std::collections::HashMap::new();
+            let mut paths = Vec::new();
+            for chain in &chains {
+                match resolve_chain(Path::new(&root), &access, chain, &mut resolved, &mut index) {
+                    Some(path) => paths.push(path),
+                    None => eprintln!("unresolved chain: {chain}"),
+                }
+            }
+            return paths;
+        }
         let mut paths = match std::env::var("LF_TEST_ARCHIVE_LIST") {
             Ok(list) => std::fs::read_to_string(&list)
                 .expect("archive list")
@@ -674,7 +719,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             Err(_) => {
                 let directory = std::env::var("LF_TEST_ARCHIVE_DIR")
-                    .expect("LF_TEST_ARCHIVE_LIST or LF_TEST_ARCHIVE_DIR");
+                    .expect("LF_TEST_CHAIN_LIST, LF_TEST_ARCHIVE_LIST or LF_TEST_ARCHIVE_DIR");
                 std::fs::read_dir(&directory)
                     .expect("archive directory")
                     .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -684,6 +729,87 @@ mod tests {
         };
         paths.sort();
         paths
+    }
+
+    /// Resolves a census chain (`a.rpf!5!3`) to the archive that directly holds
+    /// the entry: every component but the last one.
+    ///
+    /// Each archive is listed once and its rows are indexed by number, so a
+    /// chain list of hundreds of parents costs one walk per archive rather than
+    /// one search per parent.
+    fn resolve_chain(
+        root: &Path,
+        access: &Access,
+        chain: &str,
+        resolved: &mut std::collections::BTreeMap<String, Option<std::path::PathBuf>>,
+        index: &mut std::collections::HashMap<
+            std::path::PathBuf,
+            std::collections::HashMap<usize, std::path::PathBuf>,
+        >,
+    ) -> Option<std::path::PathBuf> {
+        if let Some(cached) = resolved.get(chain) {
+            return cached.clone();
+        }
+        let parts = chain.split('!').collect::<Vec<_>>();
+        if parts.is_empty() {
+            resolved.insert(chain.to_string(), None);
+            return None;
+        }
+        let mut path = root.join(parts[0]);
+        crate::files::archive::prepare_with(
+            &path,
+            access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .ok()?;
+        for part in &parts[1..] {
+            let row: usize = part.parse().ok()?;
+            if !index.contains_key(&path) {
+                index.insert(path.clone(), row_index(&path, access));
+            }
+            path = index.get(&path)?.get(&row)?.clone();
+            crate::files::archive::prepare_with(
+                &path,
+                access,
+                true,
+                &crate::files::archive::Stage::default(),
+                &lforge_rage9::rpf::Progress::default(),
+                &AtomicBool::new(false),
+            )
+            .ok()?;
+        }
+        resolved.insert(chain.to_string(), Some(path.clone()));
+        Some(path)
+    }
+
+    /// Every native row of one archive, indexed by the number its path carries.
+    fn row_index(
+        archive: &Path,
+        access: &Access,
+    ) -> std::collections::HashMap<usize, std::path::PathBuf> {
+        let mut index = std::collections::HashMap::new();
+        let mut queue = vec![(archive.to_path_buf(), 0usize)];
+        let mut examined = 0usize;
+        while let Some((folder, depth)) = queue.pop() {
+            let Ok(entries) = crate::files::list_with(&folder, access) else {
+                continue;
+            };
+            for entry in &entries {
+                examined += 1;
+                if examined > 200_000 {
+                    return index;
+                }
+                if let Some(row) = row_number(&entry.path) {
+                    index.insert(row, entry.path.clone());
+                } else if depth < 12 && entry.is_container() {
+                    queue.push((entry.path.clone(), depth + 1));
+                }
+            }
+        }
+        index
     }
 
     /// Manual verification against a real installation. The test is ignored
@@ -1043,6 +1169,22 @@ mod tests {
     }
 
     #[test]
+    fn a_source_permit_is_charged_and_released_with_its_owner() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        assert_eq!(budget.used(), 0);
+        let permit = budget
+            .acquire(40, &AtomicBool::new(false))
+            .expect("a permit inside the budget");
+        assert_eq!(budget.used(), 40, "a live source is charged");
+        drop(permit);
+        assert_eq!(
+            budget.used(),
+            0,
+            "the charge ends with the source it belongs to"
+        );
+    }
+
+    #[test]
     fn an_oversized_standalone_resource_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("oversized.bin");
@@ -1150,10 +1292,11 @@ mod tests {
         let mut empty_dictionaries = 0usize;
         let mut exact_splits = 0usize;
         let mut split_disagreements = 0usize;
+        let mut inference_outcomes: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut mismatch_samples: Vec<String> = Vec::new();
         let mut member_states: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut member_counts = BTreeMap::new();
         let mut unnamed_members = 0usize;
-        let mut hash_matches = 0usize;
         let mut hash_stem_matches = 0usize;
         let mut hash_mismatches = 0usize;
         let mut name_suffixes: BTreeMap<String, usize> = BTreeMap::new();
@@ -1163,6 +1306,12 @@ mod tests {
         let mut unsorted = 0usize;
         let mut issues = 0usize;
         let mut failures: Vec<String> = Vec::new();
+        // `LF_SURVEY_SELECTORS` prints the exact locator of every dictionary
+        // with at least that many members.
+        let selector_min: usize = std::env::var("LF_SURVEY_SELECTORS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         for archive in &archives {
             eprintln!("archive: {}", archive.display());
             let prepared = crate::files::archive::prepare_with(
@@ -1230,6 +1379,38 @@ mod tests {
                 };
                 if native.is_some_and(|native| Some(native) != inferred) {
                     split_disagreements += 1;
+                    // The inferred boundary is never used for the reported
+                    // results, but what it would produce decides whether a
+                    // standalone open fails loudly or misreads the resource.
+                    let outcome = match inferred.filter(|len| *len <= bytes.len()) {
+                        None => "no candidate",
+                        Some(inferred) => {
+                            let (system, graphics) = bytes.split_at(inferred);
+                            match decoded::dictionary_info(system, graphics) {
+                                None => "no root form",
+                                Some(info) => {
+                                    let drawable = info.drawable_members().count();
+                                    if drawable == 0 || drawable != usize::from(info.count) {
+                                        "root form, members missing"
+                                    } else {
+                                        "root form, all members resolved"
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    *inference_outcomes.entry(outcome).or_insert(0) += 1;
+                    if mismatch_samples.len() < 10 {
+                        mismatch_samples.push(format!(
+                            "{}: native {:#x}, inferred {}, {outcome}",
+                            entry.path.display(),
+                            native.unwrap_or_default(),
+                            inferred.map_or_else(
+                                || "none".to_string(),
+                                |inferred| format!("{inferred:#x}")
+                            )
+                        ));
+                    }
                 }
                 if native.is_some() {
                     exact_splits += 1;
@@ -1272,31 +1453,25 @@ mod tests {
                     match &member.name {
                         None => unnamed_members += 1,
                         Some(name) => {
-                            let stem = name
-                                .rsplit_once('.')
-                                .map(|(stem, suffix)| {
-                                    *name_suffixes
-                                        .entry(format!(".{}", suffix.to_ascii_lowercase()))
-                                        .or_insert(0) += 1;
-                                    stem
-                                })
-                                .unwrap_or(name.as_str());
-                            if lforge_rage9::rpf::names::joaat(name.as_bytes()) == member.hash {
-                                hash_matches += 1;
-                            } else if lforge_rage9::rpf::names::joaat(stem.as_bytes())
-                                == member.hash
-                            {
-                                hash_stem_matches += 1;
-                            } else {
-                                hash_mismatches += 1;
-                                if failures.len() < 400 {
-                                    failures.push(format!(
-                                        "{}: member {} hash {:#010x} matches neither {name} nor {stem}",
-                                        entry.path.display(),
-                                        member.index,
-                                        member.hash
-                                    ));
+                            if let Some((_, suffix)) = name.rsplit_once('.') {
+                                *name_suffixes
+                                    .entry(format!(".{}", suffix.to_ascii_lowercase()))
+                                    .or_insert(0) += 1;
+                            }
+                            match member.hash_matches_name {
+                                Some(true) => hash_stem_matches += 1,
+                                Some(false) => {
+                                    hash_mismatches += 1;
+                                    if failures.len() < 400 {
+                                        failures.push(format!(
+                                            "{}: member {} hash {:#010x} does not match {name}",
+                                            entry.path.display(),
+                                            member.index,
+                                            member.hash
+                                        ));
+                                    }
                                 }
+                                None => {}
                             }
                         }
                     }
@@ -1305,6 +1480,18 @@ mod tests {
                     for issue in &info.issues {
                         failures.push(format!("{}: {issue}", entry.path.display()));
                     }
+                }
+                // A maintainer needs exact selectors for representative
+                // dictionaries; the run prints them only when asked.
+                if selector_min > 0 && usize::from(info.count) >= selector_min {
+                    eprintln!(
+                        "selector: {} | {} members, page map {:#x}, split {:#x}{}",
+                        entry.path.display(),
+                        info.count,
+                        info.page_map,
+                        system_len,
+                        if native.is_some() { "" } else { " (inferred)" }
+                    );
                 }
             }
         }
@@ -1316,9 +1503,13 @@ mod tests {
         eprintln!(
             "splits: {exact_splits} native, {split_disagreements} native/inferred disagreements"
         );
+        eprintln!("inferred boundary on a disagreement: {inference_outcomes:?}");
+        for line in &mismatch_samples {
+            eprintln!("  mismatch: {line}");
+        }
         eprintln!("member states: {member_states:?}, {unnamed_members} unnamed");
         eprintln!(
-            "member hashes: {hash_matches} equal joaat of the full name, {hash_stem_matches} equal joaat of the name without its final extension, {hash_mismatches} match neither"
+            "member hashes: {hash_stem_matches} match the computed name hash, {hash_mismatches} do not"
         );
         eprintln!("member name suffixes: {name_suffixes:?}");
         eprintln!("member counts: {member_counts:?}");
@@ -1344,18 +1535,110 @@ mod tests {
         });
     }
 
-    /// Surveys every declared type-3 row in a directory of extracted archives.
+    /// One declared-type row a survey could read.
     ///
-    /// The question is whether a fragment ever references more than one member
-    /// drawable. Every root pointer slot is tested for the member-drawable
-    /// form and its target is named, so a fragment that carries components is
-    /// reported with the slot it carries them in.
+    /// `native` records whether the system/graphics boundary came from the
+    /// archive's page metadata; the reported results always use it when it is
+    /// available and never treat an inferred boundary as evidence.
+    struct SurveyRow {
+        path: std::path::PathBuf,
+        bytes: Vec<u8>,
+        system_len: usize,
+        native: bool,
+    }
+
+    impl SurveyRow {
+        fn segments(&self) -> (&[u8], &[u8]) {
+            self.bytes.split_at(self.system_len)
+        }
+    }
+
+    /// Reads every row of `type_id` in the caller-named archives and calls
+    /// `visit` for each. Returns the archives listed, the rows the metadata
+    /// declares, the rows read, and the rows that could not be read.
+    fn survey_rows(
+        archives: &[std::path::PathBuf],
+        access: &Access,
+        cancel: &AtomicBool,
+        type_id: u8,
+        mut visit: impl FnMut(&SurveyRow),
+    ) -> (usize, usize, usize, usize) {
+        let prefix = format!("RPF9 entry, type {type_id}");
+        let (mut listed, mut declared, mut read, mut unreadable) = (0, 0, 0, 0);
+        for archive in archives {
+            eprintln!("archive: {}", archive.display());
+            if crate::files::archive::prepare_with(
+                archive,
+                access,
+                true,
+                &crate::files::archive::Stage::default(),
+                &lforge_rage9::rpf::Progress::default(),
+                cancel,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let Ok(entries) = crate::files::list_with(archive, access) else {
+                continue;
+            };
+            listed += 1;
+            for entry in entries
+                .iter()
+                .filter(|entry| entry.type_name.starts_with(&prefix))
+            {
+                declared += 1;
+                let Ok(binary) = crate::files::open_binary_with(&entry.path, access) else {
+                    unreadable += 1;
+                    continue;
+                };
+                let source = binary.source;
+                let total = source.len();
+                if total > MAX_MODEL_BYTES {
+                    unreadable += 1;
+                    continue;
+                }
+                let Ok(bytes) = read_exact(&source, 0, total) else {
+                    unreadable += 1;
+                    continue;
+                };
+                let native = crate::files::resource_split_with(&entry.path, access, &source)
+                    .ok()
+                    .flatten()
+                    .and_then(|split| usize::try_from(split.system_len).ok());
+                let inferred = decoded::split_resource(&bytes).map(|split| split.system_len);
+                let boundary = native.or(inferred);
+                let Some(system_len) = boundary.filter(|len| *len <= bytes.len()) else {
+                    unreadable += 1;
+                    continue;
+                };
+                read += 1;
+                visit(&SurveyRow {
+                    path: entry.path.clone(),
+                    bytes,
+                    system_len,
+                    native: native.is_some(),
+                });
+            }
+        }
+        (listed, declared, read, unreadable)
+    }
+
+    /// Surveys every declared type-3 row in the caller-named archives.
     ///
-    /// Ignored by default. `LF_TEST_ARCHIVE_DIR` names the directory,
-    /// `LF_TEST_EXECUTABLE` names the executable that supplies the archive
-    /// keys.
+    /// The question the run answers is how a fragment's static model is
+    /// actually represented: the root variant, the single member drawable, and
+    /// the member's own LOD slots, models, geometries and skeleton and list
+    /// references. Every root slot is tested for the member-drawable form, so a
+    /// fragment that carries components would be reported with the slot it
+    /// carries them in.
+    ///
+    /// Ignored by default. `LF_TEST_ARCHIVE_LIST` names a file of extracted
+    /// archives (or `LF_TEST_ARCHIVE_DIR` a directory of them) and
+    /// `LF_TEST_EXECUTABLE` the executable that supplies the archive keys.
+    /// `LF_SURVEY_SAMPLES` bounds the locators printed for complex rows.
     #[test]
-    #[ignore = "requires LF_TEST_ARCHIVE_DIR and LF_TEST_EXECUTABLE"]
+    #[ignore = "requires LF_TEST_ARCHIVE_LIST (or LF_TEST_ARCHIVE_DIR) and LF_TEST_EXECUTABLE"]
     fn surveys_native_type_3_rows() {
         use std::collections::BTreeMap;
 
@@ -1365,79 +1648,63 @@ mod tests {
         ));
         let cancel = AtomicBool::new(false);
         let archives = survey_archives();
-        let mut listed = 0usize;
-        let mut type_3_rows = 0usize;
+        let sample_limit: usize = std::env::var("LF_SURVEY_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+        // `LF_SURVEY_NAME_FILTER` prints the locator of rows whose member name
+        // contains the substring, so a caller can find a category of asset.
+        let name_filter = std::env::var("LF_SURVEY_NAME_FILTER")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let mut matched: Vec<String> = Vec::new();
         let mut root_shape = 0usize;
+        let mut variants: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut drawable_counts: BTreeMap<usize, usize> = BTreeMap::new();
         let mut slots_holding_drawables: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut suffixed = 0usize;
-        let mut unsuffixed: Vec<String> = Vec::new();
-        let mut multi: Vec<String> = Vec::new();
+        let mut suffixes: BTreeMap<String, usize> = BTreeMap::new();
         let mut counts_words: BTreeMap<[u16; 4], usize> = BTreeMap::new();
-        let mut failures = 0usize;
-        for archive in &archives {
-            eprintln!("archive: {}", archive.display());
-            if crate::files::archive::prepare_with(
-                archive,
-                &access,
-                true,
-                &crate::files::archive::Stage::default(),
-                &lforge_rage9::rpf::Progress::default(),
-                &cancel,
-            )
-            .is_err()
-            {
-                continue;
-            }
-            let Ok(entries) = crate::files::list_with(archive, &access) else {
-                continue;
-            };
-            listed += 1;
-            for entry in entries
-                .iter()
-                .filter(|entry| entry.type_name.starts_with("RPF9 entry, type 3"))
-            {
-                type_3_rows += 1;
-                let Ok(binary) = crate::files::open_binary_with(&entry.path, &access) else {
-                    failures += 1;
-                    continue;
-                };
-                let source = binary.source;
-                let total = source.len();
-                if total > MAX_MODEL_BYTES {
-                    failures += 1;
-                    continue;
+        let mut populated_lods: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut model_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut geometry_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut skeleton_present = 0usize;
+        let mut list_present = 0usize;
+        let mut shader_group_present = 0usize;
+        let mut walk_issues = 0usize;
+        let mut inferred = 0usize;
+        let mut complex: Vec<String> = Vec::new();
+        let (listed, declared, read, unreadable) = survey_rows(
+            &archives,
+            &access,
+            &cancel,
+            3,
+            |row| {
+                if !row.native {
+                    inferred += 1;
                 }
-                let Ok(bytes) = read_exact(&source, 0, total) else {
-                    failures += 1;
-                    continue;
-                };
-                let split = crate::files::resource_split_with(&entry.path, &access, &source)
-                    .ok()
-                    .flatten()
-                    .and_then(|split| usize::try_from(split.system_len).ok())
-                    .or_else(|| decoded::split_resource(&bytes).map(|split| split.system_len));
-                let Some(split) = split.filter(|split| *split <= bytes.len()) else {
-                    failures += 1;
-                    continue;
-                };
-                let (system, graphics) = bytes.split_at(split);
+                let (system, graphics) = row.segments();
                 let Ok(header) = lforge_rage9::fragment::header(system) else {
-                    continue;
+                    return;
                 };
                 root_shape += 1;
+                *variants
+                    .entry(if header.unexplained[0].is_some() {
+                        "+0x10 pointer"
+                    } else {
+                        "+0x10 zero"
+                    })
+                    .or_insert(0) += 1;
                 *counts_words.entry(header.counts).or_insert(0) += 1;
                 let mut found = Vec::new();
-                let slots = [
+                for (slot, at) in [
                     ("drawable +0x18", Some(header.drawable)),
                     ("+0x10", header.unexplained[0]),
                     ("+0x20", header.unexplained[1]),
                     ("+0x28", header.unexplained[2]),
-                ];
-                for (slot, at) in slots {
-                    let Some(at) = at else {
-                        continue;
-                    };
+                ] {
+                    let Some(at) = at else { continue };
                     if !lforge_rage9::drawable::is_member_drawable_at(system, graphics, at as usize)
                     {
                         continue;
@@ -1448,56 +1715,198 @@ mod tests {
                     found.push((slot, at, name));
                 }
                 *drawable_counts.entry(found.len()).or_insert(0) += 1;
-                match found.len() {
-                    0 => {}
-                    1 => {
-                        if found[0].2.to_ascii_lowercase().ends_with("#ft") {
-                            suffixed += 1;
-                        } else if unsuffixed.len() < 20 {
-                            unsuffixed.push(format!(
-                                "{} [{}] slot {} {:?}",
-                                entry.path.display(),
-                                entry.type_name,
-                                found[0].0,
-                                found[0].2
-                            ));
-                        }
-                    }
-                    _ => {
-                        let names = found
-                            .iter()
-                            .map(|(slot, at, name)| format!("{slot} +{at:#x} {name:?}"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        eprintln!(
-                            "multi: {} [{}] counts {:?}: {names}",
-                            entry.path.display(),
-                            entry.type_name,
-                            header.counts
-                        );
-                        if multi.len() < 40 {
-                            multi.push(entry.path.display().to_string());
-                        }
-                    }
+                let Some(report) = lforge_rage9::drawable::inspect_member_at(
+                    system,
+                    graphics,
+                    header.drawable as usize,
+                ) else {
+                    return;
+                };
+                let name = report.header.name_text.clone().unwrap_or_default();
+                let suffix = name
+                    .rsplit_once('.')
+                    .map(|(_, suffix)| suffix.to_ascii_lowercase())
+                    .unwrap_or_default();
+                *suffixes.entry(format!(".{suffix}")).or_insert(0) += 1;
+                if suffix.trim_start_matches('#') == "ft" {
+                    suffixed += 1;
                 }
-            }
-        }
+                let models: usize = report.lod.iter().map(|slot| slot.models.len()).sum();
+                let geometries: usize = report
+                    .lod
+                    .iter()
+                    .flat_map(|slot| &slot.models)
+                    .map(|model| model.geometries.len())
+                    .sum();
+                *populated_lods.entry(report.lod.len()).or_insert(0) += 1;
+                *model_counts.entry(models).or_insert(0) += 1;
+                *geometry_counts.entry(geometries).or_insert(0) += 1;
+                if report.header.skeleton.is_some() {
+                    skeleton_present += 1;
+                }
+                if report.header.list.is_some() {
+                    list_present += 1;
+                }
+                if report.shader_group.is_some() {
+                    shader_group_present += 1;
+                }
+                if !report.issues.is_empty() {
+                    walk_issues += 1;
+                }
+                if let Some(filter) = &name_filter
+                    && name.to_ascii_lowercase().contains(filter.as_str())
+                    && matched.len() < sample_limit
+                {
+                    matched.push(format!(
+                        "{}: {name:?} counts {:?}, {} lod, {} model(s), {} geometry record(s), split {:#x}{}",
+                        row.path.display(),
+                        header.counts,
+                        report.lod.len(),
+                        models,
+                        geometries,
+                        row.system_len,
+                        if row.native { "" } else { " (inferred)" }
+                    ));
+                }
+                if (models > 1 || geometries > 4 || report.header.skeleton.is_some())
+                    && complex.len() < sample_limit
+                {
+                    complex.push(format!(
+                        "{}: variant {}, counts {:?}, {} lod, {} model(s), {} geometry record(s), skeleton {:?}, list {:?}, name {name:?}, split {:#x}{}",
+                        row.path.display(),
+                        if header.unexplained[0].is_some() {
+                            "+0x10 pointer"
+                        } else {
+                            "+0x10 zero"
+                        },
+                        header.counts,
+                        report.lod.len(),
+                        models,
+                        geometries,
+                        report.header.skeleton,
+                        report.header.list,
+                        row.system_len,
+                        if row.native { "" } else { " (inferred)" }
+                    ));
+                }
+            },
+        );
         eprintln!("archives: {listed} listed");
-        eprintln!("type-3 rows: {type_3_rows} found, {root_shape} with the root shape");
+        eprintln!("type-3 rows: {declared} declared, {read} read, {unreadable} unreadable");
+        eprintln!("{inferred} row(s) used an inferred split");
+        eprintln!("root shape: {root_shape}");
+        eprintln!("root variants: {variants:?}");
         eprintln!("drawables per row: {drawable_counts:?}");
         eprintln!("slots holding a member drawable: {slots_holding_drawables:?}");
-        eprintln!(
-            "{suffixed} single-drawable rows carry the #ft suffix, {} do not",
-            unsuffixed.len()
-        );
+        eprintln!("member name suffixes: {suffixes:?} ({suffixed} with #ft)");
         eprintln!("counts words: {counts_words:?}");
+        eprintln!("populated LOD slots per member: {populated_lods:?}");
+        eprintln!("models per member: {model_counts:?}");
+        eprintln!("geometry records per member: {geometry_counts:?}");
         eprintln!(
-            "{} multi-drawable row(s), {failures} unreadable",
-            multi.len()
+            "member references: {skeleton_present} skeleton, {list_present} list, {shader_group_present} shader group; {walk_issues} member(s) with a walk issue"
         );
-        for line in &unsuffixed {
-            eprintln!("  unsuffixed: {line}");
+        eprintln!("{} complex sample(s) printed", complex.len());
+        for line in &complex {
+            eprintln!("  complex: {line}");
+        }
+        if name_filter.is_some() {
+            eprintln!("{} name-filtered sample(s) printed", matched.len());
+            for line in &matched {
+                eprintln!("  named: {line}");
+            }
         }
         assert!(listed > 0, "no archive was listed");
+    }
+
+    /// Compares the dictionary framing of three declared container types.
+    ///
+    /// Type 4 is the drawable dictionary, type 5 the texture dictionary and
+    /// type 16 the batch dictionary. The census classes all three under the
+    /// same normalised header variant, so the run asks whether the framing is
+    /// shared rather than assuming it: each row is offered to the drawable
+    /// dictionary parser, the texture dictionary parser and the fragment root
+    /// reader, and the root words are recorded as stored.
+    ///
+    /// Ignored by default. `LF_SURVEY_TYPES` selects the types (default
+    /// `5,16,17`), `LF_TEST_ARCHIVE_LIST`/`LF_TEST_ARCHIVE_DIR` the archives
+    /// and `LF_TEST_EXECUTABLE` the executable that supplies the archive keys.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE_LIST (or LF_TEST_ARCHIVE_DIR) and LF_TEST_EXECUTABLE"]
+    fn surveys_native_container_rows() {
+        use std::collections::BTreeMap;
+
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let archives = survey_archives();
+        let types: Vec<u8> = std::env::var("LF_SURVEY_TYPES")
+            .unwrap_or_else(|_| "5,16,17".to_string())
+            .split(',')
+            .map(|value| value.trim().parse().expect("a type id"))
+            .collect();
+        for type_id in types {
+            let mut words: BTreeMap<(u64, u64, u64), usize> = BTreeMap::new();
+            let mut drawable_dictionaries = 0usize;
+            let mut texture_dictionaries = 0usize;
+            let mut fragments = 0usize;
+            let mut member_drawables = 0usize;
+            let mut sampled = 0usize;
+            let (listed, declared, read, unreadable) =
+                survey_rows(&archives, &access, &cancel, type_id, |row| {
+                    let (system, graphics) = row.segments();
+                    let word = |at: usize| {
+                        system
+                            .get(at..at + 8)
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .map(u64::from_le_bytes)
+                            .unwrap_or_default()
+                    };
+                    *words.entry((word(0), word(0x10), word(0x18))).or_insert(0) += 1;
+                    if decoded::is_drawable_dictionary(system, graphics) {
+                        drawable_dictionaries += 1;
+                    }
+                    if lforge_rage9::dictionary::is_dictionary(system) {
+                        texture_dictionaries += 1;
+                    }
+                    if lforge_rage9::fragment::header(system).is_ok() {
+                        fragments += 1;
+                        if let Some(at) =
+                            lforge_rage9::fragment::header(system)
+                                .ok()
+                                .and_then(|header| {
+                                    lforge_rage9::drawable::is_member_drawable_at(
+                                        system,
+                                        graphics,
+                                        header.drawable as usize,
+                                    )
+                                    .then_some(header.drawable)
+                                })
+                        {
+                            member_drawables += 1;
+                            if sampled < 8 {
+                                sampled += 1;
+                                eprintln!(
+                                    "  type {type_id} member: {} name {:?} counts {:?}",
+                                    row.path.display(),
+                                    lforge_rage9::drawable::member_name_at(system, at as usize),
+                                    lforge_rage9::fragment::header(system)
+                                        .map(|h| h.counts)
+                                        .ok()
+                                );
+                            }
+                        }
+                    }
+                });
+            eprintln!(
+                "type {type_id}: {listed} archive(s) listed, {declared} declared, {read} read, {unreadable} unreadable"
+            );
+            eprintln!("  root words (+0x00, +0x10, +0x18): {words:?}");
+            eprintln!(
+                "  accepted as: {drawable_dictionaries} drawable dictionary, {texture_dictionaries} texture dictionary, {fragments} fragment root ({member_drawables} with a member drawable)"
+            );
+        }
     }
 }
