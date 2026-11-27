@@ -287,22 +287,47 @@ fn association_completeness_separates_absent_and_partial() {
     ));
 }
 
-fn influence_streams(
-    weights_offset: usize,
-    index: Option<(usize, u8)>,
-) -> std::collections::HashMap<u32, Stream> {
-    let mut streams = std::collections::HashMap::new();
-    streams.insert(
-        6,
-        Stream {
-            offset: weights_offset,
-            format: 0x26,
-        },
-    );
-    if let Some((offset, format)) = index {
-        streams.insert(8, Stream { offset, format });
+fn influence_buffer(
+    blob_len: usize,
+    declarations: &[(u32, u8, u32, u8)],
+    vertex_count: usize,
+) -> lforge_rage9::drawable::VertexBuffer {
+    use lforge_rage9::drawable::{Attribute, Declaration, VertexBuffer};
+    VertexBuffer {
+        at: 0,
+        elements: 0,
+        unit: 4,
+        word_0e: 0,
+        word_10: 0,
+        graphics: 0,
+        layout: None,
+        vertex_count: vertex_count as u32,
+        packed_flags: 0,
+        declared_bytes: blob_len as u64,
+        attribute_bytes: 0,
+        layout_end: 0,
+        prefix_gap: 0,
+        attributes: declarations
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, offset, size))| Attribute {
+                slot: index,
+                offset: *offset,
+                size: *size,
+                format: 0,
+            })
+            .collect(),
+        declarations: declarations
+            .iter()
+            .map(|(slot, format, offset, _)| Declaration {
+                slot: *slot as usize,
+                format: *format,
+                offset: *offset,
+                matches_layout: true,
+            })
+            .collect(),
+        declaration_end: None,
     }
-    streams
 }
 
 #[test]
@@ -311,10 +336,12 @@ fn a_one_bone_geometry_needs_no_index_stream() {
     for vertex in 0..2 {
         blob[0x20 + vertex * 4..0x24 + vertex * 4].copy_from_slice(&[255, 0, 0, 0]);
     }
-    let streams = influence_streams(0x20, Some((0x40, 0x8c)));
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4)], 2);
     let mut diagnostics = Vec::new();
-    let influence = decode_influence(&blob, &streams, 2, Some(1), &mut diagnostics)
-        .expect("one bone resolves without an index stream");
+    let decoded = crate::influence::decode(&buffer, &blob, 2, Some(1), &mut diagnostics);
+    let crate::influence::InfluenceDecode::Decoded(influence) = decoded else {
+        panic!("one bone resolves without an index stream");
+    };
     assert_eq!(influence.bones, vec![0]);
     assert!(!influence.weighted);
     assert!(diagnostics.is_empty());
@@ -326,14 +353,12 @@ fn a_multi_bone_geometry_without_an_index_stream_is_not_guessed() {
     for vertex in 0..2 {
         blob[0x20 + vertex * 4..0x24 + vertex * 4].copy_from_slice(&[255, 0, 0, 0]);
     }
-    let streams = influence_streams(0x20, None);
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4)], 2);
     let mut diagnostics = Vec::new();
-    assert!(decode_influence(&blob, &streams, 2, Some(2), &mut diagnostics).is_none());
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.reason.contains("no influence index stream"))
-    );
+    assert!(matches!(
+        crate::influence::decode(&buffer, &blob, 2, Some(2), &mut diagnostics),
+        crate::influence::InfluenceDecode::Unsupported { .. }
+    ));
 }
 
 #[test]
@@ -341,10 +366,13 @@ fn a_packed_index_stream_reports_a_weighted_association() {
     let mut blob = vec![0u8; 0x80];
     blob[0x20..0x24].copy_from_slice(&[128, 127, 0, 0]);
     blob[0x40..0x44].copy_from_slice(&[0, 1, 0, 0]);
-    let streams = influence_streams(0x20, Some((0x40, 0x25)));
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4), (8, 0x25, 0x40, 4)], 1);
     let mut diagnostics = Vec::new();
-    let influence = decode_influence(&blob, &streams, 1, Some(2), &mut diagnostics)
-        .expect("two influences resolve");
+    let crate::influence::InfluenceDecode::Decoded(influence) =
+        crate::influence::decode(&buffer, &blob, 1, Some(2), &mut diagnostics)
+    else {
+        panic!("two influences resolve");
+    };
     assert_eq!(influence.bones, vec![0, 1]);
     assert!(influence.weighted);
 }
@@ -354,10 +382,13 @@ fn a_seven_bit_weight_normalisation_is_accepted() {
     let mut blob = vec![0u8; 0x80];
     blob[0x20..0x24].copy_from_slice(&[31, 32, 32, 32]);
     blob[0x40..0x44].copy_from_slice(&[1, 2, 3, 4]);
-    let streams = influence_streams(0x20, Some((0x40, 0x25)));
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4), (8, 0x25, 0x40, 4)], 1);
     let mut diagnostics = Vec::new();
-    let influence = decode_influence(&blob, &streams, 1, Some(5), &mut diagnostics)
-        .expect("a 127-scale weight set resolves");
+    let crate::influence::InfluenceDecode::Decoded(influence) =
+        crate::influence::decode(&buffer, &blob, 1, Some(5), &mut diagnostics)
+    else {
+        panic!("a 127-scale weight set resolves");
+    };
     assert_eq!(influence.bones, vec![1, 2, 3, 4]);
     assert!(influence.weighted);
     assert!(diagnostics.is_empty());
@@ -368,12 +399,16 @@ fn an_unnormalised_weight_total_is_accepted_and_reported() {
     let mut blob = vec![0u8; 0x80];
     blob[0x20..0x24].copy_from_slice(&[40, 43, 43, 43]);
     blob[0x40..0x44].copy_from_slice(&[2, 3, 4, 5]);
-    let streams = influence_streams(0x20, Some((0x40, 0x25)));
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4), (8, 0x25, 0x40, 4)], 1);
     let mut diagnostics = Vec::new();
-    let influence = decode_influence(&blob, &streams, 1, Some(8), &mut diagnostics)
-        .expect("the non-zero lanes name valid bones");
+    let crate::influence::InfluenceDecode::Decoded(influence) =
+        crate::influence::decode(&buffer, &blob, 1, Some(8), &mut diagnostics)
+    else {
+        panic!("the non-zero lanes name valid bones");
+    };
     assert_eq!(influence.bones, vec![2, 3, 4, 5]);
     assert!(influence.weighted);
+    assert!(!influence.deformable());
     assert!(
         diagnostics
             .iter()
@@ -386,14 +421,12 @@ fn an_index_outside_the_skeleton_is_rejected() {
     let mut blob = vec![0u8; 0x80];
     blob[0x20..0x24].copy_from_slice(&[255, 0, 0, 0]);
     blob[0x40..0x44].copy_from_slice(&[2, 0, 0, 0]);
-    let streams = influence_streams(0x20, Some((0x40, 0x25)));
+    let buffer = influence_buffer(blob.len(), &[(6, 0x26, 0x20, 4), (8, 0x25, 0x40, 4)], 1);
     let mut diagnostics = Vec::new();
-    assert!(decode_influence(&blob, &streams, 1, Some(2), &mut diagnostics).is_none());
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.reason.contains("outside the 2-bone skeleton"))
-    );
+    assert!(matches!(
+        crate::influence::decode(&buffer, &blob, 1, Some(2), &mut diagnostics),
+        crate::influence::InfluenceDecode::Unsupported { .. }
+    ));
 }
 
 const LOCAL_AT: usize = 0xA00;

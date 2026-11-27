@@ -39,8 +39,10 @@ use lforge_scene::{
 };
 use lforge_texture::{Codec, EmbeddedTexture, SourceLevel, decode_embedded, embedded_textures};
 
+mod influence;
 mod skeleton;
 
+pub use influence::InfluenceDecode;
 pub use skeleton::{AssociationCompleteness, PlacementCompleteness, SkeletonCompleteness};
 
 /// Largest vertex or index count accepted from one geometry.
@@ -537,7 +539,8 @@ fn build_scene(
     let mut bounds_checked = 0usize;
     let mut bounds_matched = 0usize;
     let mut bounds_worst_delta = 0f32;
-    let mut pending_associations: Vec<(usize, usize, Influence, u16)> = Vec::new();
+    let mut pending_associations: Vec<(usize, usize, lforge_scene::VertexInfluences, u16)> =
+        Vec::new();
     let base_name = match label {
         Some(label) => label.to_string(),
         None => report
@@ -586,28 +589,37 @@ fn build_scene(
                     decoded_geometries += 1;
                     if geometry.bone_count > 0 {
                         declared_geometries += 1;
-                        match influence {
-                            Some(influence) => {
+                    }
+                    match influence {
+                        InfluenceDecode::Decoded(decoded) => {
+                            if geometry.bone_count > 0 {
                                 associated_geometries += 1;
-                                pending_associations.push((
-                                    mesh_index,
-                                    primitive_index,
-                                    influence,
-                                    geometry.bone_count,
-                                ));
                             }
-                            None => diagnostics.push(
-                                Diagnostic::new(format!(
-                                    "geometry {geometry_index} declares {} bone(s) but its influence streams did not validate",
-                                    geometry.bone_count
-                                ))
-                                .with_mesh(mesh.name.clone()),
-                            ),
+                            pending_associations.push((
+                                mesh_index,
+                                primitive_index,
+                                decoded,
+                                geometry.bone_count,
+                            ));
                         }
-                    } else if influence.is_some() {
-                        associated_geometries += 1;
-                        let influence = influence.expect("checked above");
-                        pending_associations.push((mesh_index, primitive_index, influence, 0));
+                        InfluenceDecode::Unsupported { reason } => diagnostics.push(
+                            Diagnostic::new(format!(
+                                "geometry {geometry_index} declares {} bone(s); {reason}; the association is not decoded",
+                                geometry.bone_count
+                            ))
+                            .with_mesh(mesh.name.clone()),
+                        ),
+                        InfluenceDecode::NotDeclared => {
+                            if geometry.bone_count > 0 {
+                                diagnostics.push(
+                                    Diagnostic::new(format!(
+                                        "geometry {geometry_index} declares {} bone(s) but stores no influence attribute",
+                                        geometry.bone_count
+                                    ))
+                                    .with_mesh(mesh.name.clone()),
+                                );
+                            }
+                        }
                     }
                 }
                 Err(reason) => {
@@ -628,7 +640,7 @@ fn build_scene(
     scene.diagnostics.extend(diagnostics);
     let validation = scene.validate();
     scene.diagnostics.extend(validation);
-    for (mesh, primitive, influence, declared) in pending_associations {
+    for (mesh, primitive, influences, declared) in pending_associations {
         let present = scene
             .meshes
             .get(mesh)
@@ -637,9 +649,14 @@ fn build_scene(
             scene.associations.push(lforge_scene::PrimitiveBones {
                 mesh,
                 primitive,
-                bones: influence.bones,
-                weighted: influence.weighted,
+                bones: influences.bones.clone(),
+                weighted: influences.weighted,
                 declared_bone_count: (declared > 0).then_some(declared),
+            });
+            scene.influences.push(lforge_scene::PrimitiveInfluences {
+                mesh,
+                primitive,
+                influences,
             });
         }
     }
@@ -1466,19 +1483,12 @@ fn semantic(parameter: u32) -> TextureSemantic {
     }
 }
 
-/// The bones one decoded primitive references, and whether any vertex blends
-/// more than one of them.
-struct Influence {
-    bones: Vec<usize>,
-    weighted: bool,
-}
-
 fn decode_geometry(
     graphics: &[u8],
     geometry: &Geometry,
     bone_count: Option<usize>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(Primitive, Option<Influence>), String> {
+) -> Result<(Primitive, InfluenceDecode), String> {
     let vertex_buffer = geometry
         .vertex_buffer
         .as_ref()
@@ -1501,7 +1511,7 @@ fn decode_mesh(
     index: &IndexView,
     bone_count: Option<usize>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(Primitive, Option<Influence>), String> {
+) -> Result<(Primitive, InfluenceDecode), String> {
     let base = buffer.graphics as usize;
     let declared = usize::try_from(buffer.declared_bytes)
         .map_err(|_| "vertex buffer size overflows".to_string())?;
@@ -1520,23 +1530,21 @@ fn decode_mesh(
             "vertex buffer marker {marker:#010X} is not supported"
         ));
     }
+    // The declaration table is parsed once, by the structural walk. A zero
+    // slot there means the attribute is absent, so the entries are a map from
+    // semantic slot to stream without re-reading the words here.
     let mut streams: HashMap<u32, Stream> = HashMap::new();
-    for slot in 0..23u32 {
-        let Some(word) = u32_at(blob, 4 * slot as usize) else {
-            break;
-        };
-        if word == 0 {
+    for declaration in &buffer.declarations {
+        if declaration.offset as usize >= declared {
             continue;
         }
-        let offset = ((word >> 8) * 2) as usize;
-        let format = (word & 0xFF) as u8;
-        if offset >= declared {
-            diagnostics.push(Diagnostic::new(format!(
-                "vertex stream {slot} starts at {offset:#x}, past the {declared}-byte buffer"
-            )));
-            continue;
-        }
-        streams.insert(slot, Stream { offset, format });
+        streams.insert(
+            declaration.slot as u32,
+            Stream {
+                offset: declaration.offset as usize,
+                format: declaration.format,
+            },
+        );
     }
     let position_stream = streams
         .get(&0)
@@ -1647,7 +1655,7 @@ fn decode_mesh(
     }
     fix_winding(&positions, &mut vertices, &mut indices);
     rebuild_missing_normals(&positions, &mut vertices, &indices);
-    let influence = decode_influence(blob, &streams, vertex_count, bone_count, diagnostics);
+    let influence = influence::decode(buffer, blob, vertex_count, bone_count, diagnostics);
     Ok((
         Primitive {
             material: 0,
@@ -1656,126 +1664,6 @@ fn decode_mesh(
         },
         influence,
     ))
-}
-
-/// The weight totals most samples use: 255, and a minority 127. A total outside
-/// these is reported once per geometry. The association only needs the non-zero
-/// lanes, so it does not require a normalised total and never rescales one.
-const WEIGHT_TOTALS: [u32; 2] = [255, 127];
-
-/// Decodes the packed influence streams, when they validate.
-///
-/// The sampled resources store four `u8` blend weights in slot 6, format `0x26`,
-/// and four `u8` blend indices in slot 8, format `0x25`. A set is accepted only
-/// when every vertex's weights sum to 255 (or to 127 on the minority of
-/// geometries that scale by a half) and every weighted lane names a bone inside
-/// the skeleton. A geometry of a one-bone skeleton has no index to read: its
-/// single weight lane selects the only bone, and that is accepted only while
-/// every vertex uses lane 0 alone.
-///
-/// The two slot numbers are empirical, not declared. Searching the declaration
-/// for the weight format instead was measured over 10,106 geometries and gained
-/// no validated association: the extra candidates all failed the weight totals,
-/// so the format alone does not identify the attribute. Skeletons whose geometry
-/// declares its weights elsewhere therefore stay without an association and are
-/// reported as such.
-fn decode_influence(
-    blob: &[u8],
-    streams: &HashMap<u32, Stream>,
-    count: usize,
-    bone_count: Option<usize>,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Option<Influence> {
-    let bone_count = bone_count.filter(|bones| *bones > 0)?;
-    let weights = streams.get(&6)?;
-    if weights.format != 0x26 {
-        return None;
-    }
-    let weight_bytes = blob.get(weights.offset..weights.offset.checked_add(count * 4)?)?;
-    let weights = weight_bytes.as_chunks::<4>().0;
-    let indexes = streams.get(&8).filter(|stream| stream.format == 0x25);
-    if indexes.is_none() {
-        if bone_count != 1 {
-            diagnostics.push(Diagnostic::new(format!(
-                "the geometry declares {bone_count} bones but stores no influence index stream; the association is not decoded"
-            )));
-            return None;
-        }
-        let mut uses_lane_zero = true;
-        for (vertex, weight) in weights.iter().enumerate() {
-            let total = u32::from(weight[0])
-                + u32::from(weight[1])
-                + u32::from(weight[2])
-                + u32::from(weight[3]);
-            if total == 0 {
-                diagnostics.push(Diagnostic::new(format!(
-                    "influence weights of vertex {vertex} are all zero; the association is not decoded"
-                )));
-                return None;
-            }
-            if weight[1] != 0 || weight[2] != 0 || weight[3] != 0 {
-                uses_lane_zero = false;
-            }
-        }
-        if !uses_lane_zero {
-            diagnostics.push(Diagnostic::new(
-                "the geometry has one bone but a vertex weights another lane; the association is not decoded",
-            ));
-            return None;
-        }
-        return Some(Influence {
-            bones: vec![0],
-            weighted: false,
-        });
-    }
-    let index_stream = indexes.expect("checked above");
-    let index_bytes = blob.get(index_stream.offset..index_stream.offset.checked_add(count * 4)?)?;
-    let mut bones = BTreeSet::new();
-    let mut weighted = false;
-    let mut unusual_total: Option<(usize, u32)> = None;
-    for (vertex, (weight, index)) in weights
-        .iter()
-        .zip(index_bytes.as_chunks::<4>().0)
-        .enumerate()
-    {
-        let sum: u32 = weight.iter().map(|value| u32::from(*value)).sum();
-        if sum == 0 {
-            diagnostics.push(Diagnostic::new(format!(
-                "influence weights of vertex {vertex} are all zero; the association is not decoded"
-            )));
-            return None;
-        }
-        if !WEIGHT_TOTALS.contains(&sum) && unusual_total.is_none() {
-            unusual_total = Some((vertex, sum));
-        }
-        let mut influences = 0usize;
-        for lane in 0..4 {
-            if weight[lane] == 0 {
-                continue;
-            }
-            influences += 1;
-            let bone = usize::from(index[lane]);
-            if bone >= bone_count {
-                diagnostics.push(Diagnostic::new(format!(
-                    "vertex {vertex} names bone {bone}, outside the {bone_count}-bone skeleton; the association is not decoded"
-                )));
-                return None;
-            }
-            bones.insert(bone);
-        }
-        if influences > 1 {
-            weighted = true;
-        }
-    }
-    if let Some((vertex, total)) = unusual_total {
-        diagnostics.push(Diagnostic::new(format!(
-            "influence weights are not normalised to 255 at vertex {vertex} (total {total}); the association uses the non-zero lanes only and does not rescale them"
-        )));
-    }
-    Some(Influence {
-        bones: bones.into_iter().collect(),
-        weighted,
-    })
 }
 
 fn decode_normals(

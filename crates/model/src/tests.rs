@@ -35,8 +35,58 @@ fn vertex_buffer() -> VertexBuffer {
         attribute_bytes: 0,
         layout_end: 0,
         prefix_gap: 0,
-        attributes: Vec::new(),
-        declarations: Vec::new(),
+        attributes: vec![
+            lforge_rage9::drawable::Attribute {
+                slot: 0,
+                offset: 0x80,
+                size: 8,
+                format: 0x10,
+            },
+            lforge_rage9::drawable::Attribute {
+                slot: 4,
+                offset: 0xA0,
+                size: 4,
+                format: 0x29,
+            },
+            lforge_rage9::drawable::Attribute {
+                slot: 16,
+                offset: 0xB0,
+                size: 4,
+                format: 0x26,
+            },
+            lforge_rage9::drawable::Attribute {
+                slot: 24,
+                offset: 0xC0,
+                size: 4,
+                format: 0x1c,
+            },
+        ],
+        declarations: vec![
+            lforge_rage9::drawable::Declaration {
+                slot: 0,
+                format: 0x42,
+                offset: 0x80,
+                matches_layout: true,
+            },
+            lforge_rage9::drawable::Declaration {
+                slot: 1,
+                format: 0x26,
+                offset: 0xC0,
+                matches_layout: true,
+            },
+            lforge_rage9::drawable::Declaration {
+                slot: 2,
+                format: 0x21,
+                offset: 0xA0,
+                matches_layout: true,
+            },
+            lforge_rage9::drawable::Declaration {
+                slot: 3,
+                format: 0x28,
+                offset: 0xB0,
+                matches_layout: true,
+            },
+        ],
         declaration_end: None,
     }
 }
@@ -138,7 +188,7 @@ fn decodes_a_synthetic_quad() {
         &mut diagnostics,
     )
     .expect("quad decodes");
-    assert!(influence.is_none());
+    assert!(matches!(influence, InfluenceDecode::NotDeclared));
     assert_eq!(primitive.vertices.len(), 4);
     assert_eq!(primitive.indices, [0, 1, 2, 0, 2, 3]);
     assert_eq!(primitive.vertices[1].position, [1.0, 0.0, 0.0]);
