@@ -245,6 +245,14 @@ impl ResourceBytes {
 /// The declared native type selects the candidate, but the structure decides:
 /// a dictionary root holds no LOD slots, a fragment root points at a member
 /// drawable and names it, and a drawable holds LOD slots at zero.
+///
+/// The parsers overlap by construction: a dictionary contains member drawables,
+/// and a fragment root can satisfy the drawable header too. The order below is
+/// deliberate — the narrowest structure that accepts the bytes wins, so a
+/// dictionary is not reported as a drawable merely because it holds some. Where
+/// the overlap still leaves a real choice, the decoder reports it instead of
+/// resolving it silently: the fragment report's `ambiguous_with_drawable` flag
+/// reaches the viewer as a note.
 pub fn classify_resource(
     path: &Path,
     access: &Access,
@@ -431,9 +439,13 @@ fn read_resource_with_cancel(
         usize::try_from(system_len)
             .map_err(|_| "the system segment length overflows".to_string())?
     } else {
-        decoded::split_resource(&bytes)
-            .ok_or_else(|| "this resource has no drawable graphics segment".to_string())?
-            .system_len
+        let split = decoded::split_resource_reason(&bytes).map_err(|problem| {
+            format!(
+                "no native page metadata is available for this standalone resource and its system/graphics boundary cannot be inferred: {}. The file is unmeasured, not a different kind of resource; open it from its archive to use the authoritative layout.",
+                problem.describe()
+            )
+        })?;
+        split.system_len
     };
     Ok(ResourceBytes {
         bytes,
@@ -544,6 +556,12 @@ fn finish_fragment(
             "{} root pointer(s) reach records whose meaning is not identified",
             decoded.report.header.unexplained_present()
         ));
+    }
+    if decoded.report.ambiguous_with_drawable {
+        notes.push(
+            "the root also reads as a resource-level drawable; the member name selected the fragment interpretation"
+                .to_string(),
+        );
     }
     let components = decoded
         .components

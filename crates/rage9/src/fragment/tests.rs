@@ -96,6 +96,45 @@ fn a_fragment_named_member_is_recognised() {
     assert_eq!(report.header.counts, [1, 1, 1, 1]);
     assert_eq!(report.header.unexplained_present(), 2);
     assert!(report.named_fragment);
+    assert!(
+        !report.ambiguous_with_drawable,
+        "a root with no LOD slot at +0x50 does not also read as a drawable"
+    );
+}
+
+/// Gives the fragment root a populated LOD slot at `+0x50`, which is what a
+/// resource-level drawable header reads. The bytes then satisfy both
+/// interpretations.
+fn also_a_drawable_at_zero(system: &mut [u8]) {
+    put_u64(system, 0x50, system_ptr(0x160));
+}
+
+#[test]
+fn a_named_member_that_also_reads_as_a_drawable_reports_the_ambiguity() {
+    let (mut system, graphics) = fragment("synthetic_prop.#ft");
+    also_a_drawable_at_zero(&mut system);
+    assert!(drawable::is_drawable_at(&system, &graphics, 0));
+    let report = inspect(&system, &graphics).expect("the named member decides");
+    assert!(report.named_fragment);
+    assert!(
+        report.ambiguous_with_drawable,
+        "the overlap is reported instead of hidden"
+    );
+    assert_eq!(
+        report.header.drawable, 0x80,
+        "the member the root points at is still the one that is decoded"
+    );
+}
+
+#[test]
+fn an_unnamed_member_that_also_reads_as_a_drawable_is_not_a_fragment() {
+    let (mut system, graphics) = fragment("synthetic_prop.#dr");
+    also_a_drawable_at_zero(&mut system);
+    assert!(drawable::is_drawable_at(&system, &graphics, 0));
+    assert!(
+        inspect(&system, &graphics).is_none(),
+        "an ambiguous root without a fragment name is refused, not guessed"
+    );
 }
 
 #[test]
@@ -117,6 +156,22 @@ fn a_resource_level_drawable_is_not_a_fragment() {
     put_u64(&mut system, 0x18, 1);
     assert_eq!(header(&system), Err(Step::Drawable));
     assert!(inspect(&system, &graphics).is_none());
+}
+
+#[test]
+fn a_drawable_that_carries_the_fragment_suffix_is_not_a_fragment() {
+    // The name is the only fragment-specific signal in the bytes, so a
+    // drawable whose embedded name ends in `#ft` is the case where a suffix-led
+    // parser would be wrong. The root shape has to hold too, and here it does
+    // not: the word at `+0x18` is not a member pointer.
+    let (mut system, graphics) = fragment("misleading_prop.#ft");
+    put_u64(&mut system, 0x18, 0);
+    assert!(inspect(&system, &graphics).is_none());
+    put_u64(&mut system, 0x18, graphics_ptr(0x80));
+    assert!(
+        inspect(&system, &graphics).is_none(),
+        "a graphics pointer in the member slot does not resolve to a member"
+    );
 }
 
 #[test]

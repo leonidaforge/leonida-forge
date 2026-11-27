@@ -107,6 +107,10 @@ pub struct Report {
     pub drawable: drawable::Report,
     /// Whether the member drawable's name carries the fragment suffix.
     pub named_fragment: bool,
+    /// Whether the system segment at zero also resolves as a resource-level
+    /// drawable. When it does, the two interpretations overlap and only the
+    /// member name separates them; the overlap is reported rather than hidden.
+    pub ambiguous_with_drawable: bool,
     /// Why the walk of the member drawable was not clean, when it was not.
     pub issues: Vec<String>,
 }
@@ -183,6 +187,11 @@ pub fn is_fragment_name(report: &drawable::Report) -> bool {
 /// its `+0x50` LOD slots can coincide with a fragment root's other records, so
 /// the suffix is used here as a tie-breaker only: a member named as a fragment
 /// is one, and an unnamed member must not also read as a drawable at zero.
+///
+/// The tie-break is reported in [`Report::ambiguous_with_drawable`].
+/// Structural validation is not relaxed for it: every header step still has to
+/// hold, and an unnamed member that also reads as a drawable is refused rather
+/// than guessed.
 pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
     let header = header(system).ok()?;
     let at = header.drawable as usize;
@@ -191,12 +200,14 @@ pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
     }
     let drawable = drawable::inspect_member_at(system, graphics, at)?;
     let named_fragment = is_fragment_name(&drawable);
-    if !named_fragment && drawable::is_drawable_at(system, graphics, 0) {
+    let ambiguous_with_drawable = drawable::is_drawable_at(system, graphics, 0);
+    if !named_fragment && ambiguous_with_drawable {
         return None;
     }
     Some(Report {
         header,
         named_fragment,
+        ambiguous_with_drawable,
         issues: drawable
             .issues
             .iter()
