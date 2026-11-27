@@ -146,6 +146,48 @@ pub fn build(
                 rotation.length()
             ));
         }
+        // The `+0x38` array states the same local transform as a matrix, with
+        // the rotation transposed. Comparing the two statements checks the
+        // quaternion convention at every bone without going through the
+        // hierarchy, so a wrong convention cannot hide behind a plausible pose.
+        if let Some(stored) = report.local_matrices.get(source.index) {
+            let stored_rotation = mat3_from_row_major(&stored.rotation).transpose();
+            let actual = Mat4::from_rotation_translation(rotation, translation).to_cols_array();
+            let expected = Mat4::from_cols_array(&[
+                stored_rotation.x_axis.x,
+                stored_rotation.x_axis.y,
+                stored_rotation.x_axis.z,
+                0.0,
+                stored_rotation.y_axis.x,
+                stored_rotation.y_axis.y,
+                stored_rotation.y_axis.z,
+                0.0,
+                stored_rotation.z_axis.x,
+                stored_rotation.z_axis.y,
+                stored_rotation.z_axis.z,
+                0.0,
+                stored.translation[0],
+                stored.translation[1],
+                stored.translation[2],
+                1.0,
+            ])
+            .to_cols_array();
+            let delta = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            if rotation.is_finite() && delta > INVERSE_BIND_TOLERANCE {
+                diagnostics.push(Diagnostic::new(format!(
+                    "skeleton: the stored local-matrix record of bone {} differs from its quaternion by {delta}",
+                    source.index
+                )));
+                partial_reasons.push(format!(
+                    "the local-matrix record of bone {} did not validate",
+                    source.index
+                ));
+            }
+        }
         let (resolved_rotation, resolved_position) = match source.parent {
             Some(parent) => {
                 let parent_rotation = model_rotation
@@ -242,6 +284,15 @@ fn inverse_bind_matrix(stored: &skeleton::Matrix34) -> Mat4 {
         r20, r21, r22, 0.0, //
         tx, ty, tz, 1.0,
     ])
+}
+
+/// A matrix as glam reads the record's row-major elements.
+///
+/// The record stores nine `f32` row after row, so building a `Mat3` from those
+/// values as columns would silently transpose it.
+fn mat3_from_row_major(stored: &[f32; 9]) -> glam::Mat3 {
+    let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = *stored;
+    glam::Mat3::from_cols_array(&[r00, r10, r20, r01, r11, r21, r02, r12, r22])
 }
 
 /// The largest absolute difference between two matrices.

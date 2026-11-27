@@ -395,3 +395,178 @@ fn an_index_outside_the_skeleton_is_rejected() {
             .any(|diagnostic| diagnostic.reason.contains("outside the 2-bone skeleton"))
     );
 }
+
+const LOCAL_AT: usize = 0xA00;
+
+/// Adds the `+0x38` array: each bone's local transform with the rotation stored
+/// transposed, as the samples do.
+fn with_local_matrices(mut system: Vec<u8>, bones: &[BoneSpec], corrupt: bool) -> Vec<u8> {
+    system.resize(0x1000, 0);
+    put_u64(&mut system, SKELETON_AT + 0x38, system_ptr(LOCAL_AT as u64));
+    for (index, spec) in bones.iter().enumerate() {
+        let record = LOCAL_AT + index * 0x40;
+        // The array stores the transposed local rotation row after row, so the
+        // rotation's columns are written in order.
+        let matrix = Mat3::from_quat(spec.rotation.normalize()).to_cols_array();
+        for (slot, value) in matrix.into_iter().enumerate() {
+            let row = slot / 3;
+            let column = slot % 3;
+            let value = if corrupt && index == 1 {
+                value + 0.5
+            } else {
+                value
+            };
+            put_f32(&mut system, record + 4 * (row * 4 + column), value);
+        }
+        for (slot, value) in spec.translation.into_iter().enumerate() {
+            put_f32(&mut system, record + 0x30 + 4 * slot, value);
+        }
+    }
+    system
+}
+
+#[test]
+fn a_local_matrix_record_that_matches_its_quaternion_is_accepted() {
+    let bones = [
+        BoneSpec {
+            rotation: Quat::from_rotation_z(0.3),
+            translation: [1.0, 2.0, 3.0],
+            parent: 0xFFFF,
+        },
+        BoneSpec {
+            rotation: Quat::from_rotation_x(-0.7),
+            translation: [-2.0, 0.5, 1.0],
+            parent: 0,
+        },
+    ];
+    let system = with_local_matrices(skeleton_system(&bones, true, false), &bones, false);
+    let mut diagnostics = Vec::new();
+    let (skeleton, completeness) =
+        skeleton::build(&system, Some(SKELETON_AT as u32), &mut diagnostics);
+    assert_eq!(
+        completeness,
+        SkeletonCompleteness::Complete,
+        "{diagnostics:?}"
+    );
+    assert_eq!(skeleton.map(|skeleton| skeleton.bones.len()), Some(2));
+}
+
+#[test]
+fn a_local_matrix_record_that_disagrees_is_reported() {
+    let bones = [
+        BoneSpec {
+            rotation: Quat::IDENTITY,
+            translation: [0.0; 3],
+            parent: 0xFFFF,
+        },
+        BoneSpec {
+            rotation: Quat::from_rotation_y(0.4),
+            translation: [0.0, 1.0, 0.0],
+            parent: 0,
+        },
+    ];
+    let system = with_local_matrices(skeleton_system(&bones, true, false), &bones, true);
+    let mut diagnostics = Vec::new();
+    let (_, completeness) = skeleton::build(&system, Some(SKELETON_AT as u32), &mut diagnostics);
+    assert!(matches!(completeness, SkeletonCompleteness::Partial { .. }));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.reason.contains("local-matrix record of bone 1"))
+    );
+}
+
+#[test]
+fn noncommuting_rotations_compose_parent_then_child() {
+    // A quarter turn about Z followed by a quarter turn about X gives different
+    // matrices in the two orders, so this pins the multiplication order.
+    let parent = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+    let child = Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let system = skeleton_system(
+        &[
+            BoneSpec {
+                rotation: parent,
+                translation: [2.0, -1.0, 0.5],
+                parent: 0xFFFF,
+            },
+            BoneSpec {
+                rotation: child,
+                translation: [1.0, 2.0, -3.0],
+                parent: 0,
+            },
+        ],
+        false,
+        false,
+    );
+    let mut diagnostics = Vec::new();
+    let (skeleton, completeness) =
+        skeleton::build(&system, Some(SKELETON_AT as u32), &mut diagnostics);
+    let skeleton = skeleton.expect("a skeleton");
+    assert_eq!(
+        completeness,
+        SkeletonCompleteness::Complete,
+        "{diagnostics:?}"
+    );
+
+    let expected_rotation = parent * child;
+    let expected_position =
+        glam::Vec3::new(2.0, -1.0, 0.5) + parent * glam::Vec3::new(1.0, 2.0, -3.0);
+    let bone = &skeleton.bones[1];
+    assert!(bone.model_rotation.abs_diff_eq(expected_rotation, 1e-5));
+    assert!(bone.model_position.abs_diff_eq(expected_position, 1e-5));
+    // The other order would place the child somewhere else; the assertion above
+    // is only meaningful if that is true.
+    let reversed = child * parent;
+    let reversed_position =
+        glam::Vec3::new(2.0, -1.0, 0.5) + child * glam::Vec3::new(1.0, 2.0, -3.0);
+    assert!(!expected_rotation.abs_diff_eq(reversed, 1e-3));
+    assert!(!expected_position.abs_diff_eq(reversed_position, 1e-3));
+}
+
+#[test]
+fn a_nonuniform_scale_is_recorded_but_not_applied() {
+    // Scale is identity in every one of the 133,110 surveyed bones, so no
+    // sampled resource can tell whether a non-identity scale belongs in the
+    // composition. The decoder records the value and composes rotation and
+    // translation only, which this test pins rather than claims as support.
+    let mut system = skeleton_system(
+        &[
+            BoneSpec {
+                rotation: Quat::IDENTITY,
+                translation: [0.0; 3],
+                parent: 0xFFFF,
+            },
+            BoneSpec {
+                rotation: Quat::IDENTITY,
+                translation: [1.0, 0.0, 0.0],
+                parent: 0,
+            },
+        ],
+        false,
+        false,
+    );
+    // A non-uniform scale on the parent.
+    put_f32(&mut system, BONES_AT + 0x20, 2.0);
+    put_f32(&mut system, BONES_AT + 0x24, 3.0);
+    put_f32(&mut system, BONES_AT + 0x28, 4.0);
+    let mut diagnostics = Vec::new();
+    let (skeleton, completeness) =
+        skeleton::build(&system, Some(SKELETON_AT as u32), &mut diagnostics);
+    let skeleton = skeleton.expect("a skeleton");
+    assert_eq!(
+        completeness,
+        SkeletonCompleteness::Complete,
+        "{diagnostics:?}"
+    );
+    assert_eq!(
+        skeleton.bones[0].local_scale,
+        glam::Vec3::new(2.0, 3.0, 4.0)
+    );
+    // The child position is the parent translation plus the local one, with no
+    // scale applied.
+    assert!(
+        skeleton.bones[1]
+            .model_position
+            .abs_diff_eq(glam::Vec3::new(1.0, 0.0, 0.0), 1e-6)
+    );
+}
