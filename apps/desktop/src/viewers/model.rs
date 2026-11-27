@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Context, Entity, FontWeight, Task, Window, div, prelude::*, px, rgb};
 
+use super::BonePanel;
 use super::viewport::{RendererStatus, Viewport};
 use crate::files::{Access, model};
 use crate::ui;
@@ -14,6 +15,9 @@ use crate::ui::theme;
 const TOOLBAR_HEIGHT: f32 = 40.;
 const STATUS_BAR_HEIGHT: f32 = 26.;
 const DIAGNOSTICS_WIDTH: f32 = 360.;
+/// Largest number of hierarchy rows built in one frame. A filter narrows a
+/// larger skeleton; the decoded bones themselves stay in the scene.
+const MAX_BONE_ROWS: usize = 600;
 
 struct Summary {
     meshes: usize,
@@ -29,7 +33,7 @@ enum State {
     Loading,
     Ready {
         viewport: Entity<Viewport>,
-        summary: Summary,
+        summary: Box<Summary>,
         fragment: Option<Box<model::FragmentSummary>>,
         diagnostics: Vec<String>,
     },
@@ -40,6 +44,9 @@ pub struct ModelViewer {
     name: String,
     state: State,
     cancel: Arc<AtomicBool>,
+    /// Collapse state and bone selection of this window only.
+    bones: BonePanel,
+    bone_filter: Entity<ui::text_field::TextField>,
     _load: Task<()>,
 }
 
@@ -57,6 +64,9 @@ impl ModelViewer {
             .unwrap_or_else(|| "Model".to_string());
         let cancel = Arc::new(AtomicBool::new(false));
         let load_cancel = cancel.clone();
+        let bone_filter =
+            cx.new(|cx| ui::text_field::TextField::new("Filter bones, indices, keys", cx));
+        cx.observe(&bone_filter, |_, _, cx| cx.notify()).detach();
         let load = cx.background_spawn(async move {
             model::load_with_cancel(&path, &access, gta_root.as_deref(), &load_cancel)
         });
@@ -68,7 +78,7 @@ impl ModelViewer {
                         let scene = Arc::new(loaded.scene);
                         let viewport = cx.new(|cx| Viewport::new(scene.clone(), cx));
                         cx.observe(&viewport, |_, _, cx| cx.notify()).detach();
-                        let summary = Summary {
+                        let summary = Box::new(Summary {
                             meshes: scene.meshes.len(),
                             materials: scene.materials.len(),
                             textures: scene.textures.len(),
@@ -76,7 +86,7 @@ impl ModelViewer {
                             triangles: scene.triangle_count(),
                             completeness: loaded.completeness.clone(),
                             exact_layout: loaded.exact_layout,
-                        };
+                        });
                         let mut lines: Vec<String> = loaded.completeness.notes.to_vec();
                         if let lforge_model::GeometryCompleteness::Partial { reason } =
                             &loaded.completeness.geometry
@@ -160,6 +170,48 @@ impl ModelViewer {
                                 ));
                             }
                         }
+                        match &loaded.completeness.skeleton {
+                            lforge_model::SkeletonCompleteness::NotPresent => {
+                                lines.push(
+                                    "Skeleton: none; the drawable is complete as a static model"
+                                        .into(),
+                                );
+                            }
+                            lforge_model::SkeletonCompleteness::Complete => lines.push(format!(
+                                "Skeleton: complete ({} bones)",
+                                scene.skeleton.as_ref().map_or(0, |skeleton| skeleton.bones.len())
+                            )),
+                            lforge_model::SkeletonCompleteness::Partial { reason } => {
+                                lines.push(format!("Partial skeleton: {reason}"));
+                            }
+                            lforge_model::SkeletonCompleteness::Unsupported { reason } => {
+                                lines.push(format!("Unsupported skeleton: {reason}"));
+                            }
+                        }
+                        match &loaded.completeness.associations {
+                            lforge_model::AssociationCompleteness::NotReferenced => {}
+                            lforge_model::AssociationCompleteness::Complete => lines.push(format!(
+                                "Geometry bone associations: complete ({} primitive(s))",
+                                scene.associations.len()
+                            )),
+                            lforge_model::AssociationCompleteness::Partial { reason } => {
+                                lines.push(format!("Partial bone associations: {reason}"));
+                            }
+                            lforge_model::AssociationCompleteness::Unsupported { reason } => {
+                                lines.push(format!("Unsupported bone associations: {reason}"));
+                            }
+                        }
+                        match &loaded.completeness.placement {
+                            lforge_model::PlacementCompleteness::NotRequired => {}
+
+                            lforge_model::PlacementCompleteness::Unverified { reason } => {
+                                lines.push(format!("Static placement unverified: {reason}"));
+                            }
+                            lforge_model::PlacementCompleteness::Applied { reason } => {
+                                lines.push(format!("Static placement applied: {reason}"));
+                            }
+                        }
+                        this.bones.reset();
                         let diagnostics = lines;
                         this.name = loaded.name;
                         this.state = State::Ready {
@@ -179,12 +231,25 @@ impl ModelViewer {
             name,
             state: State::Loading,
             cancel,
+            bones: BonePanel::new(),
+            bone_filter,
             _load: task,
         }
     }
 
     fn toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let ready = matches!(self.state, State::Ready { .. });
+        let (has_skeleton, skeleton_visible, any_mesh) = match &self.state {
+            State::Ready { viewport, .. } => {
+                let viewport = viewport.read(cx);
+                (
+                    viewport.has_skeleton(),
+                    viewport.skeleton_visible(),
+                    viewport.any_mesh_visible(),
+                )
+            }
+            _ => (false, false, true),
+        };
         div()
             .flex()
             .flex_none()
@@ -204,6 +269,46 @@ impl ModelViewer {
                                 .update(cx, |viewport, cx| viewport.reset_camera(cx));
                         }
                     })),
+            )
+            .child(
+                ui::button(
+                    "skeleton-toggle",
+                    if skeleton_visible {
+                        "Hide Skeleton"
+                    } else {
+                        "Show Skeleton"
+                    },
+                )
+                .when(!has_skeleton, |el| el.text_color(rgb(theme::TEXT_DISABLED)))
+                .when(has_skeleton, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let State::Ready { viewport, .. } = &this.state {
+                            viewport
+                                .clone()
+                                .update(cx, |viewport, cx| viewport.toggle_skeleton(cx));
+                        }
+                    }))
+                }),
+            )
+            .child(
+                ui::button(
+                    "mesh-toggle",
+                    if any_mesh { "Hide Mesh" } else { "Show Mesh" },
+                )
+                .when(!ready, |el| el.text_color(rgb(theme::TEXT_DISABLED)))
+                .when(ready, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let State::Ready { viewport, .. } = &this.state {
+                            let visible = !{
+                                let viewport = viewport.read(cx);
+                                viewport.any_mesh_visible()
+                            };
+                            viewport.clone().update(cx, |viewport, cx| {
+                                viewport.set_all_meshes_visible(visible, cx);
+                            });
+                        }
+                    }))
+                }),
             )
             .child(div().w(px(1.)).h(px(18.)).mx_1().bg(rgb(theme::BORDER)))
             .child(
@@ -235,7 +340,8 @@ impl ModelViewer {
                     .min_w_0()
                     .h_full()
                     .child(viewport.clone());
-                if fragment.is_none() && diagnostics.is_empty() {
+                if fragment.is_none() && diagnostics.is_empty() && !viewport.read(cx).has_skeleton()
+                {
                     return viewport_element.into_any_element();
                 }
                 let mut panel = div()
@@ -248,6 +354,7 @@ impl ModelViewer {
                     .bg(rgb(theme::PANEL))
                     .border_l_1()
                     .border_color(rgb(theme::BORDER));
+                panel = panel.child(self.skeleton_section(viewport, cx));
                 if let Some(fragment) = fragment {
                     panel = panel.child(components_section(viewport, fragment, cx));
                 }
@@ -283,6 +390,184 @@ impl ModelViewer {
                 viewport_element.child(panel).into_any_element()
             }
         }
+    }
+
+    /// The skeleton section: visibility, filter, hierarchy and the selected
+    /// bone's metadata. It reads the decoded skeleton from the viewport's
+    /// scene, so expanding a row never decodes or reloads anything.
+    fn skeleton_section(
+        &self,
+        viewport: &Entity<Viewport>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let viewport_state = viewport.read(cx);
+        let Some(skeleton) = viewport_state.skeleton() else {
+            return div().into_any_element();
+        };
+        let bones = skeleton.bones.len();
+        let roots = skeleton.roots.len();
+        let depth = skeleton.max_depth;
+        let selected = self.bones.selected();
+        let filter = self.bone_filter.read(cx).text().to_string();
+        let rows = self.bones.rows(skeleton, &filter);
+        let shown = rows.len();
+        let mut metadata = Vec::new();
+        if let Some(index) = selected {
+            metadata = self.bones.metadata(skeleton, viewport_state.associations());
+            let _ = index;
+        }
+        let _ = viewport_state;
+
+        let mut list = div()
+            .id("bone-hierarchy")
+            .min_h_0()
+            .flex_1()
+            .overflow_y_scroll()
+            .pb_1();
+        for row in rows.into_iter().take(MAX_BONE_ROWS) {
+            let index = row.index;
+            let is_selected = selected == Some(index);
+            let chevron = if row.has_children {
+                if row.collapsed {
+                    "\u{25B8}"
+                } else {
+                    "\u{25BE}"
+                }
+            } else {
+                "\u{00B7}"
+            };
+            let toggle = div()
+                .id(("bone-toggle", index))
+                .w(px(14.))
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bones.toggle(index);
+                    cx.notify();
+                }))
+                .child(chevron);
+            let label = div()
+                .id(("bone-row", index))
+                .flex_1()
+                .min_w_0()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bones.select(Some(index));
+                    if let State::Ready { viewport, .. } = &this.state {
+                        viewport
+                            .clone()
+                            .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
+                    }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .child(format!("{} {}", row.label, row.detail)),
+                );
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pr_3()
+                    .py_0p5()
+                    .pl(px(8.0 + row.depth as f32 * 10.0))
+                    .when(is_selected, |el| el.bg(rgb(theme::SELECTION)))
+                    .hover(|style| style.bg(rgb(theme::HOVER)))
+                    .child(toggle)
+                    .child(label),
+            );
+        }
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .max_h(px(360.))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(format!(
+                                "SKELETON \u{00B7} {bones} BONE(S) \u{00B7} {roots} ROOT(S) \u{00B7} DEPTH {depth}"
+                            )),
+                    )
+                    .child(
+                        ui::button(
+                            "bones-toggle-overlay",
+                            if viewport.read(cx).skeleton_visible() {
+                                "Hide"
+                            } else {
+                                "Show"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let State::Ready { viewport, .. } = &this.state {
+                                viewport
+                                    .clone()
+                                    .update(cx, |viewport, cx| viewport.toggle_skeleton(cx));
+                            }
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .child(self.bone_filter.clone()),
+            );
+        if !metadata.is_empty() {
+            section = section.child(
+                div()
+                    .id("bone-metadata")
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .px_3()
+                    .pb_1()
+                    .children(metadata.into_iter().map(|(key, value)| {
+                        div()
+                            .flex()
+                            .gap_1()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .w(px(96.))
+                                    .flex_none()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child(key),
+                            )
+                            .child(div().min_w_0().truncate().child(value))
+                    })),
+            );
+        }
+        if shown > MAX_BONE_ROWS {
+            section = section.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!(
+                        "Showing the first {MAX_BONE_ROWS} of {shown} rows; filter to narrow them."
+                    )),
+            );
+        }
+        section.child(list).into_any_element()
     }
 
     fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {

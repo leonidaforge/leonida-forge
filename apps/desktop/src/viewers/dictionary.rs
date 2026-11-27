@@ -23,6 +23,7 @@ use gpui::{
     uniform_list,
 };
 
+use super::BonePanel;
 use super::viewport::{RendererStatus, Viewport};
 use crate::files::{Access, model};
 use crate::ui;
@@ -32,6 +33,8 @@ const TOOLBAR_HEIGHT: f32 = 40.;
 const STATUS_BAR_HEIGHT: f32 = 26.;
 const MEMBER_PANEL_WIDTH: f32 = 340.;
 const DIAGNOSTICS_WIDTH: f32 = 320.;
+/// Largest number of hierarchy rows built in one frame.
+const MAX_BONE_ROWS: usize = 400;
 
 /// A decoded member as the viewer presents it.
 struct MemberSummary {
@@ -178,6 +181,9 @@ pub struct DictionaryViewer {
     selected: usize,
     selection: MemberSelection,
     search: Entity<ui::text_field::TextField>,
+    /// Collapse state and bone selection of the displayed member only.
+    bones: BonePanel,
+    bone_filter: Entity<ui::text_field::TextField>,
     list_scroll: UniformListScrollHandle,
     path: PathBuf,
     access: Access,
@@ -208,6 +214,9 @@ impl DictionaryViewer {
         let search =
             cx.new(|cx| ui::text_field::TextField::new("Filter members, hashes, indices", cx));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        let bone_filter =
+            cx.new(|cx| ui::text_field::TextField::new("Filter bones, indices, keys", cx));
+        cx.observe(&bone_filter, |_, _, cx| cx.notify()).detach();
         let task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -238,6 +247,8 @@ impl DictionaryViewer {
             selected: 0,
             selection: MemberSelection::default(),
             search,
+            bones: BonePanel::new(),
+            bone_filter,
             list_scroll: UniformListScrollHandle::new(),
             path,
             access,
@@ -318,6 +329,10 @@ impl DictionaryViewer {
         }
         match loaded {
             Ok(loaded) => {
+                // A new member has its own skeleton: no collapse state or bone
+                // selection from the previous member survives.
+                self.bones.reset();
+                self.bone_filter.update(cx, |field, cx| field.clear(cx));
                 let scene = Arc::new(loaded.scene);
                 let viewport = cx.new(|cx| Viewport::new(scene.clone(), cx));
                 cx.observe(&viewport, |_, _, cx| cx.notify()).detach();
@@ -390,6 +405,30 @@ impl DictionaryViewer {
                     line.push_str(&diagnostic.reason);
                     line
                 }));
+                match &summary.completeness.skeleton {
+                    lforge_model::SkeletonCompleteness::NotPresent => diagnostics
+                        .push("Skeleton: none; the member is complete as a static model".into()),
+                    lforge_model::SkeletonCompleteness::Complete => {
+                        diagnostics.push(format!(
+                            "Skeleton: complete ({} bones)",
+                            scene
+                                .skeleton
+                                .as_ref()
+                                .map_or(0, |skeleton| skeleton.bones.len())
+                        ));
+                    }
+                    lforge_model::SkeletonCompleteness::Partial { reason } => {
+                        diagnostics.push(format!("Partial skeleton: {reason}"));
+                    }
+                    lforge_model::SkeletonCompleteness::Unsupported { reason } => {
+                        diagnostics.push(format!("Unsupported skeleton: {reason}"));
+                    }
+                }
+                if let lforge_model::AssociationCompleteness::Partial { reason } =
+                    &summary.completeness.associations
+                {
+                    diagnostics.push(format!("Partial bone associations: {reason}"));
+                }
                 self.member = MemberLoad::Ready {
                     viewport,
                     summary,
@@ -458,6 +497,33 @@ impl DictionaryViewer {
                     },
                 )),
             )
+            .child({
+                let (has_skeleton, visible) = match &self.member {
+                    MemberLoad::Ready { viewport, .. } => {
+                        let viewport = viewport.read(cx);
+                        (viewport.has_skeleton(), viewport.skeleton_visible())
+                    }
+                    _ => (false, false),
+                };
+                ui::button(
+                    "dictionary-skeleton-toggle",
+                    if visible {
+                        "Hide Skeleton"
+                    } else {
+                        "Show Skeleton"
+                    },
+                )
+                .when(!has_skeleton, |el| el.text_color(rgb(theme::TEXT_DISABLED)))
+                .when(has_skeleton, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        if let MemberLoad::Ready { viewport, .. } = &this.member {
+                            viewport
+                                .clone()
+                                .update(cx, |viewport, cx| viewport.toggle_skeleton(cx));
+                        }
+                    }))
+                })
+            })
             .child(div().w(px(1.)).h(px(18.)).mx_1().bg(rgb(theme::BORDER)))
             .child(
                 div()
@@ -628,7 +694,7 @@ impl DictionaryViewer {
         }
     }
 
-    fn diagnostics_panel(&self) -> gpui::AnyElement {
+    fn diagnostics_panel(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let lines = match &self.state {
             State::Ready { diagnostics, .. } => {
                 let mut lines = diagnostics.clone();
@@ -645,7 +711,7 @@ impl DictionaryViewer {
             State::Failed(err) => vec![err.clone()],
             State::Loading => vec!["Reading the dictionary.".to_string()],
         };
-        div()
+        let mut panel = div()
             .flex()
             .flex_col()
             .flex_none()
@@ -654,7 +720,9 @@ impl DictionaryViewer {
             .overflow_hidden()
             .bg(rgb(theme::PANEL))
             .border_l_1()
-            .border_color(rgb(theme::BORDER))
+            .border_color(rgb(theme::BORDER));
+        panel = panel.child(self.skeleton_section(cx));
+        panel
             .child(
                 div()
                     .px_3()
@@ -683,6 +751,150 @@ impl DictionaryViewer {
                     })),
             )
             .into_any_element()
+    }
+
+    fn skeleton_section(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let MemberLoad::Ready { viewport, .. } = &self.member else {
+            return div().into_any_element();
+        };
+        let viewport_state = viewport.read(cx);
+        let Some(skeleton) = viewport_state.skeleton() else {
+            return div().into_any_element();
+        };
+        let bones = skeleton.bones.len();
+        let roots = skeleton.roots.len();
+        let depth = skeleton.max_depth;
+        let visible = viewport_state.skeleton_visible();
+        let selected = viewport_state.selected_bone();
+        let filter = self.bone_filter.read(cx).text().to_string();
+        let rows = self.bones.rows(skeleton, &filter);
+        let shown = rows.len();
+        let mut metadata = Vec::new();
+        if selected.is_some() {
+            metadata = self.bones.metadata(skeleton, viewport_state.associations());
+        }
+        let _ = viewport_state;
+        let viewport = viewport.clone();
+
+        let mut list = div()
+            .id("dictionary-bone-hierarchy")
+            .min_h_0()
+            .overflow_y_scroll()
+            .pb_1();
+        for row in rows.into_iter().take(MAX_BONE_ROWS) {
+            let index = row.index;
+            let is_selected = selected == Some(index);
+            let chevron = if row.has_children {
+                if row.collapsed {
+                    "\u{25B8}"
+                } else {
+                    "\u{25BE}"
+                }
+            } else {
+                "\u{00B7}"
+            };
+            let toggle = div()
+                .id(("dictionary-bone-toggle", index))
+                .w(px(14.))
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bones.toggle(index);
+                    cx.notify();
+                }))
+                .child(chevron);
+            let select_viewport = viewport.clone();
+            let label = div()
+                .id(("dictionary-bone-row", index))
+                .flex_1()
+                .min_w_0()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.bones.select(Some(index));
+                    select_viewport
+                        .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .truncate()
+                        .child(format!("{} {}", row.label, row.detail)),
+                );
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pr_3()
+                    .py_0p5()
+                    .pl(px(8.0 + row.depth as f32 * 10.0))
+                    .when(is_selected, |el| el.bg(rgb(theme::SELECTION)))
+                    .hover(|style| style.bg(rgb(theme::HOVER)))
+                    .child(toggle)
+                    .child(label),
+            );
+        }
+
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .max_h(px(300.))
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(format!(
+                                "SKELETON \u{00B7} {bones} BONE(S) \u{00B7} {roots} ROOT(S) \u{00B7} DEPTH {depth}"
+                            )),
+                    )
+                    .child(if visible { "Shown" } else { "Hidden" }),
+            )
+            .child(div().px_3().py_1().child(self.bone_filter.clone()));
+        if !metadata.is_empty() {
+            section = section.child(div().flex().flex_col().gap_0p5().px_3().pb_1().children(
+                metadata.into_iter().map(|(key, value)| {
+                    div()
+                        .flex()
+                        .gap_1()
+                        .text_xs()
+                        .child(
+                            div()
+                                .w(px(88.))
+                                .flex_none()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(key),
+                        )
+                        .child(div().min_w_0().truncate().child(value))
+                }),
+            ));
+        }
+        if shown > MAX_BONE_ROWS {
+            section = section.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!(
+                        "Showing the first {MAX_BONE_ROWS} of {shown} rows; filter to narrow them."
+                    )),
+            );
+        }
+        section.child(list).into_any_element()
     }
 
     fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -783,7 +995,7 @@ impl Render for DictionaryViewer {
                     .min_h_0()
                     .child(self.member_panel(cx))
                     .child(self.viewport_area())
-                    .child(self.diagnostics_panel()),
+                    .child(self.diagnostics_panel(cx)),
             )
             .child(self.status_bar(cx))
     }

@@ -1,6 +1,7 @@
 //! Windows that open on their own, next to the explorer.
 
 pub mod binary;
+mod bones;
 mod dictionary;
 mod image;
 mod model;
@@ -9,6 +10,7 @@ pub mod texture;
 mod viewport;
 
 pub use binary::BinaryInspector;
+pub use bones::BonePanel;
 pub use dictionary::DictionaryViewer;
 pub use image::ImageViewer;
 pub use model::ModelViewer;

@@ -18,7 +18,7 @@ use gpui::{
     Window, canvas, div, prelude::*, rgb, size,
 };
 use image::{Frame as ImageFrame, RgbaImage};
-use lforge_renderer::{Background, Frame, OrbitCamera, Renderer};
+use lforge_renderer::{Background, Frame, OrbitCamera, Overlay, Renderer};
 use lforge_scene::{Aabb, Scene};
 
 use crate::ui::theme;
@@ -203,6 +203,8 @@ struct Request {
     camera: OrbitCamera,
     /// One flag per scene mesh. Shared so a request stays cheap to clone.
     visibility: Arc<Vec<bool>>,
+    skeleton: bool,
+    selected_bone: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -281,6 +283,11 @@ pub struct Viewport {
     /// Mesh visibility, one flag per scene mesh. The decoded scene is never
     /// modified; the render thread applies the flags before drawing.
     visibility: Visibility,
+    /// Whether the skeleton overlay is drawn. Hidden by default so the model
+    /// inspection experience is unchanged.
+    skeleton_visible: bool,
+    /// The highlighted bone, as an index into the scene's skeleton.
+    selected_bone: Option<usize>,
     framed: bool,
     requests: Option<LatestSender<Request>>,
     next_generation: u64,
@@ -327,6 +334,8 @@ impl Viewport {
             bounds,
             scene,
             visibility,
+            skeleton_visible: false,
+            selected_bone: None,
             framed: false,
             requests,
             next_generation: 0,
@@ -398,6 +407,73 @@ impl Viewport {
         }
     }
 
+    /// The scene's skeleton, when it has one. Reading it never decodes a
+    /// resource: the decoded skeleton lives with the scene.
+    pub fn skeleton(&self) -> Option<&lforge_scene::Skeleton> {
+        self.scene.skeleton.as_ref()
+    }
+
+    /// The scene's validated primitive-to-bone associations.
+    pub fn associations(&self) -> &[lforge_scene::PrimitiveBones] {
+        &self.scene.associations
+    }
+
+    pub fn has_skeleton(&self) -> bool {
+        self.scene.skeleton.is_some()
+    }
+
+    pub fn skeleton_visible(&self) -> bool {
+        self.skeleton_visible
+    }
+
+    /// Shows or hides the skeleton overlay. This changes drawing only: no
+    /// resource is read and no GPU geometry is replaced.
+    pub fn set_skeleton_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.skeleton_visible != visible {
+            self.skeleton_visible = visible;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_skeleton(&mut self, cx: &mut Context<Self>) {
+        let visible = !self.skeleton_visible;
+        self.set_skeleton_visible(visible, cx);
+    }
+
+    pub fn selected_bone(&self) -> Option<usize> {
+        self.selected_bone
+    }
+
+    /// Highlights one bone. The selection is a uniform range, so no buffer is
+    /// rebuilt and no resource is read.
+    pub fn select_bone(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        let index = index.filter(|index| {
+            self.scene
+                .skeleton
+                .as_ref()
+                .is_some_and(|skeleton| *index < skeleton.bones.len())
+        });
+        if self.selected_bone != index {
+            self.selected_bone = index;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    /// Whether at least one scene mesh is currently shown.
+    pub fn any_mesh_visible(&self) -> bool {
+        self.visibility.flags().iter().any(|flag| *flag)
+    }
+
+    /// Shows or hides every scene mesh. Independent of the skeleton overlay.
+    pub fn set_all_meshes_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visibility.set_all(visible) {
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
     /// Restores the initial visibility state, which is every component shown.
     pub fn restore_default_visibility(&mut self, cx: &mut Context<Self>) {
         self.show_all_components(cx);
@@ -424,6 +500,15 @@ impl Viewport {
         }
         if any && bounds.is_finite() && !bounds.is_empty() {
             bounds.sanitized()
+        } else if self.skeleton_visible
+            && let Some(skeleton) = self.scene.skeleton.as_ref()
+        {
+            let bounds = skeleton.bounds();
+            if bounds.is_finite() && !bounds.is_empty() {
+                bounds.sanitized()
+            } else {
+                self.bounds
+            }
         } else {
             self.bounds
         }
@@ -481,6 +566,8 @@ impl Viewport {
             size: self.size,
             camera: self.camera,
             visibility: Arc::new(self.visibility.flags().to_vec()),
+            skeleton: self.skeleton_visible,
+            selected_bone: self.selected_bone,
         };
         if !requests.submit(request) {
             self.requests = None;
@@ -702,12 +789,21 @@ fn spawn_render_thread(
                     }
                     applied = Some(request.visibility.clone());
                 }
-                let response = match renderer.render(
+                gpu_scene.set_skeleton_visible(request.skeleton);
+                gpu_scene.set_skeleton_selected(request.selected_bone);
+                let response = match renderer.render_with_overlay(
                     &gpu_scene,
                     &request.camera,
                     request.size.width.0 as u32,
                     request.size.height.0 as u32,
                     Background::DARK,
+                    Overlay {
+                        visible: request.skeleton,
+                        selected: request.selected_bone,
+                        // The inspector is for looking at bones inside opaque
+                        // geometry, so the interactive overlay ignores depth.
+                        depth_independent: true,
+                    },
                 ) {
                     Ok(frame) => Response::Frame {
                         generation: request.generation,

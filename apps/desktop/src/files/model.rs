@@ -598,6 +598,9 @@ fn finish_fragment(
         completeness: decoded::ModelCompleteness {
             geometry,
             textures,
+            skeleton: decoded.skeleton.clone(),
+            associations: decoded.associations.clone(),
+            placement: decoded.placement.clone(),
             selected_root: decoded.report.header.drawable as usize,
             selected_name: decoded.report.name().map(str::to_string),
             notes,
@@ -685,6 +688,7 @@ fn texture_stores(root: &Path) -> Result<Arc<StoreSet>, String> {
 mod tests {
     use super::*;
     use crate::files::Executable;
+    use std::collections::BTreeMap;
 
     /// The archives a survey reads: `LF_TEST_ARCHIVE_LIST` names a file of
     /// paths, `LF_TEST_CHAIN_LIST` a file of census chains (`a.rpf!5!3`), and
@@ -885,12 +889,13 @@ mod tests {
             };
             loaded_rows += 1;
             eprintln!(
-                "{}: {} meshes, {} materials, {} textures, {} diagnostics",
+                "{}: {} meshes, {} materials, {} textures, {} diagnostics [{}]",
                 loaded.name,
                 loaded.scene.meshes.len(),
                 loaded.scene.materials.len(),
                 loaded.scene.textures.len(),
-                loaded.scene.diagnostics.len()
+                loaded.scene.diagnostics.len(),
+                entry.path.display()
             );
             assert!(!loaded.scene.meshes.is_empty());
             assert!(loaded.scene.vertex_count() > 0);
@@ -1934,6 +1939,635 @@ mod tests {
             eprintln!("  root words (+0x00, +0x10, +0x18): {words:?}");
             eprintln!(
                 "  accepted as: {drawable_dictionaries} drawable dictionary, {texture_dictionaries} texture dictionary, {fragments} fragment root ({member_drawables} with a member drawable)"
+            );
+        }
+    }
+
+    /// The skeleton facts one surveyed row contributes.
+    struct SkeletonFacts {
+        bones: usize,
+        roots: usize,
+        depth: usize,
+        named: usize,
+        inverse_bind: usize,
+        complete: bool,
+        declared_geometries: usize,
+        validated_geometries: usize,
+        weighted_geometries: usize,
+        /// Declared geometries whose influence streams could not be read.
+        unread_geometries: usize,
+        /// Why, as a histogram.
+        unread_reasons: BTreeMap<String, usize>,
+        /// A few declaration samples, for the run output.
+        unread_samples: Vec<String>,
+        /// The structural issues the skeleton parser reported, as kinds.
+        issues: Vec<&'static str>,
+        /// The same issues as text, for a sample line.
+        issue_text: Vec<String>,
+        /// One line per geometry that declares bones but did not validate.
+        invalid: Vec<String>,
+    }
+
+    /// The issue kind, for a histogram. A pointer, bounds or count issue is
+    /// reported with the field it concerned, because the field is the useful
+    /// part of that observation.
+    fn issue_kind(issue: &lforge_rage9::skeleton::Issue) -> &'static str {
+        use lforge_rage9::skeleton::Issue;
+        match issue {
+            Issue::Pointer { .. } => "pointer",
+            Issue::Bounds { .. } => "bounds",
+            Issue::Clamped { field, .. } => field,
+            Issue::ParentArrayMismatch { .. } => "parent array mismatch",
+            Issue::InvalidParent { .. } => "invalid parent",
+            Issue::SelfParent { .. } => "self parent",
+            Issue::Cycle { .. } => "cycle",
+            Issue::NonFinite { .. } => "non-finite",
+            Issue::Missing { .. } => "missing",
+        }
+    }
+
+    /// Prints the raw skeleton header and records of one row.
+    ///
+    /// Enabled by `LF_SURVEY_DETAIL`, whose value is matched against the row
+    /// locator. A partial result needs the stored counts next to the walk that
+    /// disagreed with them, not only the disagreement.
+    fn dump_skeleton(system: &[u8], at: u32) {
+        let word = |offset: usize| {
+            system
+                .get(offset..offset + 4)
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+        };
+        let half = |offset: usize| {
+            system
+                .get(offset..offset + 2)
+                .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two bytes")))
+        };
+        let base = at as usize;
+        eprintln!(
+            "    skeleton +{at:#x}: +0x10 {:?}, +0x18 {:?}, +0x1C {:?}, key map {:?}, bones {:?}, inverse bind {:?}, local {:?}, parents {:?}, names {:?}",
+            word(base + 0x10),
+            word(base + 0x18),
+            word(base + 0x1C),
+            word(base + 0x20),
+            word(base + 0x28),
+            word(base + 0x30),
+            word(base + 0x38),
+            word(base + 0x40),
+            word(base + 0x48)
+        );
+        let Some(bone_base) = word(base + 0x28).map(|value| (value & 0x0FFF_FFFF) as usize) else {
+            return;
+        };
+        eprintln!(
+            "    bone array +{bone_base:#x}: first record +0x4E {:?}, +0x4C {:?}, +0x4A {:?}, +0x48 {:?}",
+            half(bone_base + 0x4E),
+            half(bone_base + 0x4C),
+            half(bone_base + 0x4A),
+            half(bone_base + 0x48)
+        );
+        let mut roots = Vec::new();
+        let mut outside = 0usize;
+        let mut index = 0usize;
+        while index < 4096 {
+            let record = bone_base + index * 0x50;
+            if half(record + 0x48) != Some(index as u16) {
+                break;
+            }
+            let parent = half(record + 0x46).unwrap_or(0xFFFF);
+            if parent == 0xFFFF {
+                roots.push(index);
+            } else if usize::from(parent) >= 4096 {
+                outside += 1;
+            }
+            if index < 12 {
+                eprintln!(
+                    "      bone {index}: parent {parent:#06x}, id {:?}, id16 {:?}, name {:?}, group {:?}",
+                    word(record + 0x1C),
+                    half(record + 0x4A),
+                    word(record + 0x30),
+                    [
+                        half(record + 0x48),
+                        half(record + 0x4A),
+                        half(record + 0x4C),
+                        half(record + 0x4E)
+                    ]
+                );
+            }
+            index += 1;
+        }
+        eprintln!(
+            "    walk: {index} records, {} root(s) at {:?}, {outside} parent(s) outside the array",
+            roots.len(),
+            &roots[..roots.len().min(24)]
+        );
+        for index in index.saturating_sub(20)..index + 2 {
+            let record = bone_base + index * 0x50;
+            let name_pointer = word(record + 0x30).unwrap_or(0);
+            let name_at = (name_pointer & 0x0FFF_FFFF) as usize;
+            let name = {
+                let mut text = Vec::new();
+                for offset in name_at..name_at.saturating_add(48) {
+                    match system.get(offset) {
+                        Some(&byte) if byte.is_ascii_graphic() || byte == b' ' => text.push(byte),
+                        _ => break,
+                    }
+                }
+                String::from_utf8_lossy(&text).into_owned()
+            };
+            eprintln!(
+                "      tail {index}: parent {:?}, group {:?}, name {name:?}",
+                half(record + 0x46),
+                [
+                    half(record + 0x48),
+                    half(record + 0x4A),
+                    half(record + 0x4C),
+                    half(record + 0x4E)
+                ]
+            );
+        }
+    }
+
+    /// Reads the skeleton of one drawable and counts the influence streams its
+    /// LOD-0 geometries declare.
+    fn skeleton_facts(
+        system: &[u8],
+        graphics: &[u8],
+        report: &lforge_rage9::drawable::Report,
+    ) -> Option<SkeletonFacts> {
+        let at = report.header.skeleton?;
+        let skeleton = lforge_rage9::skeleton::inspect(system, at);
+        let bone_total = skeleton.bones.len();
+        let mut declared_geometries = 0;
+        let mut validated_geometries = 0;
+        let mut weighted_geometries = 0;
+        // A geometry whose stream declaration is not the influence form, or
+        // whose bytes are outside the buffer, is not a failed association: it
+        // is one the survey could not read, and the two are counted apart.
+        let mut unread_geometries = 0;
+        let mut unread_reasons: BTreeMap<String, usize> = BTreeMap::new();
+        let mut unread_samples: Vec<String> = Vec::new();
+        let mut invalid = Vec::new();
+        // Only the highest populated LOD is decoded and drawn, so only its
+        // geometries contribute a static association.
+        for model in report
+            .lod
+            .iter()
+            .find(|slot| !slot.models.is_empty())
+            .into_iter()
+            .flat_map(|slot| &slot.models)
+        {
+            for (geometry_index, geometry) in model.geometries.iter().enumerate() {
+                if geometry.bone_count == 0 {
+                    continue;
+                }
+                declared_geometries += 1;
+                let Some(buffer) = geometry.vertex_buffer.as_ref() else {
+                    *unread_reasons
+                        .entry("no vertex buffer".to_string())
+                        .or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                };
+                let blob = graphics
+                    .get(buffer.graphics as usize..)
+                    .and_then(|tail| tail.get(..usize::try_from(buffer.declared_bytes).ok()?));
+                let Some(blob) = blob else {
+                    *unread_reasons
+                        .entry("vertex buffer outside the graphics segment".to_string())
+                        .or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                };
+                let Some(count) = Some(buffer.vertex_count as usize).filter(|count| *count > 0)
+                else {
+                    *unread_reasons.entry("no vertices".to_string()).or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                };
+                let word = |stream: usize| {
+                    blob.get(stream * 4..stream * 4 + 4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                };
+                // Slots 6 and 8 are empirical: searching the declaration for the
+                // weight format instead was measured and every extra candidate
+                // failed the weight totals. A geometry that declares its streams
+                // elsewhere is counted, not guessed at.
+                let declaration: Vec<(usize, u32)> = (0..23usize)
+                    .filter_map(|slot| word(slot).filter(|entry| *entry != 0).map(|e| (slot, e)))
+                    .collect();
+                let weight_slot = declaration
+                    .iter()
+                    .filter(|(_, entry)| entry & 0xFF == 0x26)
+                    .map(|(slot, _)| *slot)
+                    .collect::<Vec<_>>();
+                let (Some(weights), Some(indexes)) = (word(6), word(8)) else {
+                    *unread_reasons
+                        .entry("slot 6 or 8 not declared".to_string())
+                        .or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                };
+                if weights & 0xFF != 0x26 {
+                    let reason = match (geometry.bone_count, weight_slot.first()) {
+                        (1, _) => "no weight form (one bone)".to_string(),
+                        (_, Some(slot)) => format!("weight form at slot {slot}, not 6"),
+                        (_, None) => "no weight form".to_string(),
+                    };
+                    if unread_samples.len() < 4 {
+                        unread_samples.push(format!(
+                            "geometry {geometry_index}: bone_count {}, declaration {declaration:?}",
+                            geometry.bone_count
+                        ));
+                    }
+                    *unread_reasons.entry(reason).or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                }
+                // Slot 8 holds four `u8` blend indices only when its format is
+                // 0x25; another format at that slot is a different attribute. A
+                // one-bone skeleton needs no index stream: its single weight lane
+                // names the only bone.
+                let has_index_stream = indexes & 0xFF == 0x25;
+                if !has_index_stream && bone_total != 1 {
+                    if unread_samples.len() < 4 {
+                        unread_samples.push(format!(
+                            "geometry {geometry_index}: {bone_total} bones, declaration {declaration:?}"
+                        ));
+                    }
+                    *unread_reasons
+                        .entry("no index form at slot 8".to_string())
+                        .or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                }
+                let weight_offset = ((weights >> 8) * 2) as usize;
+                let weight_bytes = blob.get(weight_offset..weight_offset + count * 4);
+                let Some(weight_bytes) = weight_bytes else {
+                    *unread_reasons
+                        .entry("weight or index bytes outside the buffer".to_string())
+                        .or_insert(0) += 1;
+                    unread_geometries += 1;
+                    continue;
+                };
+                let index_bytes = if has_index_stream {
+                    let index_offset = ((indexes >> 8) * 2) as usize;
+                    let bytes = blob.get(index_offset..index_offset + count * 4);
+                    let Some(bytes) = bytes else {
+                        *unread_reasons
+                            .entry("weight or index bytes outside the buffer".to_string())
+                            .or_insert(0) += 1;
+                        unread_geometries += 1;
+                        continue;
+                    };
+                    Some(bytes)
+                } else {
+                    None
+                };
+                let mut valid = true;
+                let mut weighted = false;
+                for (vertex, w) in weight_bytes.as_chunks::<4>().0.iter().enumerate() {
+                    let total =
+                        u32::from(w[0]) + u32::from(w[1]) + u32::from(w[2]) + u32::from(w[3]);
+                    if total == 0 {
+                        valid = false;
+                        break;
+                    }
+                    let used = w.iter().filter(|value| **value > 0).count();
+                    if used > 1 {
+                        weighted = true;
+                    }
+                    match index_bytes {
+                        Some(bytes) => {
+                            let i = &bytes[vertex * 4..vertex * 4 + 4];
+                            if used > 0
+                                && (0..4)
+                                    .any(|lane| w[lane] > 0 && usize::from(i[lane]) >= bone_total)
+                            {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        None => {
+                            if w[1] != 0 || w[2] != 0 || w[3] != 0 {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if valid {
+                    validated_geometries += 1;
+                    if weighted {
+                        weighted_geometries += 1;
+                    }
+                } else if invalid.len() < 8 {
+                    invalid.push(format!(
+                        "geometry {geometry_index}: bone_count {}, weight slots {weight_slot:?}, stream 6 {:04x} 8 {:04x}, vertices {count}",
+                        geometry.bone_count,
+                        weights & 0xFFFF,
+                        indexes & 0xFFFF
+                    ));
+                }
+            }
+        }
+        Some(SkeletonFacts {
+            bones: skeleton.bones.len(),
+            roots: skeleton.roots.len(),
+            depth: skeleton.max_depth,
+            named: skeleton.named_count(),
+            inverse_bind: skeleton.inverse_bind.len(),
+            complete: skeleton.complete(),
+            issues: skeleton.issues.iter().map(issue_kind).collect(),
+            issue_text: skeleton.issues.iter().map(ToString::to_string).collect(),
+            declared_geometries,
+            validated_geometries,
+            weighted_geometries,
+            unread_geometries,
+            unread_reasons,
+            unread_samples,
+            invalid,
+        })
+    }
+
+    /// Surveys the skeletons of every declared type-2 and type-3 row in the
+    /// caller-named archives.
+    ///
+    /// The question is how skeletons are distributed and how much of them the
+    /// parser reads: presence, bone count, root count, depth, name coverage,
+    /// inverse-bind coverage, and whether each LOD-0 geometry's influence
+    /// streams validate. The run reports a selected sample, not an
+    /// installation-wide claim.
+    ///
+    /// Ignored by default. `LF_TEST_ARCHIVE_LIST`/`LF_TEST_ARCHIVE_DIR` name
+    /// the archives and `LF_TEST_EXECUTABLE` the executable that supplies the
+    /// keys. `LF_SURVEY_SAMPLES` bounds the locators printed.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE_LIST (or LF_TEST_ARCHIVE_DIR) and LF_TEST_EXECUTABLE"]
+    fn surveys_native_skeleton_rows() {
+        use std::collections::BTreeMap;
+
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let archives = survey_archives();
+        let sample_limit: usize = std::env::var("LF_SURVEY_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20);
+
+        let mut presence: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut bone_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut root_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut depths: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut issue_kinds: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut incomplete = 0usize;
+        let mut with_inverse_bind = 0usize;
+        let mut declared_geometries = 0usize;
+        let mut validated_geometries = 0usize;
+        let mut weighted_geometries = 0usize;
+        let mut unread_geometries = 0usize;
+        let mut unread_reasons: BTreeMap<String, usize> = BTreeMap::new();
+        let mut samples: Vec<String> = Vec::new();
+        let mut partial_samples: Vec<String> = Vec::new();
+        let mut invalid_samples: Vec<String> = Vec::new();
+        let mut unread_samples: Vec<String> = Vec::new();
+        let detail_dumps = std::cell::Cell::new(0usize);
+
+        for type_id in [2u8, 3u8] {
+            let (listed, declared, read, unreadable) = survey_rows(
+                &archives,
+                &access,
+                &cancel,
+                type_id,
+                |row| {
+                    let (system, graphics) = row.segments();
+                    let report = if type_id == 3 {
+                        let Ok(header) = lforge_rage9::fragment::header(system) else {
+                            return;
+                        };
+                        lforge_rage9::drawable::inspect_member_at(
+                            system,
+                            graphics,
+                            header.drawable as usize,
+                        )
+                    } else {
+                        lforge_rage9::drawable::inspect(system, graphics)
+                    };
+                    let Some(report) = report else { return };
+                    let Some(facts) = skeleton_facts(system, graphics, &report) else {
+                        *presence.entry("no skeleton pointer").or_insert(0) += 1;
+                        return;
+                    };
+                    if detail_dumps.get() < 3 {
+                        let by_path = std::env::var("LF_SURVEY_DETAIL")
+                            .is_ok_and(|needle| row.path.display().to_string().contains(&needle));
+                        let by_issue = std::env::var("LF_SURVEY_DETAIL_ISSUE")
+                            .is_ok_and(|kind| facts.issues.contains(&kind.as_str()));
+                        if (by_path || by_issue)
+                            && let Some(at) = report.header.skeleton
+                        {
+                            eprintln!("    detail: {}", row.path.display());
+                            dump_skeleton(system, at);
+                            detail_dumps.set(detail_dumps.get() + 1);
+                        }
+                    }
+                    *presence.entry("skeleton").or_insert(0) += 1;
+                    *bone_counts.entry(facts.bones).or_insert(0) += 1;
+                    *root_counts.entry(facts.roots).or_insert(0) += 1;
+                    *depths.entry(facts.depth).or_insert(0) += 1;
+                    for kind in &facts.issues {
+                        *issue_kinds.entry(kind).or_insert(0) += 1;
+                    }
+                    if !facts.complete {
+                        incomplete += 1;
+                        if partial_samples.len() < sample_limit {
+                            partial_samples.push(format!(
+                                "{}: type {type_id}, {} bones, {} root(s), depth {}, issues {:?}",
+                                row.path.display(),
+                                facts.bones,
+                                facts.roots,
+                                facts.depth,
+                                facts.issue_text
+                            ));
+                        }
+                    }
+                    if facts.inverse_bind > 0 {
+                        with_inverse_bind += 1;
+                    }
+                    declared_geometries += facts.declared_geometries;
+                    validated_geometries += facts.validated_geometries;
+                    weighted_geometries += facts.weighted_geometries;
+                    unread_geometries += facts.unread_geometries;
+                    for (reason, count) in &facts.unread_reasons {
+                        *unread_reasons.entry(reason.clone()).or_insert(0) += count;
+                    }
+                    if samples.len() < sample_limit {
+                        samples.push(format!(
+                            "{}: type {type_id}, {} bones, {} root(s), depth {}, {}/{} named, {}/{} inverse bind, {} of {} geometry influence sets validated, {} weighted, split {:#x}{}",
+                            row.path.display(),
+                            facts.bones,
+                            facts.roots,
+                            facts.depth,
+                            facts.named,
+                            facts.bones,
+                            facts.inverse_bind,
+                            facts.bones,
+                            facts.validated_geometries,
+                            facts.declared_geometries,
+                            facts.weighted_geometries,
+                            row.system_len,
+                            if row.native { "" } else { " (inferred)" }
+                        ));
+                    }
+                    if !facts.invalid.is_empty() && invalid_samples.len() < 8 {
+                        invalid_samples.push(format!(
+                            "{}: {}",
+                            row.path.display(),
+                            facts.invalid.join("; ")
+                        ));
+                    }
+                    if unread_samples.len() < 4 {
+                        for sample in &facts.unread_samples {
+                            unread_samples.push(format!("{}: {sample}", row.path.display()));
+                        }
+                    }
+                },
+            );
+            eprintln!(
+                "type {type_id}: {listed} archive(s) listed, {declared} declared, {read} read, {unreadable} unreadable"
+            );
+        }
+        eprintln!("skeleton presence: {presence:?}");
+        eprintln!("bone counts: {bone_counts:?}");
+        eprintln!("root counts: {root_counts:?}");
+        eprintln!("hierarchy depths: {depths:?}");
+        eprintln!("structural issues: {issue_kinds:?}");
+        eprintln!(
+            "{incomplete} skeleton(s) partial, {with_inverse_bind} with inverse-bind records"
+        );
+        eprintln!(
+            "influence sets: {validated_geometries} validated, {unread_geometries} without readable streams, {} invalid of {declared_geometries} declared; {weighted_geometries} weighted",
+            declared_geometries - validated_geometries - unread_geometries
+        );
+        eprintln!("  unread reasons: {unread_reasons:?}");
+        for line in &samples {
+            eprintln!("  sample: {line}");
+        }
+        for line in &partial_samples {
+            eprintln!("  partial: {line}");
+        }
+        for line in &invalid_samples {
+            eprintln!("  invalid influence: {line}");
+        }
+        for line in &unread_samples {
+            eprintln!("  unread influence: {line}");
+        }
+        assert!(!presence.is_empty(), "no row was read");
+    }
+
+    /// Verifies the four documented skeleton-bearing fragments through the
+    /// native archive path.
+    ///
+    /// Ignored by default. `LF_TEST_CHAIN_LIST` names a file with the four
+    /// chains (`levels.rpf!5!0`, `levels.rpf!5!1`, `data.rpf!26!9`,
+    /// `levels.rpf!5!8`), `LF_TEST_GAME_ROOT` the installation and
+    /// `LF_TEST_EXECUTABLE` the executable that supplies the keys.
+    #[test]
+    #[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+    fn decodes_real_skeleton_resources() {
+        use std::collections::BTreeMap;
+
+        let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let text = std::fs::read_to_string(&list).expect("chain list");
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        let mut seen: BTreeMap<String, (usize, usize, usize, bool, decoded::SkeletonCompleteness)> =
+            BTreeMap::new();
+        for chain in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some((parent_chain, row)) = chain.rsplit_once('!') else {
+                continue;
+            };
+            let Ok(row) = row.parse::<usize>() else {
+                continue;
+            };
+            let Some(parent) = resolve_chain(
+                Path::new(&root),
+                &access,
+                parent_chain,
+                &mut resolved,
+                &mut index,
+            ) else {
+                eprintln!("unresolved chain: {chain}");
+                continue;
+            };
+            if !index.contains_key(&parent) {
+                index.insert(parent.clone(), row_index(&parent, &access));
+            }
+            let Some(entry) = index.get(&parent).and_then(|rows| rows.get(&row)).cloned() else {
+                eprintln!("row {row} of {} is not listed", parent.display());
+                continue;
+            };
+            let loaded = match load_with_cancel(&entry, &access, Some(Path::new(&root)), &cancel) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    eprintln!("{}: {err}", entry.display());
+                    continue;
+                }
+            };
+            let skeleton = loaded.scene.skeleton.as_ref();
+            let weighted = loaded
+                .scene
+                .associations
+                .iter()
+                .any(|association| association.weighted);
+            let bones = skeleton.map_or(0, |skeleton| skeleton.bones.len());
+            let roots = skeleton.map_or(0, |skeleton| skeleton.roots.len());
+            let depth = skeleton.map_or(0, |skeleton| skeleton.max_depth);
+            seen.insert(
+                loaded.name.clone(),
+                (
+                    bones,
+                    roots,
+                    depth,
+                    weighted,
+                    loaded.completeness.skeleton.clone(),
+                ),
+            );
+        }
+        for (name, facts) in &seen {
+            eprintln!("{name}: {facts:?}");
+        }
+        let expected: [(&str, usize, usize, usize, bool); 4] = [
+            ("prop_am_card_tarot_deck_01a.#ft", 3, 1, 3, false),
+            ("prop_am_candlestick_02a.#ft", 4, 1, 4, false),
+            ("w_sg_goodwin_01_bolt_01_mid.#ft", 3, 1, 3, false),
+            ("mint_peacock_taxidermy_01.#ft", 10, 1, 10, true),
+        ];
+        for (name, bones, roots, depth, weighted) in expected {
+            let Some((found_bones, found_roots, found_depth, found_weighted, completeness)) =
+                seen.get(name)
+            else {
+                panic!(
+                    "{name} was not decoded; saw {:?}",
+                    seen.keys().collect::<Vec<_>>()
+                );
+            };
+            assert_eq!(*found_bones, bones, "{name}");
+            assert_eq!(*found_roots, roots, "{name}");
+            assert_eq!(*found_depth, depth, "{name}");
+            assert_eq!(*found_weighted, weighted, "{name}");
+            assert_eq!(
+                *completeness,
+                decoded::SkeletonCompleteness::Complete,
+                "{name}"
             );
         }
     }
