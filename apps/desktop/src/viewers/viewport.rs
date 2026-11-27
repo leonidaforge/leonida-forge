@@ -271,6 +271,21 @@ impl Visibility {
         self.flags.fill(visible);
         true
     }
+
+    /// The flags as they stand, for a later restore.
+    fn snapshot(&self) -> Vec<bool> {
+        self.flags.clone()
+    }
+
+    /// Puts a snapshot back. Returns whether anything changed, and never mixes
+    /// a snapshot of a different scene into this one.
+    fn restore(&mut self, snapshot: &[bool]) -> bool {
+        if snapshot.len() != self.flags.len() || self.flags == snapshot {
+            return false;
+        }
+        self.flags.clone_from_slice(snapshot);
+        true
+    }
 }
 
 pub struct Viewport {
@@ -283,6 +298,10 @@ pub struct Viewport {
     /// Mesh visibility, one flag per scene mesh. The decoded scene is never
     /// modified; the render thread applies the flags before drawing.
     visibility: Visibility,
+    /// The flags in force before every mesh was hidden, so showing the meshes
+    /// again restores a per-component or per-mesh choice instead of turning
+    /// every mesh on.
+    visibility_before_hide: Option<Vec<bool>>,
     /// Whether the skeleton overlay is drawn. Hidden by default so the model
     /// inspection experience is unchanged.
     skeleton_visible: bool,
@@ -334,6 +353,7 @@ impl Viewport {
             bounds,
             scene,
             visibility,
+            visibility_before_hide: None,
             skeleton_visible: false,
             selected_bone: None,
             framed: false,
@@ -467,7 +487,22 @@ impl Viewport {
     }
 
     /// Shows or hides every scene mesh. Independent of the skeleton overlay.
+    ///
+    /// Hiding every mesh remembers the flags that were in force, so showing
+    /// them again restores the per-mesh and per-component choices rather than
+    /// turning on a mesh the user had hidden.
     pub fn set_all_meshes_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if visible {
+            if let Some(previous) = self.visibility_before_hide.take()
+                && self.visibility.restore(&previous)
+            {
+                self.request_frame();
+                cx.notify();
+                return;
+            }
+        } else if self.any_mesh_visible() {
+            self.visibility_before_hide = Some(self.visibility.snapshot());
+        }
         if self.visibility.set_all(visible) {
             self.request_frame();
             cx.notify();
@@ -937,5 +972,30 @@ mod tests {
         assert!(ready);
         assert!(failed);
         assert_eq!(latest_frame, Some(99));
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::Visibility;
+
+    #[test]
+    fn hiding_every_mesh_and_showing_them_again_keeps_the_per_mesh_choices() {
+        let mut visibility = Visibility::new(3);
+        visibility.set_mesh(1, false);
+        let before = visibility.snapshot();
+        assert!(visibility.set_all(false));
+        assert!(!visibility.mesh(0) && !visibility.mesh(1) && !visibility.mesh(2));
+        assert!(visibility.restore(&before));
+        assert!(visibility.mesh(0));
+        assert!(!visibility.mesh(1));
+        assert!(visibility.mesh(2));
+    }
+
+    #[test]
+    fn a_snapshot_of_a_different_scene_is_ignored() {
+        let mut visibility = Visibility::new(2);
+        assert!(!visibility.restore(&[false, false, false]));
+        assert!(visibility.mesh(0) && visibility.mesh(1));
     }
 }
