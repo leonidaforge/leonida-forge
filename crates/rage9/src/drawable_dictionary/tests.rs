@@ -168,14 +168,46 @@ fn a_value_that_is_not_a_system_pointer_is_reported_per_member() {
 }
 
 #[test]
-fn unsorted_hashes_are_reported_and_not_recognised() {
+fn unsorted_hashes_are_reported_and_still_recognised() {
     let (mut system, graphics) = dictionary(2);
     put_u32(&mut system, 0x460, 0x2222_2222);
     put_u32(&mut system, 0x464, 0x1111_1111);
     let report = parse(&system, &graphics).unwrap();
     assert!(!report.hash_sorted);
     assert_eq!(report.members.len(), 2);
-    assert!(!is_drawable_dictionary(&system, &graphics));
+    // Ordering is a property of the table, not of the root's identity: the
+    // members are still selected by position.
+    assert!(is_drawable_dictionary(&system, &graphics));
+}
+
+#[test]
+fn duplicate_hashes_keep_every_member() {
+    let (mut system, graphics) = dictionary(2);
+    put_u32(&mut system, 0x460, 0x2222_2222);
+    put_u32(&mut system, 0x464, 0x2222_2222);
+    let report = parse(&system, &graphics).unwrap();
+    assert!(!report.hash_sorted, "a repeated hash is not sorted");
+    assert_eq!(report.members.len(), 2, "no member is dropped");
+    assert_eq!(report.members[0].index, 0);
+    assert_eq!(report.members[1].index, 1);
+    assert_ne!(
+        report.members[0].drawable, report.members[1].drawable,
+        "the two entries still name their own drawables"
+    );
+    assert!(is_drawable_dictionary(&system, &graphics));
+}
+
+#[test]
+fn two_members_may_share_one_drawable() {
+    let (mut system, graphics) = dictionary(2);
+    let shared = u64_at(&system, 0x470).expect("the first member value");
+    put_u64(&mut system, 0x478, shared);
+    let report = parse(&system, &graphics).unwrap();
+    assert_eq!(report.members.len(), 2);
+    assert_eq!(report.members[0].drawable, report.members[1].drawable);
+    // Both entries stay selectable by index even though the target is shared.
+    assert_eq!(report.members[0].index, 0);
+    assert_eq!(report.members[1].index, 1);
 }
 
 #[test]

@@ -332,16 +332,17 @@ fn check_array(system: &[u8], at: usize, count: usize, stride: usize) -> Result<
 /// member whose value resolves to a member drawable; an empty dictionary is
 /// accepted only when the counts are zero and the `+0x18` word is the observed
 /// [`WORD_18`], because an empty root has no member to confirm the form.
+///
+/// The hash array's ordering is reported in [`Report::hash_sorted`] and is not
+/// part of this test: a dictionary whose entries repeat or arrive out of order
+/// is still a dictionary, and its members are still selected by position.
 pub fn is_drawable_dictionary(system: &[u8], graphics: &[u8]) -> bool {
     match parse(system, graphics) {
         Ok(report) if report.empty => report.header.word_18 == WORD_18,
-        Ok(report) => {
-            report.hash_sorted
-                && report
-                    .members
-                    .iter()
-                    .any(|m| m.state == MemberState::Drawable)
-        }
+        Ok(report) => report
+            .members
+            .iter()
+            .any(|m| m.state == MemberState::Drawable),
         Err(_) => false,
     }
 }
