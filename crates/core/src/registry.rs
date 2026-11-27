@@ -130,6 +130,79 @@ pub fn is_registered(type_id: u8) -> bool {
     native_extension(type_id).is_some()
 }
 
+/// Where the extension of a resolved file name came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// The resolved name already carried an extension. It is kept as it is.
+    Original,
+    /// The name had none, so the type's declared extension was appended.
+    Declared,
+    /// The name had none and the type declares none: the name stays as it is.
+    None,
+}
+
+impl NameSource {
+    pub fn name(self) -> &'static str {
+        match self {
+            NameSource::Original => "original",
+            NameSource::Declared => "declared",
+            NameSource::None => "none",
+        }
+    }
+}
+
+/// A resolved entry name with the extension the application shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFileName {
+    pub text: String,
+    /// The extension shown, without a dot.
+    pub extension: Option<&'static str>,
+    pub source: NameSource,
+}
+
+/// The name to show for a resolved entry, with its extension resolved.
+///
+/// One rule for the Explorer and for the command line, so a name shown in one
+/// is the name shown in the other:
+///
+/// - a name that already carries an extension keeps it, because the archive's
+///   own name is the better evidence about how the engine spells it;
+/// - a name without one takes the extension the engine's type registry
+///   declares for the row's type;
+/// - a type that declares no extension — an unregistered id, or 255 — gets
+///   none. Nothing is invented.
+///
+/// The extension is a naming fact about the loader's type table. It says
+/// nothing about whether the payload is valid, and a caller must keep it apart
+/// from anything it verified itself.
+pub fn file_name(name: &str, type_id: Option<u8>) -> ResolvedFileName {
+    let declared = type_id.and_then(native_extension);
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let has_extension = match basename.rsplit_once('.') {
+        Some((stem, extension)) => !stem.is_empty() && !extension.is_empty(),
+        None => false,
+    };
+    if has_extension {
+        return ResolvedFileName {
+            text: name.to_string(),
+            extension: None,
+            source: NameSource::Original,
+        };
+    }
+    match declared {
+        Some(native) => ResolvedFileName {
+            text: format!("{name}.{}", native.extension),
+            extension: Some(native.extension),
+            source: NameSource::Declared,
+        },
+        None => ResolvedFileName {
+            text: name.to_string(),
+            extension: None,
+            source: NameSource::None,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +240,39 @@ mod tests {
             assert_eq!(native_extension(type_id), None, "type {type_id}");
         }
         assert_eq!(native_extension(NO_EXTENSION), None);
+    }
+
+    #[test]
+    fn a_resolved_name_keeps_its_own_extension() {
+        let name = file_name("packs/inner.rpf", Some(0));
+        assert_eq!(name.text, "packs/inner.rpf");
+        assert_eq!(name.source, NameSource::Original);
+        // A dotted stem is not an extension the type may replace.
+        let dotted = file_name("packs/v1.2/inner", Some(6));
+        assert_eq!(dotted.text, "packs/v1.2/inner.zbn");
+        assert_eq!(dotted.source, NameSource::Declared);
+        let hidden = file_name(".gitignore", Some(6));
+        assert_eq!(hidden.text, ".gitignore.zbn");
+    }
+
+    #[test]
+    fn a_name_without_an_extension_takes_the_declared_one() {
+        let name = file_name("packs/01_ai", Some(6));
+        assert_eq!(name.text, "packs/01_ai.zbn");
+        assert_eq!(name.extension, Some("zbn"));
+        assert_eq!(name.source, NameSource::Declared);
+        // An unobserved but registered type still declares its extension.
+        assert_eq!(file_name("x", Some(112)).text, "x.znmd");
+    }
+
+    #[test]
+    fn a_type_that_declares_nothing_gets_no_extension() {
+        for type_id in [Some(255u8), Some(19), None] {
+            let name = file_name("Unnamed Entries/Row 00042", type_id);
+            assert_eq!(name.text, "Unnamed Entries/Row 00042");
+            assert_eq!(name.extension, None, "{type_id:?}");
+            assert_eq!(name.source, NameSource::None);
+        }
     }
 
     #[test]
