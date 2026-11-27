@@ -1245,3 +1245,66 @@ fn nearest_vertex(bones: &[glam::Vec3], point: glam::Vec3) -> (usize, f32) {
     }
     (best, distance)
 }
+
+/// Reports what the decoder establishes about deformation for each chain.
+///
+/// Ignored by default. `LF_TEST_CHAIN_LIST`, `LF_TEST_GAME_ROOT` and
+/// `LF_TEST_EXECUTABLE` name the inputs.
+#[test]
+#[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+fn reports_deformation_support() {
+    let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+    let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+    let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+    let access = Access::with(Arc::new(
+        Executable::open(Path::new(&executable)).expect("executable"),
+    ));
+    let cancel = AtomicBool::new(false);
+    let text = std::fs::read_to_string(&list).expect("chain list");
+    for chain in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some(loaded) = super::tests::load_chain(Path::new(&root), &access, chain, &cancel)
+        else {
+            eprintln!("{chain}: did not load");
+            continue;
+        };
+        let scene = &loaded.scene;
+        let mut statuses: BTreeMap<String, usize> = BTreeMap::new();
+        for entry in &scene.influences {
+            *statuses
+                .entry(entry.influences.status.name().to_string())
+                .or_insert(0) += 1;
+        }
+        eprintln!(
+            "{chain} {}: {} bone(s), {} primitive(s), {} influence set(s), {} deformable, associations {}, skeleton {}, statuses {:?}",
+            loaded.name,
+            scene
+                .skeleton
+                .as_ref()
+                .map_or(0, |skeleton| skeleton.bones.len()),
+            scene
+                .meshes
+                .iter()
+                .map(|mesh| mesh.primitives.len())
+                .sum::<usize>(),
+            scene.influences.len(),
+            scene.deformable_primitive_count(),
+            loaded.completeness.associations.name(),
+            loaded.completeness.skeleton.name(),
+            statuses
+        );
+        for entry in &scene.influences {
+            let mesh = &scene.meshes[entry.mesh];
+            let primitive = &mesh.primitives[entry.primitive];
+            eprintln!(
+                "  mesh {} primitive {}: {} vertices, {} bone(s), weighted {}, max {} influence(s), status {}",
+                entry.mesh,
+                entry.primitive,
+                primitive.vertices.len(),
+                entry.influences.bones.len(),
+                entry.influences.weighted,
+                entry.influences.max_influences,
+                entry.influences.status.name()
+            );
+        }
+    }
+}

@@ -72,6 +72,25 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> State
         .child(label.into())
 }
 
+/// A compact text button for dense numeric rows, such as pose steps.
+pub fn small_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .h(px(22.))
+        .px_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .bg(rgb(theme::SURFACE))
+        .text_xs()
+        .hover(|s| s.bg(rgb(theme::HOVER)))
+        .child(label.into())
+}
+
 pub fn menu_panel() -> Div {
     div()
         .flex()

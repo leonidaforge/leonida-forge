@@ -492,6 +492,7 @@ impl ModelViewer {
                     })),
             );
         }
+        section = section.child(super::pose_panel::pose_section(viewport.clone(), cx));
         // Every row is reachable: the list renders only the rows the scroll
         // window shows, so a long hierarchy costs the visible rows rather than
         // one element per bone.

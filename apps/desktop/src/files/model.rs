@@ -3376,7 +3376,7 @@ mod tests {
     }
 
     /// Loads one native chain through the shared loading path.
-    fn load_chain(
+    pub(super) fn load_chain(
         root: &Path,
         access: &Access,
         chain: &str,

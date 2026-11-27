@@ -21,6 +21,7 @@ use image::{Frame as ImageFrame, RgbaImage};
 use lforge_renderer::{Background, Frame, OrbitCamera, Overlay, Renderer};
 use lforge_scene::{Aabb, Scene};
 
+use super::pose::{PoseDisplay, PoseFrame, PoseSession};
 use crate::ui::theme;
 
 const ORBIT_RADIANS_PER_PIXEL: f32 = 0.008;
@@ -205,6 +206,10 @@ struct Request {
     visibility: Arc<Vec<bool>>,
     skeleton: bool,
     selected_bone: Option<usize>,
+    /// The pose to apply, built on the UI thread only while pose mode is on.
+    pose: Option<Arc<PoseFrame>>,
+    pose_active: bool,
+    influence_view: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +312,9 @@ pub struct Viewport {
     skeleton_visible: bool,
     /// The highlighted bone, as an index into the scene's skeleton.
     selected_bone: Option<usize>,
+    /// Pose mode state. `None` keeps the ordinary authored inspection path.
+    pose: Option<PoseSession>,
+    pose_cache: Option<Arc<PoseFrame>>,
     framed: bool,
     requests: Option<LatestSender<Request>>,
     next_generation: u64,
@@ -356,6 +364,8 @@ impl Viewport {
             visibility_before_hide: None,
             skeleton_visible: false,
             selected_bone: None,
+            pose: None,
+            pose_cache: None,
             framed: false,
             requests,
             next_generation: 0,
@@ -481,6 +491,166 @@ impl Viewport {
         }
     }
 
+    /// Whether this scene has a pose-ready skeleton and at least one
+    /// primitive with verified influences.
+    pub fn pose_supported(&self) -> bool {
+        self.scene.supports_deformation()
+    }
+
+    pub fn is_pose_mode(&self) -> bool {
+        self.pose.is_some()
+    }
+
+    pub fn pose(&self) -> Option<&PoseSession> {
+        self.pose.as_ref()
+    }
+
+    /// Enters pose mode at the verified reference pose.
+    pub fn enter_pose_mode(&mut self, cx: &mut Context<Self>) {
+        if self.pose.is_some() || !self.pose_supported() {
+            return;
+        }
+        let bones = self
+            .scene
+            .skeleton
+            .as_ref()
+            .map_or(0, |skeleton| skeleton.bones.len());
+        self.pose = Some(PoseSession::new(bones));
+        self.pose_cache = None;
+        self.request_frame();
+        cx.notify();
+    }
+
+    /// Leaves pose mode and returns to the authored geometry.
+    pub fn exit_pose_mode(&mut self, cx: &mut Context<Self>) {
+        if self.pose.take().is_some() {
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    pub fn set_pose_display(&mut self, display: PoseDisplay, cx: &mut Context<Self>) {
+        if let Some(pose) = &mut self.pose {
+            pose.set_display(display);
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    pub fn set_influence_view(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if let Some(pose) = &mut self.pose {
+            pose.set_influence_view(enabled);
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    /// Adds rotation button presses to the selected bone.
+    pub fn adjust_pose_rotation(
+        &mut self,
+        axis: usize,
+        steps: i32,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(bone) = self.selected_bone else {
+            return Err("select a bone first".into());
+        };
+        let Some(pose) = &mut self.pose else {
+            return Err("pose mode is not enabled".into());
+        };
+        pose.adjust_rotation(bone, axis, steps)
+            .map_err(|err| err.to_string())?;
+        self.pose_cache = None;
+        self.request_frame();
+        cx.notify();
+        Ok(())
+    }
+
+    /// Adds translation button presses to the selected bone.
+    pub fn adjust_pose_translation(
+        &mut self,
+        axis: usize,
+        steps: i32,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(bone) = self.selected_bone else {
+            return Err("select a bone first".into());
+        };
+        let Some(pose) = &mut self.pose else {
+            return Err("pose mode is not enabled".into());
+        };
+        pose.adjust_translation(bone, axis, steps)
+            .map_err(|err| err.to_string())?;
+        self.pose_cache = None;
+        self.request_frame();
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn reset_pose_bone(&mut self, cx: &mut Context<Self>) {
+        let Some(bone) = self.selected_bone else {
+            return;
+        };
+        if let Some(pose) = &mut self.pose {
+            let _ = pose.reset_bone(bone);
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    pub fn reset_pose(&mut self, cx: &mut Context<Self>) {
+        if let Some(pose) = &mut self.pose {
+            pose.reset_all();
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    pub fn pose_rotation_degrees(&self, bone: usize) -> Option<[f32; 3]> {
+        self.pose.as_ref()?.rotation_degrees(bone)
+    }
+
+    pub fn pose_translation(&self, bone: usize) -> Option<glam::Vec3> {
+        self.pose.as_ref()?.translation(bone)
+    }
+
+    /// The current pose frame, cached by the session revision.
+    fn pose_frame(&mut self) -> Option<Arc<PoseFrame>> {
+        let session = self.pose.as_ref()?;
+        let skeleton = self.scene.skeleton.as_ref()?;
+        if let Some(cached) = &self.pose_cache
+            && cached.revision == session.revision()
+        {
+            return Some(cached.clone());
+        }
+        let frame = Arc::new(session.frame(skeleton).ok()?);
+        self.pose_cache = Some(frame.clone());
+        Some(frame)
+    }
+
+    /// A short report of what deforms and what stays authored.
+    pub fn deformation_report(&self) -> String {
+        let deformable = self.scene.deformable_primitive_count();
+        let total: usize = self
+            .scene
+            .meshes
+            .iter()
+            .map(|mesh| mesh.primitives.len())
+            .sum();
+        match &self.scene.skeleton {
+            Some(skeleton) => format!(
+                "{deformable} of {total} primitive(s) deform; {} bone(s)",
+                skeleton.bones.len()
+            ),
+            None => "no skeleton".to_string(),
+        }
+    }
+
     /// Whether at least one scene mesh is currently shown.
     pub fn any_mesh_visible(&self) -> bool {
         self.visibility.flags().iter().any(|flag| *flag)
@@ -514,9 +684,35 @@ impl Viewport {
         self.show_all_components(cx);
     }
 
+    /// Bounds of the deformed geometry while the posed display is active.
+    ///
+    /// Only `Reset View` reads this; the frame loop never recomputes it.
+    fn posed_view_bounds(&self) -> Option<Aabb> {
+        let session = self.pose.as_ref()?;
+        if session.display() != PoseDisplay::Posed {
+            return None;
+        }
+        let mut bounds = self.scene.posed_bounds(session.pose()).ok().flatten()?;
+        if self.skeleton_visible
+            && let Some(skeleton) = self.scene.skeleton.as_ref()
+            && let Ok(globals) = session.pose().globals(skeleton)
+        {
+            for bone in globals {
+                bounds = bounds.extend(bone.model_position);
+            }
+        }
+        Some(bounds)
+    }
+
     /// Bounds of the meshes that are currently shown. Falls back to the whole
     /// scene when nothing is visible, so framing never fails.
     fn visible_bounds(&self) -> Aabb {
+        if let Some(bounds) = self.posed_view_bounds()
+            && bounds.is_finite()
+            && !bounds.is_empty()
+        {
+            return bounds.sanitized();
+        }
         let mut bounds = Aabb::EMPTY;
         let mut any = false;
         for (index, mesh) in self.scene.meshes.iter().enumerate() {
@@ -592,10 +788,13 @@ impl Viewport {
         if self.size.width.0 <= 0 || self.size.height.0 <= 0 {
             return;
         }
+        let pose = self.pose_frame();
         let Some(requests) = &self.requests else {
             return;
         };
         self.next_generation = self.next_generation.wrapping_add(1);
+        let pose_active = pose.as_ref().is_some_and(|frame| frame.active);
+        let influence_view = pose.as_ref().is_some_and(|frame| frame.influence);
         let request = Request {
             generation: self.next_generation,
             size: self.size,
@@ -603,6 +802,9 @@ impl Viewport {
             visibility: Arc::new(self.visibility.flags().to_vec()),
             skeleton: self.skeleton_visible,
             selected_bone: self.selected_bone,
+            pose,
+            pose_active,
+            influence_view,
         };
         if !requests.submit(request) {
             self.requests = None;
@@ -814,6 +1016,7 @@ fn spawn_render_thread(
             responses.send(ready);
 
             let mut applied: Option<Arc<Vec<bool>>> = None;
+            let mut applied_pose: Option<u64> = None;
             while let Some(request) = requests.next() {
                 if applied
                     .as_ref()
@@ -824,6 +1027,22 @@ fn spawn_render_thread(
                     }
                     applied = Some(request.visibility.clone());
                 }
+                if let Some(pose) = &request.pose
+                    && applied_pose != Some(pose.revision)
+                {
+                    if let Err(err) =
+                        renderer.update_pose(&mut gpu_scene, &pose.matrices, &pose.bone_positions)
+                    {
+                        responses.send(Response::Failed(err.to_string()));
+                        return;
+                    }
+                    applied_pose = Some(pose.revision);
+                }
+                if request.pose.is_none() {
+                    applied_pose = None;
+                }
+                gpu_scene.set_pose_active(request.pose_active);
+                gpu_scene.set_influence_view(request.influence_view);
                 gpu_scene.set_skeleton_visible(request.skeleton);
                 gpu_scene.set_skeleton_selected(request.selected_bone);
                 let response = match renderer.render_with_overlay(

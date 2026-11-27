@@ -820,6 +820,7 @@ impl DictionaryViewer {
                 }),
             ));
         }
+        section = section.child(super::pose_panel::pose_section(viewport.clone(), cx));
         // Every row is reachable: the list renders only the rows the scroll
         // window shows, so a member with hundreds of bones costs the visible
         // rows rather than one element per bone.
