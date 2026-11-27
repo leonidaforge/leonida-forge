@@ -16,6 +16,7 @@ use std::sync::atomic::AtomicBool;
 
 use glam::Vec3;
 use lforge_rage9::drawable::{self, Geometry, IndexView, Report, Shader, VertexBuffer};
+use lforge_rage9::drawable_dictionary;
 use lforge_rage9::fragment;
 use lforge_scene::{
     AlphaMode, Diagnostic, Material, Mesh, Primitive, Scene, Texture, TextureBinding,
@@ -490,7 +491,15 @@ pub enum ComponentStatus {
     Unsupported(String),
 }
 
-/// One renderable component of a fragment.
+/// One component of a fragment.
+///
+/// A component is one member drawable: a root reference this decoder followed.
+/// A component's meshes are the models of that drawable's selected LOD, one
+/// mesh per model, and a geometry record becomes a primitive inside its model's
+/// mesh. The three counts therefore differ, and a mesh is never a component.
+///
+/// The verified corpus holds one component per fragment; the type is a list so a
+/// fragment with several member drawables would not need a new shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentComponent {
     /// The order this component was enumerated in.
@@ -537,6 +546,226 @@ pub struct DecodedFragment {
     pub texture_bindings: Vec<TextureBindingReport>,
     /// The LOD slot of the member drawable that was decoded.
     pub lod: usize,
+}
+
+/// Whether the resource is a drawable dictionary: a `pgDictionary`-shaped root
+/// whose members are member drawables.
+pub fn is_drawable_dictionary(system: &[u8], graphics: &[u8]) -> bool {
+    drawable_dictionary::is_drawable_dictionary(system, graphics)
+}
+
+/// What one dictionary member entry turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictionaryMemberState {
+    /// The value resolves to a member drawable.
+    Drawable,
+    /// The value is null.
+    Null,
+    /// The value is not a system pointer.
+    NotAPointer,
+    /// The value points at system data without the member drawable form.
+    NotADrawable,
+}
+
+impl DictionaryMemberState {
+    pub fn name(self) -> &'static str {
+        match self {
+            DictionaryMemberState::Drawable => "drawable",
+            DictionaryMemberState::Null => "null",
+            DictionaryMemberState::NotAPointer => "not a pointer",
+            DictionaryMemberState::NotADrawable => "not a drawable",
+        }
+    }
+}
+
+/// One member of a drawable dictionary, enumerated without decoding geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DictionaryMember {
+    /// The position in the dictionary. It is the stable identifier to select a
+    /// member by: the hash array is sorted, so positions do not depend on the
+    /// order the members were authored in.
+    pub index: usize,
+    /// The stored name hash, which equals `joaat` of the member's own name.
+    pub hash: u32,
+    /// System offset of the member drawable, when the value is a system pointer.
+    pub drawable: Option<usize>,
+    /// The member drawable's stored name, when it has one.
+    pub name: Option<String>,
+    pub state: DictionaryMemberState,
+}
+
+/// The dictionary as enumerated: membership only, no geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DictionaryInfo {
+    pub page_map: u32,
+    /// The words at `+0x10` and `+0x18`. Their meanings are not established.
+    pub word_10: u64,
+    pub word_18: u64,
+    pub count: u16,
+    pub capacity: u16,
+    /// Whether the root holds no members. An empty dictionary is valid.
+    pub empty: bool,
+    /// Whether the hash array is ascending and duplicate-free.
+    pub hash_sorted: bool,
+    pub members: Vec<DictionaryMember>,
+    /// One line per member that does not resolve, and per structural check
+    /// that did not hold. A failed member does not invalidate the others.
+    pub issues: Vec<String>,
+}
+
+impl DictionaryInfo {
+    /// The members whose value resolves to a member drawable.
+    pub fn drawable_members(&self) -> impl Iterator<Item = &DictionaryMember> {
+        self.members
+            .iter()
+            .filter(|member| member.state == DictionaryMemberState::Drawable)
+    }
+}
+
+/// Enumerates a drawable dictionary without decoding any member.
+pub fn dictionary_info(system: &[u8], graphics: &[u8]) -> Option<DictionaryInfo> {
+    let report = drawable_dictionary::parse(system, graphics).ok()?;
+    let mut issues = Vec::new();
+    if !report.hash_sorted {
+        issues.push("the hash array is not ascending and duplicate-free".to_string());
+    }
+    for member in &report.members {
+        if member.state != drawable_dictionary::MemberState::Drawable {
+            issues.push(format!(
+                "member {} hash {:#010x}: {}",
+                member.index,
+                member.hash,
+                member.state.name()
+            ));
+        }
+    }
+    let members = report
+        .members
+        .iter()
+        .map(|member| DictionaryMember {
+            index: member.index as usize,
+            hash: member.hash,
+            drawable: member.drawable.map(|at| at as usize),
+            name: member.name.clone(),
+            state: match member.state {
+                drawable_dictionary::MemberState::Drawable => DictionaryMemberState::Drawable,
+                drawable_dictionary::MemberState::Null => DictionaryMemberState::Null,
+                drawable_dictionary::MemberState::NotAPointer => DictionaryMemberState::NotAPointer,
+                drawable_dictionary::MemberState::NotADrawable => {
+                    DictionaryMemberState::NotADrawable
+                }
+            },
+        })
+        .collect();
+    Some(DictionaryInfo {
+        page_map: report.header.page_map,
+        word_10: report.header.word_10,
+        word_18: report.header.word_18,
+        count: report.header.count,
+        capacity: report.header.capacity,
+        empty: report.empty,
+        hash_sorted: report.hash_sorted,
+        members,
+        issues,
+    })
+}
+
+/// One decoded dictionary member.
+#[derive(Debug, Clone)]
+pub struct DecodedDictionaryMember {
+    pub scene: Scene,
+    pub report: drawable::Report,
+    pub member: DictionaryMember,
+    /// Completeness of this member only. The dictionary's own enumeration
+    /// status stays in [`DictionaryInfo`] and is never overwritten by this.
+    pub completeness: ModelCompleteness,
+    pub texture_bindings: Vec<TextureBindingReport>,
+    pub lod: usize,
+}
+
+/// Decodes one dictionary member into its own scene.
+///
+/// The member keeps the dictionary's resource context: its system and graphics
+/// segments supply the geometry and any embedded textures, exactly as they do
+/// for a standalone drawable. Nothing of the other members is decoded.
+pub fn decode_dictionary_member(
+    system: &[u8],
+    graphics: &[u8],
+    index: usize,
+    provider: &dyn TextureProvider,
+) -> Result<DecodedDictionaryMember, Error> {
+    let info = dictionary_info(system, graphics)
+        .ok_or_else(|| Error::new("the resource is not a drawable dictionary"))?;
+    let member = info
+        .members
+        .get(index)
+        .cloned()
+        .ok_or_else(|| Error::new(format!("the dictionary has no member {index}")))?;
+    let at = member.drawable.ok_or_else(|| {
+        Error::new(format!(
+            "member {index} does not reference a drawable ({})",
+            member.state.name()
+        ))
+    })?;
+    let report = drawable::inspect_member_at(system, graphics, at).ok_or_else(|| {
+        Error::new(format!(
+            "member {index} at system +{at:#x} is not a member drawable"
+        ))
+    })?;
+    let built = build_scene(system, graphics, provider, &report, member.name.as_deref())?;
+    let BuiltScene {
+        scene,
+        texture_bindings,
+        lod_index,
+        expected_geometries,
+        decoded_geometries,
+        geometry_failures,
+    } = built;
+    let missing_textures = scene
+        .materials
+        .iter()
+        .filter(|material| material.missing_texture)
+        .count();
+    let referenced = scene
+        .materials
+        .iter()
+        .any(|material| !material.bindings.is_empty());
+    let textures = texture_completeness(missing_textures, referenced);
+    let geometry = if report.issues.is_empty()
+        && geometry_failures == 0
+        && decoded_geometries == expected_geometries
+    {
+        GeometryCompleteness::Complete
+    } else {
+        GeometryCompleteness::Partial {
+            reason: if !report.issues.is_empty() {
+                format!(
+                    "the member drawable's structural walk reported {} issue(s)",
+                    report.issues.len()
+                )
+            } else {
+                format!("decoded {decoded_geometries} of {expected_geometries} geometries")
+            },
+        }
+    };
+    let notes = vec![
+        format!("dictionary member {} of {}", member.index, info.count),
+        format!("member name hash {:#010x}", member.hash),
+    ];
+    Ok(DecodedDictionaryMember {
+        scene,
+        report,
+        completeness: ModelCompleteness {
+            geometry,
+            textures,
+            selected_root: at,
+            selected_name: member.name.clone(),
+            notes,
+        },
+        texture_bindings,
+        lod: lod_index,
+        member,
+    })
 }
 
 /// Decodes a supported fragment into one assembled scene.

@@ -487,11 +487,17 @@ fn a_real_fragment_decodes_into_assembled_components() {
         component.drawable_at,
         decoded.report.header.drawable as usize
     );
+    // One component is one member drawable. Its meshes are that drawable's
+    // models, so a component holds a range of meshes and never one mesh.
+    assert_eq!(component.meshes, 0..decoded.scene.meshes.len());
+    assert!(decoded.scene.meshes.len() >= decoded.components.len());
     assert!(component.vertices > 0);
     assert!(decoded.scene.bounds.is_finite());
     eprintln!(
-        "{}: {} vertices, {} triangles, {} material(s), geometry {:?}",
+        "{}: {} component(s), {} mesh(es), {} vertices, {} triangles, {} material(s), geometry {:?}",
         component.name.as_deref().unwrap_or("fragment"),
+        decoded.components.len(),
+        decoded.scene.meshes.len(),
         component.vertices,
         component.triangles,
         decoded.scene.materials.len(),
