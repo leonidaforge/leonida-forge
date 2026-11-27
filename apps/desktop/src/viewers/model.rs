@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{Context, Entity, FontWeight, Task, Window, div, prelude::*, px, rgb};
 
@@ -37,6 +38,7 @@ enum State {
 pub struct ModelViewer {
     name: String,
     state: State,
+    cancel: Arc<AtomicBool>,
     _load: Task<()>,
 }
 
@@ -52,8 +54,11 @@ impl ModelViewer {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Model".to_string());
-        let load =
-            cx.background_spawn(async move { model::load(&path, &access, gta_root.as_deref()) });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let load_cancel = cancel.clone();
+        let load = cx.background_spawn(async move {
+            model::load_with_cancel(&path, &access, gta_root.as_deref(), &load_cancel)
+        });
         let task = cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -135,6 +140,7 @@ impl ModelViewer {
         Self {
             name,
             state: State::Loading,
+            cancel,
             _load: task,
         }
     }
@@ -306,6 +312,12 @@ impl ModelViewer {
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(right),
             )
+    }
+}
+
+impl Drop for ModelViewer {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 

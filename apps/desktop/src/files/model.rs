@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use lforge_model::{self as decoded, TextureProvider, TextureReference, TextureResolution};
 use lforge_scene::Scene;
@@ -115,22 +117,30 @@ impl MemoryBudget {
         }
     }
 
-    fn acquire(self: &Arc<Self>, bytes: u64) -> Result<MemoryPermit, String> {
+    fn acquire(self: &Arc<Self>, bytes: u64, cancel: &AtomicBool) -> Result<MemoryPermit, String> {
         if bytes > self.capacity {
             return Err(format!(
                 "the resource needs {bytes} bytes, more than the {}-byte model source budget",
                 self.capacity
             ));
         }
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut used = self.used.lock().unwrap_or_else(|err| err.into_inner());
         while used
             .checked_add(bytes)
             .is_none_or(|total| total > self.capacity)
         {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("the model load was cancelled while waiting for source memory".into());
+            }
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for model source memory".into());
+            }
             used = self
                 .released
-                .wait(used)
-                .unwrap_or_else(|err| err.into_inner());
+                .wait_timeout(used, Duration::from_millis(50))
+                .unwrap_or_else(|err| err.into_inner())
+                .0;
         }
         *used += bytes;
         Ok(MemoryPermit {
@@ -174,17 +184,23 @@ impl ResourceBytes {
 /// Content check used before opening a recovered resource as a model. It
 /// reads the resource but does not decode its geometry.
 pub fn is_drawable_resource(path: &Path, access: &Access) -> bool {
-    let Ok(resource) = read_resource(path, access) else {
+    let Ok(resource) = read_resource_with_cancel(path, access, &AtomicBool::new(false)) else {
         return false;
     };
     decoded::has_drawable(resource.system(), resource.graphics())
 }
 
-/// Reads a resource through the existing streaming archive layer. A native
-/// chunked resource uses the exact page split; only a resource without
-/// authoritative metadata falls back to the controlled boundary inference.
-pub fn load(path: &Path, access: &Access, gta_root: Option<&Path>) -> Result<LoadedModel, String> {
-    let resource = read_resource(path, access)?;
+/// Loads a model and abandons the wait for source memory when `cancel` is set.
+pub fn load_with_cancel(
+    path: &Path,
+    access: &Access,
+    gta_root: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<LoadedModel, String> {
+    let resource = read_resource_with_cancel(path, access, cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("the model load was cancelled".into());
+    }
     let stores = match gta_root {
         Some(root) => match texture_stores(root) {
             Ok(stores) => Some(Stores(stores)),
@@ -203,7 +219,14 @@ pub fn load(path: &Path, access: &Access, gta_root: Option<&Path>) -> Result<Loa
     finish(path, resource.exact, decoded)
 }
 
-fn read_resource(path: &Path, access: &Access) -> Result<ResourceBytes, String> {
+fn read_resource_with_cancel(
+    path: &Path,
+    access: &Access,
+    cancel: &AtomicBool,
+) -> Result<ResourceBytes, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("the model load was cancelled".into());
+    }
     let binary = super::open_binary_with(path, access)
         .map_err(|err| format!("could not open the resource: {err}"))?;
     let source = binary.source;
@@ -230,8 +253,11 @@ fn read_resource(path: &Path, access: &Access) -> Result<ResourceBytes, String> 
         }
         (0, total, false)
     };
-    let permit = MODEL_SOURCE_BUDGET.acquire(total)?;
+    let permit = MODEL_SOURCE_BUDGET.acquire(total, cancel)?;
     let bytes = read_exact(&source, 0, total)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("the model load was cancelled".into());
+    }
     let system_len = if exact {
         usize::try_from(system_len)
             .map_err(|_| "the system segment length overflows".to_string())?
@@ -355,7 +381,12 @@ mod tests {
             .filter(|entry| entry.type_name.starts_with("RPF9 entry, type 2"))
             .take(5)
         {
-            let loaded = match load(&entry.path, &access, Some(Path::new(&game_root))) {
+            let loaded = match load_with_cancel(
+                &entry.path,
+                &access,
+                Some(Path::new(&game_root)),
+                &AtomicBool::new(false),
+            ) {
                 Ok(loaded) => loaded,
                 Err(err) => {
                     eprintln!("{}: not a model: {err}", entry.path.display());
@@ -447,7 +478,13 @@ mod tests {
             .find(|entry| entry.type_name.starts_with("RPF9 entry, type 2"))
             .expect("a type 2 row in am_ornaments");
         eprintln!("model row: {} [{}]", model.path.display(), model.type_name);
-        let loaded = load(&model.path, &access, Some(Path::new(&game_root))).expect("load");
+        let loaded = load_with_cancel(
+            &model.path,
+            &access,
+            Some(Path::new(&game_root)),
+            &AtomicBool::new(false),
+        )
+        .expect("load");
         assert!(loaded.exact_layout);
         assert!(!loaded.scene.meshes.is_empty());
         eprintln!(
@@ -466,7 +503,7 @@ mod tests {
         let path = temp.path().join("oversized.bin");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(MAX_MODEL_BYTES + 1).unwrap();
-        let err = load(&path, &Access::none(), None)
+        let err = load_with_cancel(&path, &Access::none(), None, &AtomicBool::new(false))
             .err()
             .expect("the oversized resource is rejected");
         assert!(err.contains("inference limit"), "{err}");
@@ -485,18 +522,25 @@ mod tests {
     #[test]
     fn the_model_source_budget_rejects_an_oversized_request() {
         let budget = Arc::new(MemoryBudget::new(10));
-        let err = budget.acquire(11).err().expect("over capacity");
+        let err = budget
+            .acquire(11, &AtomicBool::new(false))
+            .err()
+            .expect("over capacity");
         assert!(err.contains("model source budget"), "{err}");
     }
 
     #[test]
     fn the_model_source_budget_counts_live_permits_and_releases_them() {
         let budget = Arc::new(MemoryBudget::new(10));
-        let permit = budget.acquire(6).expect("first permit");
+        let permit = budget
+            .acquire(6, &AtomicBool::new(false))
+            .expect("first permit");
         let (sender, receiver) = std::sync::mpsc::channel();
         let waiting = budget.clone();
         let thread = std::thread::spawn(move || {
-            let second = waiting.acquire(6).expect("second permit");
+            let second = waiting
+                .acquire(6, &AtomicBool::new(false))
+                .expect("second permit");
             sender.send(()).unwrap();
             drop(second);
         });
@@ -511,5 +555,25 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("the released permit wakes the waiter");
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_wait_for_source_memory_returns_promptly() {
+        let budget = Arc::new(MemoryBudget::new(10));
+        let _permit = budget
+            .acquire(10, &AtomicBool::new(false))
+            .expect("full budget");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let waiting = budget.clone();
+        let flag = cancel.clone();
+        let thread = std::thread::spawn(move || waiting.acquire(1, &flag));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        cancel.store(true, Ordering::Relaxed);
+        let err = thread
+            .join()
+            .unwrap()
+            .err()
+            .expect("the cancelled wait returns an error");
+        assert!(err.contains("cancelled"), "{err}");
     }
 }
