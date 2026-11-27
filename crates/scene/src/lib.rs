@@ -4,7 +4,17 @@
 //! crate has no graphics or UI dependency, so an offscreen exporter and the
 //! desktop viewer can share one decoded scene model.
 
+mod pose;
+mod skin;
+
 use glam::{Mat4, Quat, Vec3};
+
+pub use pose::{Pose, PoseDelta, PoseError, PosedBone, bind_transform, check_supported};
+pub use skin::{
+    BoneResolution, DeformError, DeformedPrimitive, InfluenceStatus, MAX_INFLUENCES,
+    SkinningMatrices, VertexInfluence, VertexInfluences, deform_primitive, deformed_bounds,
+    influenced_centroid,
+};
 
 /// One bone of a decoded skeleton, in model space.
 ///
@@ -93,6 +103,19 @@ pub struct PrimitiveBones {
     pub bones: Vec<usize>,
     pub weighted: bool,
     pub declared_bone_count: Option<u16>,
+}
+
+/// One primitive's resolved per-vertex influences.
+///
+/// The associations above answer which bones a geometry references; this
+/// answers how strongly, per vertex, and whether the data may deform geometry.
+/// A primitive without an entry here is inspected as authored geometry and is
+/// never assigned fabricated influences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrimitiveInfluences {
+    pub mesh: usize,
+    pub primitive: usize,
+    pub influences: VertexInfluences,
 }
 
 /// A vertex in RAGE model space (Z up, metres).
@@ -517,6 +540,10 @@ pub struct Scene {
     /// The bones each primitive's vertices reference, where the resource
     /// carries a validated influence stream.
     pub associations: Vec<PrimitiveBones>,
+    /// The resolved per-vertex influences of each primitive that carries a
+    /// verified stream. A primitive without an entry stays ordinary authored
+    /// geometry.
+    pub influences: Vec<PrimitiveInfluences>,
 }
 
 impl Default for Scene {
@@ -529,6 +556,7 @@ impl Default for Scene {
             diagnostics: Vec::new(),
             skeleton: None,
             associations: Vec::new(),
+            influences: Vec::new(),
         }
     }
 }
@@ -574,6 +602,66 @@ impl Scene {
         (!bounds.is_empty() && bounds.is_finite()).then_some(bounds)
     }
 
+    /// The verified influences of one primitive, when it has any.
+    pub fn influences_for(&self, mesh: usize, primitive: usize) -> Option<&VertexInfluences> {
+        self.influences
+            .iter()
+            .find(|entry| entry.mesh == mesh && entry.primitive == primitive)
+            .map(|entry| &entry.influences)
+    }
+
+    /// Whether any primitive can be deformed by a pose.
+    pub fn supports_deformation(&self) -> bool {
+        self.skeleton.is_some()
+            && self
+                .influences
+                .iter()
+                .any(|entry| entry.influences.deformable())
+    }
+
+    /// The number of primitives with verified, deformable influences.
+    pub fn deformable_primitive_count(&self) -> usize {
+        self.influences
+            .iter()
+            .filter(|entry| entry.influences.deformable())
+            .count()
+    }
+
+    /// Bounds of every deformable primitive at a pose.
+    ///
+    /// This is the CPU reference evaluation a viewer may request explicitly. It
+    /// skips primitives that are not deformable and returns `None` when nothing
+    /// could be evaluated.
+    pub fn posed_bounds(&self, pose: &Pose) -> Result<Option<Aabb>, (usize, usize, DeformError)> {
+        let Some(skeleton) = self.skeleton.as_ref() else {
+            return Ok(None);
+        };
+        let matrices = match SkinningMatrices::build(skeleton, pose) {
+            Ok(matrices) => matrices,
+            Err(_) => return Ok(None),
+        };
+        let mut bounds = Aabb::EMPTY;
+        let mut evaluated = false;
+        for entry in &self.influences {
+            let Some(mesh) = self.meshes.get(entry.mesh) else {
+                continue;
+            };
+            let Some(primitive) = mesh.primitives.get(entry.primitive) else {
+                continue;
+            };
+            match skin::deformed_bounds(primitive, &entry.influences, &matrices) {
+                Ok(primitive_bounds) => {
+                    if !primitive_bounds.is_empty() {
+                        bounds = bounds.union(primitive_bounds);
+                        evaluated = true;
+                    }
+                }
+                Err(err) => return Err((entry.mesh, entry.primitive, err)),
+            }
+        }
+        Ok(evaluated.then_some(bounds))
+    }
+
     /// Drops primitives whose material index or indices are out of range.
     pub fn validate(&mut self) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -605,12 +693,23 @@ impl Scene {
         if self.materials.is_empty() {
             self.materials.push(Material::default());
         }
+        let primitives_before: usize = self.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
         self.meshes.retain_mut(|mesh| {
             mesh.primitives.retain(|primitive| {
                 !primitive.vertices.is_empty() && !primitive.indices.is_empty()
             });
             !mesh.primitives.is_empty()
         });
+        let primitives_after: usize = self.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
+        // Removing a mesh or a primitive shifts the mesh and primitive indices
+        // that an influence entry names. Dropping the entries is honest; keeping
+        // them would silently bind a primitive to another primitive's weights.
+        if primitives_before != primitives_after && !self.influences.is_empty() {
+            self.influences.clear();
+            diagnostics.push(Diagnostic::new(
+                "the influence entries were dropped because validation removed a primitive",
+            ));
+        }
         self.recompute_bounds();
         diagnostics
     }
