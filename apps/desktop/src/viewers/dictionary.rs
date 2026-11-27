@@ -33,8 +33,6 @@ const TOOLBAR_HEIGHT: f32 = 40.;
 const STATUS_BAR_HEIGHT: f32 = 26.;
 const MEMBER_PANEL_WIDTH: f32 = 340.;
 const DIAGNOSTICS_WIDTH: f32 = 320.;
-/// Largest number of hierarchy rows built in one frame.
-const MAX_BONE_ROWS: usize = 400;
 
 /// A decoded member as the viewer presents it.
 struct MemberSummary {
@@ -183,6 +181,8 @@ pub struct DictionaryViewer {
     search: Entity<ui::text_field::TextField>,
     /// Collapse state and bone selection of the displayed member only.
     bones: BonePanel,
+    /// Scroll position of the bone list, so a virtualized list keeps its place.
+    bones_scroll: UniformListScrollHandle,
     bone_filter: Entity<ui::text_field::TextField>,
     list_scroll: UniformListScrollHandle,
     path: PathBuf,
@@ -248,6 +248,7 @@ impl DictionaryViewer {
             selection: MemberSelection::default(),
             search,
             bones: BonePanel::new(),
+            bones_scroll: UniformListScrollHandle::new(),
             bone_filter,
             list_scroll: UniformListScrollHandle::new(),
             path,
@@ -774,69 +775,6 @@ impl DictionaryViewer {
             metadata = self.bones.metadata(skeleton, viewport_state.associations());
         }
         let _ = viewport_state;
-        let viewport = viewport.clone();
-
-        let mut list = div()
-            .id("dictionary-bone-hierarchy")
-            .min_h_0()
-            .overflow_y_scroll()
-            .pb_1();
-        for row in rows.into_iter().take(MAX_BONE_ROWS) {
-            let index = row.index;
-            let is_selected = selected == Some(index);
-            let chevron = if row.has_children {
-                if row.collapsed {
-                    "\u{25B8}"
-                } else {
-                    "\u{25BE}"
-                }
-            } else {
-                "\u{00B7}"
-            };
-            let toggle = div()
-                .id(("dictionary-bone-toggle", index))
-                .w(px(14.))
-                .flex_none()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bones.toggle(index);
-                    cx.notify();
-                }))
-                .child(chevron);
-            let select_viewport = viewport.clone();
-            let label = div()
-                .id(("dictionary-bone-row", index))
-                .flex_1()
-                .min_w_0()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bones.select(Some(index));
-                    select_viewport
-                        .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .text_xs()
-                        .truncate()
-                        .child(format!("{} {}", row.label, row.detail)),
-                );
-            list = list.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pr_3()
-                    .py_0p5()
-                    .pl(px(8.0 + row.depth as f32 * 10.0))
-                    .when(is_selected, |el| el.bg(rgb(theme::SELECTION)))
-                    .hover(|style| style.bg(rgb(theme::HOVER)))
-                    .child(toggle)
-                    .child(label),
-            );
-        }
 
         let mut section = div()
             .flex()
@@ -882,19 +820,94 @@ impl DictionaryViewer {
                 }),
             ));
         }
-        if shown > MAX_BONE_ROWS {
-            section = section.child(
-                div()
-                    .px_3()
-                    .py_1()
+        // Every row is reachable: the list renders only the rows the scroll
+        // window shows, so a member with hundreds of bones costs the visible
+        // rows rather than one element per bone.
+        let list = uniform_list(
+            "dictionary-bone-hierarchy",
+            shown,
+            cx.processor(move |this, range, _window, cx| this.bone_rows(range, cx)),
+        )
+        .track_scroll(&self.bones_scroll)
+        .flex_1()
+        .min_h_0();
+        section.child(list).into_any_element()
+    }
+
+    /// The hierarchy rows the virtualized list asks for.
+    fn bone_rows(
+        &self,
+        range: std::ops::Range<usize>,
+        cx: &Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let MemberLoad::Ready { viewport, .. } = &self.member else {
+            return Vec::new();
+        };
+        let viewport_state = viewport.read(cx);
+        let Some(skeleton) = viewport_state.skeleton() else {
+            return Vec::new();
+        };
+        let filter = self.bone_filter.read(cx).text().to_string();
+        let rows = self.bones.rows(skeleton, &filter);
+        let selected = viewport_state.selected_bone();
+        let viewport = viewport.clone();
+        range
+            .filter_map(|position| rows.get(position))
+            .map(|row| {
+                let index = row.index;
+                let chevron = if row.has_children {
+                    if row.collapsed {
+                        "\u{25B8}"
+                    } else {
+                        "\u{25BE}"
+                    }
+                } else {
+                    "\u{00B7}"
+                };
+                let toggle = div()
+                    .id(("dictionary-bone-toggle", index))
+                    .w(px(14.))
+                    .flex_none()
                     .text_xs()
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(format!(
-                        "Showing the first {MAX_BONE_ROWS} of {shown} rows; filter to narrow them."
-                    )),
-            );
-        }
-        section.child(list).into_any_element()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.bones.toggle(index);
+                        cx.notify();
+                    }))
+                    .child(chevron);
+                let select_viewport = viewport.clone();
+                let label = div()
+                    .id(("dictionary-bone-row", index))
+                    .flex_1()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.bones.select(Some(index));
+                        select_viewport
+                            .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .truncate()
+                            .child(format!("{} {}", row.label, row.detail)),
+                    );
+                div()
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pr_3()
+                    .pl(px(8.0 + row.depth as f32 * 10.0))
+                    .when(selected == Some(index), |el| el.bg(rgb(theme::SELECTION)))
+                    .hover(|style| style.bg(rgb(theme::HOVER)))
+                    .child(toggle)
+                    .child(label)
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {

@@ -4,10 +4,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui::{Context, Entity, FontWeight, Task, Window, div, prelude::*, px, rgb};
+use gpui::{
+    Context, Entity, FontWeight, Task, UniformListScrollHandle, Window, div, prelude::*, px, rgb,
+};
 
-use super::BonePanel;
 use super::viewport::{RendererStatus, Viewport};
+use super::{BonePanel, BoneRow};
 use crate::files::{Access, model};
 use crate::ui;
 use crate::ui::theme;
@@ -15,9 +17,6 @@ use crate::ui::theme;
 const TOOLBAR_HEIGHT: f32 = 40.;
 const STATUS_BAR_HEIGHT: f32 = 26.;
 const DIAGNOSTICS_WIDTH: f32 = 360.;
-/// Largest number of hierarchy rows built in one frame. A filter narrows a
-/// larger skeleton; the decoded bones themselves stay in the scene.
-const MAX_BONE_ROWS: usize = 600;
 
 struct Summary {
     meshes: usize,
@@ -46,6 +45,9 @@ pub struct ModelViewer {
     cancel: Arc<AtomicBool>,
     /// Collapse state and bone selection of this window only.
     bones: BonePanel,
+    /// Scroll position of the bone list, so a virtualized list keeps its place
+    /// when the selection or the filter changes.
+    bones_scroll: UniformListScrollHandle,
     bone_filter: Entity<ui::text_field::TextField>,
     _load: Task<()>,
 }
@@ -232,6 +234,7 @@ impl ModelViewer {
             state: State::Loading,
             cancel,
             bones: BonePanel::new(),
+            bones_scroll: UniformListScrollHandle::new(),
             bone_filter,
             _load: task,
         }
@@ -418,71 +421,6 @@ impl ModelViewer {
         }
         let _ = viewport_state;
 
-        let mut list = div()
-            .id("bone-hierarchy")
-            .min_h_0()
-            .flex_1()
-            .overflow_y_scroll()
-            .pb_1();
-        for row in rows.into_iter().take(MAX_BONE_ROWS) {
-            let index = row.index;
-            let is_selected = selected == Some(index);
-            let chevron = if row.has_children {
-                if row.collapsed {
-                    "\u{25B8}"
-                } else {
-                    "\u{25BE}"
-                }
-            } else {
-                "\u{00B7}"
-            };
-            let toggle = div()
-                .id(("bone-toggle", index))
-                .w(px(14.))
-                .flex_none()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bones.toggle(index);
-                    cx.notify();
-                }))
-                .child(chevron);
-            let label = div()
-                .id(("bone-row", index))
-                .flex_1()
-                .min_w_0()
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.bones.select(Some(index));
-                    if let State::Ready { viewport, .. } = &this.state {
-                        viewport
-                            .clone()
-                            .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
-                    }
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .text_xs()
-                        .truncate()
-                        .child(format!("{} {}", row.label, row.detail)),
-                );
-            list = list.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .pr_3()
-                    .py_0p5()
-                    .pl(px(8.0 + row.depth as f32 * 10.0))
-                    .when(is_selected, |el| el.bg(rgb(theme::SELECTION)))
-                    .hover(|style| style.bg(rgb(theme::HOVER)))
-                    .child(toggle)
-                    .child(label),
-            );
-        }
-
         let mut section = div()
             .flex()
             .flex_col()
@@ -555,19 +493,102 @@ impl ModelViewer {
                     })),
             );
         }
-        if shown > MAX_BONE_ROWS {
-            section = section.child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child(format!(
-                        "Showing the first {MAX_BONE_ROWS} of {shown} rows; filter to narrow them."
-                    )),
-            );
-        }
+        // Every row is reachable: the list renders only the rows the scroll
+        // window shows, so a long hierarchy costs the visible rows rather than
+        // one element per bone.
+        let list = gpui::uniform_list(
+            "bone-hierarchy",
+            shown,
+            cx.processor(move |this, range, _window, cx| this.bone_rows(range, cx)),
+        )
+        .track_scroll(&self.bones_scroll)
+        .flex_1()
+        .min_h_0();
         section.child(list).into_any_element()
+    }
+
+    /// The hierarchy rows the virtualized list asks for.
+    fn bone_rows(
+        &self,
+        range: std::ops::Range<usize>,
+        cx: &Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let State::Ready { viewport, .. } = &self.state else {
+            return Vec::new();
+        };
+        let viewport_state = viewport.read(cx);
+        let Some(skeleton) = viewport_state.skeleton() else {
+            return Vec::new();
+        };
+        let filter = self.bone_filter.read(cx).text().to_string();
+        let rows = self.bones.rows(skeleton, &filter);
+        let selected = self.bones.selected();
+        range
+            .filter_map(|position| rows.get(position))
+            .map(|row| self.bone_row(row, selected, cx))
+            .collect()
+    }
+
+    fn bone_row(
+        &self,
+        row: &BoneRow,
+        selected: Option<usize>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let index = row.index;
+        let chevron = if row.has_children {
+            if row.collapsed {
+                "\u{25B8}"
+            } else {
+                "\u{25BE}"
+            }
+        } else {
+            "\u{00B7}"
+        };
+        let toggle = div()
+            .id(("bone-toggle", index))
+            .w(px(14.))
+            .flex_none()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.bones.toggle(index);
+                cx.notify();
+            }))
+            .child(chevron);
+        let label = div()
+            .id(("bone-row", index))
+            .flex_1()
+            .min_w_0()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.bones.select(Some(index));
+                if let State::Ready { viewport, .. } = &this.state {
+                    viewport
+                        .clone()
+                        .update(cx, |viewport, cx| viewport.select_bone(Some(index), cx));
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .truncate()
+                    .child(format!("{} {}", row.label, row.detail)),
+            );
+        div()
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .pr_3()
+            .pl(px(8.0 + row.depth as f32 * 10.0))
+            .when(selected == Some(index), |el| el.bg(rgb(theme::SELECTION)))
+            .hover(|style| style.bg(rgb(theme::HOVER)))
+            .child(toggle)
+            .child(label)
+            .into_any_element()
     }
 
     fn status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
