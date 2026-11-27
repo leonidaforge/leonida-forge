@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod dictionary;
 pub mod drawable;
 pub mod edup;
+pub mod fragment;
 pub mod gfx;
 pub mod kb2;
 pub mod psin;
