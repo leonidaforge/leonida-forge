@@ -112,6 +112,53 @@ type 3 (`zft`), and the notice names the member drawable `ambient_femalebody.#ft
 whose skeleton it holds. It is the sample for reaching bones past the old row
 caps: filter a leaf name and the 596 rows scroll to it.
 
+## Posing a skeleton
+
+A resource whose influences decode shows a **POSE** section under the skeleton
+list. Its header reads `N of M primitive(s) deform; K bone(s)` and then
+`reference pose` or `edited pose`. `Pose Mode` enters the session; the section
+then offers `authored` and `posed`, `Influence View`, one row of six rotation
+buttons, one row of six translation buttons, `Reset Bone` and `Reset Pose`.
+
+Rotations are Euler XYZ in degrees, five degrees per press, in the bone's parent
+space. Translations are metres in the same space, five centimetres per press.
+Nothing is written to the resource, no pose is saved, and closing the window
+discards it.
+
+1. Open `levels.rpf!5!8` and press `Pose Mode`. The header reads
+   `4 of 4 primitive(s) deform; 10 bone(s)` and `reference pose`, and the mesh is
+   unchanged.
+2. Select `Tail_01` and press `Rotate Z+` eight times. The bone line reads
+   `40 deg`, the label reads `edited pose`, and the tail fans out while the
+   pedestal, the legs and the floor stay.
+3. Press `Influence View`. The tail turns orange and yellow by weight, geometry
+   with no weight stays neutral grey, and the display switches to `posed`.
+4. Press `authored`. The authored mesh returns while the skeleton overlay stays
+   at the edited pose; `posed` restores the deformation.
+5. Press `Reset Bone`. The tail returns to the reference pose and the label reads
+   `reference pose` again.
+6. Press `Reset View`. The camera frames the deformed geometry, not the authored
+   one.
+7. Press `Exit Pose`. The authored mesh and the reference skeleton return, and
+   the POSE section keeps only its header.
+8. Open `levels.rpf!5!1`, press `Pose Mode`, select `Candle` and press
+   `Rotate Z+` twelve times. The candle holder turns 60 degrees about the bone
+   rigidly and the base stays.
+9. Open `levels.rpf!21!85`. The header reads
+   `29 of 37 primitive(s) deform; 386 bone(s)`; the eight geometries without a
+   weight attribute stay authored.
+
+The same numbers are what the harness reports for those two chains: the peacock
+moves 24,496 of the 25,456 vertices of its widest-influence primitive with a
+largest displacement of 1.19 m, and the candlestick moves all 788 vertices of the
+primitive it shares with `Candle` with a largest displacement of 0.018 m. A GPU
+compute probe over the same matrices agrees with the CPU reference on every one
+of those vertices, worst difference `3.6e-7` m and `3.7e-9` m.
+
+A resource without a verified influence set shows no POSE section at all: for
+example the four-member dictionary `data.rpf!7!0`, whose members carry no
+skeleton.
+
 ## A dictionary member with a skeleton
 
 `packs.rpf!9!5` is a drawable dictionary declared type 4 (`zdd`) with one member.
