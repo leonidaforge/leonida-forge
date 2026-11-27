@@ -106,6 +106,26 @@ pub enum Issue {
     },
     /// A record the walk needs but cannot reach.
     Missing { field: &'static str },
+    /// The walk ran past the start of the next array.
+    ///
+    /// A neighbouring array starts at a known address, so the bone records
+    /// cannot extend to it. The walk lost its footing in data that happened to
+    /// carry the next index; the records past the boundary are dropped.
+    BoneArrayOverrun {
+        walked: u64,
+        kept: u64,
+        field: &'static str,
+        at: u64,
+    },
+    /// Two arrays of one skeleton share bytes, which makes both suspect.
+    ArrayOverlap {
+        first: &'static str,
+        at: u64,
+        second: &'static str,
+        second_at: u64,
+    },
+    /// The bone records continue past the accepted maximum.
+    BeyondLimit { field: &'static str, limit: usize },
 }
 
 impl fmt::Display for Issue {
@@ -155,6 +175,28 @@ impl fmt::Display for Issue {
                 "bone {bone} stores a non-finite {field} at skeleton-relative +{at:#x}"
             ),
             Issue::Missing { field } => write!(f, "{field} is not reachable"),
+            Issue::BoneArrayOverrun {
+                walked,
+                kept,
+                field,
+                at,
+            } => write!(
+                f,
+                "the bone records were walked to {walked}, but the {field} at system +{at:#x} starts inside them; {kept} records are kept"
+            ),
+            Issue::ArrayOverlap {
+                first,
+                at,
+                second,
+                second_at,
+            } => write!(
+                f,
+                "the {first} at system +{at:#x} and the {second} at +{second_at:#x} share bytes"
+            ),
+            Issue::BeyondLimit { field, limit } => write!(
+                f,
+                "the {field} continue past the accepted maximum of {limit}"
+            ),
         }
     }
 }
@@ -208,6 +250,32 @@ impl Matrix34 {
     }
 }
 
+/// The nearest array that follows the bone array, which bounds its length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoneArrayBound {
+    /// The field whose array starts there.
+    pub field: &'static str,
+    /// System offset of that array.
+    pub at: u32,
+    /// Whether the bone records end exactly at that offset, which corroborates
+    /// the walked count rather than only bounding it.
+    pub exact: bool,
+}
+
+/// Where a skeleton record's arrays live, in system offsets.
+///
+/// The offsets are kept so a caller can bound one array by its neighbours, and
+/// so a diagnostic can name the address a value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Arrays {
+    pub keys: Option<u32>,
+    pub bones: Option<u32>,
+    pub inverse_bind: Option<u32>,
+    pub local_matrices: Option<u32>,
+    pub parents: Option<u32>,
+    pub names: Option<u32>,
+}
+
 /// What the walk established.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Report {
@@ -217,6 +285,10 @@ pub struct Report {
     /// twice the bone count on 5,604 of 5,628 surveyed skeletons and short by 1
     /// or 2 on the rest, so it tracks the key map rather than the array.
     pub recorded_keys: u32,
+    /// The resolved array offsets, for provenance and span checks.
+    pub arrays: Arrays,
+    /// The array that follows the bone array, when one does.
+    pub bone_bound: Option<BoneArrayBound>,
     pub bones: Vec<Bone>,
     /// Bones without a parent, in index order.
     pub roots: Vec<usize>,
@@ -225,6 +297,10 @@ pub struct Report {
     /// One inverse-bind record per bone, when the array resolves. Stored in
     /// transposed form, as described on [`Matrix34`].
     pub inverse_bind: Vec<Matrix34>,
+    /// One local-matrix record per bone, when the array resolves. This array
+    /// is a second statement of the local transforms, independent of the bone
+    /// records' quaternions.
+    pub local_matrices: Vec<Matrix34>,
     /// The leading `u16`s of the `+0x40` record, when it resolves. They repeat
     /// the bone records' parent indices in every sample and are kept as a
     /// second, independent statement of the hierarchy.
@@ -251,6 +327,105 @@ impl Report {
     }
 }
 
+/// The nearest array that starts above the bone array.
+///
+/// Only fixed-length arrays count: the name table is a string blob whose end is
+/// not stored, so it can neither bound nor corroborate the bone count.
+fn nearest_array_after(bone_base: u64, arrays: &Arrays) -> Option<(&'static str, u32)> {
+    [
+        ("key map", arrays.keys),
+        ("inverse-bind array", arrays.inverse_bind),
+        ("local-matrix array", arrays.local_matrices),
+        ("parent array", arrays.parents),
+    ]
+    .into_iter()
+    .filter_map(|(field, at)| at.map(|at| (field, at)))
+    .filter(|(_, at)| u64::from(*at) > bone_base)
+    .min_by_key(|(_, at)| *at)
+}
+
+/// The largest bone count the array layout allows.
+///
+/// Every array whose length is the bone count occupies `count * stride` bytes,
+/// so an array that starts later bounds an earlier one. Two arrays only have to
+/// tile: the walk can continue into whatever follows the bone allocation, and
+/// data there can carry the next record index by chance. The smallest limit any
+/// pair implies is the one the layout permits, and the field pair that produced
+/// it is returned so a diagnostic can name it.
+fn implied_bone_ceiling(arrays: &Arrays) -> Option<(&'static str, u32, u64)> {
+    let sized: Vec<(&'static str, u64, u64)> = [
+        ("bone array", arrays.bones, BONE_LEN as u64),
+        ("inverse-bind array", arrays.inverse_bind, MATRIX_LEN as u64),
+        (
+            "local-matrix array",
+            arrays.local_matrices,
+            MATRIX_LEN as u64,
+        ),
+        ("parent array", arrays.parents, 2u64),
+    ]
+    .into_iter()
+    .filter_map(|(field, at, stride)| at.map(|at| (field, u64::from(at), stride)))
+    .collect();
+    let mut best: Option<(&'static str, u32, u64)> = None;
+    for earlier in &sized {
+        for later in &sized {
+            if later.1 <= earlier.1 {
+                continue;
+            }
+            let allowed = (later.1 - earlier.1) / earlier.2;
+            if best.is_none_or(|(_, _, current)| allowed < current) {
+                best = Some((earlier.0, later.1 as u32, allowed));
+            }
+        }
+    }
+    best
+}
+
+/// Reports arrays that share bytes. Identical pointers are a shared array, not
+/// an overlap, and are left alone.
+fn check_array_overlap(report: &Report, bone_count: usize, issues: &mut Vec<Issue>) {
+    let arrays = &report.arrays;
+    let span = |field: (&'static str, Option<u32>), len: u64| {
+        field
+            .1
+            .map(|at| (field.0, u64::from(at), u64::from(at) + len))
+    };
+    let spans: Vec<(&'static str, u64, u64)> = [
+        span(
+            ("bone array", arrays.bones),
+            bone_count as u64 * BONE_LEN as u64,
+        ),
+        span(
+            ("inverse-bind array", arrays.inverse_bind),
+            bone_count as u64 * MATRIX_LEN as u64,
+        ),
+        span(
+            ("local-matrix array", arrays.local_matrices),
+            bone_count as u64 * MATRIX_LEN as u64,
+        ),
+        span(("parent array", arrays.parents), bone_count as u64 * 2),
+        span(
+            ("key map", arrays.keys),
+            u64::from(report.recorded_keys) * 8,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for (index, first) in spans.iter().enumerate() {
+        for second in spans.iter().skip(index + 1) {
+            if first.1 != second.1 && first.1 < second.2 && second.1 < first.2 {
+                issues.push(Issue::ArrayOverlap {
+                    first: first.0,
+                    at: first.1,
+                    second: second.0,
+                    second_at: second.1,
+                });
+            }
+        }
+    }
+}
+
 /// Reads the skeleton record at `at` in the system segment.
 ///
 /// `Ok` carries everything that could be read. A malformed parent reference,
@@ -263,10 +438,13 @@ pub fn inspect(system: &[u8], at: u32) -> Report {
     let mut report = Report {
         at,
         recorded_keys: 0,
+        arrays: Arrays::default(),
+        bone_bound: None,
         bones: Vec::new(),
         roots: Vec::new(),
         max_depth: 0,
         inverse_bind: Vec::new(),
+        local_matrices: Vec::new(),
         parent_array: None,
         names_at: None,
         issues: Vec::new(),
@@ -292,6 +470,24 @@ pub fn inspect(system: &[u8], at: u32) -> Report {
         }
     };
     report.names_at = optional_pointer_at(system, base as usize + 0x48, "bone names", &mut issues);
+    report.arrays = Arrays {
+        keys: optional_pointer_at(system, base as usize + 0x20, "key map", &mut issues),
+        bones: Some(bone_base as u32),
+        inverse_bind: optional_pointer_at(
+            system,
+            base as usize + 0x30,
+            "inverse-bind array",
+            &mut issues,
+        ),
+        local_matrices: optional_pointer_at(
+            system,
+            base as usize + 0x38,
+            "local-matrix array",
+            &mut issues,
+        ),
+        parents: optional_pointer_at(system, base as usize + 0x40, "parent array", &mut issues),
+        names: report.names_at,
+    };
 
     // The array length comes from the records themselves: the first `u16` of
     // the trailing group is the record's index, so a record that does not
@@ -372,9 +568,49 @@ pub fn inspect(system: &[u8], at: u32) -> Report {
         return report;
     }
 
+    // A neighbouring array starts at a known address and holds one record per
+    // bone, so two arrays that only have to tile give the layout's own limit on
+    // the count. The walk only trusts a continued index, and data at the end of
+    // the bone allocation can carry the next index by chance: two of the 5,628
+    // surveyed skeletons did exactly that, and in both the following matrix
+    // arrays only tile when the last record is dropped. The limit is enforced
+    // and the drop is reported, never silent.
+    let bound = nearest_array_after(bone_base, &report.arrays);
+    report.bone_bound = bound.map(|(field, at)| BoneArrayBound {
+        field,
+        at,
+        exact: bone_base + bones.len() as u64 * BONE_LEN as u64 == u64::from(at),
+    });
+    if let Some((field, at, allowed)) = implied_bone_ceiling(&report.arrays)
+        && (allowed as usize) < bones.len()
+    {
+        let walked = bones.len() as u64;
+        let kept = (allowed as usize).max(1);
+        bones.truncate(kept);
+        issues.push(Issue::BoneArrayOverrun {
+            walked,
+            kept: kept as u64,
+            field,
+            at: u64::from(at),
+        });
+    }
+
     report.bones = bones;
+    // The cap must never read as a complete skeleton: a record that continues
+    // the index sequence past the limit is reported rather than dropped.
+    if report.bones.len() == MAX_BONES {
+        let record = (bone_base as usize) + MAX_BONES * BONE_LEN;
+        if u16_at(system, record + 0x48) == Some(MAX_BONES as u16) {
+            issues.push(Issue::BeyondLimit {
+                field: "bone records",
+                limit: MAX_BONES,
+            });
+        }
+    }
     report.inverse_bind = read_inverse_bind(system, base, report.bones.len(), &mut issues);
+    report.local_matrices = read_local_matrices(system, base, report.bones.len(), &mut issues);
     report.parent_array = read_parent_array(system, base, report.bones.len(), &mut issues);
+    check_array_overlap(&report, report.bones.len(), &mut issues);
     resolve_hierarchy(&mut report, &mut issues);
     check_values(&mut report, &mut issues);
     report.issues = issues;
@@ -401,6 +637,22 @@ fn read_inverse_bind(
         return Vec::new();
     };
     read_matrices(system, offset, bones, "inverse-bind array", issues)
+}
+
+/// Reads the local-matrix array. As with the inverse-bind array, a missing
+/// pointer leaves the array empty and produces no issue.
+fn read_local_matrices(
+    system: &[u8],
+    base: u64,
+    bones: usize,
+    issues: &mut Vec<Issue>,
+) -> Vec<Matrix34> {
+    let Some(offset) =
+        optional_pointer_at(system, base as usize + 0x38, "local-matrix array", issues)
+    else {
+        return Vec::new();
+    };
+    read_matrices(system, offset, bones, "local-matrix array", issues)
 }
 
 fn read_matrices(
