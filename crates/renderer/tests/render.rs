@@ -214,6 +214,90 @@ fn multiple_meshes_and_materials_share_one_scene() {
     assert!(blue > 0, "the blue mesh is drawn");
 }
 
+/// Two quads in one scene: one red on the left, one blue on the right, each
+/// with its own transform. The transforms are what places them.
+fn two_component_scene() -> Scene {
+    let mut scene = Scene::new();
+    scene.materials.push(Material {
+        name: "red".into(),
+        base_color: [0.9, 0.1, 0.1, 1.0],
+        ..Material::default()
+    });
+    scene.materials.push(Material {
+        name: "blue".into(),
+        base_color: [0.1, 0.1, 0.9, 1.0],
+        ..Material::default()
+    });
+    let mut left = Mesh::new("left");
+    left.primitives.push(colored_quad(0));
+    left.transform = glam::Mat4::from_translation(glam::Vec3::new(-1.1, 0.0, 0.0));
+    let mut right = Mesh::new("right");
+    right.primitives.push(colored_quad(1));
+    right.transform = glam::Mat4::from_translation(glam::Vec3::new(1.1, 0.0, 0.0));
+    scene.meshes.push(left);
+    scene.meshes.push(right);
+    scene.validate();
+    scene
+}
+
+fn count_channels(frame: &Frame) -> (usize, usize) {
+    let mut red = 0;
+    let mut blue = 0;
+    for y in 0..frame.height {
+        for x in 0..frame.width {
+            let pixel = frame.pixel(x, y).expect("pixel");
+            if pixel[0] > pixel[2].saturating_add(20) {
+                red += 1;
+            }
+            if pixel[2] > pixel[0].saturating_add(20) {
+                blue += 1;
+            }
+        }
+    }
+    (red, blue)
+}
+
+#[test]
+fn independently_transformed_components_are_placed_by_their_transforms() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let scene = two_component_scene();
+    let gpu = renderer.upload_scene(&scene).expect("upload");
+    let camera = OrbitCamera::framing(scene.bounds, 2.0);
+    let frame = renderer
+        .render(&gpu, &camera, 120, 60, Background::DARK)
+        .expect("render");
+    let (red, blue) = count_channels(&frame);
+    assert!(red > 0, "the translated red mesh is drawn");
+    assert!(blue > 0, "the translated blue mesh is drawn");
+}
+
+#[test]
+fn a_hidden_component_is_not_drawn() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let scene = two_component_scene();
+    let mut gpu = renderer.upload_scene(&scene).expect("upload");
+    let camera = OrbitCamera::framing(scene.bounds, 2.0);
+    gpu.set_mesh_visible(1, false);
+    assert!(gpu.mesh_visible(0));
+    assert!(!gpu.mesh_visible(1));
+    let frame = renderer
+        .render(&gpu, &camera, 120, 60, Background::DARK)
+        .expect("render");
+    let (red, blue) = count_channels(&frame);
+    assert!(red > 0, "the visible mesh is still drawn");
+    assert_eq!(blue, 0, "the hidden mesh contributes no pixel");
+    gpu.set_mesh_visible(1, true);
+    let frame = renderer
+        .render(&gpu, &camera, 120, 60, Background::DARK)
+        .expect("render");
+    let (_, blue) = count_channels(&frame);
+    assert!(blue > 0, "showing it again draws it");
+}
+
 #[test]
 fn offscreen_rendering_can_be_repeated_without_a_window() {
     let Some(mut renderer) = renderer() else {

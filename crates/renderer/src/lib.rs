@@ -466,6 +466,9 @@ impl Renderer {
         let mut last_pipeline = None;
         for index in order {
             let primitive = &scene.primitives[index];
+            if !primitive.visible {
+                continue;
+            }
             let material = &scene.materials[primitive.material];
             let pipeline = if material.alpha_mode == lforge_scene::AlphaMode::Blend {
                 &self.pipelines.blend

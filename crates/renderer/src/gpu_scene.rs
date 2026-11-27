@@ -53,6 +53,10 @@ pub(crate) struct GpuPrimitive {
     pub(crate) index_count: u32,
     pub(crate) material: usize,
     pub(crate) center: Vec3,
+    /// The scene mesh the primitive was uploaded from. Visibility is set per
+    /// mesh, so hiding one component never re-reads or re-decodes anything.
+    pub(crate) mesh: usize,
+    pub(crate) visible: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +86,25 @@ impl GpuScene {
 
     pub fn primitive_count(&self) -> usize {
         self.primitives.len()
+    }
+
+    /// Shows or hides every primitive uploaded from scene mesh `mesh`.
+    ///
+    /// The upload is unchanged; only the draw list consults the flag, so a
+    /// visibility change costs one pass over the primitives.
+    pub fn set_mesh_visible(&mut self, mesh: usize, visible: bool) {
+        for primitive in &mut self.primitives {
+            if primitive.mesh == mesh {
+                primitive.visible = visible;
+            }
+        }
+    }
+
+    /// Whether at least one primitive of `mesh` is drawn.
+    pub fn mesh_visible(&self, mesh: usize) -> bool {
+        self.primitives
+            .iter()
+            .any(|primitive| primitive.mesh == mesh && primitive.visible)
     }
 
     pub(crate) fn upload(
@@ -187,8 +210,8 @@ impl GpuScene {
         }
 
         let mut primitives = Vec::new();
-        for mesh in &scene.meshes {
-            upload_mesh(device, mesh, &mut primitives);
+        for (index, mesh) in scene.meshes.iter().enumerate() {
+            upload_mesh(device, index, mesh, &mut primitives);
         }
         if primitives.is_empty() {
             return Err(Error::Scene("scene has no drawable primitives".into()));
@@ -216,7 +239,7 @@ fn transform_vertex(vertex: &Vertex, transform: Mat4, normal_matrix: Mat3) -> Gp
     }
 }
 
-fn upload_mesh(device: &wgpu::Device, mesh: &Mesh, out: &mut Vec<GpuPrimitive>) {
+fn upload_mesh(device: &wgpu::Device, mesh_index: usize, mesh: &Mesh, out: &mut Vec<GpuPrimitive>) {
     let transform = mesh.transform;
     let normal_matrix = Mat3::from_mat4(transform).inverse().transpose();
     for primitive in &mesh.primitives {
@@ -256,6 +279,8 @@ fn upload_mesh(device: &wgpu::Device, mesh: &Mesh, out: &mut Vec<GpuPrimitive>) 
             index_count: primitive.indices.len() as u32,
             material: primitive.material,
             center,
+            mesh: mesh_index,
+            visible: true,
         });
     }
 }
