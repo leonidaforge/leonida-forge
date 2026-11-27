@@ -78,11 +78,17 @@ pushed.
 - Open a drawable or a texture in its own window. The model viewer decodes the
   highest populated LOD, resolves embedded and external textures by exact
   64-bit key, frames the geometry and reports geometry and texture
-  completeness. A fragment opens in the same viewer: its member drawables are
-  listed as components with visibility toggles, and the diagnostics say when
-  only part of the fragment is assembled. Only the member drawable the
-  fragment root references is assembled; multi-drawable fragments and drawable
-  dictionaries are not identified.
+  completeness. A fragment opens in the same viewer: its member drawable is
+  listed as one component with per-mesh visibility toggles, and the diagnostics
+  say when only part of the fragment is assembled. Only the member drawable the
+  fragment root references is assembled; a fragment root that also reads as a
+  resource-level drawable reports the overlap instead of hiding it.
+- Open a drawable dictionary in its own window: the member list shows every
+  member with its name, name hash and state, and the selected member decodes
+  into the viewport. One member load runs at a time, one selection waits behind
+  it, and the newest selection wins, so rapid switching cannot queue work or
+  land an older result. Multi-drawable fragments and skeleton-driven placement
+  are not identified.
 - Export one entry to a chosen path, from the entry context menu and the File
   menu. Native entries, recovered entries, resource pages, regions and ZIP
   entries decode through one path.
