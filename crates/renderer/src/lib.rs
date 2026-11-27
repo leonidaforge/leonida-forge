@@ -15,15 +15,16 @@ mod camera;
 mod gpu_scene;
 mod texture;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 pub use camera::OrbitCamera;
-pub use gpu_scene::GpuScene;
+pub use gpu_scene::{GpuScene, SkinProbeVertex};
 pub use wgpu::AdapterInfo;
 
 use lforge_scene::Scene;
@@ -95,6 +96,15 @@ impl Default for Background {
     fn default() -> Self {
         Self::DARK
     }
+}
+
+/// One vertex evaluated by [`Renderer::probe_skinning`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProbeSample {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    /// The transformed tangent with its handedness in `w`.
+    pub tangent: [f32; 4],
 }
 
 /// A rendered frame as tightly packed RGBA8 sRGB rows, top row first.
@@ -280,6 +290,7 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     material_layout: wgpu::BindGroupLayout,
+    pose_layout: wgpu::BindGroupLayout,
     camera: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
@@ -293,6 +304,9 @@ struct Pipelines {
     opaque: wgpu::RenderPipeline,
     opaque_double_sided: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
+    skinned_opaque: wgpu::RenderPipeline,
+    skinned_opaque_double_sided: wgpu::RenderPipeline,
+    skinned_blend: wgpu::RenderPipeline,
     overlay_depth_tested: wgpu::RenderPipeline,
     overlay_depth_independent: wgpu::RenderPipeline,
 }
@@ -391,6 +405,32 @@ impl Renderer {
                 },
             ],
         });
+        let pose_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pose"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT
+                        .union(wgpu::ShaderStages::COMPUTE),
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX.union(wgpu::ShaderStages::COMPUTE),
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
         let camera = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
             size: size_of::<CameraUniform>() as u64,
@@ -458,10 +498,51 @@ impl Renderer {
                 resource: overlay_highlight.as_entire_binding(),
             }],
         });
+        let skinned_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("skinned scene"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                "{}\n{}",
+                include_str!("skinning.wgsl"),
+                include_str!("skinned_body.wgsl")
+            ))),
+        });
+        let skinned_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("skinned scene"),
+            bind_group_layouts: &[
+                Some(&camera_layout),
+                Some(&material_layout),
+                Some(&pose_layout),
+            ],
+            immediate_size: 0,
+        });
         let pipelines = Pipelines {
             opaque: create_pipeline(&device, &layout, &shader, true, false, true),
             opaque_double_sided: create_pipeline(&device, &layout, &shader, false, false, true),
             blend: create_pipeline(&device, &layout, &shader, false, true, false),
+            skinned_opaque: create_skinned_pipeline(
+                &device,
+                &skinned_layout,
+                &skinned_shader,
+                true,
+                false,
+                true,
+            ),
+            skinned_opaque_double_sided: create_skinned_pipeline(
+                &device,
+                &skinned_layout,
+                &skinned_shader,
+                false,
+                false,
+                true,
+            ),
+            skinned_blend: create_skinned_pipeline(
+                &device,
+                &skinned_layout,
+                &skinned_shader,
+                false,
+                true,
+                false,
+            ),
             overlay_depth_tested: create_overlay_pipeline(
                 &device,
                 &overlay_pipeline_layout,
@@ -482,6 +563,7 @@ impl Renderer {
             device,
             queue,
             material_layout,
+            pose_layout,
             camera,
             camera_bind_group,
             sampler,
@@ -506,10 +588,24 @@ impl Renderer {
             &self.device,
             &self.queue,
             &self.material_layout,
+            &self.pose_layout,
             &self.sampler,
             &self.fallback,
             scene,
         )
+    }
+
+    /// Applies a pose to an uploaded scene. Only the joint matrices and the
+    /// overlay lines are written; the authored vertex buffers stay as uploaded.
+    pub fn update_pose(
+        &self,
+        scene: &mut GpuScene,
+        matrices: &[Mat4],
+        bone_positions: &[Vec3],
+    ) -> Result<(), Error> {
+        scene
+            .update_pose(&self.queue, matrices, bone_positions)
+            .map_err(Error::Scene)
     }
 
     fn update_camera(&self, camera: &OrbitCamera, width: u32, height: u32) {
@@ -556,6 +652,19 @@ impl Renderer {
             multiview_mask: None,
         });
         pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        if let (Some(uniform), Some(bind_group)) = (&scene.pose_uniform, &scene.pose_bind_group) {
+            let state = gpu_scene::PoseUniform {
+                highlight_bone: scene
+                    .highlight_bone
+                    .map_or(-1, |bone| i32::try_from(bone).unwrap_or(-1)),
+                view: scene.view,
+                pad0: 0,
+                pad1: 0,
+            };
+            self.queue
+                .write_buffer(uniform, 0, bytemuck::bytes_of(&state));
+            let _ = bind_group;
+        }
         let camera_position = camera.eye();
         let mut order: Vec<usize> = (0..scene.primitives.len()).collect();
         order.sort_by(|&a, &b| {
@@ -582,7 +691,16 @@ impl Renderer {
                 continue;
             }
             let material = &scene.materials[primitive.material];
-            let pipeline = if material.alpha_mode == lforge_scene::AlphaMode::Blend {
+            let skinned = scene.pose_active && primitive.skin.is_some();
+            let pipeline = if skinned {
+                if material.alpha_mode == lforge_scene::AlphaMode::Blend {
+                    &self.pipelines.skinned_blend
+                } else if material.double_sided {
+                    &self.pipelines.skinned_opaque_double_sided
+                } else {
+                    &self.pipelines.skinned_opaque
+                }
+            } else if material.alpha_mode == lforge_scene::AlphaMode::Blend {
                 &self.pipelines.blend
             } else if material.double_sided {
                 &self.pipelines.opaque_double_sided
@@ -594,7 +712,16 @@ impl Renderer {
                 last_pipeline = Some(pipeline as *const _);
             }
             pass.set_bind_group(1, &material.bind_group, &[]);
-            pass.set_vertex_buffer(0, primitive.vertices.slice(..));
+            let vertices = match (&primitive.skin, skinned) {
+                (Some(skin), true) => {
+                    if let Some(bind_group) = &scene.pose_bind_group {
+                        pass.set_bind_group(2, bind_group, &[]);
+                    }
+                    skin.vertices.slice(..)
+                }
+                _ => primitive.vertices.slice(..),
+            };
+            pass.set_vertex_buffer(0, vertices);
             pass.set_index_buffer(primitive.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..primitive.index_count, 0, 0..1);
         }
@@ -823,6 +950,242 @@ impl Renderer {
         })
     }
 
+    /// Evaluates the skinning functions for a caller-supplied vertex set and
+    /// reads the results back.
+    ///
+    /// This is a verification path, not part of interactive rendering: a
+    /// compute pass evaluates the same `skinning.wgsl` functions the scene
+    /// pipeline's vertex shader calls, and writes position, normal and tangent
+    /// per vertex into a storage buffer that is copied back.
+    pub fn probe_skinning(
+        &self,
+        matrices: &[Mat4],
+        vertices: &[SkinProbeVertex],
+    ) -> Result<Vec<ProbeSample>, Error> {
+        if vertices.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+        struct GpuProbe {
+            position: [f32; 4],
+            normal: [f32; 4],
+            tangent: [f32; 4],
+            joints: [u32; 4],
+            weights: [f32; 4],
+        }
+        let inputs = vertices
+            .iter()
+            .map(|vertex| GpuProbe {
+                position: [
+                    vertex.position[0],
+                    vertex.position[1],
+                    vertex.position[2],
+                    1.0,
+                ],
+                normal: [vertex.normal[0], vertex.normal[1], vertex.normal[2], 0.0],
+                tangent: vertex.tangent,
+                joints: vertex.joints,
+                weights: vertex.weights,
+            })
+            .collect::<Vec<_>>();
+        let converted = matrices
+            .iter()
+            .map(|matrix| matrix.to_cols_array())
+            .collect::<Vec<[f32; 16]>>();
+        let mut joint_data = converted;
+        if joint_data.is_empty() {
+            joint_data.push(Mat4::IDENTITY.to_cols_array());
+        }
+        let joints = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("probe joints"),
+                contents: bytemuck::cast_slice(&joint_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let state = gpu_scene::PoseUniform {
+            highlight_bone: -1,
+            view: 0,
+            pad0: 0,
+            pad1: 0,
+        };
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("probe pose"),
+                contents: bytemuck::bytes_of(&state),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let pose_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("probe pose"),
+            layout: &self.pose_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: joints.as_entire_binding(),
+                },
+            ],
+        });
+        let probe_layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("probe buffers"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("skinning probe"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                    "{}\n{}",
+                    include_str!("skinning.wgsl"),
+                    include_str!("probe_body.wgsl")
+                ))),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("skinning probe"),
+                bind_group_layouts: &[
+                    Some(&probe_layout),
+                    Some(&self.pose_layout),
+                    Some(&self.pose_layout),
+                ],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("skinning probe"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("probe_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let input_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("probe vertices"),
+                contents: bytemuck::cast_slice(&inputs),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let output_len = vertices.len() * 3;
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe results"),
+            size: (output_len * size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe readback"),
+            size: (output_len * size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let buffers = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("probe buffers"),
+            layout: &probe_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("skinning probe"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &buffers, &[]);
+            pass.set_bind_group(1, &pose_bind_group, &[]);
+            pass.set_bind_group(2, &pose_bind_group, &[]);
+            pass.dispatch_workgroups((output_len as u32).div_ceil(64), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(
+            &output,
+            0,
+            &readback,
+            0,
+            (output_len * size_of::<[f32; 4]>()) as u64,
+        );
+        let submission = self.queue.submit([encoder.finish()]);
+        let (sender, receiver) = mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = sender.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .map_err(Error::Poll)?;
+        receiver
+            .recv()
+            .map_err(|_| Error::Readback(wgpu::BufferAsyncError))?
+            .map_err(Error::Readback)?;
+        let mapped = readback
+            .get_mapped_range(..)
+            .map_err(|_| Error::Readback(wgpu::BufferAsyncError))?;
+        let values = mapped
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|bytes| {
+                std::array::from_fn(|lane| {
+                    f32::from_le_bytes(
+                        bytes[lane * 4..lane * 4 + 4]
+                            .try_into()
+                            .expect("four bytes"),
+                    )
+                })
+            })
+            .collect::<Vec<[f32; 4]>>();
+        drop(mapped);
+        readback.unmap();
+        Ok(values
+            .chunks_exact(3)
+            .map(|values| ProbeSample {
+                position: [values[0][0], values[0][1], values[0][2]],
+                normal: [values[1][0], values[1][1], values[1][2]],
+                tangent: values[2],
+            })
+            .collect())
+    }
+
     /// Uploads `scene` and renders one frame. Use [`Renderer::upload_scene`]
     /// with [`Renderer::render`] to render the same scene repeatedly.
     pub fn render_offscreen(
@@ -917,6 +1280,52 @@ fn create_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: shader,
             entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_skinned_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    cull: bool,
+    blend: bool,
+    depth_write: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if blend { "skinned blend" } else { "skinned" }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_skinned"),
+            compilation_options: Default::default(),
+            buffers: &[Some(gpu_scene::GpuSkinnedVertex::layout())],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: cull.then_some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_skinned"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: COLOR_FORMAT,

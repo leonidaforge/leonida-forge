@@ -2,7 +2,7 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
-use lforge_scene::{AlphaMode, Mesh, Scene, Vertex};
+use lforge_scene::{AlphaMode, Mesh, Scene, Vertex, VertexInfluences};
 use wgpu::util::DeviceExt;
 
 use crate::Error;
@@ -38,6 +38,65 @@ impl GpuVertex {
     }
 }
 
+/// The skinned vertex: the static attributes plus the resolved influence
+/// lanes. Only primitives with verified influences get this buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct GpuSkinnedVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+    tangent: [f32; 4],
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    color: [f32; 4],
+    joints: [u32; 4],
+    weights: [f32; 4],
+}
+
+impl GpuSkinnedVertex {
+    pub(crate) const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x3,
+        2 => Float32x4,
+        3 => Float32x2,
+        4 => Float32x2,
+        5 => Float32x4,
+        6 => Uint32x4,
+        7 => Float32x4
+    ];
+
+    pub(crate) fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+/// One probe vertex for the skinning verification path.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct SkinProbeVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub tangent: [f32; 4],
+    pub joints: [u32; 4],
+    pub weights: [f32; 4],
+    /// 0 = position, 1 = normal, 2 = tangent. One point is drawn per mode.
+    pub mode: u32,
+}
+
+/// The per-frame pose state read by the skinning shader.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct PoseUniform {
+    pub highlight_bone: i32,
+    pub view: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct MaterialUniform {
@@ -46,6 +105,13 @@ struct MaterialUniform {
     params: [f32; 4],
     /// metalness, roughness, emissive weight, spare.
     surface: [f32; 4],
+}
+
+/// The skinned vertex buffer of one primitive. The authored static buffer is
+/// kept as well, so leaving pose mode never re-uploads anything.
+#[derive(Debug)]
+pub(crate) struct GpuSkin {
+    pub(crate) vertices: wgpu::Buffer,
 }
 
 #[derive(Debug)]
@@ -59,6 +125,8 @@ pub(crate) struct GpuPrimitive {
     /// mesh, so hiding one component never re-reads or re-decodes anything.
     pub(crate) mesh: usize,
     pub(crate) visible: bool,
+    /// Present only when the primitive carries verified, deformable influences.
+    pub(crate) skin: Option<GpuSkin>,
 }
 
 #[derive(Debug)]
@@ -103,6 +171,10 @@ pub(crate) struct GpuSkeleton {
     pub(crate) bone_count: usize,
     pub(crate) visible: bool,
     pub(crate) selected: Option<usize>,
+    /// Parents and marker length, kept so a pose can rebuild the lines without
+    /// re-reading the scene.
+    parents: Vec<Option<usize>>,
+    marker: f32,
 }
 
 /// A scene uploaded to one GPU device. Dropping it releases every buffer,
@@ -112,6 +184,15 @@ pub struct GpuScene {
     pub(crate) materials: Vec<GpuMaterial>,
     pub(crate) primitives: Vec<GpuPrimitive>,
     pub(crate) skeleton: Option<GpuSkeleton>,
+    pub(crate) joints: Option<wgpu::Buffer>,
+    pub(crate) pose_uniform: Option<wgpu::Buffer>,
+    pub(crate) pose_bind_group: Option<wgpu::BindGroup>,
+    pub(crate) joint_count: usize,
+    /// Whether influenced primitives are drawn through the skinned pipeline.
+    pub(crate) pose_active: bool,
+    /// `0` material shading, `1` selected-bone influence visualisation.
+    pub(crate) view: u32,
+    pub(crate) highlight_bone: Option<usize>,
     warnings: Vec<String>,
 }
 
@@ -190,6 +271,7 @@ impl GpuScene {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         material_layout: &wgpu::BindGroupLayout,
+        pose_layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
         fallback: &crate::FallbackTextures,
         scene: &Scene,
@@ -296,18 +378,137 @@ impl GpuScene {
 
         let mut primitives = Vec::new();
         for (index, mesh) in scene.meshes.iter().enumerate() {
-            upload_mesh(device, index, mesh, &mut primitives);
+            upload_mesh(device, queue, index, mesh, scene, &mut primitives);
         }
         if primitives.is_empty() {
             return Err(Error::Scene("scene has no drawable primitives".into()));
         }
         let skeleton = upload_skeleton(device, scene);
+        let joint_count = scene.skeleton.as_ref().map_or(0, |s| s.bones.len());
+        let (joints, pose_uniform, pose_bind_group) = if joint_count > 0 {
+            let joints = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("joint matrices"),
+                size: (joint_count * size_of::<[[f32; 4]; 4]>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let identity = vec![Mat4::IDENTITY.to_cols_array(); joint_count];
+            queue.write_buffer(&joints, 0, bytemuck::cast_slice(&identity));
+            let pose_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pose state"),
+                size: size_of::<PoseUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pose"),
+                layout: pose_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: pose_uniform.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: joints.as_entire_binding(),
+                    },
+                ],
+            });
+            (Some(joints), Some(pose_uniform), Some(bind_group))
+        } else {
+            (None, None, None)
+        };
         Ok(Self {
             materials,
             primitives,
             skeleton,
+            joints,
+            pose_uniform,
+            pose_bind_group,
+            joint_count,
+            pose_active: false,
+            view: 0,
+            highlight_bone: None,
             warnings,
         })
+    }
+
+    /// Whether any primitive can be drawn through the skinned pipeline.
+    pub fn has_skin(&self) -> bool {
+        self.joints.is_some()
+            && self
+                .primitives
+                .iter()
+                .any(|primitive| primitive.skin.is_some())
+    }
+
+    pub fn pose_active(&self) -> bool {
+        self.pose_active
+    }
+
+    /// Selects the skinned pipeline for influenced primitives. Turning it off
+    /// returns to the authored buffers without uploading anything.
+    pub fn set_pose_active(&mut self, active: bool) {
+        self.pose_active = active && self.joints.is_some();
+    }
+
+    pub fn influence_view(&self) -> bool {
+        self.view == 1
+    }
+
+    pub fn set_influence_view(&mut self, enabled: bool) {
+        self.view = u32::from(enabled);
+    }
+
+    pub fn highlight_bone(&self) -> Option<usize> {
+        self.highlight_bone
+    }
+
+    pub fn set_highlight_bone(&mut self, bone: Option<usize>) {
+        self.highlight_bone = bone.filter(|index| *index < self.joint_count);
+    }
+
+    /// How many bone matrices the uploaded scene holds.
+    pub fn joint_count(&self) -> usize {
+        self.joint_count
+    }
+
+    /// Writes the current skinning matrices and posed bone positions. The
+    /// authored vertex buffers are untouched, so a pose update costs one
+    /// storage write and one small overlay rewrite.
+    pub fn update_pose(
+        &mut self,
+        queue: &wgpu::Queue,
+        matrices: &[Mat4],
+        bone_positions: &[Vec3],
+    ) -> Result<(), String> {
+        let Some(joints) = &self.joints else {
+            return Err("the scene carries no skeleton".into());
+        };
+        if matrices.len() > self.joint_count {
+            return Err(format!(
+                "{} matrices do not fit the {} uploaded bones",
+                matrices.len(),
+                self.joint_count
+            ));
+        }
+        let mut data = Vec::with_capacity(self.joint_count * 16);
+        for matrix in matrices {
+            data.extend_from_slice(&matrix.to_cols_array());
+        }
+        for _ in matrices.len()..self.joint_count {
+            data.extend_from_slice(&Mat4::IDENTITY.to_cols_array());
+        }
+        queue.write_buffer(joints, 0, bytemuck::cast_slice(&data));
+        if let Some(skeleton) = &self.skeleton
+            && bone_positions.len() == skeleton.bone_count
+        {
+            let (markers, connections) =
+                overlay_lines(&skeleton.parents, skeleton.marker, bone_positions);
+            queue.write_buffer(&skeleton.markers, 0, bytemuck::cast_slice(&markers));
+            queue.write_buffer(&skeleton.connections, 0, bytemuck::cast_slice(&connections));
+        }
+        Ok(())
     }
 }
 
@@ -358,12 +559,12 @@ fn upload_skeleton(device: &wgpu::Device, scene: &Scene) -> Option<GpuSkeleton> 
     let marker_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("skeleton markers"),
         contents: bytemuck::cast_slice(&markers),
-        usage: wgpu::BufferUsages::VERTEX,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
     let connection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("skeleton connections"),
         contents: bytemuck::cast_slice(&connections),
-        usage: wgpu::BufferUsages::VERTEX,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
     });
     Some(GpuSkeleton {
         markers: marker_buffer,
@@ -373,7 +574,49 @@ fn upload_skeleton(device: &wgpu::Device, scene: &Scene) -> Option<GpuSkeleton> 
         bone_count: skeleton.bones.len(),
         visible: false,
         selected: None,
+        parents: skeleton.bones.iter().map(|bone| bone.parent).collect(),
+        marker,
     })
+}
+
+/// Rebuilds the overlay line vertices for a set of bone positions.
+fn overlay_lines(
+    parents: &[Option<usize>],
+    marker: f32,
+    positions: &[Vec3],
+) -> (Vec<OverlayVertex>, Vec<OverlayVertex>) {
+    let marker_color = [0.35, 0.95, 1.0, 1.0];
+    let connection_color = [0.15, 0.75, 0.95, 0.85];
+    let mut markers = Vec::with_capacity(positions.len() * 6);
+    let mut connections = Vec::new();
+    for (index, position) in positions.iter().enumerate() {
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            markers.push(OverlayVertex {
+                position: position.to_array(),
+                color: marker_color,
+            });
+            markers.push(OverlayVertex {
+                position: (position + axis * marker).to_array(),
+                color: marker_color,
+            });
+        }
+        if let Some(parent) = parents
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|parent| positions.get(parent))
+        {
+            connections.push(OverlayVertex {
+                position: parent.to_array(),
+                color: connection_color,
+            });
+            connections.push(OverlayVertex {
+                position: position.to_array(),
+                color: connection_color,
+            });
+        }
+    }
+    (markers, connections)
 }
 
 fn transform_vertex(vertex: &Vertex, transform: Mat4, normal_matrix: Mat3) -> GpuVertex {
@@ -391,10 +634,17 @@ fn transform_vertex(vertex: &Vertex, transform: Mat4, normal_matrix: Mat3) -> Gp
     }
 }
 
-fn upload_mesh(device: &wgpu::Device, mesh_index: usize, mesh: &Mesh, out: &mut Vec<GpuPrimitive>) {
+fn upload_mesh(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mesh_index: usize,
+    mesh: &Mesh,
+    scene: &Scene,
+    out: &mut Vec<GpuPrimitive>,
+) {
     let transform = mesh.transform;
     let normal_matrix = Mat3::from_mat4(transform).inverse().transpose();
-    for primitive in &mesh.primitives {
+    for (primitive_index, primitive) in mesh.primitives.iter().enumerate() {
         if primitive.vertices.is_empty() || primitive.indices.is_empty() {
             continue;
         }
@@ -425,6 +675,10 @@ fn upload_mesh(device: &wgpu::Device, mesh_index: usize, mesh: &Mesh, out: &mut 
             contents: bytemuck::cast_slice(&primitive.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let skin = scene
+            .influences_for(mesh_index, primitive_index)
+            .filter(|influences| influences.deformable())
+            .map(|influences| upload_skin(device, queue, &mesh.name, &vertices, influences));
         out.push(GpuPrimitive {
             vertices: vertex_buffer,
             indices: index_buffer,
@@ -433,6 +687,46 @@ fn upload_mesh(device: &wgpu::Device, mesh_index: usize, mesh: &Mesh, out: &mut 
             center,
             mesh: mesh_index,
             visible: true,
+            skin,
         });
     }
+}
+
+fn upload_skin(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    name: &str,
+    vertices: &[GpuVertex],
+    influences: &VertexInfluences,
+) -> GpuSkin {
+    let skinned = vertices
+        .iter()
+        .zip(&influences.per_vertex)
+        .map(|(vertex, lanes)| {
+            let mut joints = [0u32; 4];
+            let mut weights = [0.0f32; 4];
+            for (lane, influence) in lanes.iter().enumerate() {
+                joints[lane] = u32::from(influence.bone);
+                weights[lane] = influence.weight;
+            }
+            GpuSkinnedVertex {
+                position: vertex.position,
+                normal: vertex.normal,
+                tangent: vertex.tangent,
+                uv0: vertex.uv0,
+                uv1: vertex.uv1,
+                color: vertex.color,
+                joints,
+                weights,
+            }
+        })
+        .collect::<Vec<_>>();
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(name),
+        size: size_of_val(skinned.as_slice()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&skinned));
+    GpuSkin { vertices: buffer }
 }
