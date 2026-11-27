@@ -148,9 +148,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("the split {split:#x} is not inside the resource").into());
     }
     let (system, graphics) = bytes.split_at(split);
-    if !model::is_fragment(system, graphics) {
-        return Err("the resource is not a supported fragment".into());
-    }
     let stores = match &options.textures {
         None => None,
         Some(root) => {
@@ -165,6 +162,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Stores(set))
         }
     };
+    if !model::is_fragment(system, graphics) {
+        // A plain drawable is decoded through the same shared path, so the
+        // example also serves as the static drawable regression.
+        if !model::has_drawable(system, graphics) {
+            return Err("the resource is neither a fragment nor a drawable".into());
+        }
+        let decoded = match &stores {
+            Some(stores) => model::decode(system, graphics, stores),
+            None => model::decode(system, graphics, &model::NoTextures),
+        }?;
+        let scene = &decoded.scene;
+        let primitives: usize = scene.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
+        let bindings = decoded.texture_bindings.len();
+        let resolved = decoded
+            .texture_bindings
+            .iter()
+            .filter(|binding| matches!(binding.status, model::TextureBindingStatus::Resolved))
+            .count();
+        let reconstructed = decoded
+            .texture_bindings
+            .iter()
+            .filter(|binding| binding.texture.is_some())
+            .count();
+        println!(
+            "drawable {:?}: 1 component, {} mesh(es), {primitives} primitive(s), split {split:#x}, lod {}",
+            decoded.report.header.name_text,
+            scene.meshes.len(),
+            decoded.lod
+        );
+        println!(
+            "scene: {} vertices, {} triangles, {} material(s), {} texture(s)",
+            scene.vertex_count(),
+            scene.triangle_count(),
+            scene.materials.len(),
+            scene.textures.len()
+        );
+        println!(
+            "textures: {bindings} binding(s), {resolved} resolved, {reconstructed} reconstructed; geometry {:?}; textures {:?}",
+            decoded.completeness.geometry, decoded.completeness.textures
+        );
+        for diagnostic in &scene.diagnostics {
+            println!("  diagnostic: {}", diagnostic.reason);
+        }
+        return render_scene(scene, &options, "drawable");
+    }
     let decoded = match &stores {
         Some(stores) => model::decode_fragment(system, graphics, stores),
         None => model::decode_fragment(system, graphics, &model::NoTextures),
@@ -229,7 +271,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for diagnostic in &scene.diagnostics {
         println!("  diagnostic: {}", diagnostic.reason);
     }
+    render_scene(scene, &options, "fragment")
+}
 
+/// Renders one scene offscreen and writes it to `--out`, if one was given.
+fn render_scene(
+    scene: &lforge_scene::Scene,
+    options: &Options,
+    kind: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Some(output) = &options.output else {
         return Ok(());
     };
@@ -271,12 +321,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
     };
     let name = format!(
-        "{}-{suffix}.png",
+        "{kind}-{}-{suffix}.png",
         options
             .resource
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "fragment".into())
+            .unwrap_or_else(|| "scene".into())
     );
     let path = output.join(name);
     image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
