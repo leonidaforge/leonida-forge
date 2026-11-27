@@ -10,9 +10,11 @@ Our goal is to make GTA VI modding more accessible through open research, shared
 
 ## Building
 
-Leonida Forge currently builds on Windows 11 x64 only.
+The desktop application builds on Windows 11 x64 only. The CLI also builds on
+Linux x64; the Alpha workflow builds, tests and packages both platforms and
+publishes them in one pre-release, with `lforge` and its checksum.
 
-Requirements:
+Requirements for the desktop application:
 
 - [rustup](https://rustup.rs). `rust-toolchain.toml` pins the toolchain, and rustup installs it on first use.
 - Visual Studio Build Tools with the "Desktop development with C++" workload and a Windows SDK. GPUI needs the SDK's resource compiler.
@@ -24,6 +26,12 @@ The first build fetches GPUI from the Zed repository, which takes a few minutes.
 cargo run -p lforge-desktop    # desktop application
 cargo run -p lforge-cli -- info --json
 cargo test --workspace
+```
+
+The CLI alone has no Windows-only dependency:
+
+```sh
+cargo build --release -p lforge-cli
 ```
 
 The desktop executable is `leonida-forge.exe` and the CLI is `lforge.exe`.

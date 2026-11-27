@@ -1,10 +1,10 @@
-
-name: Windows x64 Alpha
+name: Alpha
 
 on:
   push:
     branches:
       - main
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  package:
+  windows:
+    name: Windows x64
     runs-on: windows-2025
     timeout-minutes: 60
 
@@ -46,9 +47,41 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Install the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The desktop application is Windows-only. The Linux pipeline builds and
+      # verifies the CLI, the executable the importer and servers use.
+      - run: cargo test -p lforge-cli --locked
+
+      - name: Build release executable
+        run: bash scripts/build-linux-x64.sh
+
+      - name: Verify and package
+        run: bash scripts/package-linux-x64.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-alpha
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
     name: Publish Alpha Pre-Release
-    needs: package
+    needs: [windows, linux]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
@@ -56,10 +89,16 @@ jobs:
       contents: write
 
     steps:
-      - name: Download build artifacts
+      - name: Download Windows build artifacts
         uses: actions/download-artifact@v4
         with:
           name: windows-x64-alpha
+          path: dist
+
+      - name: Download Linux build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-alpha
           path: dist
 
       - name: Publish GitHub Pre-Release
@@ -76,3 +115,4 @@ jobs:
           files: |
             dist/*.zip
             dist/*.sha256
+            dist/*.tar.gz
