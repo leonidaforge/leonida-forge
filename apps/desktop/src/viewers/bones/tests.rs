@@ -144,3 +144,36 @@ fn a_large_skeleton_lists_in_one_ordered_pass() {
     assert_eq!(rows[1999].depth, 1999);
     assert_eq!(rows[1999].label, "bone 1999");
 }
+
+#[test]
+fn a_replacement_member_starts_without_the_previous_members_bones() {
+    // A dictionary member carries its own skeleton, so a bone index means a
+    // different bone after a replacement. The viewer resets the panel before it
+    // shows the new member; nothing from the member before it may survive.
+    let mut panel = BonePanel::new();
+    panel.toggle(0);
+    panel.toggle(2);
+    panel.select(Some(3));
+    // The previous member's own state: a hidden subtree and a selection that
+    // points at a bone the replacement does not have.
+    assert_eq!(panel.rows(&skeleton(), "").len(), 1);
+
+    panel.reset();
+    let replacement = Skeleton {
+        bones: vec![
+            bone(0, None, Some("Bead"), 0xD0),
+            bone(1, Some(0), Some("Clasp"), 0xD1),
+        ],
+        roots: vec![0],
+        max_depth: 1,
+    };
+    let rows = panel.rows(&replacement, "");
+    let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+    assert_eq!(labels, vec!["Bead", "Clasp"]);
+    assert_eq!(panel.selected(), None, "the previous selection survived");
+    assert!(
+        rows.iter().all(|row| !row.collapsed),
+        "a collapsed row from the previous member survived"
+    );
+    assert!(panel.metadata(&replacement, &[]).is_empty());
+}
