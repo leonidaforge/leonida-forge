@@ -390,6 +390,10 @@ pub enum Command {
         /// Binds the journal to one build, mode, rule set and limit set
         #[arg(long, default_value = "")]
         journal_identity: String,
+        /// The name to report a single archive under, normally its path
+        /// relative to the installation. Every sample chain starts with it
+        #[arg(long)]
+        root_name: Option<String>,
     },
     /// Print the engine's type-to-extension registry for all 256 ids
     Registry {
@@ -464,11 +468,13 @@ pub fn run(command: Command) -> Result<(), String> {
             max_spool_bytes,
             journal,
             journal_identity,
+            root_name,
         } => {
             let cancel = AtomicBool::new(false);
             crate::census::run(
                 &crate::census::Options {
                     path,
+                    root_name,
                     executable,
                     recursive,
                     metadata_only,

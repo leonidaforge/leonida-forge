@@ -116,11 +116,28 @@ impl Listing {
         self.extension(type_id)
     }
 
-    /// The confirmed extension of a type ID, as text.
+    /// The extension this build applies to a type: the archive's own type
+    /// table when it carries one, otherwise the engine's registry, recovered
+    /// from the executable. The same resolution the Explorer shows, so a name
+    /// and an extension agree between the two.
     fn extension(&self, type_id: u8) -> Option<&str> {
-        self.types
+        if let Some(extension) = self
+            .types
             .extension(type_id)
             .and_then(|extension| std::str::from_utf8(extension).ok())
+        {
+            return Some(extension);
+        }
+        lforge_core::registry::native_extension(type_id).map(|native| native.extension)
+    }
+
+    /// Where the extension came from: `archive` when the archive's own type
+    /// table declares it, `declared` when only the engine registry does.
+    fn extension_source(&self, type_id: u8) -> Option<&'static str> {
+        if self.types.extension(type_id).is_some() {
+            return Some("archive");
+        }
+        lforge_core::registry::is_registered(type_id).then_some("declared")
     }
 
     fn namespace(&self, type_id: Option<u8>) -> Option<Class> {
@@ -142,6 +159,7 @@ impl Listing {
                         "type_id": type_id,
                         "rows": rows,
                         "extension": type_id.and_then(|type_id| self.extension(type_id)),
+                        "extension_source": type_id.and_then(|type_id| self.extension_source(type_id)),
                         "namespace": self
                             .namespace(type_id)
                             .map(|class| class.namespace()),
@@ -165,6 +183,7 @@ impl Listing {
             "row": entry.row,
             "type_id": type_id,
             "extension": type_id.and_then(|type_id| self.extension(type_id)),
+            "extension_source": type_id.and_then(|type_id| self.extension_source(type_id)),
             "namespace": self
                 .namespace(type_id)
                 .map(|class| class.namespace()),

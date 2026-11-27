@@ -28,6 +28,8 @@ const MAX_METADATA: u64 = 256 * 1024 * 1024;
 const SAMPLE_HEAD: usize = 32;
 /// Archive names a combination records before it only counts them.
 const SAMPLE_ARCHIVES: usize = 8;
+/// Rejected archive candidates kept as evidence; the rest are counted.
+const REJECTION_SAMPLES: usize = 8;
 const COPY_BUFFER: usize = 1024 * 1024;
 
 /// What a census is allowed to do.
@@ -61,6 +63,10 @@ impl Default for Limits {
 pub struct Options {
     /// An archive, or a directory searched for `.rpf` files.
     pub path: PathBuf,
+    /// The name the root is reported under, when `path` is one archive: the
+    /// installation-relative path. Every chain and archive identity starts with
+    /// it, so two roots that share a basename stay distinct.
+    pub root_name: Option<String>,
     /// The executable to recognise the metadata key provider in.
     pub executable: Option<PathBuf>,
     /// Enter archives stored inside an archive.
@@ -189,6 +195,9 @@ struct Tally {
     containers: u64,
     declared: u64,
     unresolved: u64,
+    /// The type ids this archive holds, so the run can count the archives of a
+    /// type exactly even when an archive is restored from the journal.
+    types: BTreeSet<Option<u8>>,
 }
 
 impl Tally {
@@ -202,6 +211,7 @@ impl Tally {
             "containers": self.containers,
             "declared": self.declared,
             "unresolved": self.unresolved,
+            "types": self.types.iter().collect::<Vec<_>>(),
         })
     }
 
@@ -216,6 +226,12 @@ impl Tally {
             containers: number("containers"),
             declared: number("declared"),
             unresolved: number("unresolved"),
+            types: value["types"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| item.as_u64().and_then(|id| u8::try_from(id).ok()))
+                .collect(),
         }
     }
 }
@@ -230,13 +246,19 @@ struct Journal {
     path: PathBuf,
     identity: String,
     done: BTreeMap<String, (Vec<(Key, Bucket)>, Tally)>,
+    /// Whether the file ends with a newline. A run that was killed mid-write
+    /// leaves a partial line, and appending to it would make the first new
+    /// record unreadable, so the next append starts a line of its own.
+    ends_with_newline: bool,
 }
 
 impl Journal {
     fn open(path: &Path, identity: &str) -> Self {
         let mut done: BTreeMap<String, (Vec<(Key, Bucket)>, Tally)> = BTreeMap::new();
-        if let Ok(text) = fs::read_to_string(path) {
-            for line in text.lines() {
+        let mut ends_with_newline = true;
+        if let Ok(bytes) = fs::read(path) {
+            ends_with_newline = bytes.last().is_none_or(|byte| *byte == b'\n');
+            for line in String::from_utf8_lossy(&bytes).lines() {
                 let Ok(record) = serde_json::from_str::<Value>(line) else {
                     // A truncated last line is an interrupted write, not a
                     // result.
@@ -272,6 +294,7 @@ impl Journal {
             path: path.to_path_buf(),
             identity: identity.to_string(),
             done,
+            ends_with_newline,
         }
     }
 
@@ -305,6 +328,12 @@ impl Journal {
             .append(true)
             .open(&self.path)
             .map_err(|err| format!("cannot open the journal: {err}"))?;
+        if !self.ends_with_newline {
+            // The previous run was killed between a record's bytes and its
+            // newline; the partial line is ignored on the next open, so start a
+            // fresh one instead of extending it.
+            writeln!(file).map_err(|err| format!("cannot write the journal: {err}"))?;
+        }
         writeln!(file, "{record}").map_err(|err| format!("cannot write the journal: {err}"))?;
         file.flush()
             .map_err(|err| format!("cannot flush the journal: {err}"))?;
@@ -330,15 +359,61 @@ struct Engine<'a> {
     declared: u64,
     unresolved: u64,
     buckets: BTreeMap<Key, Bucket>,
-    types: BTreeMap<Option<u8>, u64>,
+    types: BTreeMap<Option<u8>, TypeCount>,
     failures: Vec<Value>,
+    /// Rows the declared type made archive candidates that did not open as an
+    /// archive. Not failures: the bytes said otherwise, and the row keeps its
+    /// own classification.
+    rejected: u64,
+    rejections: Vec<Value>,
     stopped: Option<&'static str>,
 }
 
+/// What the run has seen of one entry type.
+#[derive(Debug, Default)]
+struct TypeCount {
+    entries: u64,
+    /// Every archive that holds an entry of this type, exactly.
+    archives: BTreeSet<String>,
+}
+
 /// Runs a census, writing the result to `options.output` or standard output.
+///
+/// The exit status separates three cases a caller must not confuse: a complete
+/// census, a census that stopped at a configured limit, and a census in which an
+/// archive could not be read. The summary is written in all three, and the
+/// status says whether it may be treated as a complete one.
 pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
-    let roots = discover(&options.path, cancel)?;
+    let roots = discover(&options.path, options.root_name.as_deref(), cancel)?;
     let mut out = open_output(options)?;
+    let (stopped, failures) = match pass(&roots, options, cancel, &mut out) {
+        Ok(result) => result,
+        Err(err) => {
+            out.abandon();
+            return Err(err);
+        }
+    };
+    out.finish()?;
+    if let Some(limit) = stopped {
+        return Err(format!(
+            "the census stopped at {limit}; the summary records what was counted"
+        ));
+    }
+    if failures != 0 {
+        return Err(format!(
+            "{failures} archive(s) could not be read; the summary records which"
+        ));
+    }
+    Ok(())
+}
+
+/// Writes the census. Returns why it stopped, and how many archives failed.
+fn pass(
+    roots: &[Root],
+    options: &Options,
+    cancel: &AtomicBool,
+    out: &mut Output,
+) -> Result<(Option<&'static str>, usize), String> {
     let mut engine = Engine {
         options,
         cancel,
@@ -361,6 +436,8 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
         buckets: BTreeMap::new(),
         types: BTreeMap::new(),
         failures: Vec::new(),
+        rejected: 0,
+        rejections: Vec::new(),
         stopped: None,
     };
     let header = json!({
@@ -369,6 +446,7 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
         "root": options.path.display().to_string(),
         "archives": roots.iter().map(|root| root.name.clone()).collect::<Vec<_>>(),
         "recursive": options.recursive,
+        "metadata_only": options.metadata_only,
         "entries_emitted": options.entries,
         "limits": {
             "max_depth": options.limits.max_depth,
@@ -378,12 +456,12 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
             "max_spool_bytes": options.limits.max_spool_bytes,
         },
     });
-    writeln!(out, "{header}").map_err(|err| err.to_string())?;
-    for root in &roots {
+    writeln!(out.writer, "{header}").map_err(|err| err.to_string())?;
+    for root in roots {
         if engine.cancelled() || engine.stopped.is_some() {
             break;
         }
-        if let Err(err) = engine.enter_root(root, &mut out) {
+        if let Err(err) = engine.enter_root(root, &mut out.writer) {
             engine.failures.push(json!({
                 "archive": root.name.clone(),
                 "depth": 0,
@@ -391,12 +469,9 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
             }));
         }
     }
-    let result = engine.summary(&roots);
-    writeln!(out, "{result}").map_err(|err| err.to_string())?;
-    if options.output.is_some() {
-        out.flush().map_err(|err| err.to_string())?;
-    }
-    Ok(())
+    let result = engine.summary(roots);
+    writeln!(out.writer, "{result}").map_err(|err| err.to_string())?;
+    Ok((engine.stopped, engine.failures.len()))
 }
 
 struct Root {
@@ -404,11 +479,18 @@ struct Root {
     name: String,
 }
 
-fn discover(path: &Path, cancel: &AtomicBool) -> Result<Vec<Root>, String> {
+fn discover(
+    path: &Path,
+    root_name: Option<&str>,
+    cancel: &AtomicBool,
+) -> Result<Vec<Root>, String> {
     if path.is_file() {
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+        let name = root_name
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| path.display().to_string());
         return Ok(vec![Root {
             path: path.to_path_buf(),
@@ -439,7 +521,42 @@ fn relative_name(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn open_output(options: &Options) -> Result<Box<dyn Write>, String> {
+/// Where the census is written, and how it reaches its final name.
+///
+/// A run writes to a temporary file beside the target and renames it into place
+/// only after the summary is written and flushed, so a reader never sees a
+/// half-written census and an interrupted run never replaces the previous one.
+struct Output {
+    writer: Box<dyn Write>,
+    /// `(temporary, target)`, present when writing to a file.
+    publish: Option<(PathBuf, PathBuf)>,
+}
+
+impl Output {
+    fn finish(mut self) -> Result<(), String> {
+        self.writer.flush().map_err(|err| err.to_string())?;
+        let Some((temporary, target)) = self.publish.take() else {
+            return Ok(());
+        };
+        drop(self.writer);
+        fs::rename(&temporary, &target).map_err(|err| {
+            format!(
+                "cannot publish {} as {}: {err}",
+                temporary.display(),
+                target.display()
+            )
+        })
+    }
+
+    /// Removes the temporary file of a run that did not finish.
+    fn abandon(&mut self) {
+        if let Some((temporary, _)) = self.publish.take() {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
+fn open_output(options: &Options) -> Result<Output, String> {
     match &options.output {
         Some(path) => {
             if path.exists() && !options.overwrite {
@@ -448,11 +565,20 @@ fn open_output(options: &Options) -> Result<Box<dyn Write>, String> {
                     path.display()
                 ));
             }
-            let file = File::create(path)
-                .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
-            Ok(Box::new(file))
+            let mut temporary = path.clone().into_os_string();
+            temporary.push(".part");
+            let temporary = PathBuf::from(temporary);
+            let file = File::create(&temporary)
+                .map_err(|err| format!("cannot write {}: {err}", temporary.display()))?;
+            Ok(Output {
+                writer: Box::new(file),
+                publish: Some((temporary, path.clone())),
+            })
         }
-        None => Ok(Box::new(std::io::stdout())),
+        None => Ok(Output {
+            writer: Box::new(std::io::stdout()),
+            publish: None,
+        }),
     }
 }
 
@@ -464,6 +590,19 @@ impl Engine<'_> {
     fn stop(&mut self, limit: &'static str) {
         if self.stopped.is_none() {
             self.stopped = Some(limit);
+        }
+    }
+
+    /// Records a declared-archive candidate that the bytes did not open.
+    fn reject(&mut self, chain: &str, depth: usize, entry_type: Option<u8>, error: String) {
+        self.rejected += 1;
+        if self.rejections.len() < REJECTION_SAMPLES {
+            self.rejections.push(json!({
+                "archive": chain,
+                "depth": depth,
+                "row_type": entry_type,
+                "error": error,
+            }));
         }
     }
 
@@ -508,6 +647,7 @@ impl Engine<'_> {
             for (key, bucket) in &rows {
                 self.apply(key, bucket);
             }
+            self.record_types(name, &tally.types);
             self.fold(&tally);
             self.resumed += 1;
             return Ok(());
@@ -575,8 +715,9 @@ impl Engine<'_> {
             // An RPF9 payload is an archive. A row whose declared type is the
             // archive type is a candidate even when no payload was read: a
             // metadata pass must still find archives it has not opened yet.
-            let archive_candidate = classification.format_id() == Some("rpf9")
-                || classification.declared_asset() == Some("rpf");
+            let payload_is_archive = classification.format_id() == Some("rpf9");
+            let archive_candidate =
+                payload_is_archive || classification.declared_asset() == Some("rpf");
             if !archive_candidate {
                 continue;
             }
@@ -599,16 +740,24 @@ impl Engine<'_> {
                         }));
                     }
                 }
-                Err(err) => {
+                // The payload's own magic said archive, so not opening it is a
+                // failure to read an archive.
+                Err(err) if payload_is_archive => {
                     self.failures.push(json!({
                         "archive": selector,
                         "depth": depth + 1,
                         "error": err,
                     }));
                 }
+                // Only the row's declared type suggested an archive. The bytes
+                // did not open as one, which is not a failure to read an
+                // archive: it is this census declining to call the entry one.
+                // The row keeps its own classification, and the payload pass
+                // says what it actually holds.
+                Err(err) => self.reject(&selector, depth + 1, classification.entry_type, err),
             }
         }
-        self.merge(&buckets, &tally);
+        self.merge(name, &buckets, &tally);
         if let Some(journal) = self.journal.as_ref() {
             // A stopped archive keeps its rows but is never resumed as done.
             let complete = self.stopped.is_none();
@@ -618,16 +767,29 @@ impl Engine<'_> {
     }
 
     /// Folds one archive's contribution into the run, exactly once.
-    fn merge(&mut self, buckets: &BTreeMap<Key, Bucket>, tally: &Tally) {
+    fn merge(&mut self, name: &str, buckets: &BTreeMap<Key, Bucket>, tally: &Tally) {
         for (key, bucket) in buckets {
             self.apply(key, bucket);
         }
+        self.record_types(name, &tally.types);
         self.fold(tally);
+    }
+
+    /// Remembers that `name` holds each of `types`, so the archives of a type
+    /// are counted exactly and never by a representative list.
+    fn record_types(&mut self, name: &str, types: &BTreeSet<Option<u8>>) {
+        for type_id in types {
+            self.types
+                .entry(*type_id)
+                .or_default()
+                .archives
+                .insert(name.to_string());
+        }
     }
 
     /// Adds one combination's rows, without its counters.
     fn apply(&mut self, key: &Key, bucket: &Bucket) {
-        *self.types.entry(key.entry_type).or_default() += bucket.entries;
+        self.types.entry(key.entry_type).or_default().entries += bucket.entries;
         let samples = self.options.samples;
         let existing = self.buckets.entry(key.clone()).or_default();
         existing.entries += bucket.entries;
@@ -763,6 +925,7 @@ impl Engine<'_> {
         payload_len: Option<u64>,
     ) {
         tally.entries += 1;
+        tally.types.insert(classification.entry_type);
         match classification.payload.name() {
             "decoded" => {
                 tally.probed += 1;
@@ -862,7 +1025,13 @@ impl Engine<'_> {
         let types: Vec<Value> = self
             .types
             .iter()
-            .map(|(type_id, entries)| json!({ "type": type_id, "entries": entries }))
+            .map(|(type_id, count)| {
+                json!({
+                    "type": type_id,
+                    "entries": count.entries,
+                    "archives": count.archives.len(),
+                })
+            })
             .collect();
         // Every entry has exactly one outcome, so these counts add up to the
         // entry count.
@@ -875,17 +1044,32 @@ impl Engine<'_> {
             "schema": CENSUS_SCHEMA,
             "root": roots.first().map(|root| root.name.clone()),
             "roots": roots.len(),
+            "metadata_only": self.options.metadata_only,
             "archives": self.archives,
             "resumed_archives": self.resumed,
             "entries": self.entries,
             "spooled_bytes": self.spooled,
             "stopped": self.stopped,
+            // What a caller needs in order to decide whether this summary may
+            // be treated as a complete census of the root. `complete` is about
+            // enumeration: an entry whose payload could not be decoded is still
+            // an entry that was enumerated, and its outcome says so. A stopped
+            // run cannot say how many rows it never reached, so it says that it
+            // stopped instead of inventing a count.
+            "completion": {
+                "complete": self.stopped.is_none() && self.failures.is_empty(),
+                "stopped": self.stopped,
+                "failed_archives": self.failures.len(),
+                "roots_discovered": roots.len(),
+                "roots_opened": self.roots_opened,
+            },
             "coverage": {
                 "roots_discovered": roots.len(),
                 "roots_opened": self.roots_opened,
                 "archives_opened": self.archives,
                 "nested_archives_opened": self.archives.saturating_sub(self.roots_opened),
                 "failed_archives": self.failures.len(),
+                "rejected_archive_candidates": self.rejected,
                 "entries_enumerated": self.entries,
                 "entries_probed": self.probed,
                 "entries_decoded": self.decoded,
@@ -899,6 +1083,7 @@ impl Engine<'_> {
             "outcomes": outcomes,
             "combinations": combinations,
             "failures": self.failures,
+            "rejections": self.rejections,
         })
     }
 }

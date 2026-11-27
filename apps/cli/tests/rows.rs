@@ -122,12 +122,27 @@ fn lists_rows_with_names_types_and_readability() {
     assert_eq!(rows[0]["schema"], "leonida-forge.native-row/1");
     assert_eq!(rows[0]["type_id"], 0);
     assert_eq!(rows[0]["extension"], "rpf");
+    // The extension the application shows, and where it came from: the
+    // archive's own type table, or the engine registry recovered from the
+    // executable. Never a guess.
+    assert!(
+        matches!(
+            rows[0]["extension_source"].as_str(),
+            Some("archive" | "declared")
+        ),
+        "{}",
+        rows[0]["extension_source"]
+    );
     assert_eq!(rows[0]["namespace"], "hash64");
     assert_eq!(rows[0]["name"]["status"], "resolved");
     assert_eq!(rows[0]["name"]["candidates"][0]["name"], "packs/item.rpf");
     assert_eq!(rows[0]["contents"]["readable"], true);
     assert_eq!(rows[1]["type_id"], 255);
     assert_eq!(rows[1]["namespace"], "key32");
+    // Type 255 is not registered: no extension is declared and none is
+    // invented.
+    assert_eq!(rows[1]["extension"], Value::Null);
+    assert_eq!(rows[1]["extension_source"], Value::Null);
     assert_eq!(rows[1]["name"]["status"], "resolved");
     assert_eq!(rows[2]["name"]["status"], "unresolved");
     // 64-bit values are strings, so nothing loses precision.

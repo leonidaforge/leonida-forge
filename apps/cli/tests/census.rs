@@ -46,6 +46,17 @@ fn census(path: &Path, extra: &[&str]) -> Output {
 
 fn records(output: &Output) -> Vec<Value> {
     assert!(output.status.success(), "{}", stderr(output));
+    lines(output)
+}
+
+/// The records of a run that is expected to fail: a run that stopped at a limit
+/// or could not read an archive still writes its summary.
+fn failed_records(output: &Output) -> Vec<Value> {
+    assert!(!output.status.success(), "the run should have failed");
+    lines(output)
+}
+
+fn lines(output: &Output) -> Vec<Value> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(|line| serde_json::from_str(line).expect("a JSONL record"))
@@ -169,6 +180,17 @@ fn a_nested_archive_is_entered_and_its_rows_are_counted() {
             .any(|sample| sample["chain"] == "outer.rpf!0!0"),
         "the nested row is named by its chain"
     );
+    // The `PSIN` row is typed 0, so it was a declared-archive candidate. The
+    // bytes did not open as an archive: that is a rejected candidate, not a
+    // failure to read an archive, and the run still succeeds.
+    assert!(
+        summary["coverage"]["rejected_archive_candidates"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(summary["completion"]["failed_archives"], 0);
+    assert_eq!(summary["completion"]["complete"], true);
 }
 
 #[test]
@@ -210,10 +232,12 @@ fn an_entry_limit_stops_the_census_and_says_so() {
         &assemble(&[spec(&psin()), spec(&psin())], &[]),
     );
 
-    let records = records(&census(&path, &["--max-entries", "1"]));
+    let records = failed_records(&census(&path, &["--max-entries", "1"]));
     let summary = summary(&records);
     assert_eq!(summary["entries"], 1);
     assert_eq!(summary["stopped"], "max_entries");
+    assert_eq!(summary["completion"]["complete"], false);
+    assert_eq!(summary["completion"]["stopped"], "max_entries");
 }
 
 #[test]
@@ -319,11 +343,15 @@ fn an_unreadable_root_is_a_failure_record() {
     let path = write(temp.path(), "broken.rpf", &[0u8; 128]);
 
     let output = census(&path, &[]);
-    let records = records(&output);
+    // A run in which a root could not be opened did not do what was asked, so
+    // it fails even though it wrote a summary.
+    let records = failed_records(&output);
     let summary = summary(&records);
     assert_eq!(summary["archives"], 0);
     assert_eq!(summary["entries"], 0);
     assert_eq!(summary["failures"].as_array().unwrap().len(), 1);
+    assert_eq!(summary["completion"]["complete"], false);
+    assert_eq!(summary["completion"]["failed_archives"], 1);
 }
 
 /// The journal lines written so far.
@@ -416,7 +444,7 @@ fn an_archive_that_stopped_short_is_walked_again() {
     let log = temp.path().join("run.journal.jsonl");
     let args = journalled(&log, "run-1");
 
-    let stopped = records(&census(
+    let stopped = failed_records(&census(
         &path,
         &strings(&with(&args, &["--max-entries", "1"])),
     ));
@@ -446,7 +474,7 @@ fn a_finished_nested_archive_survives_an_interrupted_root() {
     let args = journalled(&log, "run-1");
 
     // The nested archive finishes, then the entry limit stops the root.
-    let stopped = records(&census(
+    let stopped = failed_records(&census(
         &path,
         &strings(&with(&args, &["--recursive", "--max-entries", "4"])),
     ));
@@ -465,4 +493,172 @@ fn a_finished_nested_archive_survives_an_interrupted_root() {
     let resumed = records(&census(&path, &strings(&with(&args, &["--recursive"]))));
     assert_eq!(summary(&resumed)["entries"], 5);
     assert_eq!(summary(&resumed)["archives"], 2);
+}
+
+#[test]
+fn a_root_name_prefixes_every_chain_and_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let inner = assemble(&[spec(&psin())], &[]);
+    let mut row = spec(&inner);
+    row.type_id = 0;
+    let path = write(
+        temp.path(),
+        "core_bvh4.rpf",
+        &assemble(&[row, spec(&psin())], &[]),
+    );
+
+    let records = records(&census(
+        &path,
+        &["--recursive", "--root-name", "pack/core_bvh4/core_bvh4.rpf"],
+    ));
+    let summary = summary(&records);
+    // Two roots that share a basename stay distinct: the identity is the path
+    // relative to the installation, not the file name.
+    assert_eq!(summary["root"], "pack/core_bvh4/core_bvh4.rpf");
+    let nested = summary["combinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|combination| combination["identification"] == "format:psin")
+        .expect("the nested row");
+    assert!(
+        nested["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|sample| sample["chain"] == "pack/core_bvh4/core_bvh4.rpf!0!0"),
+        "the chain carries the installation-relative path"
+    );
+}
+
+#[test]
+fn a_type_reports_the_archives_that_hold_it_exactly() {
+    let temp = tempfile::tempdir().unwrap();
+    // Three nested archives, each holding one row of type 88 with a different
+    // header shape, so no single combination is present in more than one
+    // archive. A count taken from the largest combination would answer one;
+    // the exact count is three.
+    let mut rows = Vec::new();
+    for word in [0x0000_0123u32, 0x0000_0000, 0x5000_0000] {
+        let mut payload = vec![0u8; 8];
+        payload.extend_from_slice(&0x5000_0310u64.to_le_bytes());
+        payload.extend_from_slice(&word.to_le_bytes());
+        payload.extend_from_slice(&word.to_le_bytes());
+        let mut inner = spec(&payload);
+        inner.type_id = 88;
+        let mut outer = spec(&assemble(&[inner], &[]));
+        outer.type_id = 0;
+        rows.push(outer);
+    }
+    let path = write(temp.path(), "spread.rpf", &assemble(&rows, &[]));
+
+    let records = records(&census(&path, &["--recursive"]));
+    let summary = summary(&records);
+    let resources = summary["types"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == 88)
+        .expect("the resource type");
+    assert_eq!(resources["entries"], 3);
+    assert_eq!(resources["archives"], 3);
+    // The combinations really are apart, or the test would prove nothing.
+    let per_combination: u64 = summary["combinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|combination| combination["type"] == 88)
+        .map(|combination| combination["archive_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(per_combination, 3);
+    let largest = summary["combinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|combination| combination["type"] == 88)
+        .map(|combination| combination["archive_count"].as_u64().unwrap())
+        .max()
+        .unwrap();
+    assert_eq!(largest, 1);
+}
+
+#[test]
+fn a_metadata_pass_reports_entries_as_not_probed() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(
+        temp.path(),
+        "metadata.rpf",
+        &assemble(&[spec(&psin()), spec(&[0u8; 24])], &[]),
+    );
+
+    let records = records(&census(&path, &["--metadata-only"]));
+    let summary = summary(&records);
+    assert_eq!(summary["entries"], 2);
+    assert_eq!(summary["metadata_only"], true);
+    assert_eq!(summary["coverage"]["entries_probed"], 0);
+    // Nothing was read, so nothing was blocked and nothing was identified.
+    assert_eq!(summary["outcomes"]["not-probed"], 2);
+    assert_eq!(summary["outcomes"]["blocked"], Value::Null);
+    assert_eq!(summary["completion"]["complete"], true);
+}
+
+#[test]
+fn a_completed_census_is_published_only_once_it_is_finished() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "atomic.rpf", &assemble(&[spec(&psin())], &[]));
+    let target = temp.path().join("out.jsonl");
+
+    let output = census(
+        &path,
+        &["--output", target.to_str().unwrap(), "--overwrite"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("\"record\":\"summary\""));
+
+    // The run writes beside the target and renames: no partial file is left.
+    let parts = std::fs::read_dir(temp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+        .count();
+    assert_eq!(parts, 0);
+
+    // A run that stopped still publishes its summary, because what it counted
+    // is evidence, but it fails so a caller cannot take it for a complete one.
+    let stopped = census(
+        &path,
+        &[
+            "--output",
+            target.to_str().unwrap(),
+            "--overwrite",
+            "--max-entries",
+            "0",
+        ],
+    );
+    assert!(!stopped.status.success());
+    let written = std::fs::read_to_string(&target).unwrap();
+    assert!(written.contains("\"stopped\":\"max_entries\""));
+}
+
+#[test]
+fn a_journal_with_a_truncated_last_record_takes_the_next_append() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write(temp.path(), "torn.rpf", &assemble(&[spec(&psin())], &[]));
+    let log = temp.path().join("run.journal.jsonl");
+    // A run killed between a record's bytes and its newline.
+    std::fs::write(&log, "{\"identity\":\"run-1\",\"archive\":\"torn.rpf!9\"").unwrap();
+
+    let records = records(&census(&path, &strings(&journalled(&log, "run-1"))));
+    assert_eq!(summary(&records)["entries"], 1);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let complete: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("\"complete\""))
+        .collect();
+    assert_eq!(complete.len(), 1, "the new record is readable: {text}");
+    let record: Value = serde_json::from_str(complete[0]).expect("a whole record");
+    assert_eq!(record["complete"], true);
+    assert_eq!(record["tally"]["entries"], 1);
 }
