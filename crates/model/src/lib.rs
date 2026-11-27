@@ -515,6 +515,13 @@ fn build_scene(
     let mut geometry_failures = 0usize;
     let mut declared_geometries = 0usize;
     let mut associated_geometries = 0usize;
+    // The declared per-geometry boxes are the record's own statement of where a
+    // geometry sits in model space. Comparing them with the decoded vertices is
+    // the evidence that a vertex is already in the space the drawable draws in,
+    // which is a different question from whether its influences decode.
+    let mut bounds_checked = 0usize;
+    let mut bounds_matched = 0usize;
+    let mut bounds_worst_delta = 0f32;
     let mut pending_associations: Vec<(usize, usize, Influence, u16)> = Vec::new();
     let base_name = match label {
         Some(label) => label.to_string(),
@@ -539,6 +546,24 @@ fn build_scene(
             }
             match decode_geometry(graphics, geometry, bone_count, &mut diagnostics) {
                 Ok((mut primitive, influence)) => {
+                    if let Some(declared) = model
+                        .bounds
+                        .as_ref()
+                        .and_then(|bounds| bounds.per_geometry.get(geometry_index))
+                    {
+                        let (low, high) = primitive_bounds(&primitive);
+                        let delta = low
+                            .iter()
+                            .zip(declared.min.iter())
+                            .chain(high.iter().zip(declared.max.iter()))
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        bounds_checked += 1;
+                        bounds_worst_delta = bounds_worst_delta.max(delta);
+                        if delta <= BOUNDS_TOLERANCE {
+                            bounds_matched += 1;
+                        }
+                    }
                     primitive.material = material;
                     let mesh_index = scene.meshes.len();
                     let primitive_index = mesh.primitives.len();
@@ -614,8 +639,22 @@ fn build_scene(
                 "a geometry's bone association is unresolved, so no placement rule is established: {reason}"
             ),
         },
+        _ if bounds_checked == 0 => PlacementCompleteness::Unverified {
+            reason: "the record declares no geometry bounds, so the space the vertices are stored in is not established".to_string(),
+        },
+        _ if bounds_matched < bounds_checked => PlacementCompleteness::Unverified {
+            reason: format!(
+                "{} of {bounds_checked} decoded geometries differ from their declared bounds by up to {bounds_worst_delta}, so the vertex space is not established",
+                bounds_checked - bounds_matched
+            ),
+        },
         _ => PlacementCompleteness::NotRequired,
     };
+    if bounds_checked > 0 {
+        scene.diagnostics.push(Diagnostic::new(format!(
+            "coordinate space: {bounds_matched} of {bounds_checked} decoded geometries match their declared bounds, worst delta {bounds_worst_delta}"
+        )));
+    }
     Ok(BuiltScene {
         scene,
         texture_bindings,
@@ -2043,3 +2082,28 @@ mod tests;
 #[cfg(test)]
 #[path = "skeleton_tests.rs"]
 mod skeleton_tests;
+
+/// Tolerance for a decoded geometry against the box the record declares.
+///
+/// The declared box and the vertices are both `f32`, but the vertices come from
+/// quantised attributes, so the two statements agree to a fraction of a unit
+/// rather than exactly. A geometry that sits in a bone-local space instead of
+/// the drawable's own space misses its declared box by far more than this.
+const BOUNDS_TOLERANCE: f32 = 5e-3;
+
+/// The corner points of a primitive's vertex box.
+fn primitive_bounds(primitive: &Primitive) -> ([f32; 3], [f32; 3]) {
+    let mut low = [f32::INFINITY; 3];
+    let mut high = [f32::NEG_INFINITY; 3];
+    for vertex in &primitive.vertices {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(vertex.position[axis]);
+            high[axis] = high[axis].max(vertex.position[axis]);
+        }
+    }
+    if low[0].is_infinite() {
+        ([0.0; 3], [0.0; 3])
+    } else {
+        (low, high)
+    }
+}
