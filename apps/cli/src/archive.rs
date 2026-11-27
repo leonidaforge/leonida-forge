@@ -401,6 +401,51 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Verify every entry of one chunk encoding by decoding it in full and
+    /// hashing the result
+    Verify {
+        /// An archive file, or a directory searched recursively for .rpf files
+        path: PathBuf,
+        /// The name to report a single archive under, normally its
+        /// installation-relative path
+        #[arg(long)]
+        root_name: Option<String>,
+        /// Descend into an archive stored in the previous one before verifying
+        /// its rows: `row:N` for a native RPF9 row
+        #[arg(long = "enter", value_name = "SELECTOR")]
+        enters: Vec<crate::nested::Selector>,
+        /// The executable to recognize the metadata key provider in. Required
+        /// only for encrypted metadata
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// The chunk encoding to decode in full
+        #[arg(long, default_value_t = 4)]
+        encoding: u8,
+        /// Enter archives stored inside an archive
+        #[arg(long)]
+        recursive: bool,
+        /// Where to write the record stream. Defaults to standard output
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Replace the output file if it already exists
+        #[arg(long)]
+        overwrite: bool,
+        /// Archives in a chain, counting the root
+        #[arg(long, default_value_t = crate::verify::Limits::default().max_depth)]
+        max_depth: usize,
+        /// Archives opened, roots included
+        #[arg(long, default_value_t = crate::verify::Limits::default().max_archives)]
+        max_archives: u64,
+        /// Entries examined, all archives included
+        #[arg(long, default_value_t = crate::verify::Limits::default().max_entries)]
+        max_entries: u64,
+        /// Largest nested archive copied to temporary storage
+        #[arg(long, default_value_t = crate::verify::Limits::default().max_nested_bytes)]
+        max_nested_bytes: u64,
+        /// Total bytes copied to temporary storage
+        #[arg(long, default_value_t = crate::verify::Limits::default().max_spool_bytes)]
+        max_spool_bytes: u64,
+    },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
     #[command(group(
@@ -452,6 +497,43 @@ pub fn run(command: Command) -> Result<(), String> {
             json,
         } => resource(&file, id, no_cache, drawable, dictionary, record, json),
         Command::Registry { json } => crate::registry::run(json),
+        Command::Verify {
+            path,
+            root_name,
+            enters,
+            executable,
+            encoding,
+            recursive,
+            output,
+            overwrite,
+            max_depth,
+            max_archives,
+            max_entries,
+            max_nested_bytes,
+            max_spool_bytes,
+        } => {
+            let cancel = AtomicBool::new(false);
+            crate::verify::run(
+                &crate::verify::Options {
+                    path,
+                    root_name,
+                    enters,
+                    executable,
+                    encoding,
+                    recursive,
+                    output,
+                    overwrite,
+                    limits: crate::verify::Limits {
+                        max_depth,
+                        max_archives,
+                        max_entries,
+                        max_nested_bytes,
+                        max_spool_bytes,
+                    },
+                },
+                &cancel,
+            )
+        }
         Command::Census {
             path,
             executable,

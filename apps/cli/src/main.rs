@@ -14,6 +14,7 @@ mod probe;
 mod recover;
 mod registry;
 mod rows;
+mod verify;
 
 use std::process::ExitCode;
 
