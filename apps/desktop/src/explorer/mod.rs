@@ -2146,18 +2146,22 @@ fn open_image_viewer(path: PathBuf, access: Access, cx: &mut App) {
 /// (fragment) and type 4 (drawable dictionary) rows are model resources; a
 /// recovered resource needs a content check first because the recovery tree
 /// also holds texture dictionaries and other resources.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelEntryKind {
     Direct,
     Sniff,
 }
 
 fn model_entry_kind(entry: &Entry) -> Option<ModelEntryKind> {
-    if entry.type_name.starts_with("RPF9 entry, type 2")
-        || entry.type_name.starts_with("RPF9 entry, type 3")
-        || entry.type_name.starts_with("RPF9 entry, type 4")
-    {
-        return Some(ModelEntryKind::Direct);
+    // The declared asset class chooses the candidate. It does not decide what
+    // the payload is: the decoded segments do that, so a declared model row
+    // that holds something else still opens as what it holds.
+    match entry.resource_type {
+        Some(2) | Some(3) | Some(4) => return Some(ModelEntryKind::Direct),
+        // A declared archive or texture dictionary has its own viewer path and
+        // is never a model candidate.
+        Some(0) | Some(5) => return None,
+        Some(_) | None => {}
     }
     if entry.type_name == "RAGE resource" {
         return Some(ModelEntryKind::Sniff);
@@ -2383,5 +2387,85 @@ mod export_tests {
         assert_eq!(stage_label(Stage::VERIFYING), "Authenticating…");
         assert_eq!(stage_label(Stage::SCANNING), "Scanning…");
         assert_eq!(stage_label(Stage::OPENING), "Indexing archive…");
+    }
+
+    fn native_row(name: &str, type_id: u8, size: u64) -> Entry {
+        let mut entry = Entry::new(
+            name.to_string(),
+            PathBuf::from(name),
+            EntryKind::File,
+            Some(size),
+            None,
+        );
+        entry.type_name = format!("RPF9 entry, type {type_id} (ext)");
+        entry.resource_type = Some(type_id);
+        entry
+    }
+
+    #[test]
+    fn a_declared_model_row_is_a_model_candidate() {
+        // Drawable, fragment and drawable dictionary.
+        for (type_id, name) in [(2u8, "Row 00000"), (3, "Row 00001"), (4, "Row 00002")] {
+            let entry = native_row(name, type_id, 4 << 20);
+            assert_eq!(
+                model_entry_kind(&entry),
+                Some(ModelEntryKind::Direct),
+                "type {type_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_declared_container_is_not_a_model_candidate() {
+        // An archive and a texture dictionary keep their own opening path.
+        for type_id in [0u8, 5] {
+            let entry = native_row("Row 00000", type_id, 4 << 20);
+            assert_eq!(model_entry_kind(&entry), None, "type {type_id}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_resource_is_sniffed_by_content() {
+        let entry = Entry::new(
+            "Row 00000".into(),
+            PathBuf::from("Row 00000"),
+            EntryKind::File,
+            Some(1 << 20),
+            None,
+        );
+        assert_eq!(model_entry_kind(&entry), Some(ModelEntryKind::Sniff));
+    }
+
+    #[test]
+    fn a_large_or_image_file_is_not_sniffed() {
+        let large = Entry::new(
+            "huge.bin".into(),
+            PathBuf::from("huge.bin"),
+            EntryKind::File,
+            Some((64 << 20) + 1),
+            None,
+        );
+        assert_eq!(model_entry_kind(&large), None);
+
+        let image = Entry::new(
+            "preview.png".into(),
+            PathBuf::from("preview.png"),
+            EntryKind::File,
+            Some(1 << 20),
+            None,
+        );
+        assert_eq!(model_entry_kind(&image), None);
+    }
+
+    #[test]
+    fn a_folder_is_never_a_model_candidate() {
+        let folder = Entry::new(
+            "folder".into(),
+            PathBuf::from("folder"),
+            EntryKind::Directory,
+            None,
+            None,
+        );
+        assert_eq!(model_entry_kind(&folder), None);
     }
 }
