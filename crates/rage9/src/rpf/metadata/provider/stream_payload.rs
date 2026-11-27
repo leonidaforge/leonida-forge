@@ -6,14 +6,15 @@
 //! the archive data without decoding a whole resource.
 //!
 //! The selection probe uses the stored stream. For a chunked entry every zlib
-//! chunk must inflate to its declared logical size under the candidate key
-//! state, and its Adler-32 must match. For a raw DEFLATE entry, which has no
-//! checksum, the whole stream must decode to the declared logical size and end
-//! at the last stored byte. A stream that cannot be verified this way is
+//! chunk that fits in the probe must inflate to its declared logical size
+//! under the candidate key state, and its Adler-32 must match. For a raw
+//! DEFLATE entry, which has no checksum, the whole stream is read through the
+//! transform in bounded steps and must decode to the declared logical size and
+//! end at the last stored byte. A stream that cannot be verified this way is
 //! refused rather than decoded speculatively.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::Arc;
 
 use flate2::read::ZlibDecoder;
@@ -22,11 +23,17 @@ use lforge_binary::Source;
 
 use super::stream_block::EncodedStreamBlock;
 use crate::rpf::metadata::payload::{StreamTransform, apply_transform};
-use crate::rpf::metadata::transform::{BlockDecrypt, CipherDescriptor, StreamRange};
-use crate::rpf::metadata::{ChunkTable, Entry};
+use crate::rpf::metadata::transform::{BLOCK_LEN, BlockDecrypt, CipherDescriptor, StreamRange};
+use crate::rpf::metadata::{Chunk, ChunkTable, Entry};
 
-/// Stored bytes read to select and verify a transform key table.
+/// Stored bytes read to select a key state for a chunked stream. The probe
+/// decides selection only: reading and extraction stream the rest of the
+/// stored payload through [`StreamTransform`].
 pub const PROBE_LIMIT: u64 = 8 * 1024 * 1024;
+/// Stored bytes read per step while decoding a raw DEFLATE stream.
+const STREAM_STEP: usize = 64 * 1024;
+/// Bytes inflated per step while verifying a chunk or a stream.
+const INFLATE_STEP: usize = 64 * 1024;
 const ZLIB_METHOD: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,43 +142,61 @@ pub fn prepare_stream_transform(
             source.len()
         )));
     }
-    let prefix_len = location.stored_len.min(PROBE_LIMIT);
-    let mut prefix = source
-        .slice(location.payload_offset, prefix_len)
-        .map_err(|err| StreamTransformError::Read(err.to_string()))?;
-    let mut bytes = Vec::with_capacity(prefix_len as usize);
-    prefix
-        .read_to_end(&mut bytes)
-        .map_err(|err| StreamTransformError::Read(err.to_string()))?;
     let views: Vec<&dyn BlockDecrypt> = blocks
         .iter()
         .map(|block| block as &dyn BlockDecrypt)
         .collect();
-    let index = match table {
-        Some(table) => {
-            select_chunk_block(&bytes, table, location.stored_len, cipher, range, &views)
-        }
-        None if location.mode == 1 => {
-            // A raw DEFLATE stream has no checksum, so the whole stream is
-            // decoded and must reach its declared size and end.
-            if bytes.len() as u64 != location.stored_len {
-                return Err(StreamTransformError::Unverifiable(
-                    "the stored stream is larger than the probe limit",
-                ));
-            }
-            select_deflate_block(&bytes, location.logical_len, cipher, range, &views)
-        }
-        None => None,
-    }
-    .ok_or(StreamTransformError::Unverifiable(
-        "no candidate key state verified the stored stream",
-    ))?;
     let base = match table {
         Some(table) => table
             .stored_prefix(location.stored_len)
             .map_err(|err| StreamTransformError::StoredRange(err.to_string()))?,
         None => 0,
     };
+    let index = match table {
+        Some(table) => {
+            // Only selection reads a prefix; the stream itself is transformed
+            // on demand when the payload is read.
+            let probe_len = location.stored_len.min(PROBE_LIMIT);
+            let mut prefix = source
+                .slice(location.payload_offset, probe_len)
+                .map_err(|err| StreamTransformError::Read(err.to_string()))?;
+            let mut bytes = Vec::with_capacity(probe_len as usize);
+            prefix
+                .read_to_end(&mut bytes)
+                .map_err(|err| StreamTransformError::Read(err.to_string()))?;
+            if !probe_holds_first_chunk(table, base, &bytes) {
+                return Err(StreamTransformError::Unverifiable(
+                    "the first chunk is larger than the probe limit",
+                ));
+            }
+            select_chunk_block(
+                &bytes,
+                table,
+                base,
+                location.stored_len,
+                cipher,
+                range,
+                &views,
+            )
+        }
+        None if location.mode == 1 => {
+            // A raw DEFLATE stream has no checksum, so it is decoded to its
+            // end in bounded steps and must reach its declared size.
+            select_deflate_block(
+                source,
+                location.payload_offset,
+                location.stored_len,
+                location.logical_len,
+                cipher,
+                range,
+                &views,
+            )
+        }
+        None => None,
+    }
+    .ok_or(StreamTransformError::Unverifiable(
+        "no candidate key state verified the stored stream",
+    ))?;
     let mut blocks = blocks;
     let block = blocks.swap_remove(index);
     Ok(StreamTransform::new(
@@ -183,36 +208,54 @@ pub fn prepare_stream_transform(
     ))
 }
 
-/// The index of the candidate key state under which every zlib chunk of the
-/// stream inflates to its declared size.
+/// Whether the probe holds the whole first chunk, without which no candidate
+/// can be tested. A table with no chunk has nothing to verify either.
+fn probe_holds_first_chunk(table: &ChunkTable, prefix: u64, probe: &[u8]) -> bool {
+    let Some(first) = table.chunks.first() else {
+        return true;
+    };
+    let Some(compressed) = first.stored_len.checked_sub(first.padding) else {
+        return false;
+    };
+    prefix
+        .checked_add(u64::from(compressed))
+        .is_some_and(|end| end <= probe.len() as u64)
+}
+
+/// The index of the candidate key state under which every zlib chunk the probe
+/// holds inflates to its declared size.
 fn select_chunk_block(
     stored: &[u8],
     table: &ChunkTable,
+    prefix: u64,
     stored_len: u64,
     cipher: &CipherDescriptor,
     range: StreamRange,
     blocks: &[&dyn BlockDecrypt],
 ) -> Option<usize> {
-    let prefix = table.stored_prefix(stored_len).ok()?;
     blocks
         .iter()
-        .position(|block| verifies_chunks(stored, table, prefix, cipher, *block, range))
+        .position(|block| verifies_chunks(stored, table, prefix, stored_len, cipher, *block, range))
 }
 
-/// Whether `block` decodes every zlib chunk of the stream to its declared
+/// Whether `block` decodes every zlib chunk the probe holds to its declared
 /// logical size under `range`. Each zlib chunk carries an Adler-32, so a wrong
-/// key state or range fails. A stream with no zlib chunk cannot be verified
-/// and is refused.
+/// key state or range fails. A probe that ends inside a chunk verifies the
+/// chunks before it; a stream with no zlib chunk in the probe cannot be
+/// verified and is refused.
 fn verifies_chunks(
     stored: &[u8],
     table: &ChunkTable,
     prefix: u64,
+    stored_len: u64,
     cipher: &CipherDescriptor,
     block: &dyn BlockDecrypt,
     range: StreamRange,
 ) -> bool {
+    let Some(stream_len) = stored_len.checked_sub(prefix) else {
+        return false;
+    };
     let mut start = prefix;
-    let stream_len = stored.len() as u64 - prefix;
     // Transformed on demand, so a short probe stays cheap for the common
     // first-chunk case.
     let mut plain: Vec<u8> = Vec::new();
@@ -225,7 +268,10 @@ fn verifies_chunks(
             return false;
         };
         if end > stored.len() as u64 {
-            return false;
+            // The probe ends here. Everything before it has been verified
+            // against the real stream length, which is what the tail region
+            // is measured from.
+            break;
         }
         if plain.len() < end as usize {
             let from = plain.len();
@@ -244,16 +290,10 @@ fn verifies_chunks(
                 );
             }
         }
-        if chunk.method == ZLIB_METHOD {
-            let mut decoder = ZlibDecoder::new(&plain[start as usize..end as usize]);
-            let mut output = Vec::new();
-            if decoder.read_to_end(&mut output).is_err()
-                || output.len() != chunk.logical_len as usize
-            {
-                return false;
-            }
-            verified = true;
+        if !inflates_to(chunk, &plain[start as usize..end as usize]) {
+            return false;
         }
+        verified |= chunk.method == ZLIB_METHOD;
         let Some(next) = start.checked_add(u64::from(chunk.stored_len)) else {
             return false;
         };
@@ -262,62 +302,162 @@ fn verifies_chunks(
     verified
 }
 
+/// Whether a chunk's stored bytes inflate to exactly its declared logical
+/// size. A zlib chunk also has to reach its Adler-32. Output is counted in a
+/// fixed buffer, so a wrong size fails without allocating the decoded chunk.
+fn inflates_to(chunk: &Chunk, stored: &[u8]) -> bool {
+    if chunk.method != ZLIB_METHOD {
+        return true;
+    }
+    let expected = u64::from(chunk.logical_len);
+    let mut decoder = ZlibDecoder::new(stored);
+    let mut buffer = [0u8; INFLATE_STEP];
+    let mut total = 0u64;
+    loop {
+        match decoder.read(&mut buffer) {
+            Ok(0) => return total == expected,
+            Ok(n) => {
+                total += n as u64;
+                if total > expected {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 /// The index of the candidate key state under which the raw DEFLATE stream
 /// decodes to `logical_len` bytes and ends at the last stored byte.
 fn select_deflate_block(
-    stored: &[u8],
+    source: &Source,
+    offset: u64,
+    stored_len: u64,
     logical_len: u64,
     cipher: &CipherDescriptor,
     range: StreamRange,
     blocks: &[&dyn BlockDecrypt],
 ) -> Option<usize> {
-    blocks
-        .iter()
-        .position(|block| verifies_deflate(stored, logical_len, cipher, *block, range))
+    blocks.iter().position(|block| {
+        verifies_deflate(
+            source,
+            offset,
+            stored_len,
+            logical_len,
+            cipher,
+            *block,
+            range,
+        )
+    })
 }
 
 /// Whether `block` decodes the stored bytes under `range` to exactly
 /// `logical_len` bytes, ending at the last stored byte.
+///
+/// The stream is read through the transform in bounded steps, so the stored
+/// size never has to fit in memory. Raw DEFLATE has no checksum: the exact
+/// size, the stream end and zero trailing bytes are structural checks, not
+/// authentication.
 fn verifies_deflate(
-    stored: &[u8],
+    source: &Source,
+    offset: u64,
+    stored_len: u64,
     logical_len: u64,
     cipher: &CipherDescriptor,
     block: &dyn BlockDecrypt,
     range: StreamRange,
 ) -> bool {
-    let mut plain = stored.to_vec();
-    let stream_len = plain.len() as u64;
-    apply_transform(&mut plain, 0, stream_len, cipher.parameter, block, range);
+    let Ok(slice) = source.slice(offset, stored_len) else {
+        return false;
+    };
+    let mut reader = Transformed {
+        source: slice,
+        stream_len: stored_len,
+        parameter: cipher.parameter,
+        block,
+        range,
+        pos: 0,
+    };
     let mut decoder = Decompress::new(false);
-    let mut output = [0u8; 64 * 1024];
+    let mut input = [0u8; STREAM_STEP];
+    let mut output = [0u8; INFLATE_STEP];
+    let mut filled = 0usize;
     let mut consumed = 0usize;
-    let mut produced_total = 0u64;
+    let mut produced = 0u64;
     loop {
+        if consumed == filled {
+            match reader.read(&mut input) {
+                Ok(0) => return false,
+                Ok(n) => {
+                    filled = n;
+                    consumed = 0;
+                }
+                Err(_) => return false,
+            }
+        }
         let before_in = decoder.total_in();
         let before_out = decoder.total_out();
-        let Ok(status) = decoder.decompress(&plain[consumed..], &mut output, FlushDecompress::None)
+        let Ok(status) =
+            decoder.decompress(&input[consumed..filled], &mut output, FlushDecompress::None)
         else {
             return false;
         };
         let took = (decoder.total_in() - before_in) as usize;
-        produced_total += decoder.total_out() - before_out;
         consumed += took;
-        if produced_total > logical_len {
+        produced += decoder.total_out() - before_out;
+        if produced > logical_len {
             return false;
         }
-        match status {
-            Status::StreamEnd => {
-                // Raw DEFLATE rows may store zero padding after the stream.
-                // Any other trailing byte is unexplained and refuses the
-                // candidate.
-                return produced_total == logical_len
-                    && plain[consumed.min(plain.len())..]
-                        .iter()
-                        .all(|byte| *byte == 0);
-            }
-            _ if took == 0 => return false,
-            _ => {}
+        if status == Status::StreamEnd {
+            // Raw DEFLATE rows may store zero padding after the stream. Any
+            // other trailing byte is unexplained and refuses the candidate.
+            return produced == logical_len
+                && trailing_is_zero(&mut reader, &input[consumed..filled]);
         }
+        if took == 0 {
+            return false;
+        }
+    }
+}
+
+/// Whether every stored byte after the DEFLATE stream is zero.
+fn trailing_is_zero(reader: &mut Transformed<'_>, rest: &[u8]) -> bool {
+    if !rest.iter().all(|byte| *byte == 0) {
+        return false;
+    }
+    let mut buffer = [0u8; STREAM_STEP];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return true,
+            Ok(n) if buffer[..n].iter().all(|byte| *byte == 0) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Stored bytes with the payload transform applied on read.
+struct Transformed<'a> {
+    source: Source,
+    stream_len: u64,
+    parameter: [u8; BLOCK_LEN],
+    block: &'a dyn BlockDecrypt,
+    range: StreamRange,
+    pos: u64,
+}
+
+impl Read for Transformed<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.source.read(buffer)?;
+        apply_transform(
+            &mut buffer[..n],
+            self.pos,
+            self.stream_len,
+            self.parameter,
+            self.block,
+            self.range,
+        );
+        self.pos += n as u64;
+        Ok(n)
     }
 }
 
@@ -395,6 +535,7 @@ mod tests {
             &stored,
             &table,
             16,
+            stored.len() as u64,
             &cipher(),
             &Toy,
             common()
@@ -442,10 +583,28 @@ mod tests {
             &stored,
             &table,
             0,
+            stored.len() as u64,
             &cipher(),
             &Toy,
             common()
         ));
+    }
+
+    fn deflate_verifies(stored: &[u8], logical: u64, range: StreamRange) -> bool {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut file = temp.as_file();
+        file.write_all(stored).unwrap();
+        file.flush().unwrap();
+        let source = Source::open(temp.path()).unwrap();
+        verifies_deflate(
+            &source,
+            0,
+            stored.len() as u64,
+            logical,
+            &cipher(),
+            &Toy,
+            range,
+        )
     }
 
     #[test]
@@ -463,31 +622,13 @@ mod tests {
         let stored_len = stored.len() as u64;
         let range = common();
         apply_transform(&mut stored, 0, stored_len, cipher().parameter, &Toy, range);
-        assert!(verifies_deflate(
-            &stored,
-            text.len() as u64,
-            &cipher(),
-            &Toy,
-            range
-        ));
+        assert!(deflate_verifies(&stored, text.len() as u64, range));
 
         stored.extend_from_slice(&[0u8; 5]);
-        assert!(verifies_deflate(
-            &stored,
-            text.len() as u64,
-            &cipher(),
-            &Toy,
-            range
-        ));
+        assert!(deflate_verifies(&stored, text.len() as u64, range));
         let last = stored.len() - 1;
         stored[last] = 1;
-        assert!(!verifies_deflate(
-            &stored,
-            text.len() as u64,
-            &cipher(),
-            &Toy,
-            range
-        ));
+        assert!(!deflate_verifies(&stored, text.len() as u64, range));
     }
 
     #[test]
@@ -501,6 +642,92 @@ mod tests {
         value[0x23] = 0x00;
         let range = StreamRange::parse(&value).expect("a 0x1000 step");
         assert!(range.is_whole());
+    }
+
+    #[test]
+    fn a_descriptor_with_no_covered_bytes_is_rejected() {
+        // `a = b = t = 0` with a non-zero gap covers nothing.
+        let mut value = [0u8; 0x38];
+        value[0x28] = 5;
+        assert!(StreamRange::parse(&value).is_none());
+        // A trailing region needs a periodic step to measure the stream
+        // against, so `b = c = 0` is refused even with a tail.
+        let mut tail = [0u8; 0x38];
+        tail[0x30] = 1;
+        assert!(StreamRange::parse(&tail).is_none());
+    }
+
+    #[test]
+    fn a_descriptor_whose_field_sums_overflow_is_rejected() {
+        let mut leading = [0u8; 0x38];
+        leading[0x18..0x20].copy_from_slice(&u64::MAX.to_le_bytes());
+        leading[0x20] = 1;
+        assert!(StreamRange::parse(&leading).is_none());
+        let mut step = [0u8; 0x38];
+        step[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
+        step[0x28] = 1;
+        assert!(StreamRange::parse(&step).is_none());
+    }
+
+    #[test]
+    fn a_tail_longer_than_the_stream_covers_all_of_it() {
+        let range = StreamRange::from_parts(0, 1, 1, 1, 4096).unwrap();
+        assert!(range.covers(0, 100));
+        assert!(range.covers(99, 100));
+    }
+
+    #[test]
+    fn a_probe_selects_from_the_chunks_it_holds() {
+        let (stored, table) = two_chunks(common(), true);
+        let first_end = usize::try_from(table.chunks[0].stored_len).unwrap();
+        assert_eq!(
+            select_chunk_block(
+                &stored[..first_end],
+                &table,
+                0,
+                stored.len() as u64,
+                &cipher(),
+                common(),
+                &[&Toy]
+            ),
+            Some(0)
+        );
+        // A probe that ends inside the first chunk verifies nothing.
+        assert_eq!(
+            select_chunk_block(
+                &stored[..first_end - 1],
+                &table,
+                0,
+                stored.len() as u64,
+                &cipher(),
+                common(),
+                &[&Toy]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_deflate_verification_rejects_wrong_sizes_and_truncation() {
+        use flate2::write::DeflateEncoder;
+
+        let text: Vec<u8> = (0..40_000u32)
+            .map(|value| (value.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&text).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut stored = compressed.clone();
+        let range = common();
+        let stored_len = stored.len() as u64;
+        apply_transform(&mut stored, 0, stored_len, cipher().parameter, &Toy, range);
+        let logical = text.len() as u64;
+        assert!(deflate_verifies(&stored, logical, range));
+        assert!(!deflate_verifies(&stored, logical + 1, range));
+        assert!(!deflate_verifies(&stored, logical - 1, range));
+        let mut truncated = stored.clone();
+        truncated.truncate(stored.len() - 4);
+        assert!(!deflate_verifies(&truncated, logical, range));
     }
 
     fn two_chunks(range: StreamRange, second_is_zlib: bool) -> (Vec<u8>, ChunkTable) {
@@ -531,6 +758,7 @@ mod tests {
             select_chunk_block(
                 &stored,
                 &table,
+                0,
                 stored.len() as u64,
                 &cipher(),
                 common(),
@@ -547,6 +775,7 @@ mod tests {
             select_chunk_block(
                 &stored,
                 &table,
+                0,
                 stored.len() as u64,
                 &cipher(),
                 common(),
@@ -569,6 +798,7 @@ mod tests {
             select_chunk_block(
                 &bytes,
                 &table,
+                0,
                 bytes.len() as u64,
                 &cipher(),
                 whole(),
@@ -600,6 +830,7 @@ mod tests {
             select_chunk_block(
                 &stored,
                 &table,
+                0,
                 stored.len() as u64,
                 &cipher(),
                 common(),
@@ -631,6 +862,7 @@ mod tests {
             select_chunk_block(
                 &stored,
                 &table,
+                0,
                 stored.len() as u64,
                 &cipher(),
                 whole(),

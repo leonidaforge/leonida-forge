@@ -132,8 +132,10 @@ impl StreamRange {
     /// The shortest descriptor value that holds all four stream fields.
     pub const MIN_LEN: usize = 0x38;
 
-    /// `None` when the value is shorter than the stream fields or the fields
-    /// describe no range at all.
+    /// `None` when the value is shorter than the stream fields, a field sum
+    /// overflows, or the fields describe no covered position at all. An empty
+    /// coverage means the descriptor cannot be verified, so it is refused
+    /// rather than treated as a plaintext stream.
     pub fn parse(value: &[u8]) -> Option<Self> {
         let a = u64_at(value, 0x18)?;
         let b = u64_at(value, 0x20)?;
@@ -141,7 +143,7 @@ impl StreamRange {
         let t = u64_at(value, 0x30)?;
         let leading = a.checked_add(b)?;
         let step = b.checked_add(c)?;
-        if step == 0 {
+        if step == 0 || (leading == 0 && b == 0 && t == 0) {
             return None;
         }
         Some(Self {

@@ -69,9 +69,11 @@ impl StreamTransform {
     }
 
     fn apply(&self, buf: &mut [u8], absolute: u64) {
+        // Bytes before the stored prefix are not part of the stream, so they
+        // keep their stored value and do not advance the counter.
         let skip = self.base.saturating_sub(absolute).min(buf.len() as u64);
         let (_, rest) = buf.split_at_mut(skip as usize);
-        let origin = absolute + skip - self.base;
+        let origin = absolute.saturating_sub(self.base);
         apply_transform(
             rest,
             origin,
@@ -740,6 +742,51 @@ mod tests {
     }
 
     #[test]
+    fn every_window_matches_the_full_read() {
+        // The common shape plus a trailing region, read from every kind of
+        // boundary: start of the stream, inside the leading region, at a
+        // coverage start and end, inside a gap, at the start of the tail, and
+        // at the last byte.
+        let range = StreamRange::from_parts(0x800, 0x1C00, 0x400, 0x2000, 0x200).unwrap();
+        let parameter = [0x37; BLOCK_LEN];
+        let len = 40_000u64;
+        let plain: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+        let mut full = plain.clone();
+        apply_transform(&mut full, 0, len, parameter, &Toy, range);
+        let origins = [
+            0u64,
+            1,
+            15,
+            16,
+            0x7FF,
+            0x800,
+            0x1000,
+            0x23FF,
+            0x2400,
+            0x27FF,
+            0x2800,
+            len - 0x200,
+            len - 1,
+            len - 16,
+        ];
+        for origin in origins {
+            for size in [1usize, 7, 16, 17, 64, 0x200] {
+                let end = usize::try_from(origin).unwrap() + size;
+                let end = end.min(len as usize);
+                // A window starts from the stored bytes it covers, not from
+                // zeros: the transform XORs its keystream into them.
+                let mut window = plain[origin as usize..end].to_vec();
+                apply_transform(&mut window, origin, len, parameter, &Toy, range);
+                assert_eq!(
+                    &window[..],
+                    &full[origin as usize..end],
+                    "window {origin:#x}+{size} differs from the full read"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn streaming_payload_matches_the_decoded_chunk() {
         use flate2::Compression;
         use flate2::write::ZlibEncoder;
@@ -928,5 +975,53 @@ mod tests {
         let mut out = Vec::new();
         payload.read_to_end(&mut out).unwrap();
         assert_eq!(out, [a, b].concat());
+    }
+
+    #[test]
+    fn small_reads_match_the_whole_transformed_payload() {
+        let parameter = [0x2Bu8; BLOCK_LEN];
+        let a = vec![0x31u8; 9_000];
+        let b = vec![0xC7u8; 11_000];
+        let (ca, cb) = (zlib(&a), zlib(&b));
+        let mut stored = [ca.clone(), cb.clone()].concat();
+        let stored_len = stored.len() as u64;
+        apply_transform(&mut stored, 0, stored_len, parameter, &Toy, common());
+        let expected = [a.clone(), b.clone()].concat();
+        let table = two_chunk_table(&a, &ca, &b, &cb);
+
+        let (_temp, source) = chunk_file(&stored);
+        let mut whole = Payload::chunked(
+            0,
+            PayloadSource::transformed(source, transform(parameter)),
+            expected.len() as u64,
+            &table,
+        )
+        .unwrap();
+        let mut reference = Vec::new();
+        whole.read_to_end(&mut reference).unwrap();
+        assert_eq!(reference, expected);
+
+        // Unaligned, block-crossing and chunk-crossing window sizes must give
+        // the same bytes as the single read.
+        for size in [1usize, 7, 13, 64, 4_096] {
+            let (_temp, source) = chunk_file(&stored);
+            let mut payload = Payload::chunked(
+                0,
+                PayloadSource::transformed(source, transform(parameter)),
+                expected.len() as u64,
+                &table,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            let mut buffer = vec![0u8; size];
+            loop {
+                let n = payload.read(&mut buffer).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buffer[..n]);
+            }
+            assert_eq!(out, reference, "reads of {size} bytes differ");
+        }
     }
 }

@@ -1286,8 +1286,7 @@ impl Metadata {
         };
         StreamRange::parse(value).map(Some).ok_or_else(|| {
             invalid(format!(
-                "the payload transform descriptor of row {row} is {} bytes and does not describe a usable stream range",
-                value.len()
+                "the payload transform descriptor of row {row} does not describe a usable stream range"
             ))
         })
     }
