@@ -12,6 +12,7 @@ mod nested;
 mod output;
 mod probe;
 mod recover;
+mod registry;
 mod rows;
 
 use std::process::ExitCode;

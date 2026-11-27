@@ -354,6 +354,9 @@ pub enum Command {
         /// Enter archives stored inside an archive
         #[arg(long)]
         recursive: bool,
+        /// Classify from metadata only, reading no payload
+        #[arg(long)]
+        metadata_only: bool,
         /// Also write one record per entry
         #[arg(long)]
         entries: bool,
@@ -381,6 +384,12 @@ pub enum Command {
         /// Total bytes copied to temporary storage
         #[arg(long, default_value_t = 68719476736u64)]
         max_spool_bytes: u64,
+    },
+    /// Print the engine's type-to-extension registry for all 256 ids
+    Registry {
+        /// Print as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// List scan-recovery candidates, or export one of them. These are entries
     /// recovered from the data area, not native table-of-contents entries
@@ -432,10 +441,12 @@ pub fn run(command: Command) -> Result<(), String> {
             record,
             json,
         } => resource(&file, id, no_cache, drawable, dictionary, record, json),
+        Command::Registry { json } => crate::registry::run(json),
         Command::Census {
             path,
             executable,
             recursive,
+            metadata_only,
             entries,
             samples,
             output,
@@ -452,6 +463,7 @@ pub fn run(command: Command) -> Result<(), String> {
                     path,
                     executable,
                     recursive,
+                    metadata_only,
                     entries,
                     samples,
                     output,

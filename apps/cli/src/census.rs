@@ -64,6 +64,9 @@ pub struct Options {
     pub executable: Option<PathBuf>,
     /// Enter archives stored inside an archive.
     pub recursive: bool,
+    /// Classify from metadata only: no payload is read, so no format, structure
+    /// or capability is claimed.
+    pub metadata_only: bool,
     pub limits: Limits,
     /// Samples kept per combination.
     pub samples: usize,
@@ -111,7 +114,8 @@ struct Engine<'a> {
     decoded: u64,
     undecoded: u64,
     structures: u64,
-    assets: u64,
+    containers: u64,
+    declared: u64,
     unresolved: u64,
     buckets: BTreeMap<Key, Bucket>,
     types: BTreeMap<Option<u8>, u64>,
@@ -133,7 +137,8 @@ pub fn run(options: &Options, cancel: &AtomicBool) -> Result<(), String> {
         decoded: 0,
         undecoded: 0,
         structures: 0,
-        assets: 0,
+        containers: 0,
+        declared: 0,
         unresolved: 0,
         buckets: BTreeMap::new(),
         types: BTreeMap::new(),
@@ -291,8 +296,20 @@ impl Engine<'_> {
                 transform: transform.as_ref().ok().and_then(|value| value.as_ref()),
                 transform_failure: transform.as_ref().err().map(String::as_str),
             };
-            let (classification, evidence) =
-                classify::classify_entry_with_evidence(entry, None, &context);
+            let (classification, evidence) = if self.options.metadata_only {
+                (
+                    classify::classify(classify::Inputs {
+                        entry_type: entry.type_id(),
+                        original_extension: None,
+                        storage: classify::storage_of(entry),
+                        payload: classify::PayloadState::NotRead,
+                        head: None,
+                    }),
+                    classify::Evidence::default(),
+                )
+            } else {
+                classify::classify_entry_with_evidence(entry, None, &context)
+            };
             self.entries += 1;
             let mut nested_chain = chain.to_vec();
             nested_chain.push(entry.row);
@@ -318,7 +335,12 @@ impl Engine<'_> {
             if !self.options.recursive || depth + 1 >= self.options.limits.max_depth {
                 continue;
             }
-            if classification.format_id() != Some("rpf9") {
+            // An RPF9 payload is an archive. A row whose declared type is the
+            // archive type is a candidate even when no payload was read: a
+            // metadata pass must still find archives it has not opened yet.
+            let archive_candidate = classification.format_id() == Some("rpf9")
+                || classification.declared_asset() == Some("rpf");
+            if !archive_candidate {
                 continue;
             }
             if self.archives >= self.options.limits.max_archives {
@@ -452,17 +474,23 @@ impl Engine<'_> {
         payload_len: Option<u64>,
     ) {
         *self.types.entry(classification.entry_type).or_default() += 1;
-        if classification.payload.name() == "decoded" {
-            self.decoded += 1;
-        } else {
-            self.undecoded += 1;
+        match classification.payload.name() {
+            "decoded" => self.decoded += 1,
+            "not-read" => {}
+            _ => self.undecoded += 1,
         }
         let claims = classification.identification.claims();
         if claims.structure == lforge_core::classify::Confidence::Verified {
             self.structures += 1;
         }
-        if claims.asset == lforge_core::classify::Confidence::Verified {
-            self.assets += 1;
+        if matches!(
+            classification.identification,
+            Identification::Resource { .. }
+        ) {
+            self.containers += 1;
+        }
+        if classification.declared_asset().is_some() {
+            self.declared += 1;
         }
         if matches!(classification.identification, Identification::Unrecognised) {
             self.unresolved += 1;
@@ -552,7 +580,8 @@ impl Engine<'_> {
                 "entries_decoded": self.decoded,
                 "entries_undecoded": self.undecoded,
                 "structures_verified": self.structures,
-                "assets_verified": self.assets,
+                "containers_identified": self.containers,
+                "declared_asset_classes": self.declared,
                 "unresolved_formats": self.unresolved,
             },
             "types": types,
@@ -596,11 +625,19 @@ fn header_variant(classification: &Classification, head: &[u8]) -> String {
     match &classification.identification {
         Identification::Format { format, .. } => format!("format:{}", format.id),
         Identification::Resource { header, .. } => {
-            let word = head
-                .get(0x10..0x14)
-                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                .unwrap_or(0);
-            format!("resource:s{}:{word:08x}", header.segment)
+            // A resource pointer's numeric value is an instance, not a format.
+            // What can be compared between entries is the shape of the fields
+            // around it, so the raw values stay in the samples.
+            let word = |offset: usize| {
+                head.get(offset..offset + 4)
+                    .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            };
+            format!(
+                "resource:s{}:{}+{}",
+                header.segment,
+                field_kind(word(0x10)),
+                field_kind(word(0x18))
+            )
         }
         Identification::Xml { root, .. } => match root {
             Some(root) => format!("xml:{root}"),
@@ -608,6 +645,9 @@ fn header_variant(classification: &Classification, head: &[u8]) -> String {
         },
         Identification::Signature { signature, .. } => format!("signature:{signature:?}"),
         Identification::Unrecognised => {
+            if classification.payload.name() == "not-read" {
+                return "not-read".to_string();
+            }
             let first = head.get(..8).unwrap_or(head);
             if first.is_empty() {
                 "empty".to_string()
@@ -628,6 +668,40 @@ fn header_variant(classification: &Classification, head: &[u8]) -> String {
             }
         }
     }
+}
+
+/// The structural kind of a 32-bit field, for grouping entries without
+/// splitting on instance values.
+fn field_kind(word: Option<u32>) -> String {
+    let Some(word) = word else {
+        return "absent".to_string();
+    };
+    if word == 0 {
+        return "zero".to_string();
+    }
+    // A RAGE pointer carries its segment in the top nibble and an aligned
+    // offset below it.
+    let segment = (word >> 28) & 0xF;
+    let aligned = word & 0xF == 0;
+    if matches!(segment, 5 | 6) && aligned {
+        return format!("ptr:seg{segment}");
+    }
+    if word < 0x1_0000 {
+        return "small".to_string();
+    }
+    let bytes = word.to_le_bytes();
+    if bytes
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == 0)
+    {
+        let text: String = bytes
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as char)
+            .collect();
+        return format!("tag:{text}");
+    }
+    "other".to_string()
 }
 
 fn describe(classification: &Classification) -> Value {

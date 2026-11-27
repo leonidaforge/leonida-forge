@@ -135,6 +135,8 @@ impl Storage {
 pub enum PayloadState {
     /// The decoded head was read.
     Decoded,
+    /// The payload was not read at all, as in a metadata-only pass.
+    NotRead,
     /// The payload transform is required and no key state is available.
     TransformUnavailable,
     /// The payload transform is available but did not verify or run.
@@ -149,6 +151,7 @@ impl PayloadState {
     pub fn name(&self) -> &'static str {
         match self {
             PayloadState::Decoded => "decoded",
+            PayloadState::NotRead => "not-read",
             PayloadState::TransformUnavailable => "transform-unavailable",
             PayloadState::TransformFailed(_) => "transform-failed",
             PayloadState::Undecodable(_) => "undecodable",
@@ -367,6 +370,8 @@ pub enum Capability {
     Resource,
     /// Bytes only, through the binary viewer.
     Bytes,
+    /// The payload was not read, so nothing is claimed about it.
+    Unprobed,
     /// Nothing can be decoded.
     Unavailable(&'static str),
 }
@@ -379,6 +384,7 @@ impl Capability {
             Capability::Text => "text",
             Capability::Resource => "resource",
             Capability::Bytes => "bytes",
+            Capability::Unprobed => "unprobed",
             Capability::Unavailable(_) => "unavailable",
         }
     }
@@ -416,9 +422,16 @@ impl Classification {
         self.extension.resolved()
     }
 
+    /// The extension the engine registers for the type. This declares the asset
+    /// class the loader assigns to the type id; it does not verify the contents
+    /// of this entry.
+    pub fn declared_asset(&self) -> Option<&'static str> {
+        self.native.map(|native| native.extension)
+    }
+
     /// The native extension of the entry's type, without a dot.
     pub fn native_extension(&self) -> Option<&'static str> {
-        self.native.map(|native| native.extension)
+        self.declared_asset()
     }
 
     /// Whether the engine's type for this entry is a texture dictionary.
@@ -465,13 +478,6 @@ fn assemble(
     identification: Identification,
 ) -> Classification {
     let native = entry_type.and_then(registry::native_extension);
-    let asset = match native {
-        // The registry names the asset class the engine assigns to the type. It
-        // says nothing about the payload's format.
-        Some(_) => Confidence::Verified,
-        None => Confidence::Unknown,
-    };
-    let identification = identification.with_asset(asset);
     let extension = resolve_extension(original_extension, native, &identification, &payload);
     let conflict = conflict(original_extension, native, &identification);
     let capability = capability(&identification, &payload);
@@ -688,6 +694,7 @@ pub fn is_texture_dictionary_extension(extension: &str) -> bool {
 fn capability(identification: &Identification, payload: &PayloadState) -> Capability {
     match payload {
         PayloadState::Decoded => {}
+        PayloadState::NotRead => return Capability::Unprobed,
         PayloadState::TransformUnavailable => {
             return Capability::Unavailable("the payload transform needs key material");
         }
@@ -724,6 +731,9 @@ fn reason(
         PayloadState::TransformFailed(reason) => return Some(reason.clone()),
         PayloadState::Undecodable(reason) | PayloadState::Malformed(reason) => {
             return Some(reason.clone());
+        }
+        PayloadState::NotRead => {
+            return Some("the payload was not read in this pass".to_string());
         }
         PayloadState::Decoded => {}
     }
@@ -866,7 +876,8 @@ pub fn classify_entry_with_evidence(
     )
 }
 
-fn storage_of(entry: &Entry) -> Option<Storage> {
+/// The storage shape of an entry, from its metadata alone.
+pub fn storage_of(entry: &Entry) -> Option<Storage> {
     let location = match &entry.location {
         Ok(Some(location)) => *location,
         _ => return None,
@@ -996,9 +1007,12 @@ mod tests {
             }
         );
         assert_eq!(classification.extension.provenance(), "native");
+        // The registry declares the asset class for the type; it does not
+        // verify the contents of this entry.
+        assert_eq!(classification.declared_asset(), Some("rpf"));
         assert_eq!(
             classification.identification.claims().asset,
-            Confidence::Verified
+            Confidence::Unknown
         );
     }
 
@@ -1067,8 +1081,9 @@ mod tests {
         // The header shape is observed; the page map it points at is not read.
         assert_eq!(claims.signature, Confidence::Verified);
         assert_eq!(claims.structure, Confidence::Unknown);
-        // Type 88 is registered as `zsm`.
-        assert_eq!(claims.asset, Confidence::Verified);
+        // Type 88 is registered as `zsm`: a declared class, not a verified one.
+        assert_eq!(claims.asset, Confidence::Unknown);
+        assert_eq!(classification.declared_asset(), Some("zsm"));
         assert_eq!(classification.capability, Capability::Resource);
         assert_eq!(classification.extension(), Some("zsm"));
         assert_eq!(classification.extension.provenance(), "native");
