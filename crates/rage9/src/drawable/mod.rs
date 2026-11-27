@@ -1120,13 +1120,27 @@ impl<'a> Walk<'a> {
         self.bytes(Segment::System, base, 0x40, "shader record")?;
         let shader_hash = self.u32(base, "shader hash")?;
         let marker = self.u32(base + 0x04, "shader marker")?;
-        let slots_at = self.pointer(base + 0x10, "texture slot table", Segment::System)?;
+        let slots_value = self.u64(base + 0x10, "texture slot table")?;
         let parameters_at = self.pointer(base + 0x20, "parameter table", Segment::System)?;
         let flags: [u8; 8] = self
             .bytes(Segment::System, base + 0x38, 8, "shader flags")?
             .try_into()
             .expect("eight bytes");
         let (texture_parameters, total_parameters, word_06) = self.parameter_counts(parameters_at);
+        // A shader that declares no texture parameter stores no slot table. A
+        // null table next to a non-zero parameter count is still an error.
+        let slots_at = match system_pointer(slots_value) {
+            Some(at) => Some(at),
+            None if slots_value == 0 && texture_parameters == 0 => None,
+            None => {
+                self.issues.push(Issue::Pointer {
+                    field: "texture slot table",
+                    at: base as usize + 0x10,
+                    value: slots_value,
+                });
+                None
+            }
+        };
         let parameters = self.parameters(parameters_at, total_parameters, texture_parameters);
         let (slots, bound_slots) = self.slot_counts(slots_at, texture_parameters);
         let slot_states = self.slot_states(slots_at, &parameters, texture_parameters);
@@ -1180,10 +1194,13 @@ impl<'a> Walk<'a> {
 
     fn slot_states(
         &mut self,
-        at: u32,
+        at: Option<u32>,
         parameters: &[Parameter],
         texture_parameters: u8,
     ) -> Vec<Slot> {
+        let Some(at) = at else {
+            return Vec::new();
+        };
         let mut slots = Vec::with_capacity(usize::from(texture_parameters));
         for parameter in parameters.iter().filter(|parameter| parameter.texture) {
             let start = at as usize + parameter.index as usize * 8;
@@ -1246,8 +1263,11 @@ impl<'a> Walk<'a> {
         )
     }
 
-    fn slot_counts(&mut self, at: u32, texture_parameters: u8) -> (u32, u32) {
+    fn slot_counts(&mut self, at: Option<u32>, texture_parameters: u8) -> (u32, u32) {
         let declared = u32::from(texture_parameters);
+        let Some(at) = at else {
+            return (0, 0);
+        };
         let mut bound = 0;
         let mut slots = 0;
         for index in 0..declared {
@@ -1473,6 +1493,16 @@ fn ascii_string(bytes: &[u8], at: usize) -> Option<String> {
         return None;
     }
     std::str::from_utf8(text).ok().map(str::to_owned)
+}
+
+/// The stored name of the drawable at `root`, read from its `+0xA8` pointer.
+///
+/// This is the label the resource carries, not a resolved file name. It is
+/// available without walking the LOD chain, which is what a dictionary
+/// enumeration needs.
+pub fn member_name_at(system: &[u8], root: usize) -> Option<String> {
+    let name = system_pointer(u64_at(system, root + 0xA8)?)?;
+    ascii_string(system, name as usize)
 }
 
 fn system_pointer(value: u64) -> Option<u32> {

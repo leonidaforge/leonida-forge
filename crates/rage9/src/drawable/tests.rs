@@ -625,6 +625,45 @@ fn a_non_texture_parameter_class_has_no_slot() {
 }
 
 #[test]
+fn a_shader_without_texture_parameters_may_store_no_slot_table() {
+    let (mut system, graphics) = drawable();
+    // No texture parameter, no non-texture parameter, no slot table.
+    system[0xBA1] = 0;
+    put_u16(&mut system, 0xBA4, 0);
+    put_u64(&mut system, 0xA10, 0);
+    let report = inspect(&system, &graphics).unwrap();
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    assert_eq!(report.status, "complete");
+    let shader = &report.shader_group.as_ref().unwrap().shaders[0];
+    assert_eq!(shader.texture_parameters, 0);
+    assert_eq!(shader.slots, 0);
+    assert_eq!(shader.bound_slots, 0);
+    assert!(shader.parameters.is_empty());
+    assert!(shader.slot_states.is_empty());
+    assert_eq!(report.materials.declared_slots, 0);
+}
+
+#[test]
+fn a_missing_slot_table_with_texture_parameters_is_reported() {
+    let (mut system, graphics) = drawable();
+    // The shader still declares two texture parameters.
+    put_u64(&mut system, 0xA10, 0);
+    let report = inspect(&system, &graphics).unwrap();
+    assert_eq!(report.status, "partial");
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Pointer {
+            field: "texture slot table",
+            ..
+        }
+    )));
+    let shader = &report.shader_group.as_ref().unwrap().shaders[0];
+    assert_eq!(shader.texture_parameters, 2);
+    assert!(shader.slot_states.is_empty());
+    assert_eq!(report.materials.bound, 0);
+}
+
+#[test]
 fn an_overflowing_bounds_extent_is_clamped() {
     let (mut system, graphics) = drawable();
     put_u16(&mut system, 0x310, 0xFF00);

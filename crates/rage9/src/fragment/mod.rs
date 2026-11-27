@@ -1,9 +1,11 @@
 //! Fragment resources.
 //!
 //! A fragment is a resource whose system data starts with a root header and
-//! that holds a member drawable. The layout below is the one observed in 24
-//! rows of one nested archive (FRAG-F01 to FRAG-F05); every other field the
-//! root stores is reported as a slot whose meaning is not established.
+//! that holds a member drawable. The layout below was read on 40 rows of one
+//! nested archive and confirmed on all 5,553 type-3 rows of 27 nested archives
+//! (FRAG-F01 to FRAG-F08): every row holds exactly one member drawable and only
+//! `+0x18` reaches one. Every other field the root stores is reported as a slot
+//! whose meaning is not established.
 //!
 //! Observed root header, system-relative:
 //!
@@ -18,7 +20,7 @@
 //! | `+0x30` | 8 | Four `u16`; `+0x30` is `1` in every sample, the others vary |
 //!
 //! Only `+0x18` is followed. The other pointers are not scanned for further
-//! drawables: the samples contain none, so treating them as component tables
+//! drawables: 5,553 rows never reach one, so treating them as component tables
 //! would be an invention. A fragment is reported as a single-drawable
 //! representation and says so.
 //!
@@ -41,7 +43,6 @@ pub const ROOT_ZERO: u64 = 0;
 pub const COUNT_SLOTS: usize = 4;
 /// The suffix a fragment member drawable carries in every observed sample.
 pub const FRAGMENT_SUFFIX: &str = "#ft";
-
 /// Why a resource is not a supported fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -55,8 +56,6 @@ pub enum Step {
     Drawable,
     /// The drawable slot resolves but the target is not a member drawable.
     DrawableShape,
-    /// The member drawable's name does not carry the fragment suffix.
-    Name,
 }
 
 impl Step {
@@ -69,7 +68,6 @@ impl Step {
             Step::DrawableShape => {
                 "the fragment drawable slot does not resolve to a member drawable"
             }
-            Step::Name => "the member drawable's name does not end in the fragment suffix",
         }
     }
 }
@@ -174,24 +172,28 @@ pub fn is_fragment_name(report: &drawable::Report) -> bool {
 }
 
 /// Inspects a fragment. `None` when the resource does not have the root shape,
-/// or when the member drawable is not named as a fragment.
+/// when it is a resource-level drawable itself, or when the member-drawable
+/// slot does not resolve to a member drawable.
 ///
-/// A resource whose member drawable is unnamed or carries another suffix is
-/// not rejected by [`header`]; the caller can inspect the member drawable and
-/// decide. This entry point is the strict content test the explorer uses.
+/// Recognition is structural. The member name's `#ft` suffix is reported in
+/// [`Report::named_fragment`] but is not required: the declared resource type
+/// selects the candidate and the structure decides, so a fragment whose member
+/// carries another suffix is still the fragment its structure says it is.
 pub fn inspect(system: &[u8], graphics: &[u8]) -> Option<Report> {
     let header = header(system).ok()?;
+    // A resource-level drawable also starts with a zero word and a page map;
+    // its `+0x18` is the skeleton slot. A drawable is not a fragment.
+    if drawable::is_drawable_at(system, graphics, 0) {
+        return None;
+    }
     let at = header.drawable as usize;
     if at.checked_add(0xC0).is_none_or(|end| end > system.len()) {
         return None;
     }
     let drawable = drawable::inspect_member_at(system, graphics, at)?;
-    if !is_fragment_name(&drawable) {
-        return None;
-    }
     Some(Report {
         header,
-        named_fragment: true,
+        named_fragment: is_fragment_name(&drawable),
         issues: drawable
             .issues
             .iter()

@@ -99,12 +99,24 @@ fn a_fragment_named_member_is_recognised() {
 }
 
 #[test]
-fn a_member_named_as_a_drawable_is_not_a_fragment() {
+fn a_member_with_another_suffix_is_still_the_fragment_its_structure_says() {
     let (system, graphics) = fragment("synthetic_prop.#dr");
-    assert!(inspect(&system, &graphics).is_none());
+    let report = inspect(&system, &graphics).expect("the structure is a fragment root");
+    assert!(!report.named_fragment);
+    assert_eq!(report.name(), Some("synthetic_prop.#dr"));
     // The member itself still parses, which is what the model decoder uses.
     let member = drawable::inspect_member_at(&system, &graphics, 0x80).expect("a member drawable");
     assert!(!is_fragment_name(&member));
+}
+
+#[test]
+fn a_resource_level_drawable_is_not_a_fragment() {
+    let (mut system, graphics) = fragment("synthetic_prop.#ft");
+    // A drawable dictionary root stores a small integer at `+0x18` rather than
+    // the member pointer, so the fragment root shape does not hold.
+    put_u64(&mut system, 0x18, 1);
+    assert_eq!(header(&system), Err(Step::Drawable));
+    assert!(inspect(&system, &graphics).is_none());
 }
 
 #[test]
