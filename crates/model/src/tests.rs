@@ -172,7 +172,6 @@ fn a_resource_boundary_is_found_from_a_graphics_pointer_and_marker() {
     let split = split_resource(&bytes).expect("split");
     assert_eq!(split.system_len, 0x200);
     assert!(split.support >= 1);
-    assert!(!split.ambiguous);
 }
 
 #[test]
@@ -180,6 +179,59 @@ fn a_resource_without_graphics_markers_is_not_split() {
     let mut bytes = vec![0u8; 0x200];
     bytes[0x08..0x10].copy_from_slice(&0x5000_0100u64.to_le_bytes());
     assert!(split_resource(&bytes).is_none());
+    assert_eq!(
+        split_resource_reason(&bytes),
+        Err(LayoutProblem::NoMarkers),
+        "an inferred split says why it could not be made"
+    );
+}
+
+#[test]
+fn a_marker_without_a_graphics_pointer_is_not_split() {
+    let mut bytes = vec![0u8; 0x200];
+    bytes[0x08..0x10].copy_from_slice(&0x5000_0100u64.to_le_bytes());
+    bytes.extend_from_slice(&0x4042u32.to_le_bytes());
+    bytes.resize(0x300, 0);
+    assert_eq!(
+        split_resource_reason(&bytes),
+        Err(LayoutProblem::NoCandidates)
+    );
+}
+
+#[test]
+fn a_resource_that_is_too_short_to_split_says_so() {
+    assert_eq!(
+        split_resource_reason(&[0u8; 0x20]),
+        Err(LayoutProblem::NotAResource)
+    );
+}
+
+#[test]
+fn two_equally_supported_boundaries_are_reported_as_ambiguous() {
+    let mut bytes = vec![0u8; 0x200];
+    bytes[0x08..0x10].copy_from_slice(&0x5000_0100u64.to_le_bytes());
+    // Two graphics pointers and two markers. Each pointer reaches a marker for a
+    // different boundary and no boundary is supported twice, so none of them is
+    // evidence.
+    bytes[0x18..0x20].copy_from_slice(&0x6000_0000u64.to_le_bytes());
+    bytes[0x20..0x28].copy_from_slice(&0x6000_0040u64.to_le_bytes());
+    bytes.extend_from_slice(&0x4042u32.to_le_bytes());
+    bytes.resize(0x300, 0);
+    bytes[0x2C0..0x2C4].copy_from_slice(&0x4042u32.to_le_bytes());
+    let problem = split_resource_reason(&bytes).expect_err("the boundaries tie");
+    let LayoutProblem::Ambiguous(splits) = problem else {
+        panic!("a tie is reported as ambiguous, not as a missing candidate");
+    };
+    assert!(
+        splits.len() >= 2,
+        "both supported boundaries are named: {splits:?}"
+    );
+    let described = LayoutProblem::Ambiguous(splits).describe();
+    assert!(described.contains("ambiguous"), "{described}");
+    assert!(
+        described.contains("0x"),
+        "the boundaries are named: {described}"
+    );
 }
 
 #[test]

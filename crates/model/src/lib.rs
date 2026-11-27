@@ -218,11 +218,55 @@ pub struct ResourceSplit {
     pub system_len: usize,
     /// How many distinct graphics pointers supported the split.
     pub support: usize,
-    /// Several splits were supported equally well.
-    pub ambiguous: bool,
 }
 
-/// Infers the system/graphics boundary of a reconstructed resource.
+/// Why a standalone resource could not be split.
+///
+/// These are layout problems, not verdicts about the resource: a resource whose
+/// boundary cannot be inferred is unmeasured, not proven to be something else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutProblem {
+    /// Too short to hold a resource prefix, or the first word is not zero.
+    NotAResource,
+    /// No mesh-blob marker exists in the searched prefix.
+    NoMarkers,
+    /// Markers exist, but no graphics pointer lands on one.
+    NoCandidates,
+    /// Several boundaries are supported equally well, so choosing one would be
+    /// arithmetic rather than evidence.
+    Ambiguous(Vec<usize>),
+}
+
+impl LayoutProblem {
+    /// One line naming what is missing, for a viewer or a log.
+    pub fn describe(&self) -> String {
+        match self {
+            LayoutProblem::NotAResource => {
+                "the data is shorter than a resource prefix or does not start with a zero word"
+                    .to_string()
+            }
+            LayoutProblem::NoMarkers => {
+                "no mesh-blob marker exists in the searched prefix, so no graphics boundary can be located"
+                    .to_string()
+            }
+            LayoutProblem::NoCandidates => {
+                "mesh-blob markers exist, but no graphics pointer reaches one, so no boundary can be located"
+                    .to_string()
+            }
+            LayoutProblem::Ambiguous(splits) => {
+                let listed: Vec<String> = splits.iter().map(|at| format!("{at:#x}")).collect();
+                format!(
+                    "{} boundaries are supported equally well ({}), so the split is ambiguous",
+                    splits.len(),
+                    listed.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// Infers the system/graphics boundary of a reconstructed resource, naming the
+/// layout problem when it cannot.
 ///
 /// The decoded bytes do not store the boundary. A drawable's vertex-buffer
 /// graphics pointers and the mesh-blob marker at their targets do: a
@@ -230,9 +274,12 @@ pub struct ResourceSplit {
 /// marker, and a valid drawable at system zero wins. This is used for files
 /// whose archive metadata is not available to the caller; the exact boundary
 /// is preferred there when the archive layer can provide it.
-pub fn split_resource(bytes: &[u8]) -> Option<ResourceSplit> {
+///
+/// A tie between equally supported boundaries is reported instead of broken,
+/// because a resource whose layout is ambiguous needs native page metadata.
+pub fn split_resource_reason(bytes: &[u8]) -> Result<ResourceSplit, LayoutProblem> {
     if bytes.len() < 0x200 || u64_at(bytes, 0) != Some(0) {
-        return None;
+        return Err(LayoutProblem::NotAResource);
     }
     let marker = [0x42, 0x40, 0x00, 0x00];
     let markers: Vec<usize> = bytes
@@ -244,7 +291,7 @@ pub fn split_resource(bytes: &[u8]) -> Option<ResourceSplit> {
         .take(2048)
         .collect();
     if markers.is_empty() {
-        return None;
+        return Err(LayoutProblem::NoMarkers);
     }
     let pointers: Vec<u64> = (0..bytes.len().saturating_sub(8).min(4 << 20))
         .step_by(8)
@@ -269,28 +316,47 @@ pub fn split_resource(bytes: &[u8]) -> Option<ResourceSplit> {
     }
     let mut ranked: Vec<(usize, usize)> = candidates.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let plausible: Vec<(usize, usize)> = ranked
+        .into_iter()
+        .take(64)
+        .filter(|(split, _)| lforge_rage9::resource::page_map_offset(&bytes[..*split]).is_some())
+        .collect();
+    if plausible.is_empty() {
+        return Err(LayoutProblem::NoCandidates);
+    }
+    let best_support = plausible[0].1;
+    let tied: Vec<usize> = plausible
+        .iter()
+        .filter(|(_, support)| *support == best_support)
+        .map(|(split, _)| *split)
+        .take(8)
+        .collect();
+    if tied.len() > 1 {
+        return Err(LayoutProblem::Ambiguous(tied));
+    }
     let mut fallback = None;
-    for (split, support) in ranked.into_iter().take(64) {
-        let (system, graphics) = bytes.split_at(split);
-        if lforge_rage9::resource::page_map_offset(system).is_none() {
-            continue;
-        }
+    for (split, support) in &plausible {
+        let (system, graphics) = bytes.split_at(*split);
         if drawable::is_drawable(system, graphics) {
-            return Some(ResourceSplit {
-                system_len: split,
-                support,
-                ambiguous: false,
+            return Ok(ResourceSplit {
+                system_len: *split,
+                support: *support,
             });
         }
         if fallback.is_none() {
-            fallback = Some((split, support));
+            fallback = Some((*split, *support));
         }
     }
-    fallback.map(|(system_len, support)| ResourceSplit {
-        system_len,
-        support,
-        ambiguous: false,
+    Ok(ResourceSplit {
+        system_len: fallback.unwrap_or(plausible[0]).0,
+        support: fallback.unwrap_or(plausible[0]).1,
     })
+}
+
+/// Infers the system/graphics boundary, dropping the reason. Prefer
+/// [`split_resource_reason`] where the reason can be shown.
+pub fn split_resource(bytes: &[u8]) -> Option<ResourceSplit> {
+    split_resource_reason(bytes).ok()
 }
 
 /// Decodes the highest populated LOD of a drawable.
