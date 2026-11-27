@@ -10,7 +10,7 @@ pub mod texture;
 mod viewport;
 
 pub use binary::BinaryInspector;
-pub use bones::BonePanel;
+pub use bones::{BonePanel, BoneRow};
 pub use dictionary::DictionaryViewer;
 pub use image::ImageViewer;
 pub use model::ModelViewer;

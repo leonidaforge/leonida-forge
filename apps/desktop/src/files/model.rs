@@ -1983,6 +1983,9 @@ mod tests {
             Issue::Cycle { .. } => "cycle",
             Issue::NonFinite { .. } => "non-finite",
             Issue::Missing { .. } => "missing",
+            Issue::BoneArrayOverrun { .. } => "bone array overrun",
+            Issue::ArrayOverlap { .. } => "array overlap",
+            Issue::BeyondLimit { .. } => "beyond limit",
         }
     }
 
@@ -2467,6 +2470,323 @@ mod tests {
         assert!(!presence.is_empty(), "no row was read");
     }
 
+    /// A matrix as glam reads the record's row-major elements.
+    ///
+    /// The record stores nine `f32` row after row. Building a `Mat3` from those
+    /// values as columns would compare a matrix with its own transpose, which is
+    /// the mistake this probe exists to avoid.
+    fn mat3_from_row_major(stored: &[f32; 9]) -> glam::Mat3 {
+        let [r00, r01, r02, r10, r11, r12, r20, r21, r22] = *stored;
+        glam::Mat3::from_cols_array(&[r00, r10, r20, r01, r11, r21, r02, r12, r22])
+    }
+
+    fn mat3_delta(a: glam::Mat3, b: glam::Mat3) -> f32 {
+        a.to_cols_array()
+            .iter()
+            .zip(b.to_cols_array().iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    fn vec3_delta(a: glam::Vec3, b: glam::Vec3) -> f32 {
+        (a - b).abs().max_element()
+    }
+
+    /// Measures how the record's arrays bound each other and what the stored
+    /// matrices mean mathematically.
+    ///
+    /// Ignored by default. `LF_TEST_ARCHIVE_LIST`/`LF_TEST_ARCHIVE_DIR` name the
+    /// archives and `LF_TEST_EXECUTABLE` the executable that supplies the keys.
+    ///
+    /// The bone count comes from the record walk, so this run asks whether the
+    /// neighbouring arrays can confirm it: an array that starts inside the bone
+    /// array proves the walk over-read, and a gap wider than one record next to
+    /// the nearest following array is the signature a truncated walk would
+    /// leave. The matrix comparisons keep the raw stored elements apart from the
+    /// three readings of them.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE_LIST (or LF_TEST_ARCHIVE_DIR) and LF_TEST_EXECUTABLE"]
+    fn examines_skeleton_array_bounds_and_storage() {
+        use glam::{Mat3, Quat, Vec3};
+
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let archives = survey_archives();
+        let sample_limit: usize = std::env::var("LF_SURVEY_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(6);
+
+        let mut examined = 0usize;
+        let mut with_local = 0usize;
+        let mut with_inverse = 0usize;
+        let mut overlaps = 0usize;
+        let mut gaps: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut collides_one_more = 0usize;
+        let mut parent_inside_bones = 0usize;
+
+        let mut local_as_transpose_rotation = 0usize;
+        let mut local_as_rotation = 0usize;
+        let mut local_with_scale = 0usize;
+        let mut inverse_as_model_rotation = 0usize;
+        let mut inverse_as_transposed_model = 0usize;
+        let mut inverse_with_scale = 0usize;
+        let mut worst_local_rotation = 0f32;
+        let mut worst_local_translation = 0f32;
+        let mut worst_inverse_rotation = 0f32;
+        let mut worst_inverse_translation = 0f32;
+
+        let mut scale_identity = 0usize;
+        let mut scale_uniform = 0usize;
+        let mut scale_nonuniform = 0usize;
+        let mut scale_negative = 0usize;
+        let mut scale_zero = 0usize;
+        let mut scale_non_finite = 0usize;
+        let mut scale_samples: Vec<String> = Vec::new();
+        let mut bound_samples: Vec<String> = Vec::new();
+        let mut matrix_samples: Vec<String> = Vec::new();
+
+        for type_id in [2u8, 3u8] {
+            survey_rows(&archives, &access, &cancel, type_id, |row| {
+                let (system, graphics) = row.segments();
+                let report = if type_id == 3 {
+                    let Ok(header) = lforge_rage9::fragment::header(system) else {
+                        return;
+                    };
+                    lforge_rage9::drawable::inspect_member_at(
+                        system,
+                        graphics,
+                        header.drawable as usize,
+                    )
+                } else {
+                    lforge_rage9::drawable::inspect(system, graphics)
+                };
+                let Some(report) = report else { return };
+                let Some(at) = report.header.skeleton else {
+                    return;
+                };
+                let skeleton = lforge_rage9::skeleton::inspect(system, at);
+                if skeleton.bones.is_empty() {
+                    return;
+                }
+                examined += 1;
+                let count = skeleton.bones.len();
+                let arrays = skeleton.arrays;
+
+                // Where every array starts, and how far the bone array runs.
+                let start = |offset: Option<u32>| offset.map(u64::from);
+                let bone_start = u64::from(arrays.bones.unwrap_or(0));
+                let bone_end = bone_start + count as u64 * 0x50;
+                let spans: Vec<(&'static str, u64, u64)> = [
+                    ("bones", start(arrays.bones), count as u64 * 0x50),
+                    ("inverse", start(arrays.inverse_bind), count as u64 * 0x40),
+                    ("local", start(arrays.local_matrices), count as u64 * 0x40),
+                    ("parents", start(arrays.parents), count as u64 * 2),
+                    (
+                        "keys",
+                        start(arrays.keys),
+                        u64::from(skeleton.recorded_keys) * 8,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, at, len)| at.map(|at| (name, at, at + len)))
+                .collect();
+                for (index, a) in spans.iter().enumerate() {
+                    for b in spans.iter().skip(index + 1) {
+                        if a.1 != b.1 && a.1 < b.2 && b.1 < a.2 {
+                            overlaps += 1;
+                            if bound_samples.len() < sample_limit {
+                                bound_samples.push(format!(
+                                    "{}: {} +{:#x} overlaps {} +{:#x}",
+                                    row.path.display(),
+                                    a.0,
+                                    a.1,
+                                    b.0,
+                                    b.1
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(offset) = arrays.parents
+                    && u64::from(offset) < bone_end
+                    && u64::from(offset) >= bone_start
+                {
+                    parent_inside_bones += 1;
+                }
+                let next = spans
+                    .iter()
+                    .filter(|(name, at, _)| *name != "bones" && *at > bone_start)
+                    .map(|(_, at, _)| *at)
+                    .min();
+                if let Some(next) = next {
+                    let gap = next as i64 - bone_end as i64;
+                    *gaps.entry(gap).or_insert(0) += 1;
+                    if gap < 0x50 {
+                        collides_one_more += 1;
+                    }
+                }
+
+                if !skeleton.local_matrices.is_empty() {
+                    with_local += 1;
+                }
+                if !skeleton.inverse_bind.is_empty() {
+                    with_inverse += 1;
+                }
+
+                for (index, bone) in skeleton.bones.iter().enumerate() {
+                    let rotation = Quat::from_xyzw(
+                        bone.rotation[0],
+                        bone.rotation[1],
+                        bone.rotation[2],
+                        bone.rotation[3],
+                    );
+                    let translation = Vec3::from_array(bone.translation);
+                    let scale = Vec3::from_array(bone.scale);
+                    let identity = scale.abs_diff_eq(Vec3::ONE, 1e-6);
+                    let uniform = !identity
+                        && (scale.x - scale.y).abs() < 1e-6
+                        && (scale.y - scale.z).abs() < 1e-6;
+                    if !scale.is_finite() {
+                        scale_non_finite += 1;
+                    } else if scale.abs_diff_eq(Vec3::ZERO, 1e-6) {
+                        scale_zero += 1;
+                    } else if scale.min_element() < 0.0 {
+                        scale_negative += 1;
+                    } else if identity {
+                        scale_identity += 1;
+                    } else if uniform {
+                        scale_uniform += 1;
+                    } else {
+                        scale_nonuniform += 1;
+                    }
+                    if !identity && scale.is_finite() && scale_samples.len() < sample_limit {
+                        scale_samples.push(format!(
+                            "{}: bone {index} {} scale {:?}",
+                            row.path.display(),
+                            bone.name.clone().unwrap_or_default(),
+                            bone.scale
+                        ));
+                    }
+                    if !rotation.is_finite() {
+                        continue;
+                    }
+                    let local_rotation = Mat3::from_quat(rotation);
+                    let local_scale = Mat3::from_diagonal(scale);
+
+                    if let Some(stored) = skeleton.local_matrices.get(index) {
+                        let matrix = mat3_from_row_major(&stored.rotation);
+                        let as_transpose = mat3_delta(matrix, local_rotation.transpose());
+                        let as_rotation = mat3_delta(matrix, local_rotation);
+                        let with_scale =
+                            mat3_delta(matrix, (local_rotation * local_scale).transpose());
+                        if as_transpose <= 1e-3 {
+                            local_as_transpose_rotation += 1;
+                        } else if as_rotation <= 1e-3 {
+                            local_as_rotation += 1;
+                        } else if with_scale <= 1e-3 {
+                            local_with_scale += 1;
+                        }
+                        worst_local_rotation = worst_local_rotation.max(as_transpose);
+                        worst_local_translation = worst_local_translation.max(vec3_delta(
+                            Vec3::from_array(stored.translation),
+                            translation,
+                        ));
+                        if as_transpose > 1e-3 && matrix_samples.len() < sample_limit {
+                            matrix_samples.push(format!(
+                                "{}: bone {index} local rotation deltas transpose {as_transpose:.4} plain {as_rotation:.4} scaled {with_scale:.4}",
+                                row.path.display()
+                            ));
+                        }
+                    }
+                }
+
+                // Model-space rotation of each bone, for the inverse-bind
+                // convention. A skeleton of several thousand bones would make
+                // this quadratic if a parent were not already resolved, but the
+                // walk stores parents in index order.
+                let mut model_rotation: Vec<Mat3> = Vec::with_capacity(count);
+                let mut model_position: Vec<Vec3> = Vec::with_capacity(count);
+                for (index, bone) in skeleton.bones.iter().enumerate() {
+                    let rotation = Quat::from_xyzw(
+                        bone.rotation[0],
+                        bone.rotation[1],
+                        bone.rotation[2],
+                        bone.rotation[3],
+                    );
+                    let matrix = Mat3::from_quat(rotation);
+                    let translation = Vec3::from_array(bone.translation);
+                    let (resolved, position) = match bone.parent {
+                        Some(parent) if parent < index => (
+                            model_rotation[parent] * matrix,
+                            model_position[parent] + model_rotation[parent] * translation,
+                        ),
+                        _ => (matrix, translation),
+                    };
+                    model_rotation.push(resolved);
+                    model_position.push(position);
+                    let Some(stored) = skeleton.inverse_bind.get(index) else {
+                        continue;
+                    };
+                    let stored_matrix = mat3_from_row_major(&stored.rotation);
+                    let as_model = mat3_delta(stored_matrix, resolved);
+                    let as_transposed = mat3_delta(stored_matrix, resolved.transpose());
+                    let scale = Mat3::from_diagonal(Vec3::from_array(bone.scale));
+                    let with_scale = mat3_delta(stored_matrix, resolved * scale);
+                    if as_model <= 1e-3 {
+                        inverse_as_model_rotation += 1;
+                    } else if as_transposed <= 1e-3 {
+                        inverse_as_transposed_model += 1;
+                    } else if with_scale <= 1e-3 {
+                        inverse_with_scale += 1;
+                    }
+                    worst_inverse_rotation = worst_inverse_rotation.max(as_model);
+                    let expected_translation = -(resolved.transpose() * position);
+                    worst_inverse_translation = worst_inverse_translation.max(vec3_delta(
+                        Vec3::from_array(stored.translation),
+                        expected_translation,
+                    ));
+                }
+            });
+        }
+        eprintln!("skeletons examined: {examined}");
+        eprintln!("with local matrices: {with_local}, with inverse bind: {with_inverse}");
+        eprintln!(
+            "spans overlapping: {overlaps}, parent array starting inside the bone array: {parent_inside_bones}"
+        );
+        eprintln!("gap from bone array end to the nearest later array: {gaps:?}");
+        eprintln!("a further record would reach that array in {collides_one_more} skeleton(s)");
+        eprintln!(
+            "stored local rotation read as transpose(local): {local_as_transpose_rotation}, as local: {local_as_rotation}, as transpose(local*scale): {local_with_scale}"
+        );
+        eprintln!(
+            "worst local rotation delta {worst_local_rotation}, worst local translation delta {worst_local_translation}"
+        );
+        eprintln!(
+            "stored inverse rotation read as model rotation: {inverse_as_model_rotation}, as transpose: {inverse_as_transposed_model}, as model*scale: {inverse_with_scale}"
+        );
+        eprintln!(
+            "worst inverse rotation delta {worst_inverse_rotation}, worst inverse translation delta {worst_inverse_translation}"
+        );
+        eprintln!(
+            "scale identity {scale_identity}, uniform {scale_uniform}, nonuniform {scale_nonuniform}, negative {scale_negative}, zero {scale_zero}, non-finite {scale_non_finite}"
+        );
+        for line in &scale_samples {
+            eprintln!("  scale: {line}");
+        }
+        for line in &bound_samples {
+            eprintln!("  bound: {line}");
+        }
+        for line in &matrix_samples {
+            eprintln!("  matrix: {line}");
+        }
+        let _ = matrix_samples;
+        assert!(examined > 0, "no skeleton was read");
+    }
+
     /// Verifies the four documented skeleton-bearing fragments through the
     /// native archive path.
     ///
@@ -2491,6 +2811,7 @@ mod tests {
         let mut index = std::collections::HashMap::new();
         let mut seen: BTreeMap<String, (usize, usize, usize, bool, decoded::SkeletonCompleteness)> =
             BTreeMap::new();
+        let mut placement_lines: BTreeMap<String, String> = BTreeMap::new();
         for chain in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
             let Some((parent_chain, row)) = chain.rsplit_once('!') else {
                 continue;
@@ -2531,6 +2852,21 @@ mod tests {
             let bones = skeleton.map_or(0, |skeleton| skeleton.bones.len());
             let roots = skeleton.map_or(0, |skeleton| skeleton.roots.len());
             let depth = skeleton.map_or(0, |skeleton| skeleton.max_depth);
+            let evidence = loaded
+                .scene
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.reason.starts_with("coordinate space"))
+                .map(|diagnostic| diagnostic.reason.clone())
+                .unwrap_or_else(|| "no coordinate-space statement".to_string());
+            placement_lines.insert(
+                loaded.name.clone(),
+                format!(
+                    "placement {}, associations {}, {evidence}",
+                    loaded.completeness.placement.name(),
+                    loaded.completeness.associations.name()
+                ),
+            );
             seen.insert(
                 loaded.name.clone(),
                 (
@@ -2544,6 +2880,9 @@ mod tests {
         }
         for (name, facts) in &seen {
             eprintln!("{name}: {facts:?}");
+            if let Some(extra) = placement_lines.get(name) {
+                eprintln!("  {extra}");
+            }
         }
         let expected: [(&str, usize, usize, usize, bool); 4] = [
             ("prop_am_card_tarot_deck_01a.#ft", 3, 1, 3, false),
@@ -2570,5 +2909,728 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Looks for independent evidence of how a one-bone geometry binds.
+    ///
+    /// Ignored by default. `LF_TEST_ARCHIVE_LIST`/`LF_TEST_ARCHIVE_DIR` name the
+    /// archives and `LF_TEST_EXECUTABLE` the executable that supplies the keys.
+    ///
+    /// A geometry that declares one bone and stores no weight form cannot be
+    /// associated from its vertex streams. This run inspects the geometry record
+    /// itself for a bone reference, so an implicit association is only adopted if
+    /// the record states one.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE_LIST (or LF_TEST_ARCHIVE_DIR) and LF_TEST_EXECUTABLE"]
+    fn examines_single_bone_geometry_records() {
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let archives = survey_archives();
+        let sample_limit: usize = std::env::var("LF_SURVEY_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+
+        let mut single_bone = 0usize;
+        let mut multi_bone = 0usize;
+        let mut single_with_weights = 0usize;
+        let mut no_weight_single_skeleton = 0usize;
+        let mut no_weight_multi_skeleton = 0usize;
+        let mut mixed_samples: Vec<String> = Vec::new();
+        let mut words: BTreeMap<String, usize> = BTreeMap::new();
+        let mut samples: Vec<String> = Vec::new();
+
+        for type_id in [2u8, 3u8] {
+            survey_rows(&archives, &access, &cancel, type_id, |row| {
+                let (system, graphics) = row.segments();
+                let report = if type_id == 3 {
+                    let Ok(header) = lforge_rage9::fragment::header(system) else {
+                        return;
+                    };
+                    lforge_rage9::drawable::inspect_member_at(
+                        system,
+                        graphics,
+                        header.drawable as usize,
+                    )
+                } else {
+                    lforge_rage9::drawable::inspect(system, graphics)
+                };
+                let Some(report) = report else { return };
+                if report.header.skeleton.is_none() {
+                    return;
+                }
+                let word = |at: usize, offset: usize| {
+                    system
+                        .get(at + offset..at + offset + 4)
+                        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                };
+                for model in report
+                    .lod
+                    .iter()
+                    .find(|slot| !slot.models.is_empty())
+                    .into_iter()
+                    .flat_map(|slot| &slot.models)
+                {
+                    for geometry in &model.geometries {
+                        if geometry.bone_count == 0 {
+                            continue;
+                        }
+                        let has_weights = geometry.vertex_buffer.as_ref().is_some_and(|buffer| {
+                            graphics
+                                .get(buffer.graphics as usize..)
+                                .and_then(|tail| {
+                                    tail.get(..usize::try_from(buffer.declared_bytes).ok()?)
+                                })
+                                .is_some_and(|blob| {
+                                    blob.get(24..28).is_some_and(|entry| entry[0] == 0x26)
+                                })
+                        });
+                        if geometry.bone_count == 1 {
+                            single_bone += 1;
+                            if has_weights {
+                                single_with_weights += 1;
+                            } else {
+                                let skeleton_bones = lforge_rage9::skeleton::inspect(
+                                    system,
+                                    report.header.skeleton.unwrap_or(0),
+                                )
+                                .bones
+                                .len();
+                                if skeleton_bones == 1 {
+                                    no_weight_single_skeleton += 1;
+                                } else {
+                                    no_weight_multi_skeleton += 1;
+                                    if mixed_samples.len() < sample_limit {
+                                        mixed_samples.push(format!(
+                                            "{}: geometry declares 1 bone, skeleton holds {skeleton_bones}",
+                                            row.path.display()
+                                        ));
+                                    }
+                                }
+                            }
+                            let key = format!(
+                                "word_14 {:?} flags {:?} +0x28 {:?} +0x2A {:?} +0x2E {:?} +0x30 {:?} +0x34 {:?} +0x38 {:?} +0x3C {:?}",
+                                model.word_14,
+                                model.flags & 0xFFFF,
+                                word(geometry.at as usize, 0x28),
+                                word(geometry.at as usize, 0x2A),
+                                word(geometry.at as usize, 0x2E),
+                                word(geometry.at as usize, 0x30),
+                                word(geometry.at as usize, 0x34),
+                                word(geometry.at as usize, 0x38),
+                                word(geometry.at as usize, 0x3C)
+                            );
+                            *words.entry(key).or_insert(0) += 1;
+                            if samples.len() < sample_limit {
+                                samples.push(format!(
+                                    "{}: bone_count 1, weights {has_weights}, word_30 {:#x}, vertex buffer {:?}",
+                                    row.path.display(),
+                                    geometry.word_30,
+                                    geometry.vertex_buffer.as_ref().map(|buffer| (
+                                        buffer.elements,
+                                        buffer.unit,
+                                        buffer.declared_bytes
+                                    ))
+                                ));
+                            }
+                        } else {
+                            multi_bone += 1;
+                        }
+                    }
+                }
+            });
+        }
+        eprintln!("one-bone geometries: {single_bone} ({single_with_weights} with a weight form)");
+        eprintln!("multi-bone geometries: {multi_bone}");
+        eprintln!(
+            "of the one-bone geometries without a weight form: {no_weight_single_skeleton} belong to a one-bone skeleton, {no_weight_multi_skeleton} to a larger one"
+        );
+        for line in &mixed_samples {
+            eprintln!("  mixed: {line}");
+        }
+        eprintln!("one-bone geometry record words, most frequent first:");
+        let mut ranked: Vec<(&String, &usize)> = words.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        for (key, count) in ranked.iter().take(8) {
+            eprintln!("  {count:5} x {key}");
+        }
+        for line in &samples {
+            eprintln!("  sample: {line}");
+        }
+        assert!(single_bone > 0, "no one-bone geometry was read");
+    }
+
+    /// Finds the skeleton extremes of the chain corpus and names them natively.
+    ///
+    /// Ignored by default. `LF_TEST_CHAIN_LIST` names a file of census chains,
+    /// `LF_TEST_GAME_ROOT` the installation and `LF_TEST_EXECUTABLE` the
+    /// executable that supplies the keys. `LF_CHAIN_LIMIT` bounds the chains
+    /// read.
+    ///
+    /// The extreme skeletons a manual check needs must be nameable as a native
+    /// chain, so this run walks chains and reports the ones with the most bones
+    /// and the most roots rather than the paths of extracted caches.
+    #[test]
+    #[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+    fn finds_skeleton_extremes_over_chains() {
+        let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let limit: usize = std::env::var("LF_CHAIN_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(usize::MAX);
+        let stride: usize = std::env::var("LF_CHAIN_STRIDE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let text = std::fs::read_to_string(&list).expect("chain list");
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        let mut read = 0usize;
+        let mut with_skeleton = 0usize;
+        let mut multi_root = 0usize;
+        let mut by_bones: Vec<(usize, usize, usize, String, String)> = Vec::new();
+        let mut by_roots: Vec<(usize, usize, usize, String, String)> = Vec::new();
+        for chain in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .step_by(stride)
+            .take(limit)
+        {
+            let Some((parent_chain, row)) = chain.rsplit_once('!') else {
+                continue;
+            };
+            let Ok(row) = row.parse::<usize>() else {
+                continue;
+            };
+            let Some(parent) = resolve_chain(
+                Path::new(&root),
+                &access,
+                parent_chain,
+                &mut resolved,
+                &mut index,
+            ) else {
+                continue;
+            };
+            if !index.contains_key(&parent) {
+                index.insert(parent.clone(), row_index(&parent, &access));
+            }
+            let Some(entry) = index.get(&parent).and_then(|rows| rows.get(&row)).cloned() else {
+                continue;
+            };
+            let Ok(binary) = crate::files::open_binary_with(&entry, &access) else {
+                continue;
+            };
+            let source = binary.source;
+            let total = source.len();
+            if total > MAX_MODEL_BYTES {
+                continue;
+            }
+            let Ok(bytes) = read_exact(&source, 0, total) else {
+                continue;
+            };
+            let native = crate::files::resource_split_with(&entry, &access, &source)
+                .ok()
+                .flatten()
+                .and_then(|split| usize::try_from(split.system_len).ok());
+            let boundary = native.or_else(|| decoded::split_resource(&bytes).map(|s| s.system_len));
+            let Some(system_len) = boundary.filter(|len| *len <= bytes.len()) else {
+                continue;
+            };
+            read += 1;
+            let (system, graphics) = bytes.split_at(system_len);
+            let Ok(header) = lforge_rage9::fragment::header(system) else {
+                continue;
+            };
+            let Some(report) = lforge_rage9::drawable::inspect_member_at(
+                system,
+                graphics,
+                header.drawable as usize,
+            ) else {
+                continue;
+            };
+            let Some(at) = report.header.skeleton else {
+                continue;
+            };
+            let skeleton = lforge_rage9::skeleton::inspect(system, at);
+            if skeleton.bones.is_empty() {
+                continue;
+            }
+            with_skeleton += 1;
+            if skeleton.roots.len() > 1 {
+                multi_root += 1;
+            }
+            let name = lforge_rage9::drawable::member_name_at(system, header.drawable as usize)
+                .unwrap_or_default();
+            let record = (
+                skeleton.bones.len(),
+                skeleton.roots.len(),
+                skeleton.max_depth,
+                chain.to_string(),
+                name,
+            );
+            by_bones.push(record.clone());
+            by_roots.push(record);
+            by_bones.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            by_bones.truncate(6);
+            by_roots.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+            by_roots.truncate(6);
+        }
+        eprintln!(
+            "chains read: {read}, with a skeleton: {with_skeleton}, multi-root: {multi_root}"
+        );
+        eprintln!("most bones:");
+        for (bones, roots, depth, chain, name) in &by_bones {
+            eprintln!("  {bones} bones, {roots} root(s), depth {depth}: {chain} {name}");
+        }
+        eprintln!("most roots:");
+        for (bones, roots, depth, chain, name) in &by_roots {
+            eprintln!("  {roots} root(s), {bones} bones, depth {depth}: {chain} {name}");
+        }
+        assert!(with_skeleton > 0, "no skeleton was read");
+    }
+
+    /// Measures the skeleton work of one real resource.
+    ///
+    /// Ignored by default. `LF_TEST_CHAIN_LIST` names a file of census chains,
+    /// `LF_TEST_GAME_ROOT` the installation and `LF_TEST_EXECUTABLE` the
+    /// executable that supplies the keys. `LF_MEASURE_ITERATIONS` sets how often
+    /// each step repeats.
+    ///
+    /// This is a measurement, not a benchmark harness: it reports the cost of the
+    /// skeleton steps on the resource the caller names, so a large and a small
+    /// skeleton can be compared on the same machine in the same run.
+    #[test]
+    #[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+    fn measures_skeleton_work() {
+        use std::time::Instant;
+
+        let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let iterations: u32 = std::env::var("LF_MEASURE_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50);
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let text = std::fs::read_to_string(&list).expect("chain list");
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        for chain in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let Some((parent_chain, row)) = chain.rsplit_once('!') else {
+                continue;
+            };
+            let Ok(row) = row.parse::<usize>() else {
+                continue;
+            };
+            let Some(parent) = resolve_chain(
+                Path::new(&root),
+                &access,
+                parent_chain,
+                &mut resolved,
+                &mut index,
+            ) else {
+                continue;
+            };
+            if !index.contains_key(&parent) {
+                index.insert(parent.clone(), row_index(&parent, &access));
+            }
+            let Some(entry) = index.get(&parent).and_then(|rows| rows.get(&row)).cloned() else {
+                continue;
+            };
+            let resource = match read_resource_with_cancel(&entry, &access, &cancel) {
+                Ok(resource) => resource,
+                Err(err) => {
+                    eprintln!("{chain}: {err}");
+                    continue;
+                }
+            };
+            let system = resource.system();
+            let graphics = resource.graphics();
+            let Ok(header) = lforge_rage9::fragment::header(system) else {
+                continue;
+            };
+            let Some(report) = lforge_rage9::drawable::inspect_member_at(
+                system,
+                graphics,
+                header.drawable as usize,
+            ) else {
+                continue;
+            };
+            let Some(at) = report.header.skeleton else {
+                continue;
+            };
+
+            let mut drawable_us = 0f64;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let _ = lforge_rage9::fragment::header(system)
+                    .ok()
+                    .and_then(|header| {
+                        lforge_rage9::drawable::inspect_member_at(
+                            system,
+                            graphics,
+                            header.drawable as usize,
+                        )
+                    });
+                drawable_us += start.elapsed().as_secs_f64() * 1e6;
+            }
+            let mut inspect_us = 0f64;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let _ = lforge_rage9::skeleton::inspect(system, at);
+                inspect_us += start.elapsed().as_secs_f64() * 1e6;
+            }
+            let report = lforge_rage9::skeleton::inspect(system, at);
+            let bones = report.bones.len();
+            let roots = report.roots.len();
+            let depth = report.max_depth;
+            let mut rows_us = 0f64;
+            let mut filter_us = 0f64;
+            if let Ok(loaded) = crate::files::model::load_with_cancel(
+                &entry,
+                &access,
+                Some(Path::new(&root)),
+                &cancel,
+            ) && let Some(skeleton) = loaded.scene.skeleton.as_ref()
+            {
+                {
+                    let panel = crate::viewers::BonePanel::new();
+                    let filter_name = skeleton
+                        .bones
+                        .last()
+                        .and_then(|bone| bone.name.clone())
+                        .unwrap_or_default();
+                    for _ in 0..iterations {
+                        let start = Instant::now();
+                        let _ = panel.rows(skeleton, "");
+                        rows_us += start.elapsed().as_secs_f64() * 1e6;
+                        let start = Instant::now();
+                        let _ = panel.rows(skeleton, &filter_name);
+                        filter_us += start.elapsed().as_secs_f64() * 1e6;
+                    }
+                    let start = Instant::now();
+                    let _ = crate::files::model::load_with_cancel(
+                        &entry,
+                        &access,
+                        Some(Path::new(&root)),
+                        &cancel,
+                    );
+                    let load_ms = start.elapsed().as_secs_f64() * 1e3;
+                    eprintln!(
+                        "{chain}: {bones} bones, {roots} root(s), depth {depth}, {} geometries in the selected LOD",
+                        loaded
+                            .scene
+                            .meshes
+                            .iter()
+                            .map(|mesh| mesh.primitives.len())
+                            .sum::<usize>()
+                    );
+                    eprintln!(
+                        "  drawable walk {:.1} us, skeleton inspect {:.1} us, hierarchy rows {:.1} us, filtered rows {:.1} us (mean of {iterations})",
+                        drawable_us / f64::from(iterations),
+                        inspect_us / f64::from(iterations),
+                        rows_us / f64::from(iterations),
+                        filter_us / f64::from(iterations)
+                    );
+                    eprintln!("  full load, geometry and textures included: {load_ms:.1} ms");
+                    if let Ok(mut renderer) = lforge_renderer::Renderer::new() {
+                        let options = |overlay| lforge_renderer::OffscreenOptions {
+                            width: 640,
+                            height: 480,
+                            background: lforge_renderer::Background::DARK,
+                            camera: None,
+                            frame_scene: true,
+                            overlay,
+                        };
+                        let mut upload_us = 0f64;
+                        for _ in 0..10 {
+                            let start = Instant::now();
+                            let _ = renderer.upload_scene(&loaded.scene);
+                            upload_us += start.elapsed().as_secs_f64() * 1e6;
+                        }
+                        let mut plain_us = f64::MAX;
+                        let mut overlay_us = f64::MAX;
+                        for _ in 0..20 {
+                            let start = Instant::now();
+                            let _ = renderer.render_offscreen(
+                                &loaded.scene,
+                                &options(lforge_renderer::Overlay::NONE),
+                            );
+                            plain_us = plain_us.min(start.elapsed().as_secs_f64() * 1e6);
+                            let start = Instant::now();
+                            let _ = renderer.render_offscreen(
+                                &loaded.scene,
+                                &options(lforge_renderer::Overlay::skeleton(None, true)),
+                            );
+                            overlay_us = overlay_us.min(start.elapsed().as_secs_f64() * 1e6);
+                        }
+                        eprintln!(
+                            "  GPU: upload {:.0} us, offscreen render {:.0} us, with the skeleton overlay {:.0} us (minimum of 20)",
+                            upload_us / 10.0,
+                            plain_us,
+                            overlay_us
+                        );
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    /// Loads one native chain through the shared loading path.
+    fn load_chain(
+        root: &Path,
+        access: &Access,
+        chain: &str,
+        cancel: &AtomicBool,
+    ) -> Option<LoadedModel> {
+        let (parent_chain, row) = chain.rsplit_once('!')?;
+        let row = row.parse::<usize>().ok()?;
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        let parent = resolve_chain(root, access, parent_chain, &mut resolved, &mut index)?;
+        let rows = index
+            .entry(parent.clone())
+            .or_insert_with(|| row_index(&parent, access));
+        let entry = rows.get(&row)?.clone();
+        load_with_cancel(&entry, access, Some(root), cancel).ok()
+    }
+
+    /// Checks the reference resources the acceptance run depends on.
+    ///
+    /// Ignored by default. `LF_TEST_GAME_ROOT` names the installation and
+    /// `LF_TEST_EXECUTABLE` the executable that supplies the keys.
+    ///
+    /// The numbers are the ones the previous work reported, so a regression in
+    /// decoding or in texture reconstruction shows up as a changed count rather
+    /// than as a preview nobody compares.
+    #[test]
+    #[ignore = "requires LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+    fn verifies_the_reference_resources() {
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let root = Path::new(&root);
+        let expected: [(&str, &str, usize, usize, usize, usize, usize); 5] = [
+            // chain, name, meshes, materials, textures, vertices, triangles
+            (
+                "levels.rpf!5!252",
+                "prop_am_trophy_fish_06a_batchlod.#dr",
+                1,
+                1,
+                5,
+                171,
+                158,
+            ),
+            (
+                "levels.rpf!5!0",
+                "prop_am_card_tarot_deck_01a.#ft",
+                1,
+                1,
+                3,
+                88,
+                76,
+            ),
+            (
+                "levels.rpf!5!1",
+                "prop_am_candlestick_02a.#ft",
+                1,
+                2,
+                6,
+                927,
+                1232,
+            ),
+            (
+                "data.rpf!26!9",
+                "w_sg_goodwin_01_bolt_01_mid.#ft",
+                1,
+                1,
+                3,
+                620,
+                372,
+            ),
+            (
+                "levels.rpf!5!8",
+                "mint_peacock_taxidermy_01.#ft",
+                1,
+                4,
+                16,
+                41_613,
+                45_132,
+            ),
+        ];
+        for (chain, name, meshes, materials, textures, vertices, triangles) in expected {
+            let Some(loaded) = load_chain(root, &access, chain, &cancel) else {
+                panic!("{chain} did not load");
+            };
+            eprintln!(
+                "{chain} {name}: {} meshes, {} materials, {} textures, {} vertices, {} triangles, skeleton {}, placement {}",
+                loaded.scene.meshes.len(),
+                loaded.scene.materials.len(),
+                loaded.scene.textures.len(),
+                loaded.scene.vertex_count(),
+                loaded.scene.triangle_count(),
+                loaded.completeness.skeleton.name(),
+                loaded.completeness.placement.name()
+            );
+            assert_eq!(loaded.name, name, "{chain}");
+            if meshes > 0 {
+                assert_eq!(loaded.scene.meshes.len(), meshes, "{name} meshes");
+            }
+            if materials > 0 {
+                assert_eq!(loaded.scene.materials.len(), materials, "{name} materials");
+            }
+            if textures > 0 {
+                assert_eq!(loaded.scene.textures.len(), textures, "{name} textures");
+            }
+            if vertices > 0 {
+                assert_eq!(loaded.scene.vertex_count(), vertices, "{name} vertices");
+            }
+            if triangles > 0 {
+                assert_eq!(loaded.scene.triangle_count(), triangles, "{name} triangles");
+            }
+        }
+    }
+
+    /// Finds native drawable dictionaries whose members carry skeletons.
+    ///
+    /// Ignored by default. `LF_TEST_CHAIN_LIST` names type-4 census chains,
+    /// `LF_TEST_GAME_ROOT` the installation and `LF_TEST_EXECUTABLE` the
+    /// executable that supplies the keys. `LF_CHAIN_STRIDE` and `LF_CHAIN_LIMIT`
+    /// bound the walk, and `LF_DICTIONARY_MEMBERS` bounds the members read from
+    /// one dictionary.
+    ///
+    /// A manual check needs a dictionary it can name and two members whose
+    /// skeletons differ, so this run reports exactly those and nothing else.
+    #[test]
+    #[ignore = "requires LF_TEST_CHAIN_LIST, LF_TEST_GAME_ROOT and LF_TEST_EXECUTABLE"]
+    fn finds_skeleton_bearing_dictionaries() {
+        let list = std::env::var("LF_TEST_CHAIN_LIST").expect("LF_TEST_CHAIN_LIST");
+        let root = std::env::var("LF_TEST_GAME_ROOT").expect("LF_TEST_GAME_ROOT");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let limit: usize = std::env::var("LF_CHAIN_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(usize::MAX);
+        let stride: usize = std::env::var("LF_CHAIN_STRIDE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let member_cap: usize = std::env::var("LF_DICTIONARY_MEMBERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8);
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        let cancel = AtomicBool::new(false);
+        let text = std::fs::read_to_string(&list).expect("chain list");
+        let mut resolved = std::collections::BTreeMap::new();
+        let mut index = std::collections::HashMap::new();
+        let mut read = 0usize;
+        let mut with_skeleton = 0usize;
+        let mut found: Vec<String> = Vec::new();
+        let mut samples: Vec<String> = Vec::new();
+        for chain in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .step_by(stride)
+            .take(limit)
+        {
+            let Some((parent_chain, row)) = chain.rsplit_once('!') else {
+                continue;
+            };
+            let Ok(row) = row.parse::<usize>() else {
+                continue;
+            };
+            let Some(parent) = resolve_chain(
+                Path::new(&root),
+                &access,
+                parent_chain,
+                &mut resolved,
+                &mut index,
+            ) else {
+                continue;
+            };
+            if !index.contains_key(&parent) {
+                index.insert(parent.clone(), row_index(&parent, &access));
+            }
+            let Some(entry) = index.get(&parent).and_then(|rows| rows.get(&row)).cloned() else {
+                continue;
+            };
+            read += 1;
+            let Ok(dictionary) = enumerate_dictionary(&entry, &access, &cancel) else {
+                continue;
+            };
+            let members = dictionary.info.drawable_members().count();
+            let mut lines = Vec::new();
+            for member in 0..members.min(member_cap) {
+                let Ok(loaded) = load_dictionary_member(
+                    &entry,
+                    &access,
+                    Some(Path::new(&root)),
+                    member,
+                    &cancel,
+                ) else {
+                    continue;
+                };
+                let Some(skeleton) = loaded.scene.skeleton.as_ref() else {
+                    continue;
+                };
+                lines.push(format!(
+                    "  member {member} {}: {} bones, {} root(s), depth {}, placement {}, associations {}",
+                    loaded.name,
+                    skeleton.bones.len(),
+                    skeleton.roots.len(),
+                    skeleton.max_depth,
+                    loaded.completeness.placement.name(),
+                    loaded.completeness.associations.name()
+                ));
+            }
+            if !lines.is_empty() {
+                with_skeleton += 1;
+                let mut block = format!("{chain}: {members} member(s)");
+                for line in &lines {
+                    block.push('\n');
+                    block.push_str(line);
+                }
+                if lines.len() > 1 {
+                    found.push(block.clone());
+                }
+                if samples.len() < 8 {
+                    samples.push(block);
+                }
+            }
+        }
+        eprintln!("dictionaries read: {read}, with a skeleton-bearing member: {with_skeleton}");
+        for sample in samples.iter().take(6) {
+            eprintln!("{sample}");
+        }
+        eprintln!(
+            "dictionaries with differing bone counts among the members read: {}",
+            found.len()
+        );
+        for block in found.iter().take(6) {
+            eprintln!("{block}");
+        }
+        assert!(read > 0, "no dictionary was read");
     }
 }
