@@ -979,6 +979,69 @@ pub struct ChunkTable {
     pub chunks: Vec<Chunk>,
 }
 
+/// The stored prefix before the first chunk of encodings 2 and 4.
+pub const STORED_PREFIX_LEN: u64 = 16;
+
+/// Why a chunk table and a location record do not describe one stored range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredPrefixError {
+    /// The chunk stored sizes do not fit in 64 bits.
+    Overflow,
+    /// The chunks, or the prefix and chunks, take more bytes than the entry
+    /// declares.
+    ChunksOverrun { stored_end: u64, stored_len: u64 },
+    /// The prefix and the chunks take more bytes than the entry declares.
+    PrefixOverrun { prefix: u64, stored_len: u64 },
+    /// The gap between the entry's stored size and the chunks is not a
+    /// length this format was observed to use.
+    Unsupported { prefix: u64 },
+}
+
+impl ChunkTable {
+    /// The bytes stored before chunk 0, from the entry's stored size and the
+    /// sum of the chunk stored sizes.
+    ///
+    /// Encoding 2 always stores 16 bytes there. Encoding 4 stores the same
+    /// prefix on resource-page payloads and none otherwise, so the prefix is
+    /// what the stored size leaves after the chunks. Encoding 3 starts at the
+    /// payload offset. Only the observed lengths 0 and 16 are accepted.
+    pub fn stored_prefix(&self, stored_len: u64) -> Result<u64, StoredPrefixError> {
+        let stored_sum = self
+            .chunks
+            .iter()
+            .try_fold(0u64, |sum, chunk| {
+                sum.checked_add(u64::from(chunk.stored_len))
+            })
+            .ok_or(StoredPrefixError::Overflow)?;
+        let prefix = match self.encoding {
+            2 => STORED_PREFIX_LEN,
+            4 => stored_len
+                .checked_sub(stored_sum)
+                .ok_or(StoredPrefixError::ChunksOverrun {
+                    stored_end: stored_sum,
+                    stored_len,
+                })?,
+            _ => 0,
+        };
+        if !matches!(prefix, 0 | STORED_PREFIX_LEN) {
+            return Err(StoredPrefixError::Unsupported { prefix });
+        }
+        if prefix > stored_len {
+            return Err(StoredPrefixError::PrefixOverrun { prefix, stored_len });
+        }
+        let Some(end) = prefix.checked_add(stored_sum) else {
+            return Err(StoredPrefixError::Overflow);
+        };
+        if end > stored_len {
+            return Err(StoredPrefixError::ChunksOverrun {
+                stored_end: end,
+                stored_len,
+            });
+        }
+        Ok(prefix)
+    }
+}
+
 /// A pool and the range of one value inside it.
 type ValueRange = (Range<usize>, Range<usize>);
 

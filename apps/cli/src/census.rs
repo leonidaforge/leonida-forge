@@ -1239,8 +1239,6 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-/// Bytes stored before the first chunk of an encoding-2 entry.
-const ENCODING_2_PREFIX: u64 = 16;
 /// The chunk method that holds a zlib stream. Every other method copies.
 const ZLIB_METHOD: u8 = 3;
 
@@ -1280,14 +1278,6 @@ pub(crate) fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
     }
     // Encoding 2 always starts its chunks after a 16-byte prefix. Encoding 4
     // stores the same prefix for resource-page payloads and none otherwise,
-    // so what the stored size leaves after the chunks is the prefix.
-    let prefix = match table.encoding {
-        2 => ENCODING_2_PREFIX,
-        4 => location.stored_len.checked_sub(stored)?,
-        _ => 0,
-    };
-    if !matches!(prefix, 0 | ENCODING_2_PREFIX) {
-        return None;
-    }
+    let prefix = table.stored_prefix(location.stored_len).ok()?;
     Some((location.payload_offset.checked_add(prefix)?, stored))
 }

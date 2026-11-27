@@ -21,7 +21,7 @@ use flate2::{Decompress, FlushDecompress, Status};
 use lforge_binary::Source;
 
 use super::transform::{BLOCK_LEN, BlockDecrypt};
-use super::{Chunk, ChunkTable, Error, invalid};
+use super::{Chunk, ChunkTable, Error, StoredPrefixError, invalid};
 
 /// Stored bytes read per decoder step.
 const INPUT_LEN: usize = 64 * 1024;
@@ -29,15 +29,6 @@ const INPUT_LEN: usize = 64 * 1024;
 const SKIP_LEN: usize = 64 * 1024;
 /// The chunk method that holds a zlib stream. The others are copied.
 const ZLIB_METHOD: u8 = 3;
-/// Encoding-2 entries store a 16-byte prefix before the first chunk. The
-/// chunk table measures only the chunks: on real rows their stored sizes sum
-/// to exactly 16 less than the entry's stored size, and the first zlib stream
-/// starts at offset 16. The prefix's meaning is not established, but its
-/// length is the same on every observed entry. Encoding 4 stores the same
-/// prefix for resource-page payloads and none otherwise; there the stored size
-/// leaves the prefix, which is checked against these two lengths. Encoding 3
-/// starts its chunks at offset 0.
-const ENCODING_2_PREFIX: u64 = 16;
 /// Zlib chunks up to this size are kept in memory while they are read.
 /// Larger ones are kept in a temporary file.
 const CHUNK_BUFFER_LEN: u64 = 1024 * 1024;
@@ -498,36 +489,21 @@ impl Payload {
         table: &ChunkTable,
     ) -> Result<Self, Error> {
         let malformed = |what: String| invalid(format!("entry {row}: {what}"));
-        let sum_stored = table.chunks.iter().try_fold(0u64, |sum, chunk| {
-            sum.checked_add(u64::from(chunk.stored_len))
-        });
-        let sum_stored = sum_stored.ok_or_else(|| malformed("its chunk sizes overflow".into()))?;
-        // Encoding 2 always carries the 16-byte prefix. Encoding 4 carries it
-        // only when the payload is stored as resource pages, so the prefix is
-        // whatever the stored size leaves after the chunks. The observed
-        // lengths are 0 and 16; any other value means the table and the
-        // location record disagree, not that a new prefix exists.
-        let prefix = match table.encoding {
-            2 => ENCODING_2_PREFIX,
-            4 => stored.len().checked_sub(sum_stored).ok_or_else(|| {
-                malformed(format!(
-                    "its chunks take {sum_stored} stored bytes, more than its {}",
-                    stored.len()
-                ))
-            })?,
-            _ => 0,
-        };
-        if !matches!(prefix, 0 | ENCODING_2_PREFIX) {
-            return Err(malformed(format!(
-                "its chunks leave a {prefix}-byte stored prefix"
-            )));
-        }
-        if prefix > stored.len() {
-            return Err(malformed(format!(
-                "its {prefix}-byte stored prefix does not fit in its {} stored bytes",
-                stored.len()
-            )));
-        }
+        let prefix = table.stored_prefix(stored.len()).map_err(|err| match err {
+            StoredPrefixError::Overflow => malformed("its chunk sizes overflow".into()),
+            StoredPrefixError::ChunksOverrun {
+                stored_end,
+                stored_len,
+            } => malformed(format!(
+                "its chunks take {stored_end} stored bytes, more than its {stored_len}"
+            )),
+            StoredPrefixError::PrefixOverrun { prefix, stored_len } => malformed(format!(
+                "its {prefix}-byte stored prefix does not fit in its {stored_len} stored bytes"
+            )),
+            StoredPrefixError::Unsupported { prefix } => {
+                malformed(format!("its chunks leave a {prefix}-byte stored prefix"))
+            }
+        })?;
         let mut spans = Vec::with_capacity(table.chunks.len());
         let (mut logical, mut stored_at) = (0u64, prefix);
         for (n, chunk) in table.chunks.iter().enumerate() {
@@ -554,12 +530,6 @@ impl Payload {
             });
             logical += u64::from(chunk.logical_len);
             stored_at += u64::from(chunk.stored_len);
-        }
-        if stored_at > stored.len() {
-            return Err(malformed(format!(
-                "its chunks take {stored_at} stored bytes, more than its {}",
-                stored.len()
-            )));
         }
         if logical != len {
             return Err(malformed(format!(
