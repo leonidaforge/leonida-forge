@@ -137,6 +137,8 @@ pub struct OffscreenOptions {
     pub camera: Option<OrbitCamera>,
     /// Whether to compute the camera from the scene when `camera` is `None`.
     pub frame_scene: bool,
+    /// The skeleton overlay. [`Overlay::NONE`] leaves the render unchanged.
+    pub overlay: Overlay,
 }
 
 impl OffscreenOptions {
@@ -147,6 +149,7 @@ impl OffscreenOptions {
             background: Background::DARK,
             camera: None,
             frame_scene: true,
+            overlay: Overlay::NONE,
         }
     }
 
@@ -158,6 +161,46 @@ impl OffscreenOptions {
     pub fn with_background(mut self, background: Background) -> Self {
         self.background = background;
         self
+    }
+
+    /// Draws the skeleton overlay with these options.
+    pub fn with_overlay(mut self, overlay: Overlay) -> Self {
+        self.overlay = overlay;
+        self
+    }
+}
+
+/// The skeleton overlay of one render.
+///
+/// The renderer receives already interpreted, model-space lines; it never reads
+/// a proprietary skeleton record. The overlay draws after the meshes in the
+/// same pass. Without `depth_independent` a bone inside opaque geometry is
+/// hidden by that geometry, exactly as it would be if it were part of the
+/// scene; with it the overlay ignores the depth buffer so every bone stays
+/// visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Overlay {
+    pub visible: bool,
+    /// The bone to highlight, or `None` for none.
+    pub selected: Option<usize>,
+    /// Draw without depth testing.
+    pub depth_independent: bool,
+}
+
+impl Overlay {
+    /// No overlay: the render is byte-for-byte the model render.
+    pub const NONE: Self = Self {
+        visible: false,
+        selected: None,
+        depth_independent: false,
+    };
+
+    pub fn skeleton(selected: Option<usize>, depth_independent: bool) -> Self {
+        Self {
+            visible: true,
+            selected,
+            depth_independent,
+        }
     }
 }
 
@@ -238,6 +281,7 @@ pub struct Renderer {
     sampler: wgpu::Sampler,
     pipelines: Pipelines,
     fallback: FallbackTextures,
+    overlay: OverlayResources,
     target: Option<Target>,
 }
 
@@ -245,6 +289,20 @@ struct Pipelines {
     opaque: wgpu::RenderPipeline,
     opaque_double_sided: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
+    overlay_depth_tested: wgpu::RenderPipeline,
+    overlay_depth_independent: wgpu::RenderPipeline,
+}
+
+/// The uniform a skeleton overlay reads for the selected bone's marker range.
+struct OverlayResources {
+    highlight: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+/// The attachments one encoded frame renders into.
+struct Attachments<'a> {
+    color: &'a wgpu::TextureView,
+    depth: &'a wgpu::TextureView,
 }
 
 impl Renderer {
@@ -362,10 +420,56 @@ impl Renderer {
             bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
             immediate_size: 0,
         });
+        let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("overlay"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let overlay_shader = device.create_shader_module(wgpu::include_wgsl!("overlay.wgsl"));
+        let overlay_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("overlay"),
+                bind_group_layouts: &[Some(&camera_layout), Some(&overlay_layout)],
+                immediate_size: 0,
+            });
+        let overlay_highlight = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay highlight"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay"),
+            layout: &overlay_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: overlay_highlight.as_entire_binding(),
+            }],
+        });
         let pipelines = Pipelines {
             opaque: create_pipeline(&device, &layout, &shader, true, false, true),
             opaque_double_sided: create_pipeline(&device, &layout, &shader, false, false, true),
             blend: create_pipeline(&device, &layout, &shader, false, true, false),
+            overlay_depth_tested: create_overlay_pipeline(
+                &device,
+                &overlay_pipeline_layout,
+                &overlay_shader,
+                wgpu::CompareFunction::LessEqual,
+            ),
+            overlay_depth_independent: create_overlay_pipeline(
+                &device,
+                &overlay_pipeline_layout,
+                &overlay_shader,
+                wgpu::CompareFunction::Always,
+            ),
         };
         let fallback = fallback_textures(&device, &queue);
 
@@ -379,6 +483,10 @@ impl Renderer {
             sampler,
             pipelines,
             fallback,
+            overlay: OverlayResources {
+                highlight: overlay_highlight,
+                bind_group: overlay_bind_group,
+            },
             target: None,
         })
     }
@@ -414,16 +522,16 @@ impl Renderer {
     fn encode_scene(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
+        attachments: Attachments<'_>,
         scene: &GpuScene,
         camera: &OrbitCamera,
         background: Background,
+        overlay: Overlay,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("scene"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color_view,
+                view: attachments.color,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
@@ -432,7 +540,7 @@ impl Renderer {
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth_view,
+                view: attachments.depth,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Discard,
@@ -485,6 +593,48 @@ impl Renderer {
             pass.set_vertex_buffer(0, primitive.vertices.slice(..));
             pass.set_index_buffer(primitive.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..primitive.index_count, 0, 0..1);
+        }
+        self.encode_overlay(&mut pass, scene, overlay);
+    }
+
+    /// Draws the skeleton overlay, when the scene has one and the render asks
+    /// for it. The selection range goes into a uniform, so changing the
+    /// selected bone writes 16 bytes and never rebuilds a buffer.
+    fn encode_overlay(&self, pass: &mut wgpu::RenderPass<'_>, scene: &GpuScene, overlay: Overlay) {
+        let Some(skeleton) = scene.skeleton.as_ref() else {
+            return;
+        };
+        // The per-render option and the scene's own state are independent, so
+        // an offscreen caller can ask for an overlay on a freshly uploaded
+        // scene whose state still defaults to hidden.
+        if !overlay.visible && !skeleton.visible {
+            return;
+        }
+        let selected = overlay.selected.or(skeleton.selected);
+        let (start, count) = match selected.filter(|index| *index < skeleton.bone_count) {
+            Some(index) => (index as u32 * 6, 6),
+            None => (0, 0),
+        };
+        self.queue.write_buffer(
+            &self.overlay.highlight,
+            0,
+            bytemuck::bytes_of(&[start, count, 0u32, 0u32]),
+        );
+        let pipeline = if overlay.depth_independent {
+            &self.pipelines.overlay_depth_independent
+        } else {
+            &self.pipelines.overlay_depth_tested
+        };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        pass.set_bind_group(1, &self.overlay.bind_group, &[]);
+        if skeleton.marker_vertices > 0 {
+            pass.set_vertex_buffer(0, skeleton.markers.slice(..));
+            pass.draw(0..skeleton.marker_vertices, 0..1);
+        }
+        if skeleton.connection_vertices > 0 {
+            pass.set_vertex_buffer(0, skeleton.connections.slice(..));
+            pass.draw(0..skeleton.connection_vertices, 0..1);
         }
     }
 
@@ -540,16 +690,31 @@ impl Renderer {
         target: &GpuTarget,
         background: Background,
     ) -> Result<(), Error> {
+        self.render_to_target_with(scene, camera, target, background, Overlay::NONE)
+    }
+
+    /// [`Renderer::render_to_target`] with an explicit skeleton overlay.
+    pub fn render_to_target_with(
+        &self,
+        scene: &GpuScene,
+        camera: &OrbitCamera,
+        target: &GpuTarget,
+        background: Background,
+        overlay: Overlay,
+    ) -> Result<(), Error> {
         let color_view = target.color.create_view(&Default::default());
         self.update_camera(camera, target.width, target.height);
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.encode_scene(
             &mut encoder,
-            &color_view,
-            &target.depth_view,
+            Attachments {
+                color: &color_view,
+                depth: &target.depth_view,
+            },
             scene,
             camera,
             background,
+            overlay,
         );
         self.queue.submit([encoder.finish()]);
         Ok(())
@@ -563,6 +728,19 @@ impl Renderer {
         width: u32,
         height: u32,
         background: Background,
+    ) -> Result<Frame, Error> {
+        self.render_with_overlay(scene, camera, width, height, background, Overlay::NONE)
+    }
+
+    /// [`Renderer::render`] with an explicit skeleton overlay.
+    pub fn render_with_overlay(
+        &mut self,
+        scene: &GpuScene,
+        camera: &OrbitCamera,
+        width: u32,
+        height: u32,
+        background: Background,
+        overlay: Overlay,
     ) -> Result<Frame, Error> {
         let max = self.device.limits().max_texture_dimension_2d;
         let width = width.clamp(1, max);
@@ -581,11 +759,14 @@ impl Renderer {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         self.encode_scene(
             &mut encoder,
-            &color_view,
-            &target.depth_view,
+            Attachments {
+                color: &color_view,
+                depth: &target.depth_view,
+            },
             scene,
             camera,
             background,
+            overlay,
         );
         encoder.copy_texture_to_buffer(
             target.color.as_image_copy(),
@@ -654,16 +835,16 @@ impl Renderer {
                 OrbitCamera::default()
             }
         });
-        self.render(
+        self.render_with_overlay(
             &gpu,
             &camera,
             options.width,
             options.height,
             options.background,
+            options.overlay,
         )
     }
 }
-
 #[derive(Debug, Clone, Copy)]
 pub struct RendererOptions {
     pub backends: wgpu::Backends,
@@ -736,6 +917,50 @@ fn create_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format: COLOR_FORMAT,
                 blend: blend.then_some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_overlay_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("skeleton overlay"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_overlay"),
+            compilation_options: Default::default(),
+            buffers: &[Some(gpu_scene::OverlayVertex::layout())],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(depth_compare),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_overlay"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

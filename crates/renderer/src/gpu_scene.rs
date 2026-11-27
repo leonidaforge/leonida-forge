@@ -66,12 +66,50 @@ pub(crate) struct GpuMaterial {
     pub(crate) double_sided: bool,
 }
 
+/// One overlay line vertex: a model-space position and a colour.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct OverlayVertex {
+    pub(crate) position: [f32; 3],
+    pub(crate) color: [f32; 4],
+}
+
+impl OverlayVertex {
+    pub(crate) const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+
+    pub(crate) fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+/// The skeleton overlay of one uploaded scene.
+///
+/// The buffers hold model-space lines built from [`lforge_scene::Skeleton`].
+/// Toggling visibility or changing the selection never rebuilds them: the
+/// selection is a uniform range the overlay shader reads.
+#[derive(Debug)]
+pub(crate) struct GpuSkeleton {
+    pub(crate) markers: wgpu::Buffer,
+    pub(crate) marker_vertices: u32,
+    pub(crate) connections: wgpu::Buffer,
+    pub(crate) connection_vertices: u32,
+    pub(crate) bone_count: usize,
+    pub(crate) visible: bool,
+    pub(crate) selected: Option<usize>,
+}
+
 /// A scene uploaded to one GPU device. Dropping it releases every buffer,
 /// texture and bind group it owns.
 #[derive(Debug)]
 pub struct GpuScene {
     pub(crate) materials: Vec<GpuMaterial>,
     pub(crate) primitives: Vec<GpuPrimitive>,
+    pub(crate) skeleton: Option<GpuSkeleton>,
     warnings: Vec<String>,
 }
 
@@ -105,6 +143,45 @@ impl GpuScene {
         self.primitives
             .iter()
             .any(|primitive| primitive.mesh == mesh && primitive.visible)
+    }
+
+    /// Whether the scene carries a skeleton overlay.
+    pub fn has_skeleton(&self) -> bool {
+        self.skeleton.is_some()
+    }
+
+    pub fn skeleton_bone_count(&self) -> usize {
+        self.skeleton
+            .as_ref()
+            .map_or(0, |skeleton| skeleton.bone_count)
+    }
+
+    /// Whether the skeleton overlay is drawn. The uploaded buffers are
+    /// untouched.
+    pub fn skeleton_visible(&self) -> bool {
+        self.skeleton
+            .as_ref()
+            .is_some_and(|skeleton| skeleton.visible)
+    }
+
+    /// Shows or hides the skeleton overlay. This never re-uploads geometry.
+    pub fn set_skeleton_visible(&mut self, visible: bool) {
+        if let Some(skeleton) = &mut self.skeleton {
+            skeleton.visible = visible;
+        }
+    }
+
+    /// Highlights one bone in the overlay. This writes no GPU buffer.
+    pub fn set_skeleton_selected(&mut self, selected: Option<usize>) {
+        if let Some(skeleton) = &mut self.skeleton {
+            skeleton.selected = selected.filter(|index| *index < skeleton.bone_count);
+        }
+    }
+
+    pub fn skeleton_selected(&self) -> Option<usize> {
+        self.skeleton
+            .as_ref()
+            .and_then(|skeleton| skeleton.selected)
     }
 
     pub(crate) fn upload(
@@ -216,12 +293,79 @@ impl GpuScene {
         if primitives.is_empty() {
             return Err(Error::Scene("scene has no drawable primitives".into()));
         }
+        let skeleton = upload_skeleton(device, scene);
         Ok(Self {
             materials,
             primitives,
+            skeleton,
             warnings,
         })
     }
+}
+
+/// Builds the overlay lines of a scene's skeleton, when it has one.
+///
+/// Markers come first, six vertices per bone, so the selection range is
+/// `index * 6`. Parent-child connections follow. The marker length is a small
+/// fraction of the skeleton's extent, so a tiny prop skeleton and a tall one
+/// both stay visible.
+fn upload_skeleton(device: &wgpu::Device, scene: &Scene) -> Option<GpuSkeleton> {
+    let skeleton = scene.skeleton.as_ref()?;
+    if skeleton.bones.is_empty() {
+        return None;
+    }
+    let extent = skeleton.bounds().size().max_element().max(0.05);
+    let marker = extent * 0.06;
+    let connection_color = [0.15, 0.75, 0.95, 0.85];
+    let marker_color = [0.35, 0.95, 1.0, 1.0];
+    let mut markers = Vec::with_capacity(skeleton.bones.len() * 6);
+    let mut connections = Vec::new();
+    for bone in &skeleton.bones {
+        let position = bone.model_position;
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            let end = position + axis * marker;
+            markers.push(OverlayVertex {
+                position: position.to_array(),
+                color: marker_color,
+            });
+            markers.push(OverlayVertex {
+                position: end.to_array(),
+                color: marker_color,
+            });
+        }
+        if let Some(parent) = bone
+            .parent
+            .and_then(|parent| skeleton.bone_position(parent))
+        {
+            connections.push(OverlayVertex {
+                position: parent.to_array(),
+                color: connection_color,
+            });
+            connections.push(OverlayVertex {
+                position: position.to_array(),
+                color: connection_color,
+            });
+        }
+    }
+    let marker_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("skeleton markers"),
+        contents: bytemuck::cast_slice(&markers),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let connection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("skeleton connections"),
+        contents: bytemuck::cast_slice(&connections),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    Some(GpuSkeleton {
+        markers: marker_buffer,
+        marker_vertices: markers.len() as u32,
+        connections: connection_buffer,
+        connection_vertices: connections.len() as u32,
+        bone_count: skeleton.bones.len(),
+        visible: false,
+        selected: None,
+    })
 }
 
 fn transform_vertex(vertex: &Vertex, transform: Mat4, normal_matrix: Mat3) -> GpuVertex {
