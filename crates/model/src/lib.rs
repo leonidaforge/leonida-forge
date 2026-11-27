@@ -583,7 +583,8 @@ impl DictionaryMemberState {
 pub struct DictionaryMember {
     /// The position in the dictionary. It is the stable identifier to select a
     /// member by: the hash array is sorted, so positions do not depend on the
-    /// order the members were authored in.
+    /// order the members were authored in. A position identifies one member
+    /// even when two members share a hash or a drawable pointer.
     pub index: usize,
     /// The stored name hash, which equals `joaat` of the member's own name.
     pub hash: u32,
@@ -591,7 +592,23 @@ pub struct DictionaryMember {
     pub drawable: Option<usize>,
     /// The member drawable's stored name, when it has one.
     pub name: Option<String>,
+    /// `joaat` of the stored name, computed here and reported next to the
+    /// stored hash. The stored name carries a final extension that the hash
+    /// does not cover, so the hash is computed with that extension removed.
+    pub name_hash: Option<u32>,
+    /// Whether [`DictionaryMember::name_hash`] equals the stored
+    /// [`DictionaryMember::hash`]. `None` when the member has no name.
+    pub hash_matches_name: Option<bool>,
     pub state: DictionaryMemberState,
+}
+
+impl DictionaryMember {
+    /// The `joaat` hash a stored member name implies, with the final extension
+    /// removed. `None` when the member has no stored name.
+    pub fn hash_of_name(name: &str) -> u32 {
+        let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+        lforge_rage9::rpf::names::joaat(stem.as_bytes())
+    }
 }
 
 /// The dictionary as enumerated: membership only, no geometry.
@@ -642,19 +659,26 @@ pub fn dictionary_info(system: &[u8], graphics: &[u8]) -> Option<DictionaryInfo>
     let members = report
         .members
         .iter()
-        .map(|member| DictionaryMember {
-            index: member.index as usize,
-            hash: member.hash,
-            drawable: member.drawable.map(|at| at as usize),
-            name: member.name.clone(),
-            state: match member.state {
-                drawable_dictionary::MemberState::Drawable => DictionaryMemberState::Drawable,
-                drawable_dictionary::MemberState::Null => DictionaryMemberState::Null,
-                drawable_dictionary::MemberState::NotAPointer => DictionaryMemberState::NotAPointer,
-                drawable_dictionary::MemberState::NotADrawable => {
-                    DictionaryMemberState::NotADrawable
-                }
-            },
+        .map(|member| {
+            let name_hash = member.name.as_deref().map(DictionaryMember::hash_of_name);
+            DictionaryMember {
+                index: member.index as usize,
+                hash: member.hash,
+                drawable: member.drawable.map(|at| at as usize),
+                name: member.name.clone(),
+                name_hash,
+                hash_matches_name: name_hash.map(|hash| hash == member.hash),
+                state: match member.state {
+                    drawable_dictionary::MemberState::Drawable => DictionaryMemberState::Drawable,
+                    drawable_dictionary::MemberState::Null => DictionaryMemberState::Null,
+                    drawable_dictionary::MemberState::NotAPointer => {
+                        DictionaryMemberState::NotAPointer
+                    }
+                    drawable_dictionary::MemberState::NotADrawable => {
+                        DictionaryMemberState::NotADrawable
+                    }
+                },
+            }
         })
         .collect();
     Some(DictionaryInfo {

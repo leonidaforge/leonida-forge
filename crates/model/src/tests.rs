@@ -1,6 +1,25 @@
 use super::*;
 use lforge_rage9::dictionary::SlotState;
 
+#[test]
+fn a_member_name_hash_covers_the_name_without_its_final_extension() {
+    let joaat = lforge_rage9::rpf::names::joaat;
+    assert_eq!(
+        DictionaryMember::hash_of_name("farlod_structures_03.#dr"),
+        joaat(b"farlod_structures_03")
+    );
+    assert_ne!(
+        DictionaryMember::hash_of_name("farlod_structures_03.#dr"),
+        joaat(b"farlod_structures_03.#dr")
+    );
+    assert_eq!(
+        DictionaryMember::hash_of_name("noextension"),
+        joaat(b"noextension")
+    );
+    // Only the final extension is removed, not the first one.
+    assert_eq!(DictionaryMember::hash_of_name("a.b.c"), joaat(b"a.b"));
+}
+
 fn vertex_buffer() -> VertexBuffer {
     VertexBuffer {
         at: 0,
