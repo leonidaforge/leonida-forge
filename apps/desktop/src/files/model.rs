@@ -354,6 +354,13 @@ mod tests {
 
     /// Manual verification against a real installation. The test is ignored
     /// by default and reads only caller-supplied paths.
+    ///
+    /// `LF_TEST_ARCHIVE` must hold type-2 drawable rows. A root archive does
+    /// not: its type-2 rows are in nested archives. The census identifies
+    /// `levels.rpf` row 1806 (`levels.rpf!1806`) as a 123-row archive whose
+    /// type-2 rows use chunk encoding 4; extract that row to a file and point
+    /// this test at it. The rows are tried until five load, so a fixture that
+    /// starts with a row this build cannot read does not fail the test.
     #[test]
     #[ignore = "requires LF_TEST_ARCHIVE, LF_TEST_EXECUTABLE and LF_TEST_GAME_ROOT"]
     fn loads_native_type_2_rows() {
@@ -376,11 +383,16 @@ mod tests {
         let mut loaded_rows = 0usize;
         let mut complete_rows = 0usize;
         let mut partial_rows = 0usize;
+        let mut attempted = 0usize;
         for entry in entries
             .iter()
             .filter(|entry| entry.type_name.starts_with("RPF9 entry, type 2"))
-            .take(5)
+            .take(64)
         {
+            if loaded_rows == 5 {
+                break;
+            }
+            attempted += 1;
             let loaded = match load_with_cancel(
                 &entry.path,
                 &access,
@@ -419,7 +431,10 @@ mod tests {
                 }
             }
         }
-        assert!(loaded_rows > 0, "no type 2 row decoded");
+        assert!(
+            loaded_rows > 0,
+            "no type 2 row decoded ({attempted} attempted)"
+        );
         assert_eq!(complete_rows + partial_rows, loaded_rows);
         eprintln!("{loaded_rows} model(s): {complete_rows} complete, {partial_rows} partial");
     }
