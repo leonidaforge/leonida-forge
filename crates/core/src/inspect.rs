@@ -1618,7 +1618,7 @@ fn meta_resource_structure<R: Read + Seek>(
         "valid": true,
         "tag": "0DRP",
         "object_type": object_type,
-        "declared_roots": head.get(0x20..0x24).map(|word| u32::from_le_bytes(word.try_into().expect("4 bytes"))),
+        "root_block": head.get(0x20..0x24).map(|word| u32::from_le_bytes(word.try_into().expect("4 bytes"))),
         "structures": word(0x48),
         "enums": word(0x4a),
         "blocks": word(0x4c),
