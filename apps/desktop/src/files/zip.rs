@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
@@ -61,7 +62,7 @@ pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
                 None,
                 Locator::Zip(index),
             );
-            entry.resource = Some(archive.resource.with_entry(id));
+            entry.resource = Some(Arc::new(archive.resource.with_entry(id)));
             entry.resource_row = u32::try_from(index).ok();
             children.insert(child.clone(), entry);
         }

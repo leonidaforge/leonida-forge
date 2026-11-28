@@ -387,13 +387,11 @@ impl Layout {
             .filter(|&position| layout.placements[position].is_none())
             .collect();
         layout.grouped = layout.unnamed.len() < rows.len();
-        for position in 0..rows.len() {
+        for (position, entry) in entries.iter().enumerate() {
             let (folder, label) = match layout.placements[position].as_ref() {
                 Some(placement) => (placement.folder.clone(), placement.label.text.clone()),
-                None if layout.grouped => {
-                    (vec![UNNAMED.to_string()], entries[position].file_label())
-                }
-                None => (Vec::new(), entries[position].file_label()),
+                None if layout.grouped => (vec![UNNAMED.to_string()], entry.file_label()),
+                None => (Vec::new(), entry.file_label()),
             };
             layout.by_label.insert((folder, label), position);
         }
@@ -915,7 +913,7 @@ impl Native {
             None,
         );
         entry.resource_type = location.map(|l| l.type_id);
-        entry.resource = Some(resource.clone());
+        entry.resource = Some(Arc::new(resource.clone()));
         entry.resource_row = Some(row.row);
         entry.type_name = match location {
             Some(l) if l.type_id == names::RPF_TYPE => "RPF9 entry, type 0 (rpf)".to_string(),

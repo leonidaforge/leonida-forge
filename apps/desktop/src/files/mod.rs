@@ -25,6 +25,8 @@ use std::time::SystemTime;
 
 use archive::{Identified, Location};
 pub use executable::{Access, Executable};
+use std::sync::Arc;
+
 use lforge_binary::Source;
 use lforge_core::resource::ResourcePath;
 use serde::{Deserialize, Serialize};
@@ -51,8 +53,8 @@ pub struct Entry {
     pub resource_type: Option<u8>,
     /// The canonical resource path, when the entry comes from an archive.
     /// The path is display data; `resource_row` and the path's identity are
-    /// the technical record.
-    pub resource: Option<ResourcePath>,
+    /// the technical record. Shared, so a folder of rows clones cheaply.
+    pub resource: Option<Arc<ResourcePath>>,
     /// The native RPF row index or ZIP central-directory index. Diagnostic
     /// metadata, never a resource identifier.
     pub resource_row: Option<u32>,

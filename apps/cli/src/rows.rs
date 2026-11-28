@@ -420,8 +420,8 @@ fn print_ls_text(listing: &Listing, rows: &[Value], offset: usize, total: usize)
     }
     println!();
     println!(
-        "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} {}  names",
-        "row", "type", "ext", "key", "stored key", "logical", "stored", "contents", "resource"
+        "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} resource  names",
+        "row", "type", "ext", "key", "stored key", "logical", "stored", "contents"
     );
     for row in rows {
         let resource = row["resource"]["display"].as_str().unwrap_or("-");
