@@ -43,7 +43,7 @@ fn usage() -> String {
          \n\
          --member <index>       decode one drawable-dictionary member\n\
          --bone <index|name>    bone to pose; default: the largest weight total\n\
-         --degrees <deg>        rotation about model Z, default 30\n\
+         --degrees <deg>        rotation about the bone's own Z, default 30\n\
          --translate <x,y,z>    translation in the bone's parent space, metres\n\
          --compare              compare the GPU probe with the CPU reference\n\
          --render <file>        render the posed model to a PNG file\n\
@@ -225,7 +225,7 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("pose evaluation: {err:?}"))?;
     let positions: Vec<Vec3> = posed.iter().map(|bone| bone.model_position).collect();
     println!(
-        "pose: bone {bone} ({}) rotated {:.1} deg about Z and moved ({:.3}, {:.3}, {:.3}) m",
+        "pose: bone {bone} ({}) rotated {:.1} deg about its own Z and moved ({:.3}, {:.3}, {:.3}) m",
         skeleton.bones[bone]
             .name
             .clone()
