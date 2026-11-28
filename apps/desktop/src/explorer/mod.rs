@@ -2193,7 +2193,12 @@ enum ModelEntryKind {
 /// metadata encodings the census found open here: the `PSIN` container and the
 /// `RBF0` payload.
 fn opens_as_metadata(classification: Option<&lforge_core::classify::Classification>) -> bool {
-    classification.is_some_and(|value| matches!(value.format_id(), Some("psin") | Some("rbf0")))
+    classification.is_some_and(|value| {
+        matches!(
+            value.format_id(),
+            Some("psin") | Some("rbf0") | Some("meta-resource")
+        )
+    })
 }
 
 /// Whether a payload opens in the text viewer.
