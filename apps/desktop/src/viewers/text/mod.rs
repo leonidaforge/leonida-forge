@@ -10,8 +10,8 @@
 mod render;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
@@ -19,8 +19,10 @@ use gpui::{
     ScrollEvent, SharedString, Subscription, Task, Window, actions, prelude::*,
 };
 use lforge_text::document::{self, TAB_WIDTH};
-use lforge_text::syntax::{self, Span};
-use lforge_text::{Detection, Document, Encoding, Language, Match};
+use lforge_text::syntax::{self, Checkpoints, Span, State as LexState};
+use lforge_text::{
+    Cursor, Detection, Document, Encoding, Language, Load as MatchLoad, Match, Step,
+};
 
 use crate::files::{self, Access};
 use crate::ui::text_field::{TextField, TextFieldEvent};
@@ -49,6 +51,10 @@ const HIGHLIGHT_LIMIT: u32 = 20_000;
 const MAX_COPY: usize = 32 * 1024 * 1024;
 /// Matches highlighted on a line at once.
 const MAX_LINE_MATCHES: usize = 200;
+/// Lines read per step when a selection is copied.
+const COPY_BLOCK_LINES: usize = 1000;
+/// Lines lexed per step while replaying the highlighting state.
+const REPLAY_BLOCK_LINES: usize = 512;
 /// Bytes read to decide whether a payload is text.
 const SAMPLE: u64 = 64 * 1024;
 
@@ -123,6 +129,7 @@ impl Page {
 struct Request {
     first: usize,
     count: usize,
+    cancel: Arc<AtomicBool>,
     _task: Option<Task<()>>,
 }
 
@@ -146,6 +153,8 @@ struct Open {
     document: Arc<Document>,
     language: Language,
     extension: Option<String>,
+    /// Lexical states at checkpoints, shared by the page loads.
+    states: Arc<Mutex<Checkpoints>>,
     wrap: Option<Wrap>,
     wrap_task: Option<Task<()>>,
     wrap_generation: u64,
@@ -164,11 +173,12 @@ enum SearchState {
         _task: Task<()>,
     },
     Done {
-        results: lforge_text::Results,
-        current: Option<usize>,
-        /// The needle and case mode the results were found with.
+        cursor: Cursor,
         needle: String,
         match_case: bool,
+        /// A chunk load in flight, so a repeated step does not start another.
+        loading: Option<Arc<AtomicBool>>,
+        _task: Option<Task<()>>,
     },
 }
 
@@ -195,8 +205,8 @@ pub struct TextViewer {
     /// The entry's visible name: a resolved name, or the stored hash. Never the
     /// archive's internal row number.
     name: String,
-    /// The archive file the payload is stored in, and its virtual folders.
-    location: Option<String>,
+    /// The archive file the payload is stored in, when it is in one.
+    container: Option<String>,
     access: Access,
     encoding: Encoding,
     bom: bool,
@@ -336,56 +346,28 @@ fn open_failed(path: PathBuf, reason: String, cx: &mut App) {
     }
 }
 
-/// The name a payload is identified by: the entry's resolved name or stored
-/// hash, and never an internal row number.
+/// The name a payload is identified by. The caller supplies the entry's label,
+/// which is the resolved name or stored hash the Explorer shows; this function
+/// never derives an identity from the archive's internal row path.
 fn display_name(path: &Path, name: Option<&str>) -> String {
     if let Some(name) = name.filter(|name| !name.is_empty()) {
         return name.to_string();
     }
-    let last = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-    if is_row_label(&last) {
-        // Without a name the row cannot be identified better than by the
-        // archive it is stored in.
-        return files::split_location(path)
-            .and_then(|(file, _)| {
-                file.file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or(last);
-    }
-    last
-}
-
-/// Whether a path component is the archive's own `Row 00042` identity.
-fn is_row_label(component: &str) -> bool {
-    component
-        .strip_prefix("Row ")
-        .is_some_and(|row| !row.is_empty() && row.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-/// The archive and virtual folders the payload is stored under, with the row
-/// labels of nested archives left out: a row number is not a path.
-fn location(path: &Path) -> Option<String> {
-    let (file, inner) = files::split_location(path)?;
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(name) = file.file_name() {
-        parts.push(name.to_string_lossy().into_owned());
-    }
-    let mut folders: Vec<String> = inner
-        .parent()
-        .map(|parent| {
-            parent
-                .iter()
-                .map(|part| part.to_string_lossy().into_owned())
-                .filter(|part| !is_row_label(part))
-                .collect()
+    // No label was supplied: the archive, or the file itself, is all there is.
+    container_name(path)
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
         })
-        .unwrap_or_default();
-    parts.append(&mut folders);
-    Some(parts.join(" / "))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The archive file a payload is stored in, if it is stored in one. This is a
+/// real path on disk, not a virtual one.
+fn container_name(path: &Path) -> Option<String> {
+    let (file, _) = files::split_location(path)?;
+    file.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
 }
 
 /// A window that only says why nothing could be read.
@@ -412,7 +394,7 @@ impl TextViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let name = display_name(&path, name.as_deref());
-        let location = location(&path);
+        let container = container_name(&path);
         let find_field = cx.new(|cx| TextField::new("Find", cx));
         let goto_field = cx.new(|cx| TextField::new("Line", cx));
         let subscriptions = vec![
@@ -436,7 +418,7 @@ impl TextViewer {
         let mut viewer = Self {
             path,
             name,
-            location,
+            container,
             access,
             encoding: prepared.encoding,
             bom: false,
@@ -496,7 +478,10 @@ impl TextViewer {
         self.bom = false;
         self.state = State::Loading;
         self.page = None;
-        self.page_request = None;
+        if let Some(request) = self.page_request.take() {
+            request.cancel.store(true, Ordering::Relaxed);
+        }
+        self.page_generation += 1;
         self.top_row = 0;
         self.scroll_x = 0;
         self.anchor = Position::default();
@@ -547,12 +532,15 @@ impl TextViewer {
                             document: Arc::new(document),
                             language,
                             extension,
+                            states: Arc::new(Mutex::new(Checkpoints::new())),
                             wrap: None,
                             wrap_task: None,
                             wrap_generation: 0,
                         });
                         this.page = None;
-                        this.page_request = None;
+                        if let Some(request) = this.page_request.take() {
+                            request.cancel.store(true, Ordering::Relaxed);
+                        }
                         this.page_generation += 1;
                         if this.wrap {
                             this.rebuild_wrap(cx);
@@ -800,18 +788,55 @@ impl TextViewer {
         let count = last - first;
         let document = Arc::clone(&open.document);
         let language = open.language;
+        let states = Arc::clone(&open.states);
         self.page_generation += 1;
         let generation = self.page_generation;
-        let load = cx.background_spawn(async move {
-            let lines = document.read_lines(first, count)?;
-            let page_lines = lines
-                .into_iter()
-                .map(|raw| page_line(&raw, language))
-                .collect();
-            Ok::<_, document::Error>(Page {
-                first,
-                lines: page_lines,
-            })
+        // A superseded read stops at its next block instead of finishing.
+        if let Some(previous) = self.page_request.take() {
+            previous.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let load = cx.background_spawn({
+            let cancel = cancel.clone();
+            async move {
+                // Resume from the nearest checkpoint the highlighter reached,
+                // instead of lexing the document from its first line.
+                let (mut line, mut state) = states
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .resolve(first);
+                while line < first {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(document::Error::Cancelled);
+                    }
+                    let step = (first - line).min(REPLAY_BLOCK_LINES);
+                    let block = document.read_lines_cancellable(line, step, &cancel)?;
+                    for (offset, raw) in block.iter().enumerate() {
+                        let text = document::expand_tabs(raw, TAB_WIDTH);
+                        state = syntax::highlight(language, state, &text).1;
+                        states
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .checkpoint(line + offset + 1, state);
+                    }
+                    line += step;
+                }
+                let raw_lines = document.read_lines_cancellable(first, count, &cancel)?;
+                let mut page_lines = Vec::with_capacity(raw_lines.len());
+                for (offset, raw) in raw_lines.iter().enumerate() {
+                    let (page_line, next) = page_line(raw, language, state);
+                    state = next;
+                    states
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .checkpoint(first + offset + 1, state);
+                    page_lines.push(page_line);
+                }
+                Ok::<_, document::Error>(Page {
+                    first,
+                    lines: page_lines,
+                })
+            }
         });
         let task = cx.spawn(async move |this, cx| {
             let result = load.await;
@@ -821,11 +846,8 @@ impl TextViewer {
                 }
                 this.page_request = None;
                 match result {
-                    Ok(page) => {
-                        // Keep the caret's line available if the page does not
-                        // hold it.
-                        this.page = Some(page);
-                    }
+                    Ok(page) => this.page = Some(page),
+                    Err(document::Error::Cancelled) => return,
                     Err(err) => this.notify(format!("Could not read the lines: {err}"), true),
                 }
                 cx.notify();
@@ -835,6 +857,7 @@ impl TextViewer {
         self.page_request = Some(Request {
             first,
             count,
+            cancel,
             _task: Some(task),
         });
     }
@@ -1151,12 +1174,13 @@ impl TextViewer {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(results) => {
-                        let current = this.match_at_cursor(&results);
+                        let cursor = Cursor::new(&results, (this.cursor.line, this.cursor.col));
                         this.search = SearchState::Done {
-                            results,
-                            current,
+                            cursor,
                             needle,
                             match_case,
+                            loading: None,
+                            _task: None,
                         };
                         this.jump_to_match(cx);
                         this.update_match_notice();
@@ -1182,65 +1206,165 @@ impl TextViewer {
         cx.notify();
     }
 
-    /// The first match at or after the caret.
-    fn match_at_cursor(&self, results: &lforge_text::Results) -> Option<usize> {
-        let cursor = self.cursor;
-        results
-            .matches
-            .iter()
-            .position(|found| (found.line as usize, found.start) >= (cursor.line, cursor.col))
-    }
-
     fn step_match(&mut self, backward: bool, cx: &mut Context<Self>) {
-        let next = match &self.search {
+        enum Plan {
+            Moved,
+            Empty,
+            Start,
+            Load {
+                needle: String,
+                match_case: bool,
+                load: MatchLoad,
+            },
+        }
+        let plan = match &mut self.search {
             SearchState::Done {
-                results, current, ..
+                cursor,
+                needle,
+                match_case,
+                loading,
+                ..
             } => {
-                if results.is_empty() {
-                    None
-                } else {
-                    let count = results.matches.len();
-                    match (*current, backward) {
-                        (Some(index), false) => Some((index + 1) % count),
-                        (None, false) => self.match_at_cursor(results),
-                        (Some(0), true) => Some(count - 1),
-                        (Some(index), true) => Some(index - 1),
-                        (None, true) => self
-                            .match_at_cursor(results)
-                            .and_then(|index| index.checked_sub(1))
-                            .or(Some(count - 1)),
-                    }
+                if loading.is_some() {
+                    return;
+                }
+                match cursor.step(backward) {
+                    Step::Moved => Plan::Moved,
+                    Step::Empty => Plan::Empty,
+                    Step::NeedLoad => Plan::Load {
+                        needle: needle.clone(),
+                        match_case: *match_case,
+                        load: cursor.load(backward),
+                    },
                 }
             }
-            SearchState::Idle | SearchState::Running { .. } => {
-                self.start_search(cx);
-                return;
-            }
+            SearchState::Idle | SearchState::Running { .. } => Plan::Start,
         };
-        if let SearchState::Done {
-            results, current, ..
-        } = &mut self.search
-        {
-            if results.is_empty() {
+        match plan {
+            Plan::Start => self.start_search(cx),
+            Plan::Moved => {
+                self.jump_to_match(cx);
+                self.update_match_notice();
+                cx.notify();
+            }
+            Plan::Empty => {
                 self.notify("No matches".to_string(), false);
                 cx.notify();
-                return;
             }
-            *current = next;
+            Plan::Load {
+                needle,
+                match_case,
+                load,
+            } => self.load_matches(needle, match_case, load, backward, cx),
         }
-        self.jump_to_match(cx);
-        self.update_match_notice();
+    }
+
+    /// Reads the chunk the cursor needs next, then steps onto it.
+    fn load_matches(
+        &mut self,
+        needle: String,
+        match_case: bool,
+        load: MatchLoad,
+        backward: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open() else {
+            return;
+        };
+        let document = Arc::clone(&open.document);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let work = cx.background_spawn({
+            let cancel = cancel.clone();
+            let needle = needle.clone();
+            async move {
+                match load {
+                    MatchLoad::Head => lforge_text::find(&document, &needle, match_case, &cancel)
+                        .map(|results| results.matches),
+                    MatchLoad::After(after) => lforge_text::search::find_after(
+                        &document,
+                        &needle,
+                        match_case,
+                        after,
+                        lforge_text::STORE_LIMIT,
+                        &cancel,
+                    ),
+                    MatchLoad::Tail => lforge_text::search::find_before(
+                        &document,
+                        &needle,
+                        match_case,
+                        None,
+                        lforge_text::STORE_LIMIT,
+                        &cancel,
+                    ),
+                    MatchLoad::Before(before) => lforge_text::search::find_before(
+                        &document,
+                        &needle,
+                        match_case,
+                        Some(before),
+                        lforge_text::STORE_LIMIT,
+                        &cancel,
+                    ),
+                }
+            }
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = work.await;
+            this.update(cx, |this, cx| {
+                enum Outcome {
+                    Moved,
+                    Quiet,
+                    Failed(String),
+                }
+                let outcome = {
+                    let SearchState::Done {
+                        cursor, loading, ..
+                    } = &mut this.search
+                    else {
+                        return;
+                    };
+                    *loading = None;
+                    match result {
+                        Ok(chunk) => {
+                            match load {
+                                MatchLoad::Head => cursor.replace_with_head(chunk),
+                                MatchLoad::After(_) => cursor.push_after(chunk),
+                                MatchLoad::Tail => cursor.replace_with_tail(chunk),
+                                MatchLoad::Before(_) => cursor.push_before(chunk),
+                            }
+                            if cursor.step(backward) == Step::Moved {
+                                Outcome::Moved
+                            } else {
+                                Outcome::Quiet
+                            }
+                        }
+                        Err(document::Error::Cancelled) => Outcome::Quiet,
+                        Err(err) => Outcome::Failed(err.to_string()),
+                    }
+                };
+                match outcome {
+                    Outcome::Moved => {
+                        this.jump_to_match(cx);
+                        this.update_match_notice();
+                    }
+                    Outcome::Failed(err) => this.notify(format!("Search failed: {err}"), true),
+                    Outcome::Quiet => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let SearchState::Done { loading, _task, .. } = &mut self.search {
+            *loading = Some(cancel);
+            *_task = Some(task);
+        }
         cx.notify();
     }
 
     fn jump_to_match(&mut self, cx: &mut Context<Self>) {
-        let SearchState::Done {
-            results, current, ..
-        } = &self.search
-        else {
+        let SearchState::Done { cursor, .. } = &self.search else {
             return;
         };
-        let Some(found) = current.and_then(|index| results.matches.get(index)) else {
+        let Some(found) = cursor.current() else {
             return;
         };
         let position = Position {
@@ -1255,30 +1379,30 @@ impl TextViewer {
 
     fn update_match_notice(&mut self) {
         let SearchState::Done {
-            results, current, ..
+            cursor, loading, ..
         } = &self.search
         else {
             return;
         };
-        let text = if results.is_empty() {
+        let text = if cursor.is_empty() {
             "No matches".to_string()
         } else {
-            let shown = current.map_or(0, |index| index + 1);
-            let more = if results.capped { "+" } else { "" };
-            format!("{shown} of {}{more} matches", results.total)
+            let shown = cursor.position().map_or(0, |index| index + 1);
+            let loading = if loading.is_some() { " (loading)" } else { "" };
+            format!("{shown} of {} matches{loading}", cursor.total())
         };
         self.notice = Some(Notice {
             text: text.into(),
-            error: results.is_empty(),
+            error: cursor.is_empty(),
         });
     }
 
     /// Every match on one line, for highlighting.
     fn line_matches(&self, line: usize) -> Vec<Match> {
-        let SearchState::Done { results, .. } = &self.search else {
+        let SearchState::Done { cursor, .. } = &self.search else {
             return Vec::new();
         };
-        let matches = &results.matches;
+        let matches = cursor.window();
         let first = matches.partition_point(|found| (found.line as usize) < line);
         matches[first..]
             .iter()
@@ -1289,15 +1413,10 @@ impl TextViewer {
     }
 
     fn current_match(&self) -> Option<Match> {
-        let SearchState::Done {
-            results, current, ..
-        } = &self.search
-        else {
+        let SearchState::Done { cursor, .. } = &self.search else {
             return None;
         };
-        current
-            .and_then(|index| results.matches.get(index))
-            .copied()
+        cursor.current()
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
@@ -1312,27 +1431,33 @@ impl TextViewer {
         let document = Arc::clone(&open.document);
         let read = cx.background_spawn(async move {
             let mut text = String::new();
-            for line in start.line..=end.line {
-                let content = document.read_line(line)?;
-                let from = if line == start.line {
-                    document::byte_index_at_column(&content, start.col, TAB_WIDTH)
-                } else {
-                    0
-                };
-                let to = if line == end.line {
-                    document::byte_index_at_column(&content, end.col, TAB_WIDTH)
-                } else {
-                    content.len()
-                };
-                if line > start.line {
-                    text.push('\n');
+            let mut line = start.line;
+            while line <= end.line {
+                let count = (end.line - line + 1).min(COPY_BLOCK_LINES);
+                let block = document.read_lines(line, count)?;
+                for (offset, content) in block.iter().enumerate() {
+                    let index = line + offset;
+                    let from = if index == start.line {
+                        document::byte_index_at_column(content, start.col, TAB_WIDTH)
+                    } else {
+                        0
+                    };
+                    let to = if index == end.line {
+                        document::byte_index_at_column(content, end.col, TAB_WIDTH)
+                    } else {
+                        content.len()
+                    };
+                    if index > start.line {
+                        text.push('\n');
+                    }
+                    if from < to {
+                        text.push_str(&content[from..to]);
+                    }
+                    if text.len() > MAX_COPY {
+                        return Ok::<_, document::Error>(None);
+                    }
                 }
-                if from < to {
-                    text.push_str(&content[from..to]);
-                }
-                if text.len() > MAX_COPY {
-                    return Ok::<_, document::Error>(None);
-                }
+                line += count;
             }
             Ok(Some(text))
         });
@@ -1383,47 +1508,65 @@ impl Drop for TextViewer {
         if let Some(load) = self.load.take() {
             load.cancel.store(true, Ordering::Relaxed);
         }
-        if let SearchState::Running { cancel, .. } = &self.search {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(request) = self.page_request.take() {
+            request.cancel.store(true, Ordering::Relaxed);
+        }
+        match &self.search {
+            SearchState::Running { cancel, .. } => cancel.store(true, Ordering::Relaxed),
+            SearchState::Done {
+                loading: Some(cancel),
+                ..
+            } => cancel.store(true, Ordering::Relaxed),
+            SearchState::Idle | SearchState::Done { loading: None, .. } => {}
         }
     }
 }
 
 /// A decoded line as it is drawn: tabs expanded, and highlighted when it is
-/// short enough that highlighting stays cheap.
-fn page_line(raw: &str, language: Language) -> PageLine {
+/// short enough that highlighting stays cheap. Returns the state the next line
+/// starts with.
+fn page_line(raw: &str, language: Language, state: LexState) -> (PageLine, LexState) {
     let text = document::expand_tabs(raw, TAB_WIDTH);
-    let columns = text.chars().count() as u32;
-    let spans = if columns > HIGHLIGHT_LIMIT {
-        Vec::new()
+    let columns = document::display_columns(&text);
+    let (spans, state) = if columns > HIGHLIGHT_LIMIT {
+        // The line is still measured for its state, so a construct it opens
+        // still colours the lines below it.
+        let (_, state) = syntax::highlight(language, state, &text);
+        (Vec::new(), state)
     } else {
-        spans_to_columns(&text, syntax::highlight(language, &text))
+        let (spans, state) = syntax::highlight(language, state, &text);
+        (spans_to_columns(&text, spans), state)
     };
-    PageLine {
-        text: text.into(),
-        columns,
-        spans,
-    }
+    (
+        PageLine {
+            text: text.into(),
+            columns,
+            spans,
+        },
+        state,
+    )
 }
 
 /// Converts the highlighter's byte ranges into display columns in one pass.
 fn spans_to_columns(text: &str, spans: Vec<Span>) -> Vec<ColoredSpan> {
     let mut columns = Vec::with_capacity(spans.len());
     let mut chars = text.char_indices().peekable();
-    let mut column = 0usize;
+    let mut column = 0u32;
     for span in spans {
         while chars.peek().is_some_and(|(at, _)| *at < span.start) {
-            chars.next();
-            column += 1;
+            if let Some((_, c)) = chars.next() {
+                column += document::column_width(c, column);
+            }
         }
         let start = column;
         while chars.peek().is_some_and(|(at, _)| *at < span.end) {
-            chars.next();
-            column += 1;
+            if let Some((_, c)) = chars.next() {
+                column += document::column_width(c, column);
+            }
         }
         columns.push(ColoredSpan {
-            start: u32::try_from(start).unwrap_or(u32::MAX),
-            end: u32::try_from(column).unwrap_or(u32::MAX),
+            start,
+            end: column,
             token: span.token,
         });
     }

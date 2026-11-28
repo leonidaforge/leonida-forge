@@ -19,4 +19,5 @@ pub use detect::{BinaryReason, Detection, TextInfo, detect, guess_encoding};
 pub use document::{Document, Error, TAB_WIDTH};
 pub use encoding::Encoding;
 pub use language::Language;
-pub use search::{Match, Results, find};
+pub use search::{Cursor, Load, Match, Results, STORE_LIMIT, Step, find};
+pub use syntax::{Checkpoints, Span, State, Token, highlight};

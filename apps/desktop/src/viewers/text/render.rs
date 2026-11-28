@@ -10,6 +10,7 @@ use gpui::{
     MouseUpEvent, Pixels, SharedString, StyledText, TextRun, Window, anchored, canvas, deferred,
     div, font, prelude::*, px, rgb,
 };
+use lforge_text::document;
 use lforge_text::syntax::Token;
 
 use super::{
@@ -240,10 +241,10 @@ impl TextViewer {
             .child(div().text_color(rgb(theme::TEXT_MUTED)).child(self.title()))
     }
 
-    /// The entry's name, with the archive and folders it is stored in.
+    /// The entry's name, with the archive it is stored in when it is in one.
     fn title(&self) -> String {
-        match &self.location {
-            Some(location) => format!("{}  ·  in {location}", self.name),
+        match &self.container {
+            Some(container) => format!("{}  ·  in {container}", self.name),
             None => self.name.clone(),
         }
     }
@@ -642,15 +643,15 @@ impl TextViewer {
             .filter(|found| found.line as usize == line);
         let cursor = (self.cursor.line == line).then_some(self.cursor.col);
 
-        let (text, runs) = styled_line(
+        let (text, runs, actual) = styled_line(
             page_line, start_col, width, selection, &matches, current, cursor,
         );
-        let shown = text.chars().count() as u32;
+        let shown = document::display_columns(&text);
         let caret = cursor
-            .filter(|column| *column >= start_col + shown)
+            .filter(|column| *column >= actual + shown)
             .filter(|column| *column <= start_col + width)
             .map(|column| {
-                let offset = column.saturating_sub(start_col);
+                let offset = column.saturating_sub(actual);
                 div()
                     .absolute()
                     .left(px(offset as f32 * advance))
@@ -787,18 +788,20 @@ impl TextViewer {
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let (encoding, language, lines, size) = match &self.state {
+        let (encoding, language, lines, size, malformed) = match &self.state {
             State::Ready(open) => (
                 self.encoding.label(self.bom).to_string(),
                 open.language.name(),
                 open.document.line_count(),
                 files::format_size(open.document.len()),
+                open.document.malformed(),
             ),
             _ => (
                 self.encoding.label(false).to_string(),
                 "—",
                 0,
                 "—".to_string(),
+                0,
             ),
         };
         let position = format!("Ln {}, Col {}", self.cursor.line + 1, self.cursor.col + 1);
@@ -832,6 +835,13 @@ impl TextViewer {
             .child(files::count(lines, "line", "lines"))
             .child(separator())
             .child(size)
+            .when(malformed > 0, |el| {
+                el.child(separator()).child(
+                    div()
+                        .text_color(rgb(theme::ERROR))
+                        .child(format!("{malformed} undecodable")),
+                )
+            })
             .when_some(notice, |el, notice| el.child(notice))
             .when(self.notice.is_none(), |el| {
                 el.child(div().flex_1()).child(
@@ -891,7 +901,8 @@ impl TextViewer {
 /// Only the columns `start..start + width` are shaped. Syntax colours, the
 /// selection, the matches and the caret are painted per column into one style
 /// buffer, so the run list is as long as the colour changes and not as long as
-/// the line.
+/// the line. The third value is the column the slice really starts on, which
+/// differs from `start` when `start` falls inside a wide character.
 pub(super) fn styled_line(
     line: &super::PageLine,
     start: u32,
@@ -900,16 +911,18 @@ pub(super) fn styled_line(
     matches: &[lforge_text::Match],
     current: Option<lforge_text::Match>,
     cursor: Option<u32>,
-) -> (SharedString, Vec<TextRun>) {
-    let end = start.saturating_add(width).min(line.columns);
-    if end <= start {
-        return (SharedString::from(""), Vec::new());
+) -> (SharedString, Vec<TextRun>, u32) {
+    let (slice, actual) = document::slice_columns(&line.text, start, width);
+    let end = actual.saturating_add(document::display_columns(&slice));
+    if slice.is_empty() {
+        return (SharedString::from(""), Vec::new(), actual);
     }
-    let length = (end - start) as usize;
+    let length = (end - actual) as usize;
     let mut styles = vec![Style::Plain; length];
-    let index = |column: u32| (column.saturating_sub(start)) as usize;
+    let last = length.saturating_sub(1);
+    let index = |column: u32| (column.saturating_sub(actual) as usize).min(last);
     for span in &line.spans {
-        let from = span.start.max(start);
+        let from = span.start.max(actual);
         let to = span.end.min(end);
         if from >= to {
             continue;
@@ -919,8 +932,8 @@ pub(super) fn styled_line(
         }
     }
     if let Some((from, to)) = selection {
-        let from = from.max(start).min(end);
-        let to = to.max(start).min(end);
+        let from = from.max(actual).min(end);
+        let to = to.max(actual).min(end);
         if from < to {
             for style in &mut styles[index(from)..index(to)] {
                 *style = Style::Selection;
@@ -928,8 +941,8 @@ pub(super) fn styled_line(
         }
     }
     for found in matches {
-        let from = found.start.max(start).min(end);
-        let to = found.end().max(start).min(end);
+        let from = found.start.max(actual).min(end);
+        let to = found.end().max(actual).min(end);
         if from < to {
             for style in &mut styles[index(from)..index(to)] {
                 *style = Style::Match;
@@ -937,8 +950,8 @@ pub(super) fn styled_line(
         }
     }
     if let Some(found) = current {
-        let from = found.start.max(start).min(end);
-        let to = found.end().max(start).min(end);
+        let from = found.start.max(actual).min(end);
+        let to = found.end().max(actual).min(end);
         if from < to {
             for style in &mut styles[index(from)..index(to)] {
                 *style = Style::CurrentMatch;
@@ -946,23 +959,24 @@ pub(super) fn styled_line(
         }
     }
     if let Some(column) = cursor
-        && (start..end).contains(&column)
+        && (actual..end).contains(&column)
     {
         styles[index(column)] = Style::Cursor;
     }
 
-    let mut text = String::with_capacity(length);
+    let mut text = String::with_capacity(slice.len());
     let mut runs = Vec::new();
+    let mut column = actual;
     let mut current_style = styles[0];
     let mut bytes = 0;
-    for (offset, c) in line
-        .text
-        .chars()
-        .skip(start as usize)
-        .take(length)
-        .enumerate()
-    {
-        let style = styles[offset];
+    for c in slice.chars() {
+        // A zero-width character is drawn over the cell before it.
+        let cell = if document::column_width(c, column) == 0 {
+            column.saturating_sub(1).max(actual)
+        } else {
+            column
+        };
+        let style = styles[index(cell)];
         if style != current_style {
             runs.push(run(
                 bytes,
@@ -974,6 +988,7 @@ pub(super) fn styled_line(
         }
         text.push(c);
         bytes += c.len_utf8();
+        column += document::column_width(c, column);
     }
     runs.push(run(
         bytes,
@@ -981,7 +996,7 @@ pub(super) fn styled_line(
         style_background(current_style),
     ));
     runs.retain(|run| run.len > 0);
-    (text.into(), runs)
+    (text.into(), runs, actual)
 }
 
 fn style_color(style: Style) -> u32 {
