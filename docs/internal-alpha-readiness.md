@@ -240,7 +240,7 @@ Automated, run for this package:
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: pass.
-- `cargo test --workspace --locked`: 835 tests pass across the binary, core,
+- `cargo test --workspace --locked`: 1,426 tests pass across the binary, core,
   rage9, renderer, CLI and desktop crates, including unit, integration and doc
   tests.
 - `cargo build --workspace --locked`: pass.
