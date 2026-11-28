@@ -512,11 +512,20 @@ pub enum ArrayElements {
         stride: u32,
         links: Vec<RecordLink>,
     },
+    /// Element records decoded in place, for an inline array.
+    Records {
+        records: Vec<Record>,
+    },
     Reference {
         links: Vec<Reference>,
     },
     Hash32 {
         values: Vec<u32>,
+    },
+    /// Values of an established scalar type, read from the target block.
+    Scalars {
+        code: u16,
+        values: Vec<Scalar>,
     },
     Enum32 {
         enumeration: u32,
@@ -566,6 +575,15 @@ pub struct EnumValueMatch {
     pub defined: bool,
 }
 
+/// A text value stored as a reference into a text block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextValue {
+    pub word: u64,
+    pub resolution: Resolution,
+    /// The string the reference names, or why none was read.
+    pub text: Result<String, String>,
+}
+
 /// A field's value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -576,6 +594,8 @@ pub enum Value {
     Array(ArrayValue),
     Map(Box<MapValue>),
     Bitset(Bitset),
+    /// A text reference into a text block.
+    Text(TextValue),
     /// A text field: 16 bytes whose text storage is not established.
     TextSlot {
         raw: [u8; 16],
@@ -599,7 +619,7 @@ pub enum Value {
 
 impl Value {
     /// `scalar`, `enum`, `structure`, `reference`, `array`, `map`, `bitset`,
-    /// `text_slot`, `descriptor` or `unresolved`.
+    /// `text`, `text_slot`, `descriptor` or `unresolved`.
     pub fn kind(&self) -> &'static str {
         match self {
             Value::Scalar(_) => "scalar",
@@ -609,6 +629,7 @@ impl Value {
             Value::Array(_) => "array",
             Value::Map(_) => "map",
             Value::Bitset(_) => "bitset",
+            Value::Text(_) => "text",
             Value::TextSlot { .. } => "text_slot",
             Value::Descriptor { .. } => "descriptor",
             Value::Unresolved { .. } => "unresolved",
@@ -646,7 +667,10 @@ impl Record {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PoolEntry {
     Text(String),
+    /// Bytes a text pool holds that are not UTF-8, kept as stored.
+    Bytes(Vec<u8>),
     Hash32(u32),
+    Word32(u32),
     Reference(u64),
     Word64(u64),
     Word128([u8; 16]),
@@ -668,6 +692,15 @@ pub enum Content {
         /// The elements the block holds, and the ones that were decoded.
         total: u32,
         entries: Vec<PoolEntry>,
+    },
+    /// A pool typed by a field code whose width the schema establishes. The
+    /// resource form stores elements this way; the `PSIN` form does not.
+    Elements {
+        code: u16,
+        width: u32,
+        /// The elements the block holds, and the ones that were decoded.
+        total: u32,
+        entries: Vec<Scalar>,
     },
     /// The type names no structure and no known pool, or the block cannot be
     /// divided into records of its structure.

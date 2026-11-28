@@ -10,6 +10,7 @@ pub mod edup;
 pub mod fragment;
 pub mod gfx;
 pub mod kb2;
+pub mod odrp;
 pub mod psin;
 pub mod rbf0;
 pub mod rds5;
