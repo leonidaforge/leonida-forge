@@ -296,6 +296,56 @@ covered by tests.
   document family says it means, and that has not been established for any
   field of any family.
 
+## Name discovery
+
+A metadata schema stores a name as a case-sensitive Jenkins one-at-a-time hash
+of the name as written, so a hash equality is a candidate and never a proof.
+Measured over the largest resource of `data.rpf` (182 structures, 1,266 fields,
+38 enumerations, 336 enum values, 186 blocks) with the name tables the CLI
+loads by itself:
+
+| Hashes | Resolved |
+| ------ | -------: |
+| Structures | 0 of 182 |
+| Fields | 5 of 1,266 |
+| Enumeration names and values | 0 of 374 |
+| Block type words | 0 of 186 |
+
+The document is therefore not a source of schema names on its own: it stores
+hashes, and the names those hashes stand for live in the documents that use
+them. What it does carry is 4,215,226 text values, which are candidate
+preimages for hashes elsewhere. That harvest needs the same case-sensitive hash
+and must keep a candidate distinct from a confirmed identity; it is not part of
+this change and no table is committed from it.
+
+## Exporter relevance
+
+What the decoded population holds, and what it does not:
+
+- Display text and the tables that organise it. The type 111 resources are
+  label tables: one sentence per record, reached through a `0x42` text
+  reference, and a `zldbmt` resource opened by hand holds 19 records in 4 blocks
+  with 16 text values.
+- One large object graph. `data.rpf` row 476 holds 182 structures, 38
+  enumerations, 186 blocks and 290,795 records with no text value, and its
+  blocks reference each other through single references.
+- No vehicle, ped, weapon, clothing, model or texture record. Nothing in the
+  decoded values names a mesh, a texture or a model, so this form adds nothing
+  to the exporter's published entity type from `data.rpf`.
+
+Two opportunities, neither implemented here:
+
+1. Vehicle display names. The exporter publishes vehicles only and states that
+   localized display names are absent from the decoded data. These documents
+   hold localized text, so a label could fill that gap — but a link from a
+   vehicle row to a label key has not been observed, and the label tables are
+   per language. The mapping is the evidence a change would need first.
+2. A text catalogue as a category of its own. That is a new exporter schema and
+   a new website section, so it is out of scope.
+
+Nothing here should be mapped speculatively. A field means what its document
+family says it means, and that is not established for any field of this form.
+
 ## Deliberately out of scope
 
 Exporter and website schema changes, committed game-derived tables, general

@@ -244,7 +244,7 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             ("Object type", format!("0x{object_type:02X}")),
             (
                 "Structure",
-                "the resource form; its tables are not decoded".to_string(),
+                "the resource form; the metadata viewer decodes its tables".to_string(),
             ),
         ],
         Some(Summary::Rpf9) | None => Vec::new(),
