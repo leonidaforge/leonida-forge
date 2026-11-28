@@ -9,7 +9,8 @@ parentheses as the technical fallback.
 
 | Item               | Value                                                                                                         |
 | ------------------ | ------------------------------------------------------------------------------------------------------------- |
-| Release executable | `target\release\leonida-forge.exe` under the repository root                                                 |
+| Checkout           | `E:\source\leonidaforge\leonida-forge`                                                                        |
+| Release executable | `target\release\leonida-forge.exe` under that checkout                                                        |
 | Game root          | `D:\GTA VI` (read only)                                                                                       |
 | Texture stores     | `D:\GTA VI\data\ttdb`                                                                                         |
 
@@ -180,7 +181,8 @@ Conventions, the same in the CPU reference, the shader and the buttons:
 - Nothing is persisted: closing the window discards the pose.
 
 The release executable is
-`E:\source\leonidaforge\worktrees\vertex-influences-skinning\leonida-forge\target\release\leonida-forge.exe`.
+`E:\source\leonidaforge\leonida-forge\target\release\leonida-forge.exe`, built
+from that checkout with `cargo build --release -p lforge-desktop`.
 
 None of the five verified poses below changes under the new default: every one of
 them is a decoded association. The inferred class has its own section after the
