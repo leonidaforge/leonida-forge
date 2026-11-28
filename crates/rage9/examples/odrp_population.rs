@@ -106,6 +106,10 @@ struct Tally {
     /// Depth and text values.
     max_depth: usize,
     texts: u64,
+    /// Resolved text values whose string is not UTF-8, and those that carry a
+    /// character XML 1.0 cannot represent.
+    texts_not_utf8: u64,
+    texts_xml_invalid: u64,
     /// Page shapes: system pages, graphics pages.
     shapes: BTreeMap<(u8, u8), u64>,
     /// Object type bytes.
@@ -386,6 +390,9 @@ impl Tally {
         self.max_records = self.max_records.max(records);
         self.max_depth = self.max_depth.max(document.depth());
         self.texts += document.text_count() as u64;
+        let (not_utf8, xml_invalid) = count_text_faults(document);
+        self.texts_not_utf8 += not_utf8;
+        self.texts_xml_invalid += xml_invalid;
         self.unsupported_blocks += u64::from(document.unsupported_blocks);
         self.unresolved_references += u64::from(document.unresolved_references);
         if !document.issues.is_empty() {
@@ -415,6 +422,59 @@ impl Tally {
 fn summarise(issue: &str) -> String {
     // Keep the note vocabulary small: a note keeps its first clause.
     issue.split(';').next().unwrap_or(issue).to_string()
+}
+
+/// Resolved text values whose string is not UTF-8, and those that carry a
+/// character XML 1.0 cannot represent. Both are counted from the decoded
+/// document, so neither depends on the serializers.
+fn count_text_faults(document: &odrp::Document) -> (u64, u64) {
+    fn visit(record: &lforge_rage9::psin::pso::Record, faults: &mut (u64, u64)) {
+        for value in &record.fields {
+            match &value.value {
+                lforge_rage9::psin::pso::Value::Text(text) => match &text.text {
+                    Ok(text) => {
+                        if !text.chars().all(xml_text) {
+                            faults.1 += 1;
+                        }
+                    }
+                    Err(_) => faults.0 += 1,
+                },
+                lforge_rage9::psin::pso::Value::Structure(inner) => visit(inner, faults),
+                lforge_rage9::psin::pso::Value::Array(array) => {
+                    if let Ok(lforge_rage9::psin::pso::ArrayElements::Records { records }) =
+                        &array.elements
+                    {
+                        for inner in records {
+                            visit(inner, faults);
+                        }
+                    }
+                }
+                lforge_rage9::psin::pso::Value::Map(map) => {
+                    if let Ok((_, records)) = &map.entries {
+                        for inner in records {
+                            visit(inner, faults);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut faults = (0, 0);
+    for block in &document.blocks {
+        if let lforge_rage9::psin::pso::Content::Records { records, .. } = &block.content {
+            for record in records {
+                visit(record, &mut faults);
+            }
+        }
+    }
+    faults
+}
+
+/// Whether XML 1.0 may carry `character` at all.
+fn xml_text(character: char) -> bool {
+    matches!(character,
+        '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
 fn graphics_pages_of(system: &[u8]) -> Option<(u8, u8)> {
@@ -643,6 +703,14 @@ fn report(tally: &Tally, budget: &Budget, truncated: bool, roots: u64, types: bo
         tally.min_records, tally.max_records, tally.max_depth
     ));
     line(format!("text values:          {}", tally.texts));
+    line(format!(
+        "texts not UTF-8:      {} ({})",
+        tally.texts_not_utf8, tally.texts
+    ));
+    line(format!(
+        "texts XML-invalid:    {} of {}",
+        tally.texts_xml_invalid, tally.texts
+    ));
     line(format!(
         "unsupported blocks:   {} ({:?})",
         tally.unsupported_blocks, tally.unsupported_types
