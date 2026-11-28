@@ -2561,4 +2561,64 @@ mod export_tests {
         assert!(!opens_as_text(Some(Capability::Bytes), false));
         assert!(!opens_as_text(None, false));
     }
+
+    /// A synthetic fixture, not game content: a row whose declared type is the
+    /// metadata resource type and whose payload is an XML document. The
+    /// extension must not decide the viewer, so this has to open as text.
+    #[test]
+    fn a_text_payload_with_a_metadata_type_opens_as_text() {
+        use lforge_core::classify::{self, Inputs, PayloadState, Storage};
+
+        let xml = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<asset name=\"fixture\"/>";
+        for (type_id, extension) in [(11u8, Some("zmt")), (11, None), (250, Some("zmt"))] {
+            let classification = classify::classify(Inputs {
+                entry_type: Some(type_id),
+                original_extension: extension,
+                storage: Some(Storage {
+                    mode: 0,
+                    encoding: Some(2),
+                    transform: false,
+                }),
+                payload: PayloadState::Decoded,
+                head: Some(xml),
+            });
+            assert_eq!(
+                classification.capability,
+                lforge_core::classify::Capability::Text,
+                "type {type_id}"
+            );
+            assert!(
+                !opens_as_metadata(Some(&classification)),
+                "type {type_id} must not open as metadata"
+            );
+            assert!(opens_as_text(Some(classification.capability), false));
+        }
+    }
+
+    /// A synthetic fixture, not game content: a row whose declared type is the
+    /// metadata resource type and whose payload is a `PSIN` container that a
+    /// text check would accept if it looked at printable bytes alone.
+    #[test]
+    fn a_metadata_payload_keeps_the_metadata_viewer() {
+        use lforge_core::classify::{self, Inputs, PayloadState, Storage};
+
+        let mut head = b"PSIN".to_vec();
+        head.resize(64, b'a');
+        let classification = classify::classify(Inputs {
+            entry_type: Some(11),
+            original_extension: Some("zmt"),
+            storage: Some(Storage {
+                mode: 0,
+                encoding: Some(2),
+                transform: false,
+            }),
+            payload: PayloadState::Decoded,
+            head: Some(&head),
+        });
+        assert!(opens_as_metadata(Some(&classification)));
+        assert!(
+            !opens_as_text(Some(classification.capability), true),
+            "a recognised container is never claimed by the byte check"
+        );
+    }
 }
