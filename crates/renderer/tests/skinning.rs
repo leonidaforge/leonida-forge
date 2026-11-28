@@ -109,6 +109,7 @@ fn influences(per_vertex: Vec<Vec<(u16, f32)>>) -> VertexInfluences {
         max_influences,
         resolution: lforge_scene::BoneResolution::DirectSkeleton,
         status: InfluenceStatus::Complete,
+        inferred: false,
     }
 }
 
@@ -290,6 +291,83 @@ fn gpu_matches_the_cpu_for_rigid_weighted_and_hierarchical_poses() {
     pose.set_rotation(2, Quat::from_rotation_y(-0.9)).unwrap();
     pose.set_rotation(0, Quat::from_rotation_z(0.4)).unwrap();
     compare(&renderer, &scene, &pose, "two independent roots");
+}
+
+/// A primitive with no tangent attribute renders the same through the skinned
+/// pipeline and through the static pipeline over CPU-deformed vertices.
+///
+/// The skinned vertex shader normalised the skinned tangent, and a zero vector
+/// normalises to NaN, so every vertex without a tangent lost its normal-mapped
+/// lighting. This test pins the fallback: a collapsed direction falls back to the
+/// authored direction, exactly as the CPU reference does.
+#[test]
+fn a_primitive_without_tangents_skins_like_the_cpu_reference() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let skeleton = skeleton_of(vec![
+        (None, Vec3::ZERO, Quat::IDENTITY),
+        (Some(0), Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY),
+    ]);
+    let primitive = Primitive {
+        material: 0,
+        vertices: vec![
+            vertex([-0.6, 0.0, 0.0], [0.0, 0.0, 1.0], None),
+            vertex([0.6, 0.0, 0.0], [0.0, 0.0, 1.0], None),
+            vertex([0.0, 2.0, 0.0], [0.0, 0.0, 1.0], None),
+        ],
+        indices: vec![0, 1, 2],
+    };
+    let influences = influences(vec![vec![(1, 1.0)], vec![(1, 1.0)], vec![(0, 1.0)]]);
+    let scene = scene_with(skeleton, primitive, influences);
+    let skeleton = scene.skeleton.as_ref().unwrap();
+    let mut pose = Pose::reference(skeleton);
+    pose.set_rotation(0, Quat::from_rotation_z(0.6)).unwrap();
+    let matrices = SkinningMatrices::build(skeleton, &pose).unwrap();
+    let positions: Vec<Vec3> = pose
+        .globals(skeleton)
+        .unwrap()
+        .iter()
+        .map(|bone| bone.model_position)
+        .collect();
+
+    let mut cpu_scene = scene.clone();
+    let deformed = deform_primitive(
+        &cpu_scene.meshes[0].primitives[0],
+        &cpu_scene.influences[0].influences,
+        &matrices,
+    )
+    .unwrap();
+    for (index, vertex) in cpu_scene.meshes[0].primitives[0]
+        .vertices
+        .iter_mut()
+        .enumerate()
+    {
+        vertex.position = deformed.positions[index];
+        vertex.normal = deformed.normals[index];
+    }
+    cpu_scene.recompute_bounds();
+    let camera = OrbitCamera::framing(cpu_scene.bounds, 1.0);
+    let cpu = renderer.upload_scene(&cpu_scene).expect("cpu upload");
+    let cpu_frame = renderer
+        .render(&cpu, &camera, 256, 256, Background::DARK)
+        .expect("cpu render");
+
+    let mut gpu = renderer.upload_scene(&scene).expect("gpu upload");
+    renderer
+        .update_pose(&mut gpu, matrices.matrices(), &positions)
+        .expect("pose upload");
+    gpu.set_pose_active(true);
+    let gpu_frame = renderer
+        .render(&gpu, &camera, 256, 256, Background::DARK)
+        .expect("skinned render");
+    let differing = differing_pixels(&cpu_frame.pixels, &gpu_frame.pixels);
+    let delta = channel_delta(&cpu_frame.pixels, &gpu_frame.pixels);
+    eprintln!("tangent-free skinned frame: {differing} differing pixels, channel delta {delta}");
+    assert!(
+        differing <= 8 && delta <= 4,
+        "the skinned frame differs from the CPU reference: {differing} pixels, channel {delta}"
+    );
 }
 
 #[test]

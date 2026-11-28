@@ -27,10 +27,16 @@ fn probe_main(@builtin(global_invocation_id) id: vec3<u32>) {
         let position = skin_position(input.position.xyz, input.joints, input.weights);
         results[index] = vec4<f32>(position, 1.0);
     } else if (mode == 1u) {
-        let normal = normalize(skin_direction(input.normal.xyz, input.joints, input.weights));
+        let normal = safe_direction(
+            skin_direction(input.normal.xyz, input.joints, input.weights),
+            input.normal.xyz,
+        );
         results[index] = vec4<f32>(normal, 1.0);
     } else {
-        let tangent = normalize(skin_direction(input.tangent.xyz, input.joints, input.weights));
+        let tangent = safe_direction(
+            skin_direction(input.tangent.xyz, input.joints, input.weights),
+            input.tangent.xyz,
+        );
         results[index] = vec4<f32>(tangent, input.tangent.w);
     }
 }

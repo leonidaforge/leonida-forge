@@ -54,9 +54,17 @@ fn vs_skinned(input: SkinnedVertexInput) -> VertexOutput {
     let position = skin_position(input.position, input.joints, input.weights);
     output.clip_position = camera.view_projection * vec4<f32>(position, 1.0);
     output.world_position = position;
-    output.normal = normalize(skin_direction(input.normal, input.joints, input.weights));
-    let tangent = skin_direction(input.tangent.xyz, input.joints, input.weights);
-    output.tangent = vec4<f32>(normalize(tangent), input.tangent.w);
+    output.normal = safe_direction(
+        skin_direction(input.normal, input.joints, input.weights),
+        input.normal,
+    );
+    output.tangent = vec4<f32>(
+        safe_direction(
+            skin_direction(input.tangent.xyz, input.joints, input.weights),
+            input.tangent.xyz,
+        ),
+        input.tangent.w,
+    );
     output.uv = input.uv0;
     output.color = input.color;
     if (pose_state.view == 1u) {

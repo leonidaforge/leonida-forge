@@ -60,6 +60,23 @@ fn skin_direction(direction: vec3<f32>, joints: vec4<u32>, weights: vec4<f32>) -
     return out;
 }
 
+// Normalises a skinned direction and falls back to a caller-supplied direction
+// when the blend cancels it. Linear blend skinning can collapse a direction to
+// zero, and normalize() of a zero vector is NaN, which would poison the lighting
+// of every vertex that carries no tangent. The CPU reference applies the same
+// fallback, so the two evaluators agree on degenerate input too.
+fn safe_direction(direction: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let length_squared = dot(direction, direction);
+    if (length_squared > 1e-12) {
+        return direction * inverseSqrt(length_squared);
+    }
+    let fallback_squared = dot(fallback, fallback);
+    if (fallback_squared > 1e-12) {
+        return fallback * inverseSqrt(fallback_squared);
+    }
+    return vec3<f32>(0.0);
+}
+
 // The summed weight of the highlighted bone on one vertex.
 fn highlight_weight(joints: vec4<u32>, weights: vec4<f32>) -> f32 {
     let bone = pose_state.highlight_bone;
