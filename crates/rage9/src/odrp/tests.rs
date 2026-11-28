@@ -736,3 +736,108 @@ fn a_structure_block_that_is_not_whole_records_is_partial() {
     );
     assert_eq!(document.unsupported_blocks, 1);
 }
+
+#[test]
+fn a_pool_that_is_not_whole_elements_is_partial() {
+    let (system, graphics) = Builder::new()
+        .structure(StructureSpec {
+            name: 0xAAAA_0001,
+            size: 4,
+            flags: 0x300,
+            fields: vec![field(0xBBBB_0001, 0, 0x15, 0)],
+        })
+        .block(records(0xAAAA_0001, vec![0_u32.to_le_bytes().to_vec()]))
+        .block(pool(0x4a, vec![1, 2, 3]))
+        .build();
+    let document = decode(&system, &graphics).expect("a document");
+    assert_eq!(document.unsupported_blocks, 1);
+    assert_eq!(document.status(), "partial");
+    let Some(Content::Unsupported(reason)) = document.blocks.get(1).map(|b| &b.content) else {
+        panic!("the block is kept as unsupported: {:?}", document.blocks);
+    };
+    assert!(reason.contains("not whole"), "{reason}");
+}
+
+#[test]
+fn a_text_pool_without_a_final_nul_is_partial() {
+    let (system, graphics) = Builder::new()
+        .structure(StructureSpec {
+            name: 0xAAAA_0001,
+            size: 4,
+            flags: 0x300,
+            fields: vec![field(0xBBBB_0001, 0, 0x15, 0)],
+        })
+        .block(records(0xAAAA_0001, vec![0_u32.to_le_bytes().to_vec()]))
+        .block(pool(0x10, b"unterminated".to_vec()))
+        .build();
+    let document = decode(&system, &graphics).expect("a document");
+    assert_eq!(document.unsupported_blocks, 1);
+    assert_eq!(document.status(), "partial");
+    let Some(Content::Unsupported(reason)) = document.blocks.get(1).map(|b| &b.content) else {
+        panic!("the block is kept as unsupported");
+    };
+    assert!(reason.contains("NUL"), "{reason}");
+}
+
+#[test]
+fn a_reference_offset_beyond_a_u32_names_no_block() {
+    // The offset field of a reference is 44 bits wide; this word names one past
+    // the 32-bit range, so it must fault rather than wrap to offset zero.
+    let word = ((1_u64 << 32) << 20) | 2;
+    let mut record = Vec::new();
+    record.extend_from_slice(&word.to_le_bytes());
+    let (system, graphics) = Builder::new()
+        .structure(StructureSpec {
+            name: 0xAAAA_0001,
+            size: 8,
+            flags: 0x300,
+            fields: vec![field(0xBBBB_0001, 0, 0x07, 0)],
+        })
+        .structure(StructureSpec {
+            name: 0xAAAA_0002,
+            size: 4,
+            flags: 0x300,
+            fields: vec![],
+        })
+        .block(records(0xAAAA_0001, vec![record]))
+        .block(records(0xAAAA_0002, vec![0_u32.to_le_bytes().to_vec()]))
+        .build();
+    let document = decode(&system, &graphics).expect("a document");
+    assert_eq!(document.unresolved_references, 1);
+    assert_eq!(document.status(), "partial");
+    let Some(Content::Records { records, .. }) = document.blocks.first().map(|b| &b.content) else {
+        panic!("records");
+    };
+    let Value::Reference(reference) = &records[0].fields[0].value else {
+        panic!("a reference");
+    };
+    assert_eq!(reference.fault, Some(ReferenceFault::BlockOutside));
+}
+
+#[test]
+fn embedded_records_are_charged_to_the_value_budget() {
+    let (system, graphics) = Builder::new()
+        .structure(StructureSpec {
+            name: 0xAAAA_0002,
+            size: 4,
+            flags: 0x300,
+            fields: vec![],
+        })
+        .structure(StructureSpec {
+            name: 0xAAAA_0001,
+            size: 8,
+            flags: 0x300,
+            fields: vec![
+                field(0xBBBB_0001, 0, 0x05, 0xAAAA_0002),
+                field(0xBBBB_0002, 4, 0x05, 0xAAAA_0002),
+            ],
+        })
+        .block(records(0xAAAA_0001, vec![vec![0; 8]]))
+        .build();
+    let limits = Limits {
+        nodes: 2,
+        ..Limits::default()
+    };
+    let err = super::decode(&system, &graphics, &limits).expect_err("the budget stops it");
+    assert!(matches!(err, Error::Limit(_)), "{err:?}");
+}

@@ -699,6 +699,12 @@ impl Reader<'_> {
                 }
             }
         }
+        // A pool whose bytes do not divide into its elements is kept as it is
+        // stored: reported as unsupported rather than read as an empty pool.
+        if let Some(reason) = pool_shape_problem(kind, bytes) {
+            self.unsupported += 1;
+            return Ok(Content::Unsupported(reason));
+        }
         let (total, entries) = self.read_pool(bytes, kind)?;
         Ok(Content::Pool {
             kind,
@@ -784,9 +790,6 @@ impl Reader<'_> {
             if bytes.is_empty() {
                 return Ok((0, Vec::new()));
             }
-            if bytes[bytes.len() - 1] != 0 {
-                return Ok((0, Vec::new()));
-            }
             let pieces: Vec<&[u8]> = bytes.split(|&byte| byte == 0).collect();
             let total = pieces.len() - 1;
             let count = total.min(self.limits.elements);
@@ -808,9 +811,6 @@ impl Reader<'_> {
             return Ok((total as u32, entries));
         }
         let stride = kind.stride().expect("a sized pool has a stride");
-        if !bytes.len().is_multiple_of(stride) {
-            return Ok((0, Vec::new()));
-        }
         let total = bytes.len() / stride;
         let count = total.min(self.limits.elements);
         if count < total {
@@ -853,6 +853,12 @@ impl Reader<'_> {
                 "structures nest deeper than {} levels",
                 self.limits.depth
             )));
+        }
+        // An embedded record costs the same as a block's record, so one record
+        // that embeds the same structures many times cannot multiply the work
+        // past the document's budget.
+        if depth > 0 {
+            self.spend(1)?;
         }
         if active.contains(&(structure.name, at)) {
             return Err(malformed(format!(
@@ -920,7 +926,11 @@ impl Reader<'_> {
                 let target = unique(&self.structures, field.auxiliary, |item| item.name)
                     .cloned()
                     .filter(|target| {
-                        target.size > 0 && field.offset + target.size <= structure.size
+                        target.size > 0
+                            && field
+                                .offset
+                                .checked_add(target.size)
+                                .is_some_and(|end| end <= structure.size)
                     });
                 match target {
                     Some(target) => {
@@ -1447,7 +1457,10 @@ impl Reader<'_> {
             return None;
         }
         let number = (word & 0xf_ffff) as u32;
-        let offset = (word >> 20) as u32;
+        // The offset field is 44 bits wide; one that does not fit a `u32` names
+        // no location this decoder can address, which is a fault rather than a
+        // wrapped offset.
+        let offset = u32::try_from(word >> 20).ok()?;
         let block = self.blocks.iter().find(|block| block.index == number)?;
         (offset <= block.len).then_some((number, offset))
     }
@@ -1500,7 +1513,9 @@ impl Reader<'_> {
         };
         if structure.size == 0
             || !offset.is_multiple_of(structure.size)
-            || offset + structure.size > block.len
+            || offset
+                .checked_add(structure.size)
+                .is_none_or(|end| end > block.len)
         {
             self.unresolved += 1;
             return fault(ReferenceFault::NotARecord);
@@ -1720,6 +1735,24 @@ fn pointer_offset(value: u64, segment: Segment, len: usize) -> Option<u32> {
 }
 
 /// The stored width of a type code, when the schema establishes one.
+/// Why a pool's bytes cannot be divided into the elements its type establishes:
+/// a sized pool whose length is not a whole number of elements, or a text pool
+/// whose last string has no terminator. `None` when the bytes divide.
+fn pool_shape_problem(kind: PoolKind, bytes: &[u8]) -> Option<String> {
+    let len = bytes.len();
+    match kind.stride() {
+        None if bytes.last().is_some_and(|byte| *byte != 0) => Some(format!(
+            "the text block's {len} bytes do not end with a NUL"
+        )),
+        None => None,
+        Some(stride) if !len.is_multiple_of(stride) => Some(format!(
+            "the block's {len} bytes are not whole {stride}-byte {} elements",
+            kind.name()
+        )),
+        Some(_) => None,
+    }
+}
+
 fn element_width(code: u16, upper: u16) -> Option<u32> {
     match code {
         TYPE_TEXT_REFERENCE => Some(TEXT_REFERENCE_WIDTH),
