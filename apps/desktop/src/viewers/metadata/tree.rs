@@ -290,6 +290,20 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
                     format!("{head} of enum {} values {values:?}", hash32(*enumeration)),
                     Tone::Normal,
                 ),
+                Ok(ArrayElements::Records { records }) => (
+                    format!(
+                        "{head} of inline records  \u{00B7}  {} records",
+                        records.len()
+                    ),
+                    Tone::Normal,
+                ),
+                Ok(ArrayElements::Scalars { code, values }) => (
+                    format!(
+                        "{head} of type 0x{code:04X}  \u{00B7}  {} values",
+                        values.len()
+                    ),
+                    Tone::Normal,
+                ),
             }
         }
         Value::Map(map) => {
@@ -328,6 +342,10 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
                 Tone::Normal,
             )
         }
+        Value::Text(text) => match &text.text {
+            Ok(value) => (format!("text \"{value}\""), Tone::Accent),
+            Err(reason) => (format!("text unread  \u{00B7}  {reason}"), Tone::Warning),
+        },
         Value::TextSlot { raw } => (format!("text slot  {}", bytes_text(raw)), Tone::Warning),
         Value::Descriptor { code, upper, .. } => (
             format!("element descriptor  \u{00B7}  type 0x{code:04X} upper {upper}"),
@@ -514,6 +532,19 @@ impl<'a> Walker<'a> {
                 format!("{total} elements  \u{00B7}  {} decoded", entries.len()),
                 !entries.is_empty(),
             ),
+            Content::Elements {
+                code,
+                width,
+                total,
+                entries,
+            } => (
+                format!("block {}  \u{00B7}  type 0x{code:04X}", block.index),
+                format!(
+                    "{total} \u{00D7} {width} B elements  \u{00B7}  {} decoded",
+                    entries.len()
+                ),
+                !entries.is_empty(),
+            ),
             Content::Unsupported(reason) => (
                 format!("block {}  \u{00B7}  unsupported", block.index),
                 reason.clone(),
@@ -532,8 +563,81 @@ impl<'a> Walker<'a> {
             expandable,
             tone,
         });
-        let base = 2;
-        match &block.content {
+        self.content_rows(2, &block.content);
+    }
+
+    /// The rows of one block of a `0DRP` resource: the same contents a
+    /// container block has, named by its segment and offset.
+    fn resource_block_rows(&mut self, block: &lforge_rage9::odrp::Block) {
+        let segment = match block.segment {
+            lforge_rage9::resource::Segment::System => "system",
+            lforge_rage9::resource::Segment::Graphics => "graphics",
+        };
+        let (kind, detail) = match &block.content {
+            Content::Records {
+                structure,
+                stride,
+                total,
+                records,
+            } => (
+                "records",
+                format!(
+                    "{}{}  \u{00B7}  {total} \u{00D7} {stride} B  \u{00B7}  {} decoded",
+                    hash32(block.id),
+                    name_of(self.names, *structure),
+                    records.len()
+                ),
+            ),
+            Content::Pool {
+                kind,
+                total,
+                entries,
+            } => (
+                kind.name(),
+                format!("{total} elements  \u{00B7}  {} decoded", entries.len()),
+            ),
+            Content::Elements {
+                code,
+                width,
+                total,
+                entries,
+            } => (
+                "elements",
+                format!(
+                    "type 0x{code:04X}  \u{00B7}  {total} \u{00D7} {width} B  \u{00B7}  {} decoded",
+                    entries.len()
+                ),
+            ),
+            Content::Unsupported(reason) => ("unsupported", reason.clone()),
+        };
+        let label = format!(
+            "block {}  \u{00B7}  {segment} {:#x}  \u{00B7}  {kind}",
+            block.index, block.offset
+        );
+        let tone = match &block.content {
+            Content::Unsupported(_) => Tone::Warning,
+            _ => Tone::Normal,
+        };
+        let expandable = match &block.content {
+            Content::Records { records, .. } => !records.is_empty(),
+            Content::Pool { entries, .. } => !entries.is_empty(),
+            Content::Elements { entries, .. } => !entries.is_empty(),
+            Content::Unsupported(_) => false,
+        };
+        self.push(Row {
+            depth: 1,
+            copy: format!("{label}  {detail}"),
+            label,
+            detail,
+            expandable,
+            tone,
+        });
+        self.content_rows(2, &block.content);
+    }
+
+    /// The rows under one block: its records, pool entries or elements.
+    fn content_rows(&mut self, base: usize, content: &Content) {
+        match content {
             Content::Records { records, .. } => {
                 let shown: Vec<&Record> = records.iter().take(MAX_CHILDREN).collect();
                 for record in shown {
@@ -563,6 +667,8 @@ impl<'a> Walker<'a> {
                         PoolEntry::Reference(word) | PoolEntry::Word64(word) => {
                             (hash64(*word), Tone::Muted)
                         }
+                        PoolEntry::Bytes(bytes) => (bytes_text(bytes), Tone::Warning),
+                        PoolEntry::Word32(word) => (format!("0x{word:08X}"), Tone::Muted),
                         PoolEntry::Word128(bytes) => (bytes_text(bytes), Tone::Muted),
                     };
                     self.push(Row {
@@ -572,6 +678,27 @@ impl<'a> Walker<'a> {
                         detail: text,
                         expandable: false,
                         tone,
+                    });
+                }
+                if entries.len() > MAX_CHILDREN {
+                    self.group(
+                        base,
+                        format!("… {} more elements", entries.len() - MAX_CHILDREN),
+                        String::new(),
+                        false,
+                    );
+                }
+            }
+            Content::Elements { entries, .. } => {
+                for (index, entry) in entries.iter().take(MAX_CHILDREN).enumerate() {
+                    let text = format!("{} {}", entry.type_name(), scalar_text(entry));
+                    self.push(Row {
+                        depth: base,
+                        label: format!("[{index}]"),
+                        copy: text.clone(),
+                        detail: text,
+                        expandable: false,
+                        tone: Tone::Muted,
                     });
                 }
                 if entries.len() > MAX_CHILDREN {
@@ -694,6 +821,24 @@ impl<'a> Walker<'a> {
                         });
                     }
                 }
+                Ok(ArrayElements::Records { records }) => {
+                    for record in records.iter().take(MAX_CHILDREN) {
+                        self.record_rows(depth + 1, record);
+                    }
+                }
+                Ok(ArrayElements::Scalars { values, .. }) => {
+                    for (index, value) in values.iter().take(MAX_CHILDREN).enumerate() {
+                        let text = format!("{} {}", value.type_name(), scalar_text(value));
+                        self.push(Row {
+                            depth: depth + 1,
+                            label: format!("[{index}]"),
+                            detail: text.clone(),
+                            copy: text,
+                            expandable: false,
+                            tone: Tone::Muted,
+                        });
+                    }
+                }
             },
             Value::Map(map) => {
                 if let Ok((_, records)) = &map.entries {
@@ -714,6 +859,8 @@ impl<'a> Walker<'a> {
                 Ok(ArrayElements::Reference { links }) => !links.is_empty(),
                 Ok(ArrayElements::Hash32 { values }) => !values.is_empty(),
                 Ok(ArrayElements::Enum32 { values, .. }) => !values.is_empty(),
+                Ok(ArrayElements::Records { records }) => !records.is_empty(),
+                Ok(ArrayElements::Scalars { values, .. }) => !values.is_empty(),
                 Err(_) => false,
             },
             Value::Map(map) => map
@@ -802,6 +949,165 @@ pub fn build(document: &Document, names: &Names) -> Tree {
         summary,
         issues,
         truncated: walker.truncated,
+    }
+}
+
+/// Builds the rows of one decoded `0DRP` metadata resource.
+///
+/// The rows show what the resource stores: its header, the schema, every block
+/// with its segment and offset, the root blocks no reference reaches, and the
+/// decoder's notes. A block expands to its records; a record expands to its
+/// fields; a text value shows the string its reference names.
+pub fn build_odrp(document: &lforge_rage9::odrp::Document, names: &Names) -> Tree {
+    let mut walker = Walker::new(names);
+    let header = document.header;
+    walker.group(
+        0,
+        "header".to_string(),
+        format!(
+            "object type 0x{:02X}  \u{00B7}  {} system and {} graphics pages",
+            header.object_type, header.system_pages, header.graphics_pages
+        ),
+        true,
+    );
+    for (label, detail) in [
+        (
+            "declared roots".to_string(),
+            format!(
+                "{}  \u{00B7}  meaning not established; {} root blocks derived from the references",
+                header.declared_roots,
+                document.roots.len()
+            ),
+        ),
+        (
+            "counts".to_string(),
+            format!(
+                "{} structures  \u{00B7}  {} enums  \u{00B7}  {} blocks",
+                header.structures, header.enums, header.blocks
+            ),
+        ),
+        (
+            "page map".to_string(),
+            format!(
+                "system offset {:#x}  \u{00B7}  {} system and {} graphics pages",
+                header.page_map, header.system_pages, header.graphics_pages
+            ),
+        ),
+        (
+            "unknown word".to_string(),
+            format!(
+                "{} at +0x4E  \u{00B7}  extra pointer {}",
+                header.unknown,
+                header
+                    .extra_pointer
+                    .map_or_else(|| "none".to_string(), |pointer| format!("{pointer:#x}"))
+            ),
+        ),
+    ] {
+        walker.push(Row {
+            depth: 1,
+            copy: format!("{label}  {detail}"),
+            label,
+            detail,
+            expandable: false,
+            tone: Tone::Muted,
+        });
+    }
+    walker.group(
+        0,
+        "schema".to_string(),
+        format!(
+            "{} structures, {} enums",
+            document.structures.len(),
+            document.enums.len()
+        ),
+        !document.structures.is_empty() || !document.enums.is_empty(),
+    );
+    for structure in &document.structures {
+        walker.structure_rows(structure);
+    }
+    for enumeration in &document.enums {
+        walker.enum_rows(enumeration);
+    }
+    let records = document.record_count();
+    walker.group(
+        0,
+        "blocks".to_string(),
+        format!(
+            "{} blocks, {records} records decoded",
+            document.blocks.len()
+        ),
+        !document.blocks.is_empty(),
+    );
+    for block in &document.blocks {
+        walker.resource_block_rows(block);
+    }
+    walker.group(
+        0,
+        "roots".to_string(),
+        format!("{} blocks no reference reaches", document.roots.len()),
+        !document.roots.is_empty(),
+    );
+    for number in &document.roots {
+        let Some(block) = document.blocks.iter().find(|block| block.index == *number) else {
+            continue;
+        };
+        let label = format!(
+            "block {}  \u{00B7}  {}{}",
+            block.index,
+            hash32(block.id),
+            name_of(names, block.id)
+        );
+        let detail = format!(
+            "{} segment at {:#x}  \u{00B7}  {} bytes",
+            match block.segment {
+                lforge_rage9::resource::Segment::System => "system",
+                lforge_rage9::resource::Segment::Graphics => "graphics",
+            },
+            block.offset,
+            block.len
+        );
+        walker.push(Row {
+            depth: 1,
+            copy: format!("{label}  {detail}"),
+            label,
+            detail,
+            expandable: false,
+            tone: Tone::Normal,
+        });
+    }
+    let issues = document.issues.clone();
+    if !issues.is_empty() {
+        walker.group(
+            0,
+            "issues".to_string(),
+            format!("{} reported", issues.len()),
+            true,
+        );
+        for issue in &issues {
+            walker.push(Row {
+                depth: 1,
+                label: issue.clone(),
+                detail: String::new(),
+                copy: issue.clone(),
+                expandable: false,
+                tone: Tone::Warning,
+            });
+        }
+    }
+    let summary = format!(
+        "{} structures  \u{00B7}  {} blocks  \u{00B7}  {records} records  \u{00B7}  {} texts  \u{00B7}  depth {}",
+        document.structures.len(),
+        document.blocks.len(),
+        document.text_count(),
+        document.depth()
+    );
+    Tree {
+        rows: walker.rows,
+        status: document.status(),
+        summary,
+        issues,
+        truncated: document.truncated,
     }
 }
 

@@ -581,7 +581,23 @@ fn content_area(state: &State, visible: usize) -> ContentArea {
 /// same rows. What names the document is what its status line reports.
 fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, String), String> {
     let bytes = crate::files::read_with(path, access).map_err(|err| err.to_string())?;
-    let document = lforge_core::metadata::decode(&bytes).map_err(|err| err.to_string())?;
+    // A `0DRP` resource stores a graphics segment after its system pages. The
+    // row's page table says where the second segment starts, so it is read
+    // before decoding; without it the decoder can only read a resource whose
+    // pages are all system data.
+    let split = if lforge_rage9::odrp::is_odrp(&bytes) {
+        crate::files::open_binary_with(path, access)
+            .ok()
+            .and_then(|binary| {
+                crate::files::resource_split_with(path, access, &binary.source)
+                    .ok()
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    let document =
+        lforge_core::metadata::decode_with_split(&bytes, split).map_err(|err| err.to_string())?;
     let names = names_for(path);
     match &document {
         lforge_core::metadata::Document::Pso(document) => Ok((
@@ -591,6 +607,14 @@ fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, String), String> 
         lforge_core::metadata::Document::Rbf0(document) => Ok((
             tree::build_rbf0(document),
             format!("{} names in the document", document.names.len()),
+        )),
+        lforge_core::metadata::Document::Odrp(document) => Ok((
+            tree::build_odrp(document, &names),
+            format!(
+                "{} hashes named  \u{00B7}  {} text values",
+                names.len(),
+                document.text_count()
+            ),
         )),
     }
 }

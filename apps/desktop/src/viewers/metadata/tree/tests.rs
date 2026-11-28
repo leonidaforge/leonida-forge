@@ -593,3 +593,115 @@ fn named(name: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(name);
     bytes
 }
+
+fn resource_document() -> lforge_rage9::odrp::Document {
+    let field = Field {
+        name: 0xaaaa_0002,
+        offset: 0,
+        type_word: 0x42u32,
+        auxiliary: 0,
+    };
+    lforge_rage9::odrp::Document {
+        header: lforge_rage9::odrp::Header {
+            object_type: 0x7a,
+            declared_roots: 1,
+            structures: 1,
+            enums: 0,
+            blocks: 2,
+            unknown: 0,
+            system_pages: 1,
+            graphics_pages: 0,
+            page_map: 0x100,
+            extra_pointer: None,
+        },
+        structures: vec![lforge_rage9::psin::pso::Structure {
+            name: 0x1111_1111,
+            signature: 0x2222_2222,
+            flags: 0x300,
+            size: 8,
+            fields: vec![field],
+        }],
+        enums: Vec::new(),
+        blocks: vec![
+            lforge_rage9::odrp::Block {
+                index: 1,
+                id: 0x1111_1111,
+                offset: 0x80,
+                len: 8,
+                segment: lforge_rage9::resource::Segment::System,
+                content: Content::Records {
+                    structure: 0x1111_1111,
+                    stride: 8,
+                    total: 1,
+                    records: vec![Record {
+                        offset: 0x80,
+                        structure: 0x1111_1111,
+                        fields: vec![FieldValue {
+                            field,
+                            extent: Some(8),
+                            value: Value::Text(lforge_rage9::psin::pso::TextValue {
+                                word: 2,
+                                resolution: lforge_rage9::psin::pso::Resolution::Located(
+                                    lforge_rage9::psin::pso::Location {
+                                        block: 2,
+                                        offset: 0,
+                                        len: 16,
+                                    },
+                                ),
+                                text: Ok("A label".to_string()),
+                            }),
+                        }],
+                    }],
+                },
+            },
+            lforge_rage9::odrp::Block {
+                index: 2,
+                id: 0x10,
+                offset: 0x90,
+                len: 8,
+                segment: lforge_rage9::resource::Segment::System,
+                content: Content::Pool {
+                    kind: lforge_rage9::psin::pso::PoolKind::Text,
+                    total: 1,
+                    entries: vec![lforge_rage9::psin::pso::PoolEntry::Text(
+                        "A label".to_string(),
+                    )],
+                },
+            },
+        ],
+        roots: vec![1],
+        issues: Vec::new(),
+        unsupported_blocks: 0,
+        unresolved_references: 0,
+        truncated: false,
+    }
+}
+
+#[test]
+fn a_resource_document_has_visible_rows_and_its_text() {
+    let tree = build_odrp(&resource_document(), &Names::empty());
+    assert!(!tree.rows.is_empty());
+    let labels: Vec<&str> = tree.rows.iter().map(|row| row.label.as_str()).collect();
+    assert_eq!(labels[0], "header");
+    assert!(labels.contains(&"schema"));
+    assert!(labels.contains(&"blocks"));
+    assert!(labels.contains(&"roots"));
+    assert_eq!(tree.status, "decoded");
+    assert!(
+        tree.rows.iter().any(|row| row.detail.contains("A label")),
+        "{:?}",
+        tree.rows.iter().map(|row| &row.detail).collect::<Vec<_>>()
+    );
+    assert!(tree.summary.contains("texts"));
+}
+
+#[test]
+fn a_resource_block_names_its_segment_and_offset() {
+    let tree = build_odrp(&resource_document(), &Names::empty());
+    let block = tree
+        .rows
+        .iter()
+        .find(|row| row.label.starts_with("block 1"))
+        .expect("a block row");
+    assert!(block.label.contains("system 0x80"), "{}", block.label);
+}
