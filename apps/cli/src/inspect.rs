@@ -19,9 +19,11 @@ use std::sync::atomic::AtomicBool;
 use lforge_binary::Source;
 use lforge_core::archive::Format;
 use lforge_core::inspect as recognition;
+use lforge_core::resource::{EntryId, Locator, ResourcePath};
 use lforge_core::zip as zip_archive;
 use lforge_rage9::rpf::metadata::transform::Algorithm;
 use lforge_rage9::rpf::metadata::{Entry, Payload};
+use lforge_rage9::rpf::names::Types;
 use serde_json::{Map, Value, json};
 
 use crate::native::{self, Alternates};
@@ -235,6 +237,15 @@ pub fn archive(
     }
 }
 
+/// The resource block of a document: the canonical path, never the row index.
+fn resource_json(path: &ResourcePath) -> Value {
+    json!({
+        "display": path.display(),
+        "identity": path.identity(),
+        "limitations": path.limitations(),
+    })
+}
+
 fn inspect_row(
     resolved: &nested::Resolved,
     row: u32,
@@ -254,6 +265,14 @@ fn inspect_row(
         });
     }
     let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
+    // Every document names the entry by its canonical path, so a failure
+    // report does too. The row index stays a diagnostic selection.
+    let mut source = source;
+    source["resource"] = resource_json(&resolved.resource().with_entry(EntryId::from_row(
+        &entry,
+        None,
+        &Types::default(),
+    )));
     let alternates = Alternates::resolve(&resolved.path, &opened.metadata);
     let selection = json!({ "kind": "row", "index": row, "raw": raw });
 
@@ -470,6 +489,12 @@ fn inspect_zip(
     if entry.is_dir() {
         return Err(format!("ZIP entry {index} is a directory, not a file"));
     }
+    let mut source = source;
+    source["resource"] = resource_json(&resolved.resource().with_entry(EntryId::named(
+        entry.name.clone(),
+        None,
+        Locator::Zip(index),
+    )));
     let selection = json!({ "kind": "zip", "index": index, "raw": raw });
 
     if raw {
@@ -654,14 +679,28 @@ fn print_text(document: &Value) {
             println!("file:        {file}");
         }
         if let Some(archive) = source.get("archive").and_then(Value::as_str) {
-            match (
-                source.get("row").and_then(Value::as_u64),
-                source.get("zip").and_then(Value::as_u64),
-            ) {
-                (Some(row), _) => println!("archive:     {archive} row {row}"),
-                (None, Some(zip)) => println!("archive:     {archive} ZIP entry {zip}"),
-                (None, None) => println!("archive:     {archive}"),
-            }
+            println!("archive:     {archive}");
+        }
+        if let Some(display) = source
+            .get("resource")
+            .and_then(|resource| resource.get("display"))
+            .and_then(Value::as_str)
+        {
+            println!("resource:    {display}");
+        }
+        match (
+            source.get("row").and_then(Value::as_u64),
+            source.get("zip").and_then(Value::as_u64),
+        ) {
+            (Some(row), _) => println!(
+                "selected:    row {row} of the archive above (diagnostic, not a resource \
+                 identifier)"
+            ),
+            (None, Some(zip)) => println!(
+                "selected:    ZIP entry {zip} of the archive above (diagnostic, not a resource \
+                 identifier)"
+            ),
+            (None, None) => {}
         }
     }
     if let Some(provenance) = map.get("provenance").and_then(Value::as_object) {
@@ -671,7 +710,12 @@ fn print_text(document: &Value) {
             let path = chain
                 .iter()
                 .map(|step| {
-                    let selector = step.get("selector").and_then(Value::as_str).unwrap_or("-");
+                    let selector = step
+                        .get("resource")
+                        .and_then(|resource| resource.get("display"))
+                        .and_then(Value::as_str)
+                        .or_else(|| step.get("selector").and_then(Value::as_str))
+                        .unwrap_or("-");
                     let format = step.get("format").and_then(Value::as_str).unwrap_or("-");
                     format!("{selector} -> {format}")
                 })

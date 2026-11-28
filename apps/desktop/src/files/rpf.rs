@@ -779,6 +779,16 @@ pub fn file_prefix(archive: &Archive, inner: &Path) -> io::Result<Option<PathBuf
     Ok(None)
 }
 
+/// The canonical identity of the native row at `inner`, for the path of a
+/// nested archive entered from it. `None` for scan-recovered entries, whose
+/// folders are not native rows.
+pub fn entry_id(archive: &Archive, inner: &Path) -> Option<lforge_core::resource::EntryId> {
+    match contents(archive).ok()? {
+        Contents::Native(native) => native.entry_id(inner),
+        Contents::Recovered(..) => None,
+    }
+}
+
 pub fn file_len(archive: &Archive, inner: &Path) -> io::Result<u64> {
     let index = match contents(archive)? {
         Contents::Native(native) => return native.file_len(inner),
@@ -1474,7 +1484,8 @@ pub(crate) mod tests {
         assert!(named > 0, "the built-in tables resolved no names");
         assert!(
             rows.iter()
-                .any(|row| !row.name.starts_with("0x") && !row.name.starts_with("Row "))
+                .any(|row| !row.name.starts_with("0x") && !row.name.starts_with("unidentified")),
+            "no entry was labelled with a verified name"
         );
         // Verified paths become folders, and the unnamed group comes last.
         let root = files::list_with(&archive, &access).unwrap();

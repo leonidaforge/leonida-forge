@@ -27,6 +27,7 @@ use lforge_binary::Source;
 use lforge_core::archive::{self as identify, HEAD_LEN};
 pub use lforge_core::archive::{Format, Identified};
 use lforge_core::classify::{self, Classification};
+use lforge_core::resource::{EntryId, ResourcePath};
 use lforge_rage9::rpf::Progress;
 
 use super::executable::Access;
@@ -102,6 +103,9 @@ pub struct Archive {
     /// The executable that may authenticate the stored table of contents.
     /// Carried along so no reader has to look one up globally.
     pub access: Access,
+    /// The canonical path of this archive: the root file name and every
+    /// nested archive it was entered through. It names no entry itself.
+    pub resource: ResourcePath,
 }
 
 impl Archive {
@@ -124,6 +128,7 @@ impl Archive {
                 caveat: None,
                 dependencies: Vec::new(),
                 access: access.clone(),
+                resource: ResourcePath::root(file_name(path)),
             }),
             other => Err(other),
         })
@@ -853,6 +858,16 @@ pub(crate) fn forget_kept(path: &Path) {
     kept_archives().by_path.remove(path);
 }
 
+/// The canonical identity of the nested archive at `inner`, for the path of
+/// the archive opened from it.
+fn nested_entry_id(parent: &Archive, inner: &Path) -> Option<EntryId> {
+    let entry = match parent.format {
+        Format::Zip => zip::entry_id(parent, inner),
+        Format::Rpf9 => rpf::entry_id(parent, inner),
+    }?;
+    Some(entry)
+}
+
 /// The kept archive at `inner` in `parent`, if it was opened from the same
 /// file on disk and the files it depends on are unchanged.
 fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
@@ -866,6 +881,10 @@ fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
         return None;
     }
     entry.last_used = now;
+    let resource = match nested_entry_id(parent, inner) {
+        Some(entry) => parent.resource.push(entry),
+        None => parent.resource.clone(),
+    };
     Some(Archive {
         path,
         format: entry.format,
@@ -877,6 +896,7 @@ fn kept(parent: &Archive, inner: &Path) -> Option<Archive> {
         caveat: entry.caveat.clone(),
         dependencies: entry.dependencies.clone(),
         access: parent.access.clone(),
+        resource,
     })
 }
 

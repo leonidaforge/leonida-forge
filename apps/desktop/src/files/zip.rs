@@ -11,6 +11,7 @@ use std::time::SystemTime;
 
 use chrono::{Local, NaiveDate, TimeZone};
 use lforge_binary::Source;
+use lforge_core::resource::{EntryId, Locator};
 use zip::{CompressionMethod, ZipArchive};
 
 use super::archive::{Archive, check_size};
@@ -48,10 +49,21 @@ pub fn list(archive: &Archive, inner: &Path) -> io::Result<Vec<Entry>> {
                 .or_insert_with(|| Entry::new(child, path, EntryKind::Directory, None, None));
         } else {
             let modified = file.last_modified().and_then(to_system_time);
-            children.insert(
+            let mut entry = Entry::new(
                 child.clone(),
-                Entry::new(child, path, EntryKind::File, Some(file.size()), modified),
+                path,
+                EntryKind::File,
+                Some(file.size()),
+                modified,
             );
+            let id = EntryId::named(
+                name.to_string_lossy().replace('\\', "/"),
+                None,
+                Locator::Zip(index),
+            );
+            entry.resource = Some(archive.resource.with_entry(id));
+            entry.resource_row = u32::try_from(index).ok();
+            children.insert(child.clone(), entry);
         }
     }
 
@@ -91,6 +103,18 @@ pub fn file_len(archive: &Archive, inner: &Path) -> io::Result<u64> {
     let mut zip = open(archive)?;
     let index = find(&mut zip, inner)?;
     Ok(zip.by_index_raw(index).map_err(io::Error::other)?.size())
+}
+
+/// The canonical identity of the ZIP entry at `inner`, for the path of an
+/// archive entered from it.
+pub fn entry_id(archive: &Archive, inner: &Path) -> Option<EntryId> {
+    let mut zip = open(archive).ok()?;
+    let index = find(&mut zip, inner).ok()?;
+    Some(EntryId::named(
+        inner.to_string_lossy().replace('\\', "/"),
+        None,
+        Locator::Zip(index),
+    ))
 }
 
 /// Decompresses one file into `out`, within `limit` bytes.

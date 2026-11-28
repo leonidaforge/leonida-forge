@@ -71,9 +71,9 @@ fn evicted_archives_are_prepared_again() {
     // A native table is read again without preparing.
     let native = temp.path().join("native.rpf");
     fs::write(&native, native_rpf(&[spec(b"row", 1)])).unwrap();
-    assert_eq!(names(&list(&native).unwrap()), ["Row 00000"]);
+    assert_eq!(names(&list(&native).unwrap()), ["unidentified"]);
     forget(&native);
-    assert_eq!(names(&list(&native).unwrap()), ["Row 00000"]);
+    assert_eq!(names(&list(&native).unwrap()), ["unidentified"]);
 
     // A nested archive is opened again from its parent.
     let outer = temp.path().join("outer.zip");
@@ -103,8 +103,9 @@ fn mixed_chain(dir: &Path) -> (Vec<PathBuf>, PathBuf, PathBuf) {
     let outer = dir.join("chain.zip");
     fs::write(&outer, zip_bytes(&[("native.rpf", &native)])).unwrap();
     let native = outer.join("native.rpf");
-    let encrypted = native.join("Row 00000");
-    let zip = native.join("Row 00001");
+    // Both rows store no key, so their labels carry the occurrence number.
+    let encrypted = native.join("unidentified~1");
+    let zip = native.join("unidentified~2");
     let paths = vec![native.clone(), encrypted.clone(), zip.clone()];
     (paths, recovered_xml(&encrypted), zip.join("leaf.txt"))
 }
@@ -281,8 +282,8 @@ fn companion_changes_reach_every_level() {
     fs::write(&main, &full).unwrap();
     let data = temp.path().join("data.dat");
     fs::write(&data, companion_of(&full, 2)).unwrap();
-    let level1 = main.join("Row 00000");
-    let level2 = level1.join("Row 00000");
+    let level1 = main.join("unidentified");
+    let level2 = level1.join("unidentified");
     let leaf = level2.join("leaf.txt");
     let levels = [main.clone(), level1.clone(), level2.clone()];
     assert_eq!(read(&leaf).unwrap(), b"leaf");
@@ -329,7 +330,7 @@ fn cancelled_loading_leaves_nothing_behind() {
     .unwrap();
     let outer = temp.path().join("outer.zip");
     fs::write(&outer, zip_bytes(&[("big.zip", &big)])).unwrap();
-    for nested in [native.join("Row 00000"), outer.join("big.zip")] {
+    for nested in [native.join("unidentified"), outer.join("big.zip")] {
         let err = prepare(&nested, &Progress::default(), &AtomicBool::new(true)).unwrap_err();
         assert_eq!(
             err.kind(),

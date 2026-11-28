@@ -330,8 +330,10 @@ fn lists_entries_from_the_table_of_contents() {
         // Type 5 declares `ztd`, so the name it completes is shown with it.
         format!("0x{:016X}.ztd", hash64(b"data")),
         format!("0x{:016X}.rpf", hash64(b"packed")),
-        "Row 00003".to_string(),
-        "Row 00004".to_string(),
+        // The last two rows store no usable key, so they carry no hash and
+        // say so; their row index stays in the details.
+        "unidentified~1".to_string(),
+        "unidentified~2".to_string(),
     ];
     assert_eq!(names_of(&entries).join("\n"), expected.join("\n"));
     let kinds: Vec<EntryKind> = entries.iter().map(|e| e.kind).collect();
@@ -384,6 +386,9 @@ fn lists_entries_from_the_table_of_contents() {
     let err = files::read(&entries[3].path).unwrap_err();
     assert!(err.to_string().contains("no location record"), "{err}");
 
+    // A path saved when row numbers were the entry paths still opens the same
+    // entry.
+    assert_eq!(files::read(&path.join("Row 00004")).unwrap(), [4; 16]);
     // Each entry has exactly one path.
     for alias in ["Row 0", "Row 000000", "row 00001", "Row 00005", "Row 1"] {
         assert!(files::read(&path.join(alias)).is_err(), "{alias}");
@@ -412,11 +417,15 @@ fn duplicate_visible_labels_keep_distinct_entry_paths() {
     )
     .unwrap();
     let entries = files::list(&path).unwrap();
-    assert_eq!(entries[0].name, entries[1].name);
+    // One key, two entries: the occurrence number keeps their labels and
+    // paths apart, and neither becomes a row number.
+    assert_eq!(entries[0].name, format!("0x{hash:016X}.rpf~1"));
+    assert_eq!(entries[1].name, format!("0x{hash:016X}.rpf~2"));
     assert_ne!(entries[0].path, entries[1].path);
     assert_eq!(files::read(&entries[0].path).unwrap(), b"first payload");
     assert_eq!(files::read(&entries[1].path).unwrap(), b"second payload");
     assert_eq!(detail(&entries[0], "Name hash"), format!("0x{hash:016X}"));
+    assert_eq!(detail(&entries[0], "Resource note"), resource::DUPLICATE);
 }
 
 #[test]
@@ -471,8 +480,9 @@ fn verified_paths_become_folders_and_unnamed_rows_come_last() {
         detail(&packs[1], "Names"),
         "packs/inner.rpf, PACKS\\INNER.rpf"
     );
-    // The entry path stays the row number, under the folder it was placed in.
-    assert_eq!(packs[1].path, path.join("packs").join("Row 00000"));
+    // The entry's path is its verified name under the folder it was placed
+    // in.
+    assert_eq!(packs[1].path, path.join("packs").join("inner.rpf"));
     assert_eq!(files::read(&packs[1].path).unwrap(), [1; 16]);
     let nested = files::list(&packs[0].path).unwrap();
     assert_eq!(names_of(&nested), ["leaf.rpf"]);
@@ -564,13 +574,17 @@ fn flat_and_folder_layouts_share_one_row_identity() {
             format!("0x{:016X}.rpf", hash64(b"unnamed"))
         ]
     );
-    // The labels can repeat; the paths stay the canonical row paths.
-    assert_eq!(rows[0].path, path.join("packs").join("Row 00000"));
+    // The labels can repeat; the paths stay the canonical entry paths.
+    assert_eq!(rows[0].path, path.join("packs").join("inner.rpf"));
     assert_eq!(
         rows[1].path,
-        path.join("packs").join("inner").join("Row 00001")
+        path.join("packs").join("inner").join("leaf.rpf")
     );
-    assert_eq!(rows[2].path, path.join("Unnamed Entries").join("Row 00002"));
+    assert_eq!(
+        rows[2].path,
+        path.join("Unnamed Entries")
+            .join(format!("0x{:016X}.rpf", hash64(b"unnamed")))
+    );
     assert_eq!(files::read_with(&rows[1].path, &flat).unwrap(), [2; 16]);
     let note = files::describe_with(&path, &flat).unwrap();
     assert!(note.contains("one list"), "{note}");
@@ -613,8 +627,23 @@ fn names_come_from_a_lut_beside_the_executable() {
     let archive = opened(&path);
     let builtin = Builtin::load(Some(&directory));
     let mut native = Native::read(&archive).unwrap();
-    native.names = Names::read_with(&archive, &native.rows, &native.types, &builtin);
-    native.layout = Layout::build(&native.rows, native.names.as_ref());
+    native.names = Names::read_with(&archive, &native.rows, &Types::default(), &builtin);
+    native.entry_ids = native
+        .rows
+        .iter()
+        .map(|row| {
+            EntryId::from_row(
+                row,
+                native
+                    .names
+                    .as_ref()
+                    .and_then(|names| names.matches.row(row.row)),
+                &Types::default(),
+            )
+        })
+        .collect();
+    resource::assign_occurrences(&mut native.entry_ids);
+    native.layout = Layout::build(&native.rows, &native.entry_ids);
     let root = native
         .list(&archive, Path::new(""), ListingLayout::Folders)
         .unwrap();
@@ -628,7 +657,7 @@ fn names_come_from_a_lut_beside_the_executable() {
         "User mapping, verified by hash"
     );
     assert_eq!(detail(&props[0], "Name hash"), format!("0x{item:016X}"));
-    assert_eq!(props[0].path, archive.path.join("Props").join("Row 00000"));
+    assert_eq!(props[0].path, archive.path.join("Props").join("Item.ydr"));
     let unnamed = native
         .list(
             &archive,
@@ -701,15 +730,16 @@ fn names_can_be_declared_for_stored_keys() {
     .unwrap();
 
     let root = files::list(&path).unwrap();
-    // The entry remains its row; a name only decides where it is listed.
+    // The entry's path is the verified name; the stored key stays in the
+    // details.
     assert_eq!(names_of(&root), ["Props", "Readme.txt"]);
     let props = files::list(&root[0].path).unwrap();
     assert_eq!(names_of(&props), ["Item.ydr"]);
     assert_eq!(
         props[0].path.file_name().unwrap().to_str().unwrap(),
-        "Row 00000"
+        "Item.ydr"
     );
-    assert_eq!(props[0].path, path.join("Props").join("Row 00000"));
+    assert_eq!(props[0].path, path.join("Props").join("Item.ydr"));
     assert_eq!(detail(&props[0], "Names"), "Props/Item.ydr");
     assert_eq!(
         detail(&props[0], "Name source"),
@@ -863,10 +893,10 @@ fn folder_spellings_that_fold_alike_are_one_folder() {
     let children = files::list(&root[0].path).unwrap();
     assert_eq!(names_of(&children), ["A.rpf", "B.rpf"]);
     assert_eq!(
-        files::read(&path.join("PACKS").join("Row 00001")).unwrap(),
+        files::read(&path.join("PACKS").join("B.rpf")).unwrap(),
         [2; 16]
     );
-    assert!(files::read(&path.join("packs").join("Row 00000")).is_err());
+    assert!(files::read(&path.join("packs").join("A.rpf")).is_err());
 }
 
 #[test]
@@ -971,8 +1001,9 @@ fn raw_entries_open_as_nested_archives() {
     )
     .unwrap();
 
-    // ZIP in RPF9, as a view.
-    let row = |n: u32| path.join(row_name(n));
+    // ZIP in RPF9, as a view. Every path is the entry's canonical label.
+    let listed = files::list(&path).unwrap();
+    let row = |n: usize| listed[n].path.clone();
     let nested = opened(&row(0));
     assert_eq!(
         (nested.format, nested.depth, nested.decompressed),
@@ -986,7 +1017,7 @@ fn raw_entries_open_as_nested_archives() {
         (archive::Format::Rpf9, 0)
     );
     assert_eq!(
-        files::read(&row(1).join("Row 00000")).unwrap(),
+        files::read(&row(1).join("unidentified")).unwrap(),
         b"deep leaf"
     );
     assert_eq!(names_of(&list_opened(&row(2))), [files::rpf::RECOVERED]);
@@ -1018,8 +1049,8 @@ fn native_archives_open_inside_zip_archives() {
         let path = outer.join("data.bin");
         let nested = opened(&path);
         assert_eq!(nested.decompressed, decompressed);
-        assert_eq!(names_of(&files::list(&path).unwrap()), ["Row 00000"]);
-        assert_eq!(files::read(&path.join("Row 00000")).unwrap(), b"inside");
+        assert_eq!(names_of(&files::list(&path).unwrap()), ["unidentified"]);
+        assert_eq!(files::read(&path.join("unidentified")).unwrap(), b"inside");
     }
 }
 
@@ -1053,7 +1084,7 @@ fn usable_tables_are_read_once_until_something_changes() {
     fs::write(&path, native_rpf(&[spec(b"one", 1)])).unwrap();
     let before = full_reads();
     for _ in 0..3 {
-        assert_eq!(names_of(&files::list(&path).unwrap()), ["Row 00000"]);
+        assert_eq!(names_of(&files::list(&path).unwrap()), ["unidentified"]);
         files::describe(&path).unwrap();
     }
     assert_eq!(full_reads(), before + 1);
@@ -1179,7 +1210,7 @@ fn decoded_entries_read_and_hold_archives() {
     }
     // Archives in decoded entries are recognised by content and decompressed
     // within the chain's budget.
-    let row = |n: u32| path.join(row_name(n));
+    let row = |n: usize| entries[n].path.clone();
     let nested = opened(&row(2));
     assert_eq!(nested.format, archive::Format::Zip);
     assert_eq!(nested.decompressed, zip.len() as u64);
@@ -1189,7 +1220,7 @@ fn decoded_entries_read_and_hold_archives() {
         assert_eq!(nested.format, archive::Format::Rpf9);
         assert_eq!(nested.decompressed, inner_native.len() as u64);
         assert_eq!(
-            files::read(&row(n).join("Row 00000")).unwrap(),
+            files::read(&row(n).join("unidentified")).unwrap(),
             b"deep leaf"
         );
     }
@@ -1209,7 +1240,7 @@ fn decoded_entries_read_and_hold_archives() {
     )
     .unwrap();
     let err = archive::prepare(
-        &cancelled.join("Row 00000"),
+        &cancelled.join("unidentified"),
         &Progress::default(),
         &AtomicBool::new(true),
     )
@@ -1331,7 +1362,8 @@ fn changed_companions_are_checked_again() {
     fs::write(&path, &main).unwrap();
     let data = temp.path().join("data.dat");
     fs::write(&data, companion_of(&full, 2)).unwrap();
-    let row = |n: u32| path.join(row_name(n));
+    let listed = files::list(&path).unwrap();
+    let row = |n: usize| listed[n].path.clone();
     assert_eq!(files::read(&row(0)).unwrap(), text);
 
     // A wrong identifier makes the cached companion unusable.
@@ -1414,7 +1446,8 @@ fn archives_in_companions_open_and_follow_the_companion() {
     fs::write(&path, &full).unwrap();
     let data = temp.path().join("data.dat");
     fs::write(&data, companion_of(&full, 2)).unwrap();
-    let row = |n: u32| path.join(row_name(n));
+    let listed = files::list(&path).unwrap();
+    let row = |n: usize| listed[n].path.clone();
 
     // ZIP and RPF9 in companion rows, recognised by content.
     let nested = opened(&row(0));
@@ -1428,7 +1461,7 @@ fn archives_in_companions_open_and_follow_the_companion() {
     let nested = opened(&row(1));
     assert_eq!(nested.format, archive::Format::Rpf9);
     assert_eq!(
-        files::read(&row(1).join("Row 00000")).unwrap(),
+        files::read(&row(1).join("unidentified")).unwrap(),
         b"deep leaf"
     );
     let nested = opened(&row(2));
@@ -1458,7 +1491,7 @@ fn archives_in_companions_open_and_follow_the_companion() {
     fs::write(&data, companion_of(&full, 2)).unwrap();
     assert_eq!(files::read(&row(0).join("leaf.txt")).unwrap(), b"leaf");
     assert_eq!(
-        files::read(&row(1).join("Row 00000")).unwrap(),
+        files::read(&row(1).join("unidentified")).unwrap(),
         b"deep leaf"
     );
 }

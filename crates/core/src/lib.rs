@@ -6,6 +6,7 @@ pub mod classify;
 pub mod dictionary;
 pub mod inspect;
 pub mod registry;
+pub mod resource;
 pub mod zip;
 
 use std::path::PathBuf;

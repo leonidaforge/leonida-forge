@@ -4,18 +4,19 @@
 //! engine processes first is used only after it authenticated against a local
 //! executable (see [`super::rpf`]), or recovered by scanning instead.
 //!
-//! The table holds hashes of entry names, not names. Each entry keeps its row
-//! number as its stable path, `Row 00042`, and is labelled with a verified
-//! unambiguous resolved name, otherwise the stored key in canonical form.
-//! A verified name that is a safe relative path is shown as folders; every
-//! other row is listed after them in [`UNNAMED`]. Names come from the LUT files
-//! embedded in the application and read beside the executable, and from the
-//! local table `<archive file>.names.txt` next to the file on disk. That table
-//! holds candidate paths relative to the archive, or explicit
-//! `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. Names are display
-//! data only: entry paths stay the row names.
+//! The table holds hashes of entry names, not names. Each entry has a
+//! canonical resource path: the archive hierarchy, then a verified
+//! unambiguous resolved name or, when none exists, the stored key at its
+//! namespace width. A verified name that is a safe relative path is shown as
+//! folders; every other row is listed after them in [`UNNAMED`]. Names come
+//! from the LUT files embedded in the application and read beside the
+//! executable, and from the local table `<archive file>.names.txt` next to the
+//! file on disk. That table holds candidate paths relative to the archive, or
+//! explicit `hash64:HASH<TAB>name` and `key32:HASH<TAB>name` mappings. A row
+//! index is diagnostic metadata and is never a resource identifier; earlier
+//! `Row 00042` paths are still accepted as aliases of a saved reference.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,14 +25,15 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_core::resource::{self, EntryId, ResourcePath};
 use lforge_rage9::rpf::metadata::transform::{Algorithm, CipherDescriptor};
 use lforge_rage9::rpf::metadata::verify::VerifyReport;
 use lforge_rage9::rpf::metadata::{
     ChunkTable, Companion, CompanionStatus, Entry as Row, Error, Metadata, Payload, Stored,
 };
 use lforge_rage9::rpf::names::{
-    self, Builtin, CandidateOutcome, Class, Key, MountPrefix, Provenance, Resolution,
-    ResolutionSet, Resolver, StringTable, Types, builtin,
+    self, Builtin, CandidateOutcome, Key, MountPrefix, Provenance, Resolution, ResolutionSet,
+    Resolver, StringTable, Types, builtin,
 };
 
 use super::archive::{Archive, Dependency, Stamp, check_size, file_stamp};
@@ -43,8 +45,9 @@ pub const NAMES_SUFFIX: &str = ".names.txt";
 /// The folder that holds the rows a verified relative path cannot place.
 pub const UNNAMED: &str = "Unnamed Entries";
 
-const ROW_NOTE: &str = "Listed from the archive's table of contents. The label is a verified \
-     unambiguous name, otherwise the stored key; the row number identifies the entry.";
+const ROW_NOTE: &str = "Listed from the archive's table of contents. The path is the verified \
+     unambiguous name, otherwise the stored key at its namespace width. The row number in the \
+     details is diagnostic metadata, not a resource identifier.";
 
 /// Why the stored table of contents cannot be read as it is.
 #[derive(Debug, Clone)]
@@ -203,12 +206,14 @@ fn companion_stamps(dir: Option<&Path>, records: &[Companion]) -> Vec<Option<Sta
 
 pub struct Native {
     rows: Vec<Row>,
+    /// The canonical identity of every row, in row order. The locator and the
+    /// key are technical; the verified name is display data.
+    entry_ids: Vec<EntryId>,
     names: Option<Names>,
     /// Where each row is listed, from the verified relative paths.
     layout: Layout,
     companions: Companions,
     authentication: Authentication,
-    types: Types,
     /// Present when the metadata was authenticated; it can build
     /// payload-transform blocks.
     stream: Option<lforge_rage9::rpf::metadata::provider::RecognizedSource>,
@@ -281,17 +286,6 @@ impl Names {
             builtin: builtin.sources().to_vec(),
         })
     }
-
-    /// A verified unambiguous name of the row, if the tables have one.
-    fn verified_name(&self, row: u32) -> Option<&str> {
-        match &self.matches.row(row)?.resolution {
-            Resolution::Resolved(names) => names
-                .iter()
-                .find(|name| name.verified)
-                .map(|name| name.text.as_str()),
-            Resolution::Ambiguous(_) | Resolution::Unresolved => None,
-        }
-    }
 }
 
 /// Where one row is listed.
@@ -308,12 +302,13 @@ struct Placement {
 /// The archive stores hashes of paths, not folders. A row whose verified
 /// unambiguous name is a safe relative path is listed under that path; every
 /// other row is listed in [`UNNAMED`]. Nothing here changes a row's identity:
-/// an entry's path stays `<folder>/Row NNNNN`, so each row has exactly one
-/// path.
+/// the identity is the stored key, and the path is its canonical label.
 #[derive(Debug, Default)]
 struct Layout {
     /// By row number, `None` for a row in the unnamed folder.
     placements: Vec<Option<Placement>>,
+    /// Every row by its folder and visible label, for O(1) path lookup.
+    by_label: HashMap<(Vec<String>, String), usize>,
     /// Folder components, including the root as the empty list.
     folders: BTreeMap<Vec<String>, VirtualFolder>,
     /// Row numbers without a usable path, in row order.
@@ -333,22 +328,25 @@ struct VirtualFolder {
 }
 
 impl Layout {
-    fn build(rows: &[Row], names: Option<&Names>) -> Self {
+    fn build(rows: &[Row], entries: &[EntryId]) -> Self {
         let mut layout = Self {
             placements: vec![None; rows.len()],
             ..Self::default()
         };
         layout.folders.insert(Vec::new(), VirtualFolder::default());
-        for row in rows {
-            let Some(name) = names.and_then(|names| names.verified_name(row.row)) else {
+        for (position, row) in rows.iter().enumerate() {
+            let Some(entry) = entries.get(position) else {
                 continue;
             };
-            let Some((folder, label)) = placement(name, row.type_id()) else {
+            let Some(name) = entry.name.as_deref() else {
                 continue;
             };
-            let Some(position) = usize::try_from(row.row).ok().filter(|&p| p < rows.len()) else {
+            let Some((folder, mut label)) = placement(name, row.type_id()) else {
                 continue;
             };
+            // The visible label carries the occurrence marker of a duplicate
+            // key, so two rows with one name keep distinct paths.
+            label.text = entry.file_label();
             // The engine folds case and `\` in a path, so folder spellings
             // that fold alike are one folder. The first spelling is kept.
             let mut path: Vec<String> = Vec::new();
@@ -389,6 +387,16 @@ impl Layout {
             .filter(|&position| layout.placements[position].is_none())
             .collect();
         layout.grouped = layout.unnamed.len() < rows.len();
+        for position in 0..rows.len() {
+            let (folder, label) = match layout.placements[position].as_ref() {
+                Some(placement) => (placement.folder.clone(), placement.label.text.clone()),
+                None if layout.grouped => {
+                    (vec![UNNAMED.to_string()], entries[position].file_label())
+                }
+                None => (Vec::new(), entries[position].file_label()),
+            };
+            layout.by_label.insert((folder, label), position);
+        }
         layout
     }
 }
@@ -537,11 +545,26 @@ fn row_name(row: u32) -> String {
     format!("Row {row:05}")
 }
 
-/// The row of a name made by [`row_name`]. Other spellings are rejected, so
-/// each entry has exactly one path.
+/// The row of a name made by [`row_name`]. It is accepted only as an alias of
+/// a reference saved before names were displayed.
 fn parse_row_name(name: &str) -> Option<u32> {
     let row = name.strip_prefix("Row ")?.parse().ok()?;
     (row_name(row) == name).then_some(row)
+}
+
+/// The canonical key a key-only label spells. An extension and an occurrence
+/// marker after the key are ignored.
+fn parse_key_label(name: &str) -> Option<Key> {
+    let rest = name.strip_prefix("0x")?;
+    let hex: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_hexdigit())
+        .collect();
+    match hex.len() {
+        16 => u64::from_str_radix(&hex, 16).ok().map(Key::Hash64),
+        8 => u32::from_str_radix(&hex, 16).ok().map(Key::Key32),
+        _ => None,
+    }
 }
 
 fn not_found() -> io::Error {
@@ -628,15 +651,26 @@ impl Native {
         let rows: Vec<Row> = metadata.entries().collect();
         let types = Types::default();
         let names = Names::read(archive, &rows, &types);
-        let layout = Layout::build(&rows, names.as_ref());
+        let mut entry_ids: Vec<EntryId> = rows
+            .iter()
+            .map(|row| {
+                EntryId::from_row(
+                    row,
+                    names.as_ref().and_then(|names| names.matches.row(row.row)),
+                    &types,
+                )
+            })
+            .collect();
+        resource::assign_occurrences(&mut entry_ids);
+        let layout = Layout::build(&rows, &entry_ids);
         let companions = Companions::read(archive, &metadata);
         Self {
             rows,
+            entry_ids,
             names,
             layout,
             companions,
             authentication,
-            types,
             stream,
         }
     }
@@ -686,18 +720,47 @@ impl Native {
         &self.companions.alternates
     }
 
+    /// The row a path names.
+    ///
+    /// A path is matched by its canonical display label first. The earlier
+    /// row-name paths (`Row 00042`) and the key-only labels are accepted as
+    /// aliases, so a reference saved before a name was discovered still
+    /// opens the same entry.
     fn row(&self, inner: &Path) -> Option<&Row> {
         let parts = path_parts(inner)?;
         let (name, folder) = parts.split_last()?;
-        let row = self
-            .rows
-            .get(usize::try_from(parse_row_name(name)?).ok()?)?;
-        let placement = self
+        let key = (
+            folder
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect::<Vec<_>>(),
+            (*name).to_string(),
+        );
+        if let Some(&position) = self.layout.by_label.get(&key) {
+            return self.rows.get(position);
+        }
+        if let Some(row) = parse_row_name(name)
+            && let Some(position) = usize::try_from(row).ok()
+            && self.folder_matches(position, folder)
+        {
+            return self.rows.get(position);
+        }
+        let key = parse_key_label(name)?;
+        (0..self.rows.len())
+            .find(|&position| {
+                self.entry_ids[position].key == Some(key) && self.folder_matches(position, folder)
+            })
+            .map(|position| &self.rows[position])
+    }
+
+    /// Whether `position` is listed in `folder`.
+    fn folder_matches(&self, position: usize, folder: &[&str]) -> bool {
+        match self
             .layout
             .placements
-            .get(usize::try_from(row.row).ok()?)?
-            .as_ref();
-        let matches = match placement {
+            .get(position)
+            .and_then(Option::as_ref)
+        {
             Some(placement) => placement
                 .folder
                 .iter()
@@ -705,8 +768,23 @@ impl Native {
                 .eq(folder.iter().copied()),
             None if self.layout.grouped => folder.len() == 1 && folder[0] == UNNAMED,
             None => folder.is_empty(),
-        };
-        matches.then_some(row)
+        }
+    }
+
+    /// The canonical identity of the entry at `inner`, for a nested archive
+    /// entered through this table. An alias spelling resolves to the same
+    /// entry.
+    pub fn entry_id(&self, inner: &Path) -> Option<EntryId> {
+        let row = self.row(inner)?;
+        let position = usize::try_from(row.row).ok()?;
+        self.entry_ids.get(position).cloned()
+    }
+
+    /// The canonical path of the row at `position` in `archive`.
+    pub fn resource(&self, archive: &Archive, position: usize) -> Option<ResourcePath> {
+        self.entry_ids
+            .get(position)
+            .map(|entry| archive.resource.with_entry(entry.clone()))
     }
 
     fn resolution(&self, row: u32) -> Option<&Resolution> {
@@ -743,12 +821,12 @@ impl Native {
         }
     }
 
-    /// The visible name of the row at `index`: the file name its verified
-    /// relative path ends in, else the stored key in canonical form.
+    /// The visible name of the row at `index`: the last component of its
+    /// canonical resource label.
     fn label(&self, index: usize) -> String {
         match &self.layout.placements[index] {
             Some(placement) => placement.label.text.clone(),
-            None => self.key_label(&self.rows[index]),
+            None => self.entry_ids[index].file_label(),
         }
     }
 
@@ -765,26 +843,6 @@ impl Native {
         let placement = self.layout.placements[index].as_ref()?;
         (placement.label.source != lforge_core::registry::NameSource::Original)
             .then_some(placement.label.original.as_str())
-    }
-
-    /// The stored key of the row in canonical form, with only a confirmed
-    /// extension.
-    fn key_label(&self, row: &Row) -> String {
-        let hash = row.name_hash.as_ref().ok().and_then(|value| *value);
-        let key = row.name_key.as_ref().ok().and_then(|value| *value);
-        let stored = match row.type_id().and_then(|type_id| self.types.class(type_id)) {
-            Some(Class::Hash64) => hash.map(Key::Hash64),
-            Some(Class::Key32) => key.map(Key::Key32),
-            _ => match (hash, key) {
-                (Some(hash), _) => Some(Key::Hash64(hash)),
-                (None, Some(key)) => Some(Key::Key32(key)),
-                _ => None,
-            },
-        };
-        match stored {
-            Some(key) => lforge_core::registry::file_name(&key.canonical(), row.type_id()).text,
-            None => row_name(row.row),
-        }
     }
 
     /// Where the displayed names came from, and whether their keys were
@@ -836,7 +894,6 @@ impl Native {
 
     fn entry(&self, archive: &Archive, index: usize) -> Entry {
         let row = &self.rows[index];
-        let path_name = row_name(row.row);
         let label = self.label(index);
         let dir = self.row_dir(archive, index);
         let location = match &row.location {
@@ -847,14 +904,19 @@ impl Native {
             Some(_) => EntryKind::File,
             None => EntryKind::Unavailable,
         };
+        let resource = self
+            .resource(archive, index)
+            .unwrap_or_else(|| archive.resource.clone());
         let mut entry = Entry::new(
-            label,
-            dir.join(&path_name),
+            label.clone(),
+            dir.join(&label),
             kind,
             location.map(|l| l.logical_len),
             None,
         );
         entry.resource_type = location.map(|l| l.type_id);
+        entry.resource = Some(resource.clone());
+        entry.resource_row = Some(row.row);
         entry.type_name = match location {
             Some(l) if l.type_id == names::RPF_TYPE => "RPF9 entry, type 0 (rpf)".to_string(),
             Some(l) => format!("RPF9 entry, type {}", l.type_id),
@@ -862,14 +924,23 @@ impl Native {
         };
         let malformed = |reason: &String| format!("Malformed: {reason}");
         let mut details = vec![
+            ("Resource path", resource.display()),
+            ("Resource identity", resource.identity()),
             (
                 "Row",
-                format!("{} (identifies the entry in this archive)", row.row),
+                format!(
+                    "{} (diagnostic: the entry's position in this archive, not a resource \
+                     identifier)",
+                    row.row
+                ),
             ),
             ("Metadata", self.authentication.text()),
             ("Names", self.names_text(row)),
             ("Name source", self.names_source_text(row)),
         ];
+        for limitation in resource.limitations() {
+            details.push(("Resource note", limitation.to_string()));
+        }
         // A name this build completed with a declared extension says so, and
         // keeps the archive's own spelling beside it, so a synthesized name is
         // never mistaken for one the archive stores.
@@ -1103,6 +1174,8 @@ impl Native {
         for component in inner.components() {
             prefix.push(component);
             if self.row(&prefix).is_some() {
+                // The spelling the caller used, so a prefix is compared with
+                // the path it came from; entry labels are canonical already.
                 return Some(prefix);
             }
         }
@@ -1132,7 +1205,7 @@ impl Native {
             return Some(format!(
                 "All {} of the archive's rows in one list, labelled by a verified name or by the \
                  stored key. Switch to the folders view to see the verified relative paths as \
-                 folders. Row numbers remain the entry paths.",
+                 folders. The path of each entry is that label under its folders.",
                 count(self.rows.len(), "row", "rows")
             ));
         }
@@ -1148,7 +1221,8 @@ impl Native {
             let key: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
             return self.layout.folders.contains_key(&key).then(|| {
                 "Reconstructed from the relative path a verified name describes. The archive \
-                 stores neither names nor folders, and an entry's path stays its row number."
+                 stores neither names nor folders; each entry's path is its canonical label \
+                 under this folder."
                     .to_string()
             });
         }
@@ -1170,8 +1244,8 @@ impl Native {
         };
         let mut note = format!(
             "Listed from the archive's table of contents, {}: {} in table order, labelled by a \
-             verified name or by the stored key. Row numbers remain the entry paths. The \
-             signature covers the metadata, not the payloads.",
+             verified name or by the stored key. Each entry's path is that label under its \
+             folders. The signature covers the metadata, not the payloads.",
             provenance,
             match total {
                 1 => "1 entry".to_string(),

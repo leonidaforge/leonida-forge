@@ -18,11 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_binary::Source;
 use lforge_core::archive::{self, Format, Identified};
+use lforge_core::resource::{EntryId, Locator, ResourcePath};
 use lforge_core::zip as zip_archive;
 use lforge_rage9::rpf::metadata::Payload;
 use serde_json::{Value, json};
 
-use crate::native::{self, Alternates, Authentication};
+use crate::native::Authentication;
 
 /// The default cap on the decoded size of one intermediate archive.
 pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -51,8 +52,6 @@ impl Default for Limits {
     }
 }
 
-/// Caps the metadata area read for a nested RPF9 archive.
-const MAX_METADATA: u64 = 256 * 1024 * 1024;
 /// Bytes copied per step.
 const COPY_LEN: usize = 64 * 1024;
 
@@ -132,6 +131,9 @@ impl FromStr for Selector {
 #[derive(Debug, Clone)]
 pub struct Level {
     pub selector: Selector,
+    /// The canonical path of the archive this level entered: the root file and
+    /// every nested archive above it, ending with this entry.
+    pub resource: ResourcePath,
     /// The format of the archive that was entered, as recognised from its
     /// contents.
     pub format: Format,
@@ -160,6 +162,21 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The canonical path of the archive the chain resolved to.
+    pub fn resource(&self) -> ResourcePath {
+        self.chain
+            .last()
+            .map(|level| level.resource.clone())
+            .unwrap_or_else(|| {
+                ResourcePath::root(
+                    self.root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| self.root.display().to_string()),
+                )
+            })
+    }
+
     /// The provenance block of an inspection document.
     pub fn provenance_json(&self, selection: Value, representation: Value) -> Value {
         let chain: Vec<Value> = self
@@ -170,6 +187,11 @@ impl Resolved {
                     "selector": level.selector.label(),
                     "selector_kind": level.selector.kind(),
                     "selector_index": level.selector.index(),
+                    "resource": {
+                        "display": level.resource.display(),
+                        "identity": level.resource.identity(),
+                        "limitations": level.resource.limitations(),
+                    },
                     "format": level.format.name(),
                     "format_id": level.format.name().to_lowercase(),
                     "entry": {
@@ -239,6 +261,11 @@ pub fn resolve_with(
     let mut current = Current {
         path: file.to_path_buf(),
         format: root_format,
+        resource: ResourcePath::root(
+            file.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| file.display().to_string()),
+        ),
         temp: None,
     };
     let mut chain = Vec::with_capacity(enters.len());
@@ -249,10 +276,11 @@ pub fn resolve_with(
         }
         let step = enter(&current, selector, executable, cancel, used, limits)?;
         used = add_budget(used, step.size, limits.max_chain_bytes)?;
-        chain.push(step.level);
+        chain.push(step.level.clone());
         current = Current {
             path: step.path,
             format: step.format,
+            resource: step.level.resource,
             temp: step.temp,
         };
     }
@@ -284,6 +312,8 @@ fn add_budget(used: u64, size: u64, limit: u64) -> Result<u64, String> {
 struct Current {
     path: std::path::PathBuf,
     format: Format,
+    /// The canonical path of the archive at `path`.
+    resource: ResourcePath,
     temp: Option<tempfile::TempPath>,
 }
 
@@ -345,32 +375,46 @@ fn enter_row(
     used: u64,
     limits: &Limits,
 ) -> Result<Step, String> {
-    let opened =
-        native::open_metadata_cancellable(&current.path, MAX_METADATA, executable, cancel)?;
-    let rows = opened.metadata.rows();
-    if u64::from(rows) > limits.max_entries {
+    // The row records and the name tables come from the same listing the
+    // read-only commands print, so an entered archive is named the same way.
+    let listing = crate::rows::Listing::open(&current.path, executable, &[], cancel)?;
+    let rows = listing.entries().len();
+    if u64::try_from(rows).unwrap_or(u64::MAX) > limits.max_entries {
         return Err(format!(
             "the table of contents of {} has {rows} rows, more than the {} row limit",
             current.path.display(),
             limits.max_entries
         ));
     }
-    if row >= rows {
+    let position = usize::try_from(row)
+        .ok()
+        .filter(|&position| position < rows);
+    let Some(position) = position else {
         return Err(match rows {
             0 => "the nested archive has no rows".to_string(),
-            1 => format!("row {row} is out of range: the only row is 0"),
-            _ => format!("row {row} is out of range: the rows are 0 to {}", rows - 1),
+            1 => "row 0 is the only row of the nested archive; the selector is out of range"
+                .to_string(),
+            _ => format!(
+                "the nested archive has {rows} rows, numbered 0 to {}",
+                rows - 1
+            ),
         });
-    }
-    let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
-    let alternates = Alternates::resolve(&current.path, &opened.metadata);
+    };
+    let entry = &listing.entries()[position];
+    let entry_id = listing
+        .entry_id(position)
+        .cloned()
+        .expect("every row has an identity");
+    let resource = current.resource.clone().push(entry_id);
+    let alternates = listing.alternates();
     let payload = entry
-        .payload(&opened.source, alternates.sources())
-        .map_err(|err| format!("row {row} of the nested archive cannot be decoded: {err}"))?;
+        .payload(&listing.opened().source, alternates.sources())
+        .map_err(|err| format!("{} cannot be decoded: {err}", resource.display()))?;
     let size = payload.len();
     if size > limits.max_archive_bytes {
         return Err(format!(
-            "row {row} of the nested archive decodes to {size} bytes, more than the {} byte limit",
+            "{} decodes to {size} bytes, more than the {} byte limit",
+            resource.display(),
             limits.max_archive_bytes
         ));
     }
@@ -382,15 +426,16 @@ fn enter_row(
         ));
     }
     let (source, temp) = spool_payload(payload, size, cancel)?;
-    let (temp, format) = identify_temp(source, temp, "row")?;
+    let (temp, format) = identify_temp(source, temp, &resource.display())?;
     let path = temp.to_path_buf();
     Ok(Step {
         level: Level {
             selector: Selector::Row(row),
+            resource,
             format,
             size,
             name: None,
-            authentication: Some(opened.authentication),
+            authentication: Some(listing.opened().authentication.clone()),
         },
         path,
         format,
@@ -444,11 +489,13 @@ fn enter_zip(
         ));
     }
     let (source, temp) = spool_entry(&zip, &mut source, len, entry, size, cancel)?;
-    let (temp, format) = identify_temp(source, temp, "zip entry")?;
+    let (temp, format) = identify_temp(source, temp, &entry.name)?;
     let path = temp.to_path_buf();
+    let entry_id = EntryId::named(entry.name.clone(), None, Locator::Zip(index));
     Ok(Step {
         level: Level {
             selector: Selector::Zip(index),
+            resource: current.resource.clone().push(entry_id),
             format,
             size,
             name: Some(entry.name.clone()),

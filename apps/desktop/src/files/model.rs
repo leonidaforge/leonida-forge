@@ -616,17 +616,6 @@ fn file_stem_name(path: &Path) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
 }
 
-/// The row number a native row path carries, as the table of contents labels
-/// it (`Row 00042`).
-#[cfg(test)]
-fn row_number(path: &Path) -> Option<usize> {
-    path.file_name()?
-        .to_str()?
-        .strip_prefix("Row ")?
-        .parse()
-        .ok()
-}
-
 /// Finds a native row the explorer lists, following the folders it groups
 /// rows into. Bounded so a large archive cannot be walked whole.
 #[cfg(test)]
@@ -640,7 +629,7 @@ fn find_row(root: &Path, access: &Access, row: usize) -> Option<PathBuf> {
             if examined > 65_536 {
                 return None;
             }
-            if row_number(&entry.path) == Some(row) {
+            if entry.resource_row == u32::try_from(row).ok() {
                 return Some(entry.path.clone());
             }
             // A row's path carries the folders its resolved name implies, so a
@@ -824,8 +813,8 @@ mod tests {
                 if examined > 200_000 {
                     return index;
                 }
-                if let Some(row) = row_number(&entry.path) {
-                    index.insert(row, entry.path.clone());
+                if let Some(row) = entry.resource_row {
+                    index.insert(row as usize, entry.path.clone());
                 } else if depth < 12 && entry.is_container() {
                     queue.push((entry.path.clone(), depth + 1));
                 }
@@ -949,12 +938,7 @@ mod tests {
         let rows = crate::files::list_with(&folder, &access).expect("list furniture");
         let nested = rows
             .iter()
-            .find(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "Row 00005")
-            })
+            .find(|entry| entry.resource_row == Some(5))
             .expect("am_ornaments row 5");
         eprintln!(
             "nested archive: {} [{}]",
@@ -1119,10 +1103,11 @@ mod tests {
         let entries = crate::files::list_with(&nested.path, &access).expect("list nested");
         let mut dictionaries = 0usize;
         let mut members_rendered = 0usize;
-        for entry in entries
-            .iter()
-            .filter(|entry| rows.contains(&row_number(&entry.path).unwrap_or(usize::MAX)))
-        {
+        for entry in entries.iter().filter(|entry| {
+            entry
+                .resource_row
+                .is_some_and(|row| rows.contains(&(row as usize)))
+        }) {
             let kind = classify_resource(&entry.path, &access, &AtomicBool::new(false))
                 .expect("a model resource");
             if kind != ResourceKind::Dictionary {

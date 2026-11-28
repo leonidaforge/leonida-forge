@@ -339,12 +339,7 @@ mod tests {
         let entries = crate::files::list_with(&folder, &access).expect("list rows");
         let dictionary = entries
             .iter()
-            .find(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "Row 00009")
-            })
+            .find(|entry| entry.resource_row == Some(9))
             .expect("level_design.rpf row 9");
         crate::files::archive::prepare_with(
             &dictionary.path,
@@ -358,12 +353,7 @@ mod tests {
         let rows = crate::files::list_with(&dictionary.path, &access).expect("list rows");
         let row = rows
             .iter()
-            .find(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "Row 00001")
-            })
+            .find(|entry| entry.resource_row == Some(1))
             .expect("the 0x2F3EE2D573D62231 resource");
         let file = crate::files::open_binary_with(&row.path, &access).expect("open dictionary");
         let split = crate::files::resource_split_with(&row.path, &access, &file.source)
@@ -391,12 +381,7 @@ mod tests {
         let entries = crate::files::list_with(&nested, &access).expect("list rows");
         let dictionary = entries
             .iter()
-            .find(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "Row 00007")
-            })
+            .find(|entry| entry.resource_row == Some(7))
             .expect("the row 7 nested archive");
         crate::files::archive::prepare_with(
             &dictionary.path,
@@ -410,12 +395,7 @@ mod tests {
         let rows = crate::files::list_with(&dictionary.path, &access).expect("list row 7");
         let row = rows
             .iter()
-            .find(|entry| {
-                entry
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name == "Row 00002")
-            })
+            .find(|entry| entry.resource_row == Some(2))
             .expect("the 1024x512 UI dictionary");
         let file = crate::files::open_binary_with(&row.path, &access).expect("open UI dictionary");
         let split = crate::files::resource_split_with(&row.path, &access, &file.source)

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use lforge_binary::Source;
+use lforge_core::resource::{self, EntryId, ResourcePath};
 use lforge_rage9::rpf::metadata::transform::{Algorithm, CipherDescriptor};
 use lforge_rage9::rpf::metadata::{Entry, Field};
 use lforge_rage9::rpf::names::{Class, Key, MountPrefix, Resolver, RowNames, Types};
@@ -41,6 +42,8 @@ pub struct Listing {
     opened: Opened,
     types: Types,
     resolved: ResolutionSet,
+    /// The canonical identity of every row, in row order.
+    entry_ids: Vec<EntryId>,
     entries: Vec<Entry>,
 }
 
@@ -69,26 +72,55 @@ impl Listing {
         let types = Types::default();
         let entries: Vec<Entry> = opened.metadata.entries().collect();
         let resolved = Resolver::new(&tables.table, &types, MountPrefix::EMPTY).resolve(&entries);
-        let by_row = resolved
+        let by_row: std::collections::HashMap<u32, usize> = resolved
             .rows
             .iter()
             .enumerate()
             .map(|(position, row)| (row.row, position))
             .collect();
+        // One canonical identity per row, shared by every record and message.
+        let mut entry_ids: Vec<EntryId> = entries
+            .iter()
+            .map(|entry| {
+                EntryId::from_row(
+                    entry,
+                    by_row
+                        .get(&entry.row)
+                        .map(|&position| &resolved.rows[position]),
+                    &types,
+                )
+            })
+            .collect();
+        resource::assign_occurrences(&mut entry_ids);
+        let relative = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
         Ok(Self {
             archive: path.to_path_buf(),
-            relative: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string()),
+            relative,
             opened,
             types,
             resolved: ResolutionSet {
                 rows: resolved.rows,
                 by_row,
             },
+            entry_ids,
             entries,
         })
+    }
+
+    /// The canonical path of the row at `position`.
+    pub fn resource(&self, position: usize) -> Option<ResourcePath> {
+        self.entry_ids
+            .get(position)
+            .map(|entry| ResourcePath::root(self.relative.clone()).with_entry(entry.clone()))
+    }
+
+    /// The canonical identity of the row at `position`, for a caller that
+    /// enters one of its entries as another archive.
+    pub fn entry_id(&self, position: usize) -> Option<&EntryId> {
+        self.entry_ids.get(position)
     }
 
     /// The alternate read sources of this archive.
@@ -222,6 +254,13 @@ impl Listing {
             "authentication": self.opened.authentication.status(),
         });
         record["archive"] = json!(self.relative);
+        if let Some(resource) = self.resource(position) {
+            record["resource"] = json!({
+                "display": resource.display(),
+                "identity": resource.identity(),
+                "limitations": resource.limitations(),
+            });
+        }
         record
     }
 
@@ -381,11 +420,12 @@ fn print_ls_text(listing: &Listing, rows: &[Value], offset: usize, total: usize)
     }
     println!();
     println!(
-        "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} name",
-        "row", "type", "ext", "key", "stored key", "logical", "stored", "contents"
+        "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} {}  names",
+        "row", "type", "ext", "key", "stored key", "logical", "stored", "contents", "resource"
     );
     for row in rows {
-        let name = names_text(&row["name"]);
+        let resource = row["resource"]["display"].as_str().unwrap_or("-");
+        let names = names_text(&row["name"]);
         let key = match (&row["name_hash"], &row["name_key"]) {
             (Value::Null, Value::Null) => "-".to_string(),
             (Value::Null, key) => format!("key {}", text(key)),
@@ -393,7 +433,7 @@ fn print_ls_text(listing: &Listing, rows: &[Value], offset: usize, total: usize)
         };
         let location = row["contents"]["state"].as_str().unwrap_or("-");
         println!(
-            "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} {}",
+            "{:>6} {:>4} {:<5} {:<8} {:<20} {:>12} {:>12} {:<12} {}  {}",
             row["row"],
             text(&row["type_id"]),
             row["extension"].as_str().unwrap_or("-"),
@@ -402,11 +442,16 @@ fn print_ls_text(listing: &Listing, rows: &[Value], offset: usize, total: usize)
             text(&row["logical_size"]),
             text(&row["stored_size"]),
             location,
-            name
+            resource,
+            names
         );
     }
     println!();
     println!("showing {} of {} rows from {}", rows.len(), total, offset);
+    println!(
+        "the row column is the entry's position in this archive's table of contents, not a \
+         resource identifier; lines with no name show the stored key"
+    );
 }
 
 fn names_text(name: &Value) -> String {
@@ -642,12 +687,13 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         );
         for row in &found {
             println!(
-                "{:<28} {:>6} {:>4} {:<5} {:<8} {}",
+                "{:<28} {:>6} {:>4} {:<5} {:<8} {}  {}",
                 row["archive"].as_str().unwrap_or("-"),
                 row["row"],
                 text(&row["type_id"]),
                 row["extension"].as_str().unwrap_or("-"),
                 row["namespace"].as_str().unwrap_or("-"),
+                row["resource"]["display"].as_str().unwrap_or("-"),
                 names_text(&row["name"])
             );
         }

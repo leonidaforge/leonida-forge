@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use archive::{Identified, Location};
 pub use executable::{Access, Executable};
 use lforge_binary::Source;
+use lforge_core::resource::ResourcePath;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,13 @@ pub struct Entry {
     pub type_name: String,
     /// The native RPF row type, when the entry comes from a native archive.
     pub resource_type: Option<u8>,
+    /// The canonical resource path, when the entry comes from an archive.
+    /// The path is display data; `resource_row` and the path's identity are
+    /// the technical record.
+    pub resource: Option<ResourcePath>,
+    /// The native RPF row index or ZIP central-directory index. Diagnostic
+    /// metadata, never a resource identifier.
+    pub resource_row: Option<u32>,
     /// Format-specific properties for the preview pane. Entries that have
     /// them also bring their own type name.
     pub details: Vec<(&'static str, String)>,
@@ -75,6 +83,8 @@ impl Entry {
             modified,
             type_name,
             resource_type: None,
+            resource: None,
+            resource_row: None,
             details: Vec::new(),
             order: None,
             last: false,
