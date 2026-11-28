@@ -265,6 +265,15 @@ pub enum Command {
         max_depth: usize,
         #[arg(long, default_value_t = 64)]
         max_archives: usize,
+        /// Enter archives stored inside an archive, and search their rows too
+        #[arg(long)]
+        recursive: bool,
+        /// The largest archive stored inside one row that may be entered
+        #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+        max_nested_bytes: u64,
+        /// The temporary storage a search may use for nested archives
+        #[arg(long, default_value_t = 64 * 1024 * 1024 * 1024)]
+        max_spool_bytes: u64,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -729,6 +738,9 @@ pub fn run(command: Command) -> Result<(), String> {
             limit,
             max_depth,
             max_archives,
+            recursive,
+            max_nested_bytes,
+            max_spool_bytes,
             json,
         } => rows::run_search(rows::SearchOptions {
             path,
@@ -746,6 +758,9 @@ pub fn run(command: Command) -> Result<(), String> {
             max_depth,
             max_archives,
             json,
+            recursive,
+            max_nested_bytes,
+            max_spool_bytes,
         }),
         Command::Manifest {
             file,

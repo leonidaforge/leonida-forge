@@ -68,7 +68,20 @@ impl Listing {
         cancel: &AtomicBool,
     ) -> Result<Self, String> {
         let opened = native::open_metadata_cancellable(path, MAX_METADATA, executable, cancel)?;
-        let tables = native::load_name_tables(path, name_files)?;
+        Self::from_opened(path, table_name(path), opened, name_files)
+    }
+
+    /// Resolves the rows of an archive already read from `origin`, a file on
+    /// disk, and reports it under `identity`. An archive stored inside another
+    /// one takes its name table from `origin`, because the table beside a
+    /// `.rpf` file describes every archive in that file.
+    pub fn from_opened(
+        origin: &Path,
+        identity: String,
+        opened: Opened,
+        name_files: &[PathBuf],
+    ) -> Result<Self, String> {
+        let tables = native::load_name_tables(origin, name_files)?;
         let types = Types::default();
         let entries: Vec<Entry> = opened.metadata.entries().collect();
         let resolved = Resolver::new(&tables.table, &types, MountPrefix::EMPTY).resolve(&entries);
@@ -97,8 +110,8 @@ impl Listing {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         Ok(Self {
-            archive: path.to_path_buf(),
-            relative,
+            archive: origin.to_path_buf(),
+            relative: identity,
             opened,
             types,
             resolved: ResolutionSet {
@@ -279,6 +292,24 @@ impl Listing {
     pub fn authentication_json(&self) -> Value {
         authentication_json(&self.opened.authentication)
     }
+}
+
+/// How a file on disk is named in output: its own file name, so a search over
+/// an installation reports the archives the user would name.
+fn table_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The identity a nested archive reached through `rows` is reported under.
+fn chain_name(parent: &str, rows: &[u32]) -> String {
+    let mut value = parent.to_string();
+    for row in rows {
+        value.push('!');
+        value.push_str(&row.to_string());
+    }
+    value
 }
 
 fn field<T>(value: &Field<T>, show: impl Fn(&T) -> Value) -> Value {
@@ -498,6 +529,12 @@ pub struct SearchOptions {
     pub offset: usize,
     pub limit: usize,
     pub json: bool,
+    /// Enter archives stored inside an archive, and search their rows too.
+    pub recursive: bool,
+    /// The largest archive one row may store, spooled to temporary storage.
+    pub max_nested_bytes: u64,
+    /// The most temporary storage one search may use for nested archives.
+    pub max_spool_bytes: u64,
 }
 
 /// Parses `--hash` as `hash64` (16 digits) or `key32` (8 digits), with or
@@ -598,6 +635,23 @@ fn hash_matches(class: Option<Class>, entry: &Entry, hash: Key) -> bool {
     }
 }
 
+/// One archive the search still has to look at.
+struct Pending {
+    /// The file on disk whose bytes the archive is read from.
+    origin: PathBuf,
+    /// How the archive is named in output.
+    identity: String,
+    /// How many archives it was reached through; a file on disk is 0.
+    depth: usize,
+    /// An archive already opened, or `None` for a file on disk not yet opened.
+    opened: Option<Box<Opened>>,
+}
+
+/// Whether `entry` declares the archive type, so a search may enter it.
+fn is_archive(entry: &Entry, extension: Option<&str>) -> bool {
+    entry.type_id().is_some()
+        && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
+}
 pub fn run_search(options: SearchOptions) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     let root = options.path.clone();
@@ -615,40 +669,80 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
     let mut matched = 0usize;
     // One companion resolution per opened archive, reused for every row.
     let mut companions_resolved = 0usize;
+    let mut nested_opened = 0usize;
+    let mut spooled = 0u64;
+    let mut stopped = None;
     let offset = options.offset;
-    // Collect in a deterministic order: archives sorted, rows in row order.
-    for archive in &archives {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err("cancelled".to_string());
-        }
-        if !single && let Some(filter) = &options.archive {
-            let relative = archive
+    let filter = options
+        .archive
+        .as_ref()
+        .map(|filter| filter.to_ascii_lowercase());
+    // A file on disk is named by its path under the search root, so `--archive`
+    // keeps selecting by directory; a single file is named by its file name.
+    let name_of = |archive: &Path| {
+        if single {
+            table_name(archive)
+        } else {
+            archive
                 .strip_prefix(&root)
                 .unwrap_or(archive)
                 .to_string_lossy()
-                .replace('\\', "/");
-            if !relative
-                .to_ascii_lowercase()
-                .contains(&filter.to_ascii_lowercase())
-            {
-                continue;
-            }
+                .replace('\\', "/")
         }
-        let listing = match Listing::open(
-            archive,
-            options.executable.as_deref(),
-            &options.candidates,
-            &cancel,
-        ) {
-            Ok(listing) => listing,
-            Err(reason) => {
-                skipped.push(json!({
-                    "archive": archive.display().to_string(),
-                    "reason": reason,
-                }));
-                continue;
+    };
+    // Files on disk first, in scan order, then the archives inside them in row
+    // order, so the output order does not depend on how the walk is scheduled.
+    let mut pending: Vec<Pending> = archives
+        .iter()
+        .rev()
+        .map(|archive| Pending {
+            origin: archive.clone(),
+            identity: name_of(archive),
+            depth: 0,
+            opened: None,
+        })
+        .collect();
+    while let Some(item) = pending.pop() {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        if let Some(filter) = &filter
+            && !item.identity.to_ascii_lowercase().contains(filter)
+        {
+            continue;
+        }
+        let opened = match item.opened {
+            Some(opened) => *opened,
+            None => {
+                match native::open_metadata_cancellable(
+                    &item.origin,
+                    MAX_METADATA,
+                    options.executable.as_deref(),
+                    &cancel,
+                ) {
+                    Ok(opened) => opened,
+                    Err(reason) => {
+                        skipped.push(json!({
+                            "archive": item.identity,
+                            "reason": reason,
+                        }));
+                        continue;
+                    }
+                }
             }
         };
+        let listing =
+            match Listing::from_opened(&item.origin, item.identity.clone(), opened, &options.candidates)
+            {
+                Ok(listing) => listing,
+                Err(reason) => {
+                    skipped.push(json!({
+                        "archive": item.identity,
+                        "reason": reason,
+                    }));
+                    continue;
+                }
+            };
         let alternates = listing.alternates();
         companions_resolved += 1;
         for position in 0..listing.entries.len() {
@@ -660,12 +754,63 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 found.push(listing.row_json(position, &listing.opened.source, &alternates));
             }
         }
+        if !options.recursive || item.depth + 1 >= options.max_depth {
+            continue;
+        }
+        let mut children = Vec::new();
+        for position in 0..listing.entries.len() {
+            if stopped.is_some() {
+                break;
+            }
+            let entry = &listing.entries[position];
+            if !is_archive(
+                entry,
+                entry.type_id().and_then(|type_id| listing.extension(type_id)),
+            ) {
+                continue;
+            }
+            let identity = chain_name(&item.identity, &[entry.row]);
+            let limits = native::NestedLimits {
+                max_nested_bytes: options.max_nested_bytes,
+                max_spool_bytes: options.max_spool_bytes,
+                spooled,
+            };
+            match native::open_nested(
+                entry,
+                &listing.opened,
+                alternates.sources(),
+                &identity,
+                limits,
+                options.executable.as_deref(),
+                &cancel,
+            ) {
+                Ok((nested, spent)) => {
+                    spooled += spent;
+                    nested_opened += 1;
+                    children.push(Pending {
+                        origin: item.origin.clone(),
+                        identity,
+                        depth: item.depth + 1,
+                        opened: Some(Box::new(nested)),
+                    });
+                }
+                Err(native::NestedError::SpoolBudget { .. }) => {
+                    stopped = Some("max_spool_bytes");
+                }
+                Err(err) => {
+                    skipped.push(json!({ "archive": identity, "reason": err.to_string() }));
+                }
+            }
+        }
+        pending.extend(children.into_iter().rev());
     }
     if options.json {
         let document = json!({
             "schema": SEARCH_SCHEMA,
             "root": root.display().to_string(),
             "archives": archives.len(),
+            "nested": nested_opened,
+            "spooled_bytes": spooled,
             "matched": matched,
             "offset": offset,
             "limit": options.limit,
@@ -673,6 +818,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             "truncated": matched > offset + found.len(),
             "companions_resolved": companions_resolved,
             "archives_truncated": truncated,
+            "stopped": stopped,
             "skipped": skipped,
             "rows": found,
         });
@@ -683,7 +829,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             found.len(),
             matched,
             matched,
-            archives.len()
+            companions_resolved
         );
         for row in &found {
             println!(
@@ -703,6 +849,9 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 entry["archive"].as_str().unwrap_or("?"),
                 entry["reason"].as_str().unwrap_or("?")
             );
+        }
+        if let Some(reason) = stopped {
+            println!("stopped: {reason}");
         }
         Ok(())
     }
