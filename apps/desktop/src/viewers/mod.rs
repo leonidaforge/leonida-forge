@@ -4,6 +4,7 @@ pub mod binary;
 mod bones;
 mod dictionary;
 mod image;
+pub mod metadata;
 mod model;
 mod renderer_demo;
 pub mod text;

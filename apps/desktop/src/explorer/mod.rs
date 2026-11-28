@@ -965,6 +965,11 @@ impl Explorer {
                 let texture_dictionary = classification
                     .as_ref()
                     .is_some_and(|value| value.is_texture_dictionary());
+                // A row that starts with the `PSIN` container magic holds a
+                // self-describing metadata document, which has its own view.
+                let metadata = classification
+                    .as_ref()
+                    .is_some_and(|value| value.format_id() == Some("psin"));
                 match identified {
                     Ok(Identified::Archive(_)) => {
                         this.mark_archive(&path);
@@ -1001,6 +1006,9 @@ impl Explorer {
                             && texture_dictionary =>
                     {
                         crate::viewers::texture::open_resource(path, access, cx)
+                    }
+                    Ok(Identified::Unknown) if metadata => {
+                        crate::viewers::metadata::open(path, access, cx)
                     }
                     Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
                     Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),
