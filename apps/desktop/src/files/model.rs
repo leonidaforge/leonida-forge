@@ -3816,3 +3816,9 @@ mod survey;
 #[cfg(test)]
 #[path = "model_deformation.rs"]
 mod deformation;
+
+/// The canonical path probe lives beside the loader so it can reuse the archive
+/// walk and the file layer. It is test-only: nothing in the application calls it.
+#[cfg(test)]
+#[path = "canonical_paths.rs"]
+mod canonical_paths;
