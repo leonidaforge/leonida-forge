@@ -22,4 +22,6 @@ tempfile.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 rand_core = { version = "0.6.4", features = ["getrandom"] }
+
