@@ -41,6 +41,33 @@ supported bone has identity scale. A blended direction that collapses to zero
 falls back to the authored direction and is counted, in the CPU path and in both
 shader paths.
 
+## Deformation policy
+
+An influence set that was decoded from the record is not the same thing as one
+that was inferred from a bone count. `lforge_scene::DeformationPolicy` carries the
+choice, and its default admits decoded associations only:
+
+```rust
+let policy = DeformationPolicy::EXPLICIT;      // default everywhere
+let policy = DeformationPolicy::WITH_INFERRED; // opt-in
+policy.admits(&influences);                    // false for an inferred set under EXPLICIT
+```
+
+`deform_primitive`, `deformed_bounds`, `Scene::posed_bounds`,
+`Scene::supports_deformation` and `Scene::deformable_primitive_count` all use the
+default. The `_with` and `_under` variants take a policy, and an inferred set under
+the default returns `DeformError::InferredExcluded`, which is distinct from
+`UnsupportedInfluences`: the first says the data is plausible but not verified,
+the second says the data could not be read.
+
+The renderer stores the choice in `GpuScene::set_policy`. The skinned buffer for an
+inferred primitive is still uploaded, so switching the policy needs no re-upload:
+the draw list consults the policy per primitive and per frame.
+
+The desktop panel shows the toggle only when the scene has inferred primitives,
+labels it `Inferred / Single-bone excluded` or `Single-bone included`, and states
+how many primitives the choice covers.
+
 ## Renderer
 
 A primitive with verified, deformable influences gets a second vertex buffer that
@@ -122,5 +149,5 @@ probe with the CPU reference and optionally writes one PNG.
 - Non-identity scale is refused rather than composed.
 - A pose is entered by hand. No animation clip, playback or blending is decoded.
 - A geometry whose weights do not sum to 255 or 127 is reported and not deformed.
-- An inferred single-bone association is marked as inferred and counted
-  separately in the panel.
+- An inferred single-bone association is marked as inferred, excluded by default,
+  and counted separately in the panel.

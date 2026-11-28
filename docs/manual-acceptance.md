@@ -117,7 +117,8 @@ caps: filter a leaf name and the 596 rows scroll to it.
 A resource whose influences decode shows a **POSE** section under the skeleton
 list. Its header reads `N of M primitive(s) deform; K bone(s)` and then
 `reference pose` or `edited pose`; an inferred association adds
-`(I inferred single-bone)`. `Pose Mode` enters the session. The section then
+`(I inferred single-bone excluded)` or `included`. `Pose Mode` enters the session.
+The section then
 offers `authored` and `posed`, `Influence View`, six rotation buttons, six
 translation buttons, `Reset Bone` and `Reset Pose`.
 
@@ -136,6 +137,10 @@ Conventions, the same in the CPU reference, the shader and the buttons:
 
 The release executable is
 `E:\source\leonidaforge\worktrees\vertex-influences-skinning\leonida-forge\target\release\leonida-forge.exe`.
+
+None of the five verified poses below changes under the new default: every one of
+them is a decoded association. The inferred class has its own section after the
+weighted cases.
 
 ### Peacock, weighted deformation
 
@@ -204,6 +209,29 @@ Both resources are fragments whose decoded LOD-0 member drawable holds one
 root independence rather than weighted character skinning. The 596-bone skeleton
 uploads and renders, which is what the matrix buffer has to carry; the geometry
 does not exercise it. The weighted large-skeleton case is the dominator above.
+
+### Inferred single-bone associations are opt-in
+
+`levels.rpf!1240!14` is `coastguard_base_towcable.#ft`: one bone, one root, two
+primitives and 150 vertices. Its declaration table is
+`[0,1,2,3,4,11,12,13,14,15,17]`, so it stores a tangent stream and **no** weight or
+index attribute. The two primitives are associated with the only bone by
+inference.
+
+| Step | Expected |
+| ---- | -------- |
+| Press `Pose Mode` | `0 of 2 primitive(s) deform (2 inferred single-bone excluded); 1 bone(s)` |
+| Select `SKEL_ROOT` (index 0), press `Rotate Z+` six times | the mesh does not move; the label reads `edited pose` |
+| Read the panel line under the toggle | `2 primitive(s) stay authored: their single-bone association is inferred, not verified` |
+| Press `Single-bone excluded` | the toggle reads `Single-bone included`, the header reads `2 of 2 primitive(s) deform (2 inferred single-bone included)`, and the cable now follows the bone: 150 of 150 vertices move, worst 1.66 m |
+| Press `Influence View` | the cable is shaded yellow at full weight, which is what an inferred single influence holds |
+| Press `Single-bone included` again | the mesh returns to the authored pose and the header returns to `0 of 2` |
+| Press `Reset Bone`, then `Exit Pose`, then `Pose Mode` | the reference pose each time, and the policy returns to excluded, because the session is new |
+
+The same geometry is the declaration-parser sample for tangents: the old reader
+stopped after slot 4 and never saw slot 11, so it decoded the mesh without
+tangents. The posed render now matches the CPU-deformed reference to 1 pixel of
+630,000.
 
 ### Weighted data the decoder rejects
 
