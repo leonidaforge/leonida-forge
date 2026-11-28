@@ -219,10 +219,22 @@ truncated bodies, an unknown token class, a name index beyond the table,
 excessive nesting, an oversized value, a trailing payload, canonical identity
 in the export, and the viewer's row building, filtering and status.
 
-Desktop validation for this change is automated only. The release binary starts
-and holds its window, and the routing and row tests cover the viewer's decision
-and its rows, but the viewer was not clicked through on real data in this
-change.
+Desktop validation is visual for the first frame and automated for the rest.
+Three resources were opened in the Metadata Viewer on this machine and the
+window captured: the reported `data.rpf` UI document (30 elements, 187 rows),
+the PSIN document of `data.rpf` row 41 (124 structures, 5,824 rows) and the
+largest RBF0 payload of the installation (68,398 elements, 130,968 rows). Each
+painted its root, its children and its values.
+
+Before that check the viewer painted an empty content area with a correct
+toolbar and status bar: the list sat in a block-level container, where its
+flex sizing means nothing, so it measured no height. That is fixed and covered
+by `content_area` and row tests, but the fix itself is only observable in a
+rendered window.
+
+What remains unverified by hand: clicking a row to fold it, typing in the
+filter, and the Copy Row button. Their logic is covered by tests; no mouse or
+keyboard interaction was performed in this change.
 
 ## Name discovery
 

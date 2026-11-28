@@ -355,13 +355,8 @@ impl Render for MetadataViewer {
         let truncated = self.ready().is_some_and(|ready| ready.tree.truncated);
         let row_count = self.ready().map_or(0, |ready| ready.tree.rows.len());
 
-        let content: AnyElement = match &self.state {
-            State::Loading => ui::centered_message("Reading the metadata document.", None),
-            State::Failed(err) => ui::centered_message(
-                "This metadata document cannot be decoded.",
-                Some(err.clone()),
-            ),
-            State::Ready(_) => uniform_list(
+        let content: AnyElement = match content_area(&self.state, visible.len()) {
+            ContentArea::Rows => uniform_list(
                 "metadata-rows",
                 visible.len(),
                 cx.processor(move |this, range, _window, cx| {
@@ -373,6 +368,7 @@ impl Render for MetadataViewer {
             .flex_1()
             .min_h_0()
             .into_any_element(),
+            ContentArea::Message { title, detail } => ui::centered_message(title, detail),
         };
 
         div()
@@ -441,9 +437,16 @@ impl Render for MetadataViewer {
                     ),
             )
             .child(
+                // The list is a flex item that takes the height left between
+                // the toolbar and the status bar. It must sit in a flex column:
+                // in a block box its `flex_1` means nothing, it measures its
+                // own intrinsic height and paints nothing.
                 div()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .bg(rgb(theme::PANEL))
                     .child(content),
             )
@@ -526,6 +529,51 @@ pub(crate) fn open(
     }
 }
 
+/// The detail line a document with no rows reports, so the reason is visible
+/// rather than implied.
+fn empty_document_detail(tree: &tree::Tree) -> String {
+    if !tree.issues.is_empty() {
+        return tree.issues.join("; ");
+    }
+    "the document carries no elements, fields, attributes or text".to_string()
+}
+
+/// What the area between the toolbar and the status bar shows.
+///
+/// A decoded document with rows is a list. Everything else is a message, so a
+/// viewer never presents an unexplained blank area: a document with no rows, a
+/// filter that matches nothing and a failed decode each say what they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContentArea {
+    Rows,
+    Message {
+        title: &'static str,
+        detail: Option<String>,
+    },
+}
+
+fn content_area(state: &State, visible: usize) -> ContentArea {
+    match state {
+        State::Loading => ContentArea::Message {
+            title: "Reading the metadata document.",
+            detail: None,
+        },
+        State::Failed(err) => ContentArea::Message {
+            title: "This metadata document cannot be decoded.",
+            detail: Some(err.clone()),
+        },
+        State::Ready(ready) if ready.tree.rows.is_empty() => ContentArea::Message {
+            title: "This metadata document has no rows to show.",
+            detail: Some(empty_document_detail(&ready.tree)),
+        },
+        State::Ready(_) if visible == 0 => ContentArea::Message {
+            title: "No row matches the filter.",
+            detail: Some("Clear the filter to see the whole document.".to_string()),
+        },
+        State::Ready(_) => ContentArea::Rows,
+    }
+}
+
 /// Reads and decodes `path`.
 ///
 /// The format comes from the payload's own signature: a `PSIN` container is
@@ -585,7 +633,7 @@ mod tests {
     use lforge_core::resource::{EntryId, ResourcePath};
     use lforge_rage9::rpf::names::Key;
 
-    use super::identity;
+    use super::{ContentArea, Ready, State, content_area, identity};
 
     fn named(key: u64, name: &'static str, type_id: u8) -> EntryId {
         EntryId::new(
@@ -612,5 +660,90 @@ mod tests {
             identity(std::path::Path::new("C:/game/data/thing.zmt"), None),
             "thing.zmt"
         );
+    }
+
+    fn ready(rows: usize, issues: &[&str]) -> State {
+        State::Ready(Box::new(Ready {
+            tree: super::tree::Tree {
+                rows: (0..rows)
+                    .map(|index| super::tree::Row {
+                        depth: 0,
+                        label: format!("row {index}"),
+                        detail: String::new(),
+                        copy: String::new(),
+                        expandable: false,
+                        tone: super::tree::Tone::Normal,
+                    })
+                    .collect(),
+                status: "decoded",
+                summary: String::new(),
+                issues: issues.iter().map(|issue| issue.to_string()).collect(),
+                truncated: false,
+            },
+            source: String::new(),
+            names: String::new(),
+        }))
+    }
+
+    #[test]
+    fn a_decoded_document_with_rows_is_a_list() {
+        assert_eq!(content_area(&ready(3, &[]), 3), ContentArea::Rows);
+        // A filtered list still has rows to draw.
+        assert_eq!(content_area(&ready(3, &[]), 1), ContentArea::Rows);
+    }
+
+    #[test]
+    fn a_document_with_no_rows_says_so() {
+        match content_area(&ready(0, &[]), 0) {
+            ContentArea::Message { title, detail } => {
+                assert!(title.contains("no rows"), "{title}");
+                let detail = detail.unwrap_or_default();
+                assert!(detail.contains("no elements"), "{detail}");
+            }
+            ContentArea::Rows => panic!("an empty document must not be drawn as an empty list"),
+        }
+    }
+
+    #[test]
+    fn a_document_with_no_rows_reports_why() {
+        match content_area(&ready(0, &["the parse stopped: Unterminated"]), 0) {
+            ContentArea::Message { detail, .. } => assert_eq!(
+                detail.as_deref(),
+                Some("the parse stopped: Unterminated"),
+                "the reason the document is empty is shown, not implied"
+            ),
+            ContentArea::Rows => panic!("an empty document must not be drawn as an empty list"),
+        }
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so() {
+        match content_area(&ready(4, &[]), 0) {
+            ContentArea::Message { title, .. } => {
+                assert!(title.contains("No row matches"), "{title}");
+            }
+            ContentArea::Rows => panic!("no visible row must not be a blank list"),
+        }
+    }
+
+    #[test]
+    fn a_failed_decode_shows_the_reason() {
+        match content_area(&State::Failed("not a PSIN or RBF0 document".to_string()), 0) {
+            ContentArea::Message { detail, .. } => {
+                assert_eq!(detail.as_deref(), Some("not a PSIN or RBF0 document"));
+            }
+            ContentArea::Rows => panic!("a failed decode is not a list"),
+        }
+    }
+
+    #[test]
+    fn the_loading_state_says_it_is_reading() {
+        match content_area(&State::Loading, 0) {
+            ContentArea::Message { title, detail } => {
+                assert!(title.contains("Reading"), "{title}");
+                assert!(detail.is_none());
+            }
+            ContentArea::Rows => panic!("nothing is decoded yet"),
+        }
     }
 }

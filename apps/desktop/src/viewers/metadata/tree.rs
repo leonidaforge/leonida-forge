@@ -815,10 +815,17 @@ const MAX_RBF0_TEXT: usize = 160;
 /// the document's own way of writing a list, so they are kept as they are
 /// rather than folded into an array the payload does not have.
 pub fn build_rbf0(document: &rbf::Document) -> Tree {
+    build_rbf0_with(document, MAX_ROWS)
+}
+
+/// [`build_rbf0`] with an explicit row cap, so truncation can be exercised
+/// without building a document large enough to hit the real one.
+fn build_rbf0_with(document: &rbf::Document, max_rows: usize) -> Tree {
     let mut walker = Rbf0Walker {
         document,
         rows: Vec::new(),
         truncated: false,
+        max_rows,
     };
     walker.group(
         0,
@@ -928,11 +935,12 @@ struct Rbf0Walker<'a> {
     document: &'a rbf::Document,
     rows: Vec<Row>,
     truncated: bool,
+    max_rows: usize,
 }
 
 impl<'a> Rbf0Walker<'a> {
     fn push(&mut self, row: Row) -> bool {
-        if self.rows.len() >= MAX_ROWS {
+        if self.rows.len() >= self.max_rows {
             self.truncated = true;
             return false;
         }

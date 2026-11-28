@@ -355,3 +355,241 @@ fn an_rbf0_document_that_stopped_reports_it_as_a_warning_row() {
         .expect("the failure row");
     assert_eq!(warning.tone, Tone::Warning);
 }
+
+/// A deeper synthetic RBF0 payload, so the viewer is exercised on two levels
+/// of nesting, both number classes and two text nodes:
+///
+/// ```text
+/// screen [@kind]
+///   text "note"
+///   count = 3      (integer)
+///   ratio = 1.5    (double)
+///   row
+///     cell
+///       label
+///         text "hi"
+/// ```
+fn deep_rbf0_bytes() -> Vec<u8> {
+    fn u16v(value: u16) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+    fn u32v(value: u32) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+    fn token(code: u8, index: u16) -> Vec<u8> {
+        u16v(u16::from(code) << 12 | index)
+    }
+    fn named(name: &[u8]) -> Vec<u8> {
+        let mut bytes = u16v(name.len() as u16);
+        bytes.extend_from_slice(name);
+        bytes
+    }
+    fn element(index: u16, name: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut bytes = token(0, index);
+        bytes.extend_from_slice(&named(name));
+        bytes.extend_from_slice(&u32v(0));
+        bytes.extend_from_slice(&u16v(0));
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&u16v(0xFFFF));
+        bytes
+    }
+    fn text(value: &[u8]) -> Vec<u8> {
+        let mut bytes = u16v(0xFFFD);
+        bytes.extend_from_slice(&u32v(value.len() as u32 + 1));
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+        bytes
+    }
+    fn value(code: u8, index: u16, name: &[u8], raw: &[u8]) -> Vec<u8> {
+        let mut bytes = token(code, index);
+        bytes.extend_from_slice(&named(name));
+        bytes.extend_from_slice(raw);
+        bytes
+    }
+    let label = element(6, b"label", &text(b"hi"));
+    let cell = element(5, b"cell", &label);
+    let row = element(4, b"row", &cell);
+    let mut body = text(b"note");
+    body.extend_from_slice(&value(1, 2, b"count", &3_i64.to_le_bytes()));
+    body.extend_from_slice(&value(4, 3, b"ratio", &1.5_f64.to_le_bytes()));
+    body.extend_from_slice(&row);
+    let mut attribute = token(6, 1);
+    attribute.extend_from_slice(&named(b"kind"));
+    attribute.extend_from_slice(&u16v(8));
+    attribute.extend_from_slice(b"uiScreen");
+    let mut root = token(0, 0);
+    root.extend_from_slice(&named(b"screen"));
+    root.extend_from_slice(&u32v(0));
+    root.extend_from_slice(&u16v(1));
+    root.extend_from_slice(&attribute);
+    root.extend_from_slice(&body);
+    root.extend_from_slice(&u16v(0xFFFF));
+    let mut bytes = b"RBF0".to_vec();
+    bytes.extend_from_slice(&u16v(0xFFFB));
+    bytes.extend_from_slice(&u16v(1));
+    bytes.extend_from_slice(&root);
+    bytes
+}
+
+fn deep_rbf0_document() -> rbf::Document {
+    rbf::decode(
+        &deep_rbf0_bytes(),
+        &rbf::Limits::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("a readable payload")
+}
+
+/// The rows a viewer draws on its first frame: nothing collapsed, no filter.
+fn initial_rows(tree: &Tree) -> Vec<String> {
+    tree.visible(&HashSet::new(), "")
+        .into_iter()
+        .map(|index| tree.rows[index].label.clone())
+        .collect()
+}
+
+#[test]
+fn a_fresh_rbf0_viewer_shows_the_root_and_every_child() {
+    let tree = build_rbf0(&deep_rbf0_document());
+    let labels = initial_rows(&tree);
+    // An empty first frame with a full document is the defect this covers.
+    assert_eq!(labels.len(), tree.rows.len());
+    assert_eq!(
+        &labels[..10],
+        [
+            "document", "screen", "@kind", "text", "count", "ratio", "row", "cell", "label", "text"
+        ]
+    );
+    assert_eq!(labels[10], "name table");
+    let depths: Vec<usize> = tree.rows.iter().take(10).map(|row| row.depth).collect();
+    assert_eq!(depths, [0, 1, 2, 2, 2, 2, 2, 3, 4, 5]);
+    assert!(tree.rows[1].expandable, "the root folds and unfolds");
+    assert_eq!(tree.status, "decoded");
+    assert!(!tree.truncated);
+}
+
+#[test]
+fn rbf0_attributes_values_and_text_are_visible_rows() {
+    let tree = build_rbf0(&deep_rbf0_document());
+    let find = |label: &str| {
+        tree.rows
+            .iter()
+            .find(|row| row.label == label)
+            .unwrap_or_else(|| panic!("a {label} row"))
+    };
+    assert_eq!(find("@kind").detail, "uiScreen");
+    assert_eq!(find("@kind").tone, Tone::Accent);
+    assert!(
+        find("count").detail.contains("integer"),
+        "{}",
+        find("count").detail
+    );
+    assert!(
+        find("count").detail.starts_with('3'),
+        "{}",
+        find("count").detail
+    );
+    assert!(
+        find("ratio").detail.contains("double"),
+        "{}",
+        find("ratio").detail
+    );
+    assert!(
+        find("ratio").detail.starts_with("1.5"),
+        "{}",
+        find("ratio").detail
+    );
+    let texts: Vec<&str> = tree
+        .rows
+        .iter()
+        .filter(|row| row.label == "text")
+        .map(|row| row.detail.as_str())
+        .collect();
+    assert_eq!(texts, ["note", "hi"]);
+}
+
+#[test]
+fn a_fresh_psin_viewer_shows_every_row() {
+    let tree = build(&document(), &Names::empty());
+    let labels = initial_rows(&tree);
+    assert_eq!(labels.len(), tree.rows.len());
+    assert_eq!(labels[0], "schema");
+    assert!(labels.iter().any(|label| label.starts_with("block 1")));
+    assert!(labels.iter().any(|label| label.starts_with("record ")));
+}
+
+#[test]
+fn an_rbf0_filter_that_matches_nothing_shows_no_row() {
+    let tree = build_rbf0(&deep_rbf0_document());
+    assert!(tree.visible(&HashSet::new(), "no-such-row").is_empty());
+    // The empty query is the first-frame case and keeps every row.
+    assert_eq!(initial_rows(&tree).len(), tree.rows.len());
+}
+
+#[test]
+fn the_rbf0_row_cap_truncates_and_says_so() {
+    let tree = build_rbf0_with(&deep_rbf0_document(), 4);
+    assert_eq!(tree.rows.len(), 4);
+    assert!(tree.truncated);
+    let labels: Vec<&str> = tree.rows.iter().map(|row| row.label.as_str()).collect();
+    assert_eq!(labels, ["document", "screen", "@kind", "text"]);
+}
+
+#[test]
+fn a_failed_rbf0_document_still_shows_the_rows_it_reached() {
+    let mut bytes = deep_rbf0_bytes();
+    bytes.truncate(bytes.len() - 1);
+    let document = rbf::decode(
+        &bytes,
+        &rbf::Limits::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("a readable header");
+    let tree = build_rbf0(&document);
+    assert_eq!(tree.status, "failed");
+    assert!(!tree.rows.is_empty());
+    assert!(!tree.issues.is_empty());
+    let labels = initial_rows(&tree);
+    assert!(labels.iter().any(|label| label == "text"), "{labels:?}");
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("the parse stopped")),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn an_empty_rbf0_document_is_never_an_empty_frame() {
+    let mut root = token(0, 0);
+    root.extend_from_slice(&named(b"r"));
+    root.extend_from_slice(&[0; 4]);
+    root.extend_from_slice(&0u16.to_le_bytes());
+    root.extend_from_slice(&0xFFFFu16.to_le_bytes());
+    let mut bytes = b"RBF0".to_vec();
+    bytes.extend_from_slice(&0xFFFBu16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&root);
+    let document = rbf::decode(
+        &bytes,
+        &rbf::Limits::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("a readable payload");
+    let tree = build_rbf0(&document);
+    let labels = initial_rows(&tree);
+    assert_eq!(labels[0], "document");
+    assert_eq!(labels[1], "r");
+    assert!(labels.contains(&"name table".to_string()));
+}
+
+/// The token and name builders the empty-document test needs.
+fn token(code: u8, index: u16) -> Vec<u8> {
+    (u16::from(code) << 12 | index).to_le_bytes().to_vec()
+}
+
+fn named(name: &[u8]) -> Vec<u8> {
+    let mut bytes = (name.len() as u16).to_le_bytes().to_vec();
+    bytes.extend_from_slice(name);
+    bytes
+}
