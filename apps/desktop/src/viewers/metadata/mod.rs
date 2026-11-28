@@ -12,11 +12,13 @@ mod tree;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, KeyDownEvent, MouseButton, ScrollStrategy, Task,
     UniformListScrollHandle, Window, div, prelude::*, px, rgb, uniform_list,
 };
+use lforge_core::resource::ResourcePath;
 use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::rpf::names::{Builtin, StringTable};
 
@@ -62,14 +64,12 @@ pub struct MetadataViewer {
 impl MetadataViewer {
     pub fn new(
         path: PathBuf,
+        resource: Option<Arc<ResourcePath>>,
         access: Access,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let title = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
+        let title = identity(&path, resource.as_deref());
         let filter = cx.new(|cx| {
             ui::text_field::TextField::new("Filter structures, fields, values", cx)
         });
@@ -81,11 +81,14 @@ impl MetadataViewer {
             let result = decode.await;
             this.update(cx, |this, cx| {
                 this.state = match result {
-                    Ok((tree, source, names)) => State::Ready(Box::new(Ready {
-                        tree,
-                        source,
-                        names,
-                    })),
+                    Ok((tree, names)) => {
+                        let source = this.title.clone();
+                        State::Ready(Box::new(Ready {
+                            tree,
+                            source,
+                            names,
+                        }))
+                    }
                     Err(err) => State::Failed(err),
                 };
                 this.selected = 0;
@@ -473,12 +476,15 @@ impl Render for MetadataViewer {
     }
 }
 
-/// Opens the metadata viewer on `path`.
-pub(crate) fn open(path: PathBuf, access: Access, cx: &mut App) {
-    let title = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+/// Opens the metadata viewer on `path`, described by its canonical resource
+/// path when the entry came from an archive.
+pub(crate) fn open(
+    path: PathBuf,
+    resource: Option<Arc<ResourcePath>>,
+    access: Access,
+    cx: &mut App,
+) {
+    let title = identity(&path, resource.as_deref());
     let options = gpui::WindowOptions {
         window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::centered(
             None,
@@ -494,7 +500,7 @@ pub(crate) fn open(path: PathBuf, access: Access, cx: &mut App) {
     };
     if let Err(err) = cx.open_window(options, |window, cx| {
         ui::close_through_gpui(window, cx);
-        let viewer = cx.new(|cx| MetadataViewer::new(path, access, window, cx));
+        let viewer = cx.new(|cx| MetadataViewer::new(path, resource, access, window, cx));
         let focus = viewer.read(cx).focus.clone();
         focus.focus(window, cx);
         viewer
@@ -504,13 +510,26 @@ pub(crate) fn open(path: PathBuf, access: Access, cx: &mut App) {
 }
 
 /// Reads and decodes `path`, and indexes the names a table offers.
-fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, String, usize), String> {
+fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, usize), String> {
     let bytes = crate::files::read_with(path, access).map_err(|err| err.to_string())?;
     let document = lforge_rage9::psin::pso::decode(&bytes).map_err(|err| err.to_string())?;
     let names = names_for(path);
     let indexed = names.len();
     let built = tree::build(&document, &names);
-    Ok((built, path.display().to_string(), indexed))
+    Ok((built, indexed))
+}
+
+/// How the viewer names what it shows: the canonical resource path when the
+/// entry came from an archive, else the file name. A payload read through a
+/// temporary spool file is never named by that file.
+fn identity(path: &Path, resource: Option<&ResourcePath>) -> String {
+    match resource {
+        Some(resource) => resource.display(),
+        None => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+    }
 }
 
 /// The name table of the archive holding `path`, then the built-in tables.

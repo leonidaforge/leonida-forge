@@ -970,6 +970,16 @@ impl Explorer {
                 let metadata = classification
                     .as_ref()
                     .is_some_and(|value| value.format_id() == Some("psin"));
+                // A format this build reads structurally is never re-read as
+                // text. A `PSIN` container carries printable names and strings,
+                // so a byte-level text check alone would accept it.
+                let unclaimed = matches!(
+                    capability,
+                    None | Some(lforge_core::classify::Capability::Bytes)
+                        | Some(lforge_core::classify::Capability::Unprobed)
+                );
+                let text_document = capability == Some(lforge_core::classify::Capability::Text)
+                    || (unclaimed && text.is_some());
                 match identified {
                     Ok(Identified::Archive(_)) => {
                         this.mark_archive(&path);
@@ -977,13 +987,15 @@ impl Explorer {
                     }
                     // Opening it explains why it is not a valid archive.
                     Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                    // A recognised metadata container keeps its own view, even
+                    // when its bytes would also pass a text check.
+                    Ok(Identified::Unknown) if metadata => {
+                        crate::viewers::metadata::open(path, resource, access, cx)
+                    }
                     // A payload the classification reads as a text document, or
                     // whose own bytes are text, opens in the text viewer. This
                     // is decided before any resource decode is attempted.
-                    Ok(Identified::Unknown)
-                        if capability == Some(lforge_core::classify::Capability::Text)
-                            || text.is_some() =>
-                    {
+                    Ok(Identified::Unknown) if text_document => {
                         crate::viewers::text::open(path, resource, access, cx)
                     }
                     // A drawable resource is a model before it is a container.
@@ -1006,9 +1018,6 @@ impl Explorer {
                             && texture_dictionary =>
                     {
                         crate::viewers::texture::open_resource(path, access, cx)
-                    }
-                    Ok(Identified::Unknown) if metadata => {
-                        crate::viewers::metadata::open(path, access, cx)
                     }
                     Ok(Identified::Unknown) if image => open_image_viewer(path, access, cx),
                     Ok(Identified::Unknown) => open_binary_inspector(path, access, cx),

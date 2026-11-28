@@ -186,7 +186,7 @@ pub fn archive(
     let Some(row) = row else {
         return Err("a metadata document comes from one native row; give --row".to_string());
     };
-    write_metadata(file, &resolved.path, executable, row, &options, &output)
+    write_metadata(file, &resolved, executable, row, &options, &output)
 }
 
 fn archive_report(
@@ -608,14 +608,22 @@ fn emit_payload(
 /// bytes it came from.
 fn write_metadata(
     origin: &Path,
-    read: &Path,
+    resolved: &nested::Resolved,
     executable: Option<&Path>,
     row: u32,
     options: &Options,
     output: &Path,
 ) -> Result<(), String> {
+    let read = resolved.path.as_path();
     let opened = native::open_metadata(read, MAX_METADATA, executable)?;
     let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
+    // The document names the row by its canonical path, exactly as an
+    // inspection document does; the row index stays a diagnostic selection.
+    let resource = resource_json(&resolved.resource().with_entry(EntryId::from_row(
+        &entry,
+        None,
+        &Types::default(),
+    )));
     // Companions sit beside the file the chain starts at, not beside the
     // temporary file an entered archive was decompressed into.
     let alternates = Alternates::resolve(origin, &opened.metadata);
@@ -676,6 +684,7 @@ fn write_metadata(
     let provenance = json!({
         "archive": path_string(origin),
         "read_from": path_string(read),
+        "resource": resource,
         "row": row,
         "name_hash": entry.name_hash.clone().ok().flatten().map(|hash| format!("0x{hash:016X}")),
         "name_key": entry.name_key.clone().ok().flatten().map(|key| format!("0x{key:08X}")),

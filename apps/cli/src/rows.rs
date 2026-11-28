@@ -37,8 +37,11 @@ const MAX_METADATA: u64 = 256 * 1024 * 1024;
 
 /// One opened archive with the name tables applied to its rows.
 pub struct Listing {
+    /// The file on disk the bytes come from: an archive stored inside another
+    /// one is still read out of the root file.
     archive: PathBuf,
-    relative: String,
+    /// The canonical path of the archive itself, without its entry.
+    path: ResourcePath,
     opened: Opened,
     types: Types,
     resolved: ResolutionSet,
@@ -68,16 +71,17 @@ impl Listing {
         cancel: &AtomicBool,
     ) -> Result<Self, String> {
         let opened = native::open_metadata_cancellable(path, MAX_METADATA, executable, cancel)?;
-        Self::from_opened(path, table_name(path), opened, name_files)
+        let root = table_name(path);
+        Self::from_opened(path, ResourcePath::root(root), opened, name_files)
     }
 
     /// Resolves the rows of an archive already read from `origin`, a file on
-    /// disk, and reports it under `identity`. An archive stored inside another
+    /// disk, whose canonical path is `path`. An archive stored inside another
     /// one takes its name table from `origin`, because the table beside a
     /// `.rpf` file describes every archive in that file.
     pub fn from_opened(
         origin: &Path,
-        identity: String,
+        path: ResourcePath,
         opened: Opened,
         name_files: &[PathBuf],
     ) -> Result<Self, String> {
@@ -105,13 +109,9 @@ impl Listing {
             })
             .collect();
         resource::assign_occurrences(&mut entry_ids);
-        let relative = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string());
         Ok(Self {
             archive: origin.to_path_buf(),
-            relative: identity,
+            path,
             opened,
             types,
             resolved: ResolutionSet {
@@ -127,7 +127,7 @@ impl Listing {
     pub fn resource(&self, position: usize) -> Option<ResourcePath> {
         self.entry_ids
             .get(position)
-            .map(|entry| ResourcePath::root(self.relative.clone()).with_entry(entry.clone()))
+            .map(|entry| self.path.with_entry(entry.clone()))
     }
 
     /// The canonical identity of the row at `position`, for a caller that
@@ -266,7 +266,7 @@ impl Listing {
             ),
             "authentication": self.opened.authentication.status(),
         });
-        record["archive"] = json!(self.relative);
+        record["archive"] = json!(self.path.archive_display());
         if let Some(resource) = self.resource(position) {
             record["resource"] = json!({
                 "display": resource.display(),
@@ -300,16 +300,6 @@ fn table_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-/// The identity a nested archive reached through `rows` is reported under.
-fn chain_name(parent: &str, rows: &[u32]) -> String {
-    let mut value = parent.to_string();
-    for row in rows {
-        value.push('!');
-        value.push_str(&row.to_string());
-    }
-    value
 }
 
 fn field<T>(value: &Field<T>, show: impl Fn(&T) -> Value) -> Value {
@@ -402,7 +392,7 @@ pub fn run_ls(options: LsOptions) -> Result<(), String> {
         let document = json!({
             "schema": LIST_SCHEMA,
             "archive": listing.archive.display().to_string(),
-            "relative": listing.relative,
+            "relative": listing.path.archive_display(),
             "authentication": listing.authentication_json(),
             "types": listing.types_json(),
             "total": total,
@@ -428,7 +418,7 @@ fn print_json(value: &Value) -> Result<(), String> {
 fn print_ls_text(listing: &Listing, rows: &[Value], offset: usize, total: usize) {
     println!(
         "archive:      {} ({} rows, {} authenticated)",
-        listing.relative,
+        listing.path.archive_display(),
         total,
         listing.opened.authentication.status()
     );
@@ -639,8 +629,8 @@ fn hash_matches(class: Option<Class>, entry: &Entry, hash: Key) -> bool {
 struct Pending {
     /// The file on disk whose bytes the archive is read from.
     origin: PathBuf,
-    /// How the archive is named in output.
-    identity: String,
+    /// The canonical path of the archive itself.
+    path: ResourcePath,
     /// How many archives it was reached through; a file on disk is 0.
     depth: usize,
     /// An archive already opened, or `None` for a file on disk not yet opened.
@@ -698,7 +688,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         .rev()
         .map(|archive| Pending {
             origin: archive.clone(),
-            identity: name_of(archive),
+            path: ResourcePath::root(name_of(archive)),
             depth: 0,
             opened: None,
         })
@@ -708,7 +698,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             return Err("cancelled".to_string());
         }
         if let Some(filter) = &filter
-            && !item.identity.to_ascii_lowercase().contains(filter)
+            && !item.path.archive_display().to_ascii_lowercase().contains(filter)
         {
             continue;
         }
@@ -728,7 +718,8 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                     Ok(opened) => opened,
                     Err(reason) => {
                         skipped.push(json!({
-                            "archive": item.identity,
+                            "archive": item.path.archive_display(),
+                            "identity": item.path.identity(),
                             "reason": reason,
                         }));
                         continue;
@@ -736,18 +727,22 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 }
             }
         };
-        let listing =
-            match Listing::from_opened(&item.origin, item.identity.clone(), opened, &options.candidates)
-            {
-                Ok(listing) => listing,
-                Err(reason) => {
-                    skipped.push(json!({
-                        "archive": item.identity,
-                        "reason": reason,
-                    }));
-                    continue;
-                }
-            };
+        let listing = match Listing::from_opened(
+            &item.origin,
+            item.path.clone(),
+            opened,
+            &options.candidates,
+        ) {
+            Ok(listing) => listing,
+            Err(reason) => {
+                skipped.push(json!({
+                    "archive": item.path.archive_display(),
+                    "identity": item.path.identity(),
+                    "reason": reason,
+                }));
+                continue;
+            }
+        };
         let alternates = listing.alternates();
         companions_resolved += 1;
         for position in 0..listing.entries.len() {
@@ -780,7 +775,9 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 stopped = Some("max_archives");
                 break;
             }
-            let identity = chain_name(&item.identity, &[entry.row]);
+            let Some(child) = listing.resource(position) else {
+                continue;
+            };
             let limits = native::NestedLimits {
                 max_nested_bytes: options.max_nested_bytes,
                 max_spool_bytes: options.max_spool_bytes,
@@ -790,7 +787,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 entry,
                 &listing.opened,
                 alternates.sources(),
-                &identity,
+                &child.archive_display(),
                 limits,
                 options.executable.as_deref(),
                 &cancel,
@@ -800,7 +797,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                     nested_opened += 1;
                     children.push(Pending {
                         origin: item.origin.clone(),
-                        identity,
+                        path: child,
                         depth: item.depth + 1,
                         opened: Some(Box::new(nested)),
                     });
@@ -809,7 +806,11 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                     stopped = Some("max_spool_bytes");
                 }
                 Err(err) => {
-                    skipped.push(json!({ "archive": identity, "reason": err.to_string() }));
+                    skipped.push(json!({
+                        "archive": child.archive_display(),
+                        "identity": child.identity(),
+                        "reason": err.to_string(),
+                    }));
                 }
             }
         }
@@ -895,7 +896,7 @@ pub fn run_manifest(options: ManifestOptions) -> Result<(), String> {
     let header = json!({
         "schema": MANIFEST_SCHEMA,
         "archive": listing.archive.display().to_string(),
-        "relative": listing.relative,
+        "relative": listing.path.archive_display(),
         "authentication": listing.authentication_json(),
         "types": listing.types_json(),
         "rows": listing.entries.len(),
