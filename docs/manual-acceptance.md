@@ -116,48 +116,136 @@ caps: filter a leaf name and the 596 rows scroll to it.
 
 A resource whose influences decode shows a **POSE** section under the skeleton
 list. Its header reads `N of M primitive(s) deform; K bone(s)` and then
-`reference pose` or `edited pose`. `Pose Mode` enters the session; the section
-then offers `authored` and `posed`, `Influence View`, one row of six rotation
-buttons, one row of six translation buttons, `Reset Bone` and `Reset Pose`.
+`reference pose` or `edited pose`; an inferred association adds
+`(I inferred single-bone)`. `Pose Mode` enters the session. The section then
+offers `authored` and `posed`, `Influence View`, six rotation buttons, six
+translation buttons, `Reset Bone` and `Reset Pose`.
 
-Rotations are Euler XYZ in degrees, five degrees per press, in the bone's parent
-space. Translations are metres in the same space, five centimetres per press.
-Nothing is written to the resource, no pose is saved, and closing the window
-discards it.
+Conventions, the same in the CPU reference, the shader and the buttons:
 
-1. Open `levels.rpf!5!8` and press `Pose Mode`. The header reads
-   `4 of 4 primitive(s) deform; 10 bone(s)` and `reference pose`, and the mesh is
-   unchanged.
-2. Select `Tail_01` and press `Rotate Z+` eight times. The bone line reads
-   `40 deg`, the label reads `edited pose`, and the tail fans out while the
-   pedestal, the legs and the floor stay.
-3. Press `Influence View`. The tail turns orange and yellow by weight, geometry
-   with no weight stays neutral grey, and the display switches to `posed`.
-4. Press `authored`. The authored mesh returns while the skeleton overlay stays
-   at the edited pose; `posed` restores the deformation.
-5. Press `Reset Bone`. The tail returns to the reference pose and the label reads
-   `reference pose` again.
-6. Press `Reset View`. The camera frames the deformed geometry, not the authored
-   one.
-7. Press `Exit Pose`. The authored mesh and the reference skeleton return, and
-   the POSE section keeps only its header.
-8. Open `levels.rpf!5!1`, press `Pose Mode`, select `Candle` and press
-   `Rotate Z+` twelve times. The candle holder turns 60 degrees about the bone
-   rigidly and the base stays.
-9. Open `levels.rpf!21!85`. The header reads
-   `29 of 37 primitive(s) deform; 386 bone(s)`; the eight geometries without a
-   weight attribute stay authored.
+- A rotation button adds 5 degrees about the named axis **of the bone's own
+  space**, applied after the stored local rotation. It is not a model-space or
+  parent-space axis.
+- A translation button adds 0.05 m along the named axis **in the parent's
+  space**, the space the stored local translation lives in.
+- Euler order for the three buttons is XYZ, and each angle wraps to
+  `-180..180`.
+- Scale is not offered. A bone with non-identity scale is refused, not
+  approximated.
+- Nothing is persisted: closing the window discards the pose.
 
-The same numbers are what the harness reports for those two chains: the peacock
-moves 24,496 of the 25,456 vertices of its widest-influence primitive with a
-largest displacement of 1.19 m, and the candlestick moves all 788 vertices of the
-primitive it shares with `Candle` with a largest displacement of 0.018 m. A GPU
-compute probe over the same matrices agrees with the CPU reference on every one
-of those vertices, worst difference `3.6e-7` m and `3.7e-9` m.
+The release executable is
+`E:\source\leonidaforge\worktrees\vertex-influences-skinning\leonida-forge\target\release\leonida-forge.exe`.
 
-A resource without a verified influence set shows no POSE section at all: for
-example the four-member dictionary `data.rpf!7!0`, whose members carry no
-skeleton.
+### Peacock, weighted deformation
+
+`levels.rpf!5!8`, declared type 3, `mint_peacock_taxidermy_01.#ft`. Ten bones,
+one root, depth 10, four primitives, 41,613 vertices, all four deformable.
+
+| Step | Expected |
+| ---- | -------- |
+| Press `Pose Mode` | `4 of 4 primitive(s) deform; 10 bone(s)`, `reference pose`, mesh unchanged |
+| Select `Tail_01` (index 4), press `Rotate Z+` eight times | bone line reads `0 0 40`, label `edited pose`, tail fans out; worst vertex displacement 1.19 m |
+| Count the moved geometry | 31,480 of 41,613 vertices move. Primitive 0 (2,685 vertices, one bone) does not move; primitive 3 (25,456 vertices, seven bones) moves 24,496 of them; the pedestal, legs and floor stay |
+| Press `Influence View` | tail shaded orange to yellow by weight (0.906 and 0.094 on the first vertex), unweighted geometry neutral grey, display switches to `posed` |
+| Select a bone no vertex references, for example `bone 9` | the influence view shows no highlighted geometry; the section still reads `edited pose` |
+| Press `authored` | authored mesh returns, skeleton overlay keeps the edited pose, label `edited pose` |
+| Press `posed` | the deformation returns |
+| Press `Reset Bone` | tail returns to reference, label `reference pose` |
+| Press `Reset Pose` | every delta clears, label `reference pose` |
+| Press `Reset View` after a large rotation | camera frames the deformed geometry, not the authored one |
+| Press `Exit Pose` | authored mesh and reference skeleton return; the section keeps only its header |
+| Press `Pose Mode` again | `reference pose`: the discarded pose does not come back |
+
+### Candlestick, single-influence deformation
+
+`levels.rpf!5!1`, declared type 3, `prop_am_candlestick_02a.#ft`. Four bones, one
+root, two primitives, 927 vertices, both deformable, both single-influence, both
+whole-primitive rigid.
+
+| Step | Expected |
+| ---- | -------- |
+| Press `Pose Mode`, select `Candle` (index 3), press `Rotate Z+` twelve times | bone line reads `0 0 60` |
+| Count the moved geometry | 139 of 927 vertices move, by at most 0.0182 m; the 139-vertex primitive is bound to `Candle` and turns as one piece |
+| Check the other primitive | the 788-vertex primitive is bound to bone 2 and does not move at all |
+| Press `Reset Bone` | both primitives return to the authored shape |
+
+The earlier acceptance page called all 788 vertices affected. That was the
+primitive's size, not the moved count; the measurement above replaces it.
+
+### Dominator9, partial support on a 386-bone skeleton
+
+`levels.rpf!21!85`, declared type 3, `dominator9_hi.#ft`. 386 bones, one root,
+depth 19, three meshes and 37 primitives, of which 29 deform (91,466 vertices).
+The eight that do not deform declare no usable influence attribute and stay on
+the authored path. The highest active bone index is 385, one below the bone
+count.
+
+| Step | Expected |
+| ---- | -------- |
+| Press `Pose Mode` | `29 of 37 primitive(s) deform; 386 bone(s)` |
+| Select `wing_rf` (index 372), press `Rotate Z+` five times | bone line reads `0 0 25` |
+| Count the moved geometry | 2,077 vertices move: 1,840 of mesh 1 primitive 0 and 237 of mesh 1 primitive 4, worst 0.304 m |
+| Check propagation | the only other moved bone is 372's child; the other 384 bones keep their transform |
+| Press `Reset Bone` | every primitive returns to the authored shape |
+
+The bone name is reported, not interpreted: nothing here claims the part is a
+door, a wheel or a suspension element.
+
+### Large skeleton and multiple roots
+
+| Resource | Selector | Skeleton | Step | Expected |
+| -------- | -------- | -------- | ---- | -------- |
+| Ambient female body | `packs.rpf!26!255`, type 3, `ambient_femalebody.#ft` | 596 bones, 16 roots, depth 24 | `Pose Mode`, select `SKEL_ROOT` (index 0), `Rotate Z+` six times | `1 of 1 primitive(s) deform; 596 bone(s)`; 572 bones move and 24 do not, all 24 under the other 15 roots; the single 25-vertex primitive moves 9.15 m |
+| Rabbit | `packs.rpf!26!0`, type 3, `crm_rabbit_marsh_m_00.#ft` | 98 bones, 10 roots, depth 15 | `Pose Mode`, select `SKEL_ROOT` (index 0), `Rotate Z+` six times | 81 bones move, the 17 bones under the other nine roots keep their transforms, and the 25-vertex primitive moves 9.17 m |
+
+Both resources are fragments whose decoded LOD-0 member drawable holds one
+25-vertex primitive bound to the root bone, so they verify pose propagation and
+root independence rather than weighted character skinning. The 596-bone skeleton
+uploads and renders, which is what the matrix buffer has to carry; the geometry
+does not exercise it. The weighted large-skeleton case is the dominator above.
+
+### Weighted data the decoder rejects
+
+`packs.rpf!9!5` is a one-member drawable dictionary; member 0 is
+`neckwearbowtie_mr1_000_regular_t_un_high_full.#dr` with 69 bones, 69 roots and
+one 125-vertex primitive with four influences on 12 bones. Its four weights total
+254 rather than 255 or 127, so the primitive is reported as unnormalised and is
+not deformed.
+
+| Step | Expected |
+| ---- | -------- |
+| Open `packs.rpf!9!5`, select member 0 | skeleton section reads `69 BONE(S) · 69 ROOT(S) · DEPTH 1`; no POSE section appears |
+| Read the diagnostics | one line names the unnormalised blend weights and the total 254 |
+| Toggle the skeleton | bones render at the reference pose; the mesh stays authored |
+
+A dictionary member carries its own skeleton and its own viewport. Selecting a
+different member replaces the viewport, and a new viewport starts with pose mode
+off, so a pose cannot survive a member switch. This dictionary has one member,
+so the replacement path is covered by the unit test of `Viewport` construction
+and by the model viewer, not by switching inside this dictionary.
+
+### Lifecycle checks
+
+| Check | Expected |
+| ----- | -------- |
+| Hold a rotation button down on the peacock | the last step is what renders; no queued backlog, no growing delay, no reload |
+| Change the selected bone repeatedly in the influence view | the colours follow the new bone without a resource reload or a geometry upload |
+| Hide a mesh, pose, then exit pose mode | the mesh stays hidden; the camera is unchanged |
+| Open two model windows and pose one | the other window keeps its own pose and camera |
+| Close a window while posed | the render thread stops and the GPU buffers are released with it |
+
+### Skeleton-free and unrelated resources
+
+`levels.rpf!5!252` (`prop_am_trophy_fish_06a_batchlod.#dr`, type 2) has no
+skeleton and shows no POSE section. Its default render is unchanged: 171
+vertices, 158 triangles, one mesh, one material, five reconstructed texture
+bindings, complete geometry and textures.
+
+The drawable dictionaries `data.rpf!7!0`, `data.rpf!31!6`, `data.rpf!31!8` and
+`pack/core_restofworld/core_restofworld.rpf!6!0`, and the texture dictionary
+`data.rpf!1!0` with five records, are unchanged checks from the earlier
+acceptance runs.
 
 ## A dictionary member with a skeleton
 
