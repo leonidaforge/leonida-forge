@@ -106,11 +106,12 @@ pushed.
   container opens in the metadata viewer: the tree walks the schema and the
   instance blocks, a row expands and collapses, a filter keeps the rows that
   match and the ancestors that hold them, and a row copies as text. The stored
-  hash stays the identity and a resolved name is shown beside it. A payload the
-  classification reads as text opens in the text viewer instead, so a metadata
-  container is never claimed by a byte-level text check: `PSIN` and `RBF0`
-  payloads carry thousands of zero bytes in their first 64 KiB, and the text
-  check refuses any payload containing one.
+  hash stays the identity and a resolved name is shown beside it. The same
+  viewer opens an `RBF0` payload and a `0DRP` metadata resource, each through
+  the shared metadata API. A payload the classification reads as text opens in
+  the text viewer instead, so a metadata container is never claimed by a
+  byte-level text check: metadata payloads carry thousands of zero bytes in
+  their first 64 KiB, and the text check refuses any payload containing one.
 - The window names the resource by its canonical path, the same string the CLI
   reports, so a row inside a nested archive shows the whole chain and never the
   temporary file it was decompressed into.
@@ -144,8 +145,9 @@ pushed.
   A `PMAP` container carries the `PSIN` signature, so it opens in the metadata
   viewer, which reports the `PMAP` family and that its instance data is not
   decoded; the bytes stay reachable through File → Open in Binary Inspector.
-  An `RBF0` payload and the `0DRP` resource form are not metadata containers;
-  they are recognised by signature and open in the Binary Inspector directly.
+  An `RBF0` payload and a `0DRP` resource are not metadata containers; they do
+  not carry the `PSIN` sections. Both are recognised by signature and decoded
+  into the metadata viewer, which reports the form it read.
   A block whose type names neither a structure nor a pool keeps its bytes and
   is reported as unsupported rather than guessed at.
 - Vertex semantics. A drawable's bounds, layout codes, declaration bytes, index
@@ -222,6 +224,15 @@ resource type, in 31 of the 42 archives: 2,573 carry the `PSIN` signature, 1,462
 are `RBF0` payloads and 1,286 are the `0DRP` resource form. The census counts
 what each entry is; it does not deserialize a metadata document, so a `.zmt` row
 it calls `psin` may still hold either `PSIN` family.
+
+The metadata decoders were validated separately, over every payload the
+signature finds rather than over the head classification. An exhaustive walk of
+`data.rpf` decoded all 1,462 `RBF0` payloads and all 15,768 `0DRP` resources;
+the resource walk enters nested archives, so it also reaches the 14,482 type 111
+rows the census's type 11 count does not name. 15,767 resources decode to their
+full extent and one is partial, for four blocks no structure, pool element or
+established width describes. No reference fails to bind and no read limit is
+reached. `docs/formats/rbf0.md` and `docs/formats/odrp.md` state the details.
 
 ## Test coverage
 

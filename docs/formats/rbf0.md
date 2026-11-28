@@ -4,6 +4,7 @@ RBF0 is the second metadata encoding a type 11 row can hold. This document
 describes how Leonida Forge decodes it, where the code lives, and what the
 decoder was validated against. The format itself is specified in the research
 repository (`formats/metadata/rbf0`); this document is about the implementation.
+The third form, the `0DRP` resource, has its own document (`odrp.md`).
 
 ## Where the code lives
 
@@ -127,9 +128,10 @@ class, string statistics and name digests. It does not print names or text.
 
 ## Desktop
 
-`opens_as_metadata` accepts a classification whose `format_id` is `psin` or
-`rbf0`, and the metadata arm stays ahead of the text arm, so a payload this
-build reads structurally is never claimed by the byte-level text check.
+`opens_as_metadata` accepts a classification whose `format_id` is `psin`, `rbf0`
+or `meta-resource`, and the metadata arm stays ahead of the text arm, so a
+payload this build reads structurally is never claimed by the byte-level text
+check.
 
 The Metadata Viewer decodes either format into the same rows:
 
@@ -307,6 +309,6 @@ Concrete opportunities for a later task, none of them implemented here:
 
 ## Deliberately out of scope
 
-Decoding of `PSIN`/`PMAP` instance data, the `0DRP` resource form, undefined
-`PSIN`/`LSCH` block interpretation, general metadata name discovery, and any
-exporter or website schema change.
+Decoding of `PSIN`/`PMAP` instance data, undefined `PSIN`/`LSCH` block
+interpretation, general metadata name discovery, and any exporter or website
+schema change.
