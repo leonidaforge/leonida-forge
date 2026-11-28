@@ -73,7 +73,7 @@ pub const META_RESOURCE: FormatInfo = FormatInfo {
     id: "meta-resource",
     name: "metadata resource",
     support: "recognition",
-    detail: "the `0DRP` tag and the object type byte; the self-describing tables are not decoded here",
+    detail: "the `0DRP` tag and the object type byte; the self-describing tables decode as a `0DRP` document",
 };
 
 pub const EDUP: FormatInfo = FormatInfo {
@@ -221,7 +221,8 @@ pub enum Summary {
         tags: usize,
         max_depth: usize,
     },
-    /// The `0DRP` form of the same metadata, which this build does not decode.
+    /// The `0DRP` form of the same metadata: a resource whose system segment
+    /// holds the schema, the blocks and a text pool.
     MetaResource {
         object_type: u8,
     },
@@ -1585,14 +1586,15 @@ fn rpf9_structure() -> Value {
     })
 }
 
-/// Reads the `0DRP` tag and the object type byte of the resource form of the
-/// metadata. The self-describing tables that follow are a separate layout from
-/// the `PSIN` container, and this build does not decode them.
+/// Reads the `0DRP` tag, the object type byte and the table counts of the
+/// resource form. The tables themselves decode as a `0DRP` document
+/// (`lforge_core::metadata`), which is a separate layout from the `PSIN`
+/// container; this structure report is the recognition only.
 fn meta_resource_structure<R: Read + Seek>(
     source: &mut R,
     cancel: &AtomicBool,
 ) -> (Value, Option<Summary>, Option<Failure>) {
-    let head = match lforge_binary::read_at(source, 0, 0x15) {
+    let head = match lforge_binary::read_at(source, 0, 0x50) {
         Ok(head) => head,
         Err(err) => {
             return (
@@ -1609,12 +1611,21 @@ fn meta_resource_structure<R: Read + Seek>(
         return (Value::Null, None, None);
     }
     let object_type = head.get(0x14).copied();
+    let word = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?))
+    };
     let structure = json!({
         "valid": true,
         "tag": "0DRP",
         "object_type": object_type,
+        "declared_roots": head.get(0x20..0x24).map(|word| u32::from_le_bytes(word.try_into().expect("4 bytes"))),
+        "structures": word(0x48),
+        "enums": word(0x4a),
+        "blocks": word(0x4c),
+        "unknown_word": word(0x4e),
+        "page_map": lforge_rage9::resource::page_map_offset(&head),
         "limitations": [
-            "the self-describing tables of the resource form are not decoded; the PSIN container of the same metadata is",
+            "this report is the recognition; `--metadata-output` decodes the resource's schema, blocks and values",
             "no field, block or value of this form is assigned a meaning",
         ],
     });

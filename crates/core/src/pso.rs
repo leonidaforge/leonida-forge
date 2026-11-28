@@ -30,6 +30,9 @@ pub struct Counts {
     pub roots: usize,
     pub structure_blocks: usize,
     pub pool_blocks: usize,
+    /// Elements of a block typed by a field code, and how many were read.
+    pub elements: usize,
+    pub elements_decoded: usize,
     pub unsupported_blocks: usize,
     /// `Some(false)` when the copied resource header disagrees with the tables.
     pub header_matches: Option<bool>,
@@ -65,26 +68,31 @@ pub fn counts(document: &Document) -> Counts {
                 counts.records_decoded += records.len();
             }
             Content::Pool { .. } => counts.pool_blocks += 1,
+            Content::Elements { total, entries, .. } => {
+                counts.pool_blocks += 1;
+                counts.elements += *total as usize;
+                counts.elements_decoded += entries.len();
+            }
             Content::Unsupported(_) => counts.unsupported_blocks += 1,
         }
     }
     counts
 }
 
-fn hash32(value: u32) -> String {
+pub(crate) fn hash32(value: u32) -> String {
     format!("0x{value:08X}")
 }
 
-fn hash64(value: u64) -> String {
+pub(crate) fn hash64(value: u64) -> String {
     format!("0x{value:016X}")
 }
 
-fn bytes_hex(bytes: &[u8]) -> String {
+pub(crate) fn bytes_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 /// The candidates a hash index offers, as a document of its own.
-fn named(names: &Names, hash: u32) -> Json {
+pub(crate) fn named(names: &Names, hash: u32) -> Json {
     match names.lookup(hash) {
         [] => json!({ "status": "unresolved" }),
         [only] => json!({ "status": "resolved", "name": only }),
@@ -93,7 +101,7 @@ fn named(names: &Names, hash: u32) -> Json {
 }
 
 /// The type name of a type code the schema establishes, or `None`.
-fn type_name(code: u16, upper: u16) -> Option<&'static str> {
+pub(crate) fn type_name(code: u16, upper: u16) -> Option<&'static str> {
     lforge_rage9::psin::pso::type_width(code, upper)?;
     Some(match code {
         0x01 => "bool",
@@ -127,7 +135,7 @@ fn type_name(code: u16, upper: u16) -> Option<&'static str> {
     })
 }
 
-fn field_json(field: &Field) -> Json {
+pub(crate) fn field_json(field: &Field) -> Json {
     json!({
         "name": hash32(field.name),
         "offset": field.offset,
@@ -139,7 +147,7 @@ fn field_json(field: &Field) -> Json {
     })
 }
 
-fn structure_json(structure: &Structure, names: &Names) -> Json {
+pub(crate) fn structure_json(structure: &Structure, names: &Names) -> Json {
     json!({
         "name": hash32(structure.name),
         "nameCandidates": named(names, structure.name),
@@ -155,7 +163,7 @@ fn structure_json(structure: &Structure, names: &Names) -> Json {
     })
 }
 
-fn target_json(target: &Target, names: &Names) -> Json {
+pub(crate) fn target_json(target: &Target, names: &Names) -> Json {
     json!({
         "block": target.block,
         "record": target.record,
@@ -165,7 +173,7 @@ fn target_json(target: &Target, names: &Names) -> Json {
     })
 }
 
-fn fault_text(fault: ReferenceFault) -> &'static str {
+pub(crate) fn fault_text(fault: ReferenceFault) -> &'static str {
     match fault {
         ReferenceFault::BlockOutside => "block_outside",
         ReferenceFault::NoStructure => "no_structure",
@@ -173,7 +181,7 @@ fn fault_text(fault: ReferenceFault) -> &'static str {
     }
 }
 
-fn reference_json(reference: &Reference, names: &Names) -> Json {
+pub(crate) fn reference_json(reference: &Reference, names: &Names) -> Json {
     if reference.is_null() {
         return json!({ "word": hash64(0), "null": true });
     }
@@ -191,7 +199,7 @@ fn reference_json(reference: &Reference, names: &Names) -> Json {
     }
 }
 
-fn resolution_json(resolution: Resolution, word: u64) -> Json {
+pub(crate) fn resolution_json(resolution: Resolution, word: u64) -> Json {
     match resolution {
         Resolution::Null => json!({ "word": hash64(word), "null": true }),
         Resolution::Located(location) => json!({
@@ -208,7 +216,7 @@ fn resolution_json(resolution: Resolution, word: u64) -> Json {
     }
 }
 
-fn enum_json(value: &EnumValueMatch, names: &Names) -> Json {
+pub(crate) fn enum_json(value: &EnumValueMatch, names: &Names) -> Json {
     json!({
         "kind": "enum",
         "value": value.value,
@@ -223,7 +231,7 @@ fn enum_json(value: &EnumValueMatch, names: &Names) -> Json {
     })
 }
 
-fn scalar_json(scalar: &Scalar, names: &Names) -> Json {
+pub(crate) fn scalar_json(scalar: &Scalar, names: &Names) -> Json {
     let mut value = json!({
         "kind": "scalar",
         "type": scalar.type_name(),
@@ -251,7 +259,28 @@ fn scalar_json(scalar: &Scalar, names: &Names) -> Json {
     value
 }
 
-fn array_json(elements: &Result<ArrayElements, String>, names: &Names) -> Json {
+pub(crate) fn scalar_text(scalar: &Scalar) -> String {
+    match scalar {
+        Scalar::Bool(inner) => inner.to_string(),
+        Scalar::I8(inner) => inner.to_string(),
+        Scalar::U8(inner) => inner.to_string(),
+        Scalar::I16(inner) => inner.to_string(),
+        Scalar::U16(inner) => inner.to_string(),
+        Scalar::U32(inner) => inner.to_string(),
+        Scalar::I32(inner) => inner.to_string(),
+        Scalar::U64(inner) => inner.to_string(),
+        Scalar::F16(inner) | Scalar::F32(inner) => inner.to_string(),
+        Scalar::Hash32(inner) => hash32(*inner),
+        Scalar::Hash64(inner) => hash64(*inner),
+        Scalar::Vector { values, count } => values[..usize::from(*count)]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+            .join(","),
+    }
+}
+
+pub(crate) fn array_json(elements: &Result<ArrayElements, String>, names: &Names) -> Json {
     match elements {
         Err(reason) => json!({ "error": reason }),
         Ok(ArrayElements::Structure {
@@ -274,6 +303,15 @@ fn array_json(elements: &Result<ArrayElements, String>, names: &Names) -> Json {
             "type": "reference",
             "links": links.iter().map(|reference| reference_json(reference, names)).collect::<Vec<Json>>(),
         }),
+        Ok(ArrayElements::Records { records }) => json!({
+            "type": "records",
+            "records": records.iter().map(|record| record_json(record, names)).collect::<Vec<Json>>(),
+        }),
+        Ok(ArrayElements::Scalars { code, values }) => json!({
+            "type": "scalars",
+            "elementType": format!("0x{code:04X}"),
+            "values": values.iter().map(|scalar| scalar_json(scalar, names)).collect::<Vec<Json>>(),
+        }),
         Ok(ArrayElements::Hash32 { values }) => json!({
             "type": "hash32",
             "values": values.iter().map(|value| json!({
@@ -293,7 +331,7 @@ fn array_json(elements: &Result<ArrayElements, String>, names: &Names) -> Json {
     }
 }
 
-fn value_json(value: &Value, names: &Names) -> Json {
+pub(crate) fn value_json(value: &Value, names: &Names) -> Json {
     match value {
         Value::Scalar(scalar) => scalar_json(scalar, names),
         Value::Enum(inner) => enum_json(inner, names),
@@ -340,6 +378,21 @@ fn value_json(value: &Value, names: &Names) -> Json {
             "enumeration": hash32(bitset.enumeration),
             "enumerationCandidates": named(names, bitset.enumeration),
         }),
+        Value::Text(text) => {
+            let mut document = json!({
+                "kind": "text",
+                "word": hash64(text.word),
+                "reference": resolution_json(text.resolution, text.word),
+            });
+            match &text.text {
+                Ok(value) => document["text"] = json!(value),
+                Err(reason) => {
+                    document["text"] = Json::Null;
+                    document["note"] = json!(reason);
+                }
+            }
+            document
+        }
         Value::TextSlot { raw } => json!({
             "kind": "text_slot",
             "bytes": bytes_hex(raw),
@@ -374,7 +427,7 @@ fn value_json(value: &Value, names: &Names) -> Json {
     }
 }
 
-fn record_json(record: &Record, names: &Names) -> Json {
+pub(crate) fn record_json(record: &Record, names: &Names) -> Json {
     json!({
         "offset": record.offset,
         "structure": hash32(record.structure),
@@ -388,16 +441,18 @@ fn record_json(record: &Record, names: &Names) -> Json {
     })
 }
 
-fn entries_json(entries: &[PoolEntry], names: &Names) -> Vec<Json> {
+pub(crate) fn entries_json(entries: &[PoolEntry], names: &Names) -> Vec<Json> {
     entries
         .iter()
         .map(|entry| match entry {
             PoolEntry::Text(text) => json!(text),
+            PoolEntry::Bytes(bytes) => json!({ "bytes": bytes_hex(bytes) }),
             PoolEntry::Hash32(value) => json!({
                 "value": hash32(*value),
                 "candidates": named(names, *value),
             }),
             PoolEntry::Reference(word) => json!(hash64(*word)),
+            PoolEntry::Word32(word) => json!(format!("0x{word:08X}")),
             PoolEntry::Word64(word) => json!(hash64(*word)),
             PoolEntry::Word128(bytes) => json!(bytes_hex(bytes)),
         })
@@ -445,6 +500,26 @@ fn block_json(block: &lforge_rage9::psin::pso::Block, names: &Names, full: bool)
             document["decoded"] = json!(entries.len());
             if full {
                 document["entries"] = json!(entries_json(entries, names));
+            }
+        }
+        Content::Elements {
+            code,
+            width,
+            total,
+            entries,
+        } => {
+            document["kind"] = json!("elements");
+            document["elementType"] = json!(format!("0x{code:04X}"));
+            document["width"] = json!(width);
+            document["total"] = json!(total);
+            document["decoded"] = json!(entries.len());
+            if full {
+                document["entries"] = json!(
+                    entries
+                        .iter()
+                        .map(|scalar| scalar_json(scalar, names))
+                        .collect::<Vec<Json>>()
+                );
             }
         }
         Content::Unsupported(reason) => {
@@ -541,7 +616,7 @@ pub fn document_json(document: &Document, names: &Names, sample: usize) -> Json 
     })
 }
 
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         match character {
@@ -556,7 +631,7 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn attribute(out: &mut String, name: &str, value: impl std::fmt::Display) {
+pub(crate) fn attribute(out: &mut String, name: &str, value: impl std::fmt::Display) {
     out.push(' ');
     out.push_str(name);
     out.push_str("=\"");
@@ -564,7 +639,7 @@ fn attribute(out: &mut String, name: &str, value: impl std::fmt::Display) {
     out.push('"');
 }
 
-fn open(out: &mut String, tag: &str, depth: usize) {
+pub(crate) fn open(out: &mut String, tag: &str, depth: usize) {
     for _ in 0..depth {
         out.push_str("  ");
     }
@@ -572,7 +647,7 @@ fn open(out: &mut String, tag: &str, depth: usize) {
     out.push_str(tag);
 }
 
-fn close(out: &mut String, tag: &str, depth: usize) {
+pub(crate) fn close(out: &mut String, tag: &str, depth: usize) {
     for _ in 0..depth {
         out.push_str("  ");
     }
@@ -581,7 +656,7 @@ fn close(out: &mut String, tag: &str, depth: usize) {
     out.push_str(">\n");
 }
 
-fn field_attributes(document: &mut String, field: &Field) {
+pub(crate) fn field_attributes(document: &mut String, field: &Field) {
     attribute(document, "name", hash32(field.name));
     attribute(document, "offset", field.offset);
     attribute(document, "type", format!("0x{:04X}", field.code()));
@@ -596,7 +671,7 @@ fn field_attributes(document: &mut String, field: &Field) {
     }
 }
 
-fn array_attributes(document: &mut String, array: &lforge_rage9::psin::pso::ArrayValue) {
+pub(crate) fn array_attributes(document: &mut String, array: &lforge_rage9::psin::pso::ArrayValue) {
     attribute(document, "descriptor", array.descriptor);
     attribute(document, "count", array.span.count);
     attribute(document, "capacity", array.span.capacity);
@@ -613,7 +688,7 @@ fn array_attributes(document: &mut String, array: &lforge_rage9::psin::pso::Arra
     }
 }
 
-fn value_xml(out: &mut String, value: &Value, depth: usize) {
+pub(crate) fn value_xml(out: &mut String, value: &Value, depth: usize) {
     match value {
         Value::Scalar(scalar) => {
             open(out, "value", depth);
@@ -743,6 +818,20 @@ fn value_xml(out: &mut String, value: &Value, depth: usize) {
                         out.push_str("/>\n");
                     }
                 }
+                Ok(ArrayElements::Records { records }) => {
+                    for record in records {
+                        record_xml(out, record, depth + 1);
+                    }
+                }
+                Ok(ArrayElements::Scalars { code, values }) => {
+                    for value in values {
+                        open(out, "element", depth + 1);
+                        attribute(out, "type", format!("0x{code:04X}"));
+                        attribute(out, "typeName", value.type_name());
+                        attribute(out, "text", scalar_text(value));
+                        out.push_str("/>\n");
+                    }
+                }
             }
             close(out, "value", depth);
         }
@@ -795,6 +884,23 @@ fn value_xml(out: &mut String, value: &Value, depth: usize) {
             attribute(out, "bytes", bytes_hex(raw));
             out.push_str("/>\n");
         }
+        Value::Text(text) => {
+            open(out, "value", depth);
+            attribute(out, "kind", "text");
+            attribute(out, "word", hash64(text.word));
+            if let Resolution::Located(location) = text.resolution {
+                attribute(out, "block", location.block);
+                attribute(out, "blockOffset", location.offset);
+            }
+            if let Resolution::Fault(fault) = text.resolution {
+                attribute(out, "fault", fault_text(fault));
+            }
+            match &text.text {
+                Ok(value) => attribute(out, "text", value),
+                Err(reason) => attribute(out, "note", reason),
+            }
+            out.push_str("/>\n");
+        }
         Value::Descriptor {
             code,
             upper,
@@ -828,7 +934,7 @@ fn value_xml(out: &mut String, value: &Value, depth: usize) {
     }
 }
 
-fn record_xml(out: &mut String, record: &Record, depth: usize) {
+pub(crate) fn record_xml(out: &mut String, record: &Record, depth: usize) {
     open(out, "record", depth);
     attribute(out, "offset", record.offset);
     attribute(out, "structure", hash32(record.structure));
@@ -968,15 +1074,45 @@ pub fn document_xml(document: &Document, sample: usize, source: &[(&str, String)
                         open(&mut out, "entry", 2);
                         match entry {
                             PoolEntry::Text(text) => attribute(&mut out, "text", text.clone()),
+                            PoolEntry::Bytes(bytes) => {
+                                attribute(&mut out, "bytes", bytes_hex(bytes));
+                            }
                             PoolEntry::Hash32(value) => attribute(&mut out, "hash", hash32(*value)),
                             PoolEntry::Reference(word) => {
                                 attribute(&mut out, "word", hash64(*word));
+                            }
+                            PoolEntry::Word32(word) => {
+                                attribute(&mut out, "word", format!("0x{word:08X}"));
                             }
                             PoolEntry::Word64(word) => attribute(&mut out, "word", hash64(*word)),
                             PoolEntry::Word128(bytes) => {
                                 attribute(&mut out, "bytes", bytes_hex(bytes));
                             }
                         }
+                        out.push_str("/>\n");
+                    }
+                    close(&mut out, "block", 1);
+                } else {
+                    out.push_str("/>\n");
+                }
+            }
+            Content::Elements {
+                code,
+                width,
+                total,
+                entries,
+            } => {
+                attribute(&mut out, "kind", "elements");
+                attribute(&mut out, "type", format!("0x{code:04X}"));
+                attribute(&mut out, "width", width);
+                attribute(&mut out, "total", total);
+                attribute(&mut out, "decoded", entries.len());
+                if index < sample && !entries.is_empty() {
+                    out.push_str(">\n");
+                    for entry in entries {
+                        open(&mut out, "entry", 2);
+                        attribute(&mut out, "type", entry.type_name());
+                        attribute(&mut out, "text", scalar_text(entry));
                         out.push_str("/>\n");
                     }
                     close(&mut out, "block", 1);

@@ -11,18 +11,23 @@
 //! as identities and never replaces one with a name; [`Document::Rbf0`] keeps
 //! the names the payload stores. Neither is forced into the other's shape.
 
+use lforge_rage9::odrp;
+use lforge_rage9::psin::pso::Limits;
 use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::rbf0;
+use lforge_rage9::rpf::resource::PageSplit;
 use serde_json::{Value as Json, json};
 
 use crate::pso;
 
+pub use lforge_rage9::odrp::Document as OdrpDocument;
 pub use lforge_rage9::psin::pso::Document as PsoDocument;
 pub use lforge_rage9::rbf0::Document as Rbf0Document;
 
 /// The schema of the JSON document each format writes.
 pub const PSO_SCHEMA: &str = "leonida-forge.psin-document/1";
 pub const RBF0_SCHEMA: &str = "leonida-forge.rbf0-document/1";
+pub const ODRP_SCHEMA: &str = "leonida-forge.odrp-document/1";
 
 /// A decoded metadata document.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +36,8 @@ pub enum Document {
     Pso(PsoDocument),
     /// An `RBF0` payload.
     Rbf0(Rbf0Document),
+    /// A `0DRP` metadata resource.
+    Odrp(Box<OdrpDocument>),
 }
 
 /// Why a payload is not a document this build decodes.
@@ -42,6 +49,10 @@ pub enum Error {
     Pso(String),
     /// An `RBF0` payload that did not decode.
     Rbf0(String),
+    /// A `0DRP` resource that did not decode.
+    Odrp(String),
+    /// A `0DRP` resource whose graphics pages were not located.
+    OdrpNeedsPages,
 }
 
 impl std::fmt::Display for Error {
@@ -50,6 +61,10 @@ impl std::fmt::Display for Error {
             Error::Unknown => f.write_str("the payload is not a PSIN or RBF0 document"),
             Error::Pso(reason) => write!(f, "PSIN: {reason}"),
             Error::Rbf0(reason) => write!(f, "RBF0: {reason}"),
+            Error::Odrp(reason) => write!(f, "0DRP: {reason}"),
+            Error::OdrpNeedsPages => f.write_str(
+                "0DRP: the resource has graphics pages, so its page table is needed to locate them",
+            ),
         }
     }
 }
@@ -59,8 +74,18 @@ impl std::error::Error for Error {}
 /// Decodes a metadata payload by its own signature.
 ///
 /// `PSIN` is tried first because its magic is checked before anything is read
-/// and `RBF0`'s is equally specific; the two never share four bytes.
+/// and `RBF0`'s is equally specific; the two never share four bytes. A
+/// `0DRP` resource is recognised by its header shape and tag.
+///
+/// A resource with graphics pages needs the page split the caller reads from
+/// the row's page table; [`decode_with_split`] takes it. Without it, only a
+/// resource whose pages are all system data can be split.
 pub fn decode(payload: &[u8]) -> Result<Document, Error> {
+    decode_with_split(payload, None)
+}
+
+/// Decodes a metadata payload, splitting a `0DRP` resource with `split`.
+pub fn decode_with_split(payload: &[u8], split: Option<PageSplit>) -> Result<Document, Error> {
     if lforge_rage9::psin::is_psin(payload) {
         return lforge_rage9::psin::pso::decode(payload)
             .map(Document::Pso)
@@ -75,7 +100,33 @@ pub fn decode(payload: &[u8]) -> Result<Document, Error> {
         .map_err(|err| Error::Rbf0(err.to_string()))?;
         return Ok(Document::Rbf0(document));
     }
+    if odrp::is_odrp(payload) {
+        let (system, graphics) = match split {
+            Some(split) => {
+                let system_len = usize::try_from(split.system_len)
+                    .ok()
+                    .filter(|len| *len <= payload.len())
+                    .ok_or_else(|| {
+                        Error::Odrp("the page split is larger than the payload".to_string())
+                    })?;
+                payload.split_at(system_len)
+            }
+            None => match graphics_pages(payload) {
+                Some(0) => (payload, &[][..]),
+                _ => return Err(Error::OdrpNeedsPages),
+            },
+        };
+        let document = odrp::decode(system, graphics, &Limits::default())
+            .map_err(|err| Error::Odrp(err.to_string()))?;
+        return Ok(Document::Odrp(Box::new(document)));
+    }
     Err(Error::Unknown)
+}
+
+/// The page counts a `0DRP` payload's page map declares.
+fn graphics_pages(payload: &[u8]) -> Option<u8> {
+    let map = lforge_rage9::resource::page_map_offset(payload)? as usize;
+    Some(*payload.get(map + 9)?)
 }
 
 impl Document {
@@ -84,6 +135,7 @@ impl Document {
         match self {
             Document::Pso(_) => "pso",
             Document::Rbf0(_) => "rbf0",
+            Document::Odrp(_) => "0drp",
         }
     }
 
@@ -92,6 +144,7 @@ impl Document {
         match self {
             Document::Pso(_) => PSO_SCHEMA,
             Document::Rbf0(_) => RBF0_SCHEMA,
+            Document::Odrp(_) => ODRP_SCHEMA,
         }
     }
 
@@ -106,6 +159,7 @@ impl Document {
                 if whole { "decoded" } else { "partial" }
             }
             Document::Rbf0(document) => document.status(),
+            Document::Odrp(document) => document.status(),
         }
     }
 
@@ -124,6 +178,14 @@ impl Document {
                 document.names.len(),
                 document.depth()
             ),
+            Document::Odrp(document) => format!(
+                "{} structures, {} blocks, {} records, {} texts, depth {}",
+                document.structures.len(),
+                document.blocks.len(),
+                document.record_count(),
+                document.text_count(),
+                document.depth()
+            ),
         }
     }
 
@@ -134,6 +196,7 @@ impl Document {
         match self {
             Document::Pso(document) => pso::document_json(document, names, sample),
             Document::Rbf0(document) => crate::rbf0::document_json(document),
+            Document::Odrp(document) => crate::odrp::document_json(document, names, sample),
         }
     }
 
@@ -144,6 +207,7 @@ impl Document {
         match self {
             Document::Pso(document) => pso::document_xml(document, sample, source),
             Document::Rbf0(document) => crate::rbf0::document_xml(document, source),
+            Document::Odrp(document) => crate::odrp::document_xml(document, sample, source),
         }
     }
 
@@ -175,6 +239,7 @@ impl Document {
                     "textNodes": counts.text_nodes,
                 })
             }
+            Document::Odrp(document) => crate::odrp::counts_json(document),
         }
     }
 }
@@ -196,6 +261,54 @@ mod tests {
         bytes.extend_from_slice(&0_u16.to_le_bytes()); // attribute count
         bytes.extend_from_slice(&[0xFF, 0xFF]); // terminator
         bytes
+    }
+
+    /// A `0DRP` header with a page map that declares `graphics` graphics pages
+    /// and nothing else; enough to test dispatch and the split.
+    fn odrp_header(system_pages: u8, graphics_pages: u8) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x100];
+        let map = 0x80usize;
+        bytes[8..16].copy_from_slice(&(0x5000_0000u64 | map as u64).to_le_bytes());
+        bytes[0x10..0x14].copy_from_slice(b"0DRP");
+        bytes[0x14] = 0x7A;
+        bytes[0x20..0x24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[map + 8] = system_pages;
+        bytes[map + 9] = graphics_pages;
+        bytes
+    }
+
+    #[test]
+    fn a_resource_with_graphics_pages_needs_its_page_table() {
+        let payload = odrp_header(1, 1);
+        assert_eq!(decode(&payload).unwrap_err(), Error::OdrpNeedsPages);
+        assert!(matches!(
+            decode_with_split(&payload, None).unwrap_err(),
+            Error::OdrpNeedsPages
+        ));
+    }
+
+    #[test]
+    fn a_split_past_the_payload_is_refused() {
+        let payload = odrp_header(1, 1);
+        let split = PageSplit {
+            system_len: 0x1000,
+            graphics_len: 0,
+            system_pages: 1,
+            graphics_pages: 1,
+        };
+        assert!(matches!(
+            decode_with_split(&payload, Some(split)).unwrap_err(),
+            Error::Odrp(_)
+        ));
+    }
+
+    #[test]
+    fn a_resource_shaped_payload_is_dispatched_to_the_resource_decoder() {
+        // The tables are absent, so the decoder must report a resource
+        // problem rather than an unknown payload.
+        let payload = odrp_header(1, 0);
+        assert!(matches!(decode(&payload).unwrap_err(), Error::Odrp(_)));
+        assert_ne!(decode(&payload).unwrap_err(), Error::Unknown);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod classify;
 pub mod dictionary;
 pub mod inspect;
 pub mod metadata;
+pub mod odrp;
 pub mod pso;
 pub mod rbf0;
 pub mod registry;
