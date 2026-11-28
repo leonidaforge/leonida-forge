@@ -8,9 +8,11 @@
 //! vocabulary, not a grammar, so every path and every message keeps them
 //! apart.
 //!
-//! No tag, field, block or value gets a semantic name here. Value bodies and
-//! block contents stay opaque and bounded, and the checksum is reported
-//! separately from the structural parse.
+//! This module walks the framing and reports it without field meaning. The
+//! `LSCH` family also carries a self-describing schema and instance data,
+//! which [`pso`] decodes into typed structures, arrays, maps and references.
+
+pub mod pso;
 
 #[cfg(test)]
 mod tests;
