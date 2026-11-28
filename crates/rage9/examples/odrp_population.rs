@@ -110,8 +110,9 @@ struct Tally {
     shapes: BTreeMap<(u8, u8), u64>,
     /// Object type bytes.
     object_types: BTreeMap<u8, u64>,
-    /// Declared roots words.
-    declared_roots: BTreeMap<u32, u64>,
+    /// Root block words, and how many resources derive that same root.
+    root_block: BTreeMap<u32, u64>,
+    roots_agree: u64,
     /// Resources whose roots list is empty.
     without_roots: u64,
     /// Field and block type words, when `--types` asks.
@@ -267,7 +268,7 @@ impl Run {
                 "enums": document.header.enums,
                 "blocks": document.header.blocks,
                 "unknownWord": document.header.unknown,
-                "declaredRoots": document.header.declared_roots,
+                "declaredRoots": document.header.root_block,
                 "roots": document.roots,
                 "records": document.record_count(),
                 "depth": document.depth(),
@@ -354,11 +355,14 @@ impl Tally {
             .entry(document.header.object_type)
             .or_default() += 1;
         *self
-            .declared_roots
-            .entry(document.header.declared_roots)
+            .root_block
+            .entry(document.header.root_block)
             .or_default() += 1;
         if document.roots.is_empty() {
             self.without_roots += 1;
+        }
+        if document.roots.first() == Some(&document.header.root_block) {
+            self.roots_agree += 1;
         }
         if self.opened == 1 {
             self.min_bytes = bytes;
@@ -653,7 +657,11 @@ fn report(tally: &Tally, budget: &Budget, truncated: bool, roots: u64, types: bo
     }
     line(format!("page shapes:          {:?}", tally.shapes));
     line(format!("object type bytes:    {:?}", tally.object_types));
-    line(format!("declared root words:  {:?}", tally.declared_roots));
+    line(format!("root block words:     {:?}", tally.root_block));
+    line(format!(
+        "header root agrees:   {} of {}",
+        tally.roots_agree, tally.opened
+    ));
     line(format!(
         "resources without a derived root: {}",
         tally.without_roots

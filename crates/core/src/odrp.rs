@@ -216,7 +216,7 @@ pub fn document_json(
         "status": document.status(),
         "header": {
             "objectType": document.header.object_type,
-            "declaredRoots": document.header.declared_roots,
+            "rootBlock": document.header.root_block,
             "structures": document.header.structures,
             "enums": document.header.enums,
             "blocks": document.header.blocks,
@@ -256,7 +256,7 @@ pub fn document_json(
             "a structure or field name stays the 32-bit hash the schema stores; no name replaces it",
             "a block's type word is reported as stored; a type whose element width is not established keeps its bytes",
             "a map's two words are the number of bucket records and the number of entries they hold",
-            "the word at +0x20 and the pointer at +0x40 are reported as stored; no meaning is established for them",
+            "the pointer at +0x40 is reported as stored; no meaning is established for it",
             "the roots are derived from the decoded references, not stored as a list",
         ],
     })
@@ -282,7 +282,7 @@ pub fn document_xml(document: &Document, sample: usize, source: &[(&str, String)
 
     open(&mut out, "header", 1);
     attribute(&mut out, "objectType", document.header.object_type);
-    attribute(&mut out, "declaredRoots", document.header.declared_roots);
+    attribute(&mut out, "rootBlock", document.header.root_block);
     attribute(&mut out, "structures", document.header.structures);
     attribute(&mut out, "enums", document.header.enums);
     attribute(&mut out, "blocks", document.header.blocks);

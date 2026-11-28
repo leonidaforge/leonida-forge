@@ -311,6 +311,8 @@ fn decodes_a_record_and_its_text() {
     assert_eq!(document.record_count(), 1);
     assert_eq!(document.text_count(), 1);
     assert_eq!(document.roots, vec![1]);
+    assert_eq!(document.header.root_block, 1);
+    assert!(document.issues.is_empty(), "{:?}", document.issues);
     let Some(Content::Records { records, .. }) = document.blocks.first().map(|b| &b.content) else {
         panic!("the first block holds records");
     };
@@ -323,6 +325,28 @@ fn decodes_a_record_and_its_text() {
         panic!("the second field is a text reference");
     };
     assert_eq!(text.text.as_deref(), Ok("second"));
+}
+
+#[test]
+fn a_header_root_the_derived_roots_do_not_hold_is_reported() {
+    let (mut system, graphics) = text_document();
+    system[0x20..0x24].copy_from_slice(&2u32.to_le_bytes());
+    let document = decode(&system, &graphics).expect("a document");
+    assert_eq!(document.header.root_block, 2);
+    assert_eq!(document.roots, vec![1]);
+    assert!(
+        document
+            .issues
+            .iter()
+            .any(|issue| issue.contains("block 2")),
+        "{:?}",
+        document.issues
+    );
+    assert_eq!(
+        document.status(),
+        "decoded",
+        "a header note alone does not make a document partial"
+    );
 }
 
 #[test]

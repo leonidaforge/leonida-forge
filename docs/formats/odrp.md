@@ -38,7 +38,7 @@ segment.
 | `+0x10` | tag | `0DRP` |
 | `+0x14` | object type | `0x7A` in all 15,768 observed resources; meaning not established |
 | `+0x18` | zero | A zero `u64` |
-| `+0x20` | word | Constant per resource shape, ranges 0 to 89; meaning not established |
+| `+0x20` | root block | The block the header names as the root, counted from one; equals the derived root in all 15,768 resources |
 | `+0x28` | structure table | System pointer |
 | `+0x30` | enumeration table | System pointer, zero when there are none |
 | `+0x38` | block table | System pointer |
@@ -106,8 +106,9 @@ It returns an `odrp::Document`:
   length and `content`: `Records` of one structure, a `Pool` of a known element,
   `Elements` of a field code's scalars, or `Unsupported` with the reason.
 - `roots` — the structure blocks no decoded reference reaches, in block order.
-  The word at `+0x20` is not used for this, because no rule connecting it to
-  those blocks was established.
+  The derivation does not consult the header's root block, so the two readings
+  can be compared; a header root the derivation does not hold is reported as an
+  issue.
 - `issues`, `unsupported_blocks`, `unresolved_references`, `truncated` — what
   does not add up.
 
@@ -234,7 +235,8 @@ target/release/examples/odrp_population "<GAME_ROOT>/data.rpf" \
 | Page shapes (system, graphics) | (1, 0) 15,609, (2, 0) 159 |
 | Resources carrying enumerations | 1,310, 2,780 values in total |
 | Object type bytes | `0x7A`, 15,768 |
-| Declared root words | 1: 1,247, 2: 14,485, 3: 35, 89: 1 |
+| Root block words | 1: 1,247, 2: 14,485, 3: 35, 89: 1 |
+| Resources whose derived root is the header's root block | 15,768 of 15,768 |
 
 No observed resource had a graphics page, so no block was read from a graphics
 segment; the graphics path is covered by synthetic tests alone.
@@ -280,8 +282,8 @@ covered by tests.
 
 ## Remaining limits
 
-- The meaning of the word at `+0x20`, the fourth `u16` at `+0x4E` and the
-  pointer at `+0x40` is not established. They are reported, not interpreted.
+- The meaning of the fourth `u16` at `+0x4E` and of the pointer at `+0x40` is
+  not established. Both are reported, not interpreted.
 - A `0x44` text slot's layout is unknown, so its 16 bytes are kept and not read
   as text.
 - Four blocks in one resource cannot be divided; their bytes are kept.

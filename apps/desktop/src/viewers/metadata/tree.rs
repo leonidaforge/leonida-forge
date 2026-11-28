@@ -972,10 +972,10 @@ pub fn build_odrp(document: &lforge_rage9::odrp::Document, names: &Names) -> Tre
     );
     for (label, detail) in [
         (
-            "declared roots".to_string(),
+            "root block".to_string(),
             format!(
-                "{}  \u{00B7}  meaning not established; {} root blocks derived from the references",
-                header.declared_roots,
+                "{} at +0x20  \u{00B7}  {} root blocks derived from the references",
+                header.root_block,
                 document.roots.len()
             ),
         ),

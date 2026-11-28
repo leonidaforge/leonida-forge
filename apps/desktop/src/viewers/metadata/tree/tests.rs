@@ -604,7 +604,7 @@ fn resource_document() -> lforge_rage9::odrp::Document {
     lforge_rage9::odrp::Document {
         header: lforge_rage9::odrp::Header {
             object_type: 0x7a,
-            declared_roots: 1,
+            root_block: 1,
             structures: 1,
             enums: 0,
             blocks: 2,

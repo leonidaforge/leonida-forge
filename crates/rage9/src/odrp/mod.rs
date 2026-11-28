@@ -10,7 +10,7 @@
 //!
 //! - The system segment starts with a zero `u64`, a system pointer to the page
 //!   map at `+0x08`, the tag at `+0x10`, the object type at `+0x14`, a zero
-//!   `u64` at `+0x18` and a `u32` at `+0x20` whose meaning is not established.
+//!   `u64` at `+0x18` and the root block at `+0x20`.
 //! - `+0x28` addresses the structure table of 32-byte records, `+0x30` the
 //!   enumeration table of 24-byte records (zero when there are none), `+0x38`
 //!   the block table of 16-byte records and `+0x40` a system pointer the
@@ -132,9 +132,11 @@ pub struct Header {
     /// The object type byte after the tag. `0x7A` in every observed resource;
     /// its meaning is not established.
     pub object_type: u8,
-    /// The word at `+0x20`. Constant per resource shape; meaning not
-    /// established.
-    pub declared_roots: u32,
+    /// The block the header names as the document's root, counted from one.
+    /// Every one of the 15,768 decoded resources stores the number of the block
+    /// the derived roots hold, so the word reads as a root block rather than a
+    /// count. Zero means the header names no root.
+    pub root_block: u32,
     pub structures: u16,
     pub enums: u16,
     pub blocks: u16,
@@ -170,8 +172,8 @@ pub struct Document {
     pub enums: Vec<Enumeration>,
     pub blocks: Vec<Block>,
     /// Structure blocks no decoded reference reaches, in block order. Derived
-    /// from the decoded references; the word at `+0x20` is not used, because
-    /// no rule connecting it to these blocks was established.
+    /// from the decoded references, independently of [`Header::root_block`], so
+    /// the two readings can be compared.
     pub roots: Vec<u32>,
     /// What does not add up and what was not decoded.
     pub issues: Vec<String>,
@@ -330,7 +332,32 @@ fn decode_with(system: &[u8], graphics: &[u8], limits: &Limits) -> Result<Docume
     reader.read_blocks(header)?;
     let mut document = reader.finish(header);
     document.roots = derive_roots(&document);
+    check_root(&mut document);
     Ok(document)
+}
+
+/// Reports a header root block the derived roots do not hold and the block
+/// table does not name. Both readings agree across the observed population, so
+/// a disagreement is worth a note rather than a silent choice of one of them.
+fn check_root(document: &mut Document) {
+    let root = document.header.root_block;
+    if root == 0 {
+        document
+            .issues
+            .push("the header names no root block".to_string());
+        return;
+    }
+    if document.roots.contains(&root) {
+        return;
+    }
+    let reason = if document.blocks.iter().any(|block| block.index == root) {
+        "a reference reaches it"
+    } else {
+        "the block table does not name it"
+    };
+    document.issues.push(format!(
+        "the header names block {root} as the root, and {reason}"
+    ));
 }
 
 /// The two reconstructed segments of a resource.
@@ -381,7 +408,7 @@ fn read_header(system: &[u8]) -> Result<Header, Error> {
     };
     Ok(Header {
         object_type: head[0x14],
-        declared_roots: u32_at(head, 0x20).expect("0x20 fits the header"),
+        root_block: u32_at(head, 0x20).expect("0x20 fits the header"),
         structures: u16_at(head, 0x48).expect("0x48 fits the header"),
         enums: u16_at(head, 0x4a).expect("0x4a fits the header"),
         blocks: u16_at(head, 0x4c).expect("0x4c fits the header"),
