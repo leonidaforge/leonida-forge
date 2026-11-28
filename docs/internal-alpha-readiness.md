@@ -114,6 +114,13 @@ pushed.
 - The window names the resource by its canonical path, the same string the CLI
   reports, so a row inside a nested archive shows the whole chain and never the
   temporary file it was decompressed into.
+- The `.zmt` population the archives on disk reach is 865 rows, counted by
+  outcome: 837 carry the `PSIN` signature, of which 686 decode completely, 89
+  keep at least one block whose type no structure or pool defines, and 62 are
+  the `PMAP` family; 27 are `RBF0` payloads and 1 is the `0DRP` resource form.
+  None is text. The counts are exhaustive for that population and say nothing
+  about the 4,664 `.zmt` rows inside archives stored in `data.rpf`, which a
+  recursive search reaches but which were not decoded when this was written.
 
 ## Unsupported functionality
 
@@ -133,12 +140,14 @@ pushed.
   codec, decodes no audio and does not materialise packets; KB2 decodes no frame
   and names no codec; texture dictionaries expose their records but decode no
   pixel and resolve no texture reference.
-- Metadata containers that are not the `LSCH` family get no viewer. A `PMAP`
-  container is reported as the family it is and its instance data is not
-  decoded; an `RBF0` payload and the `0DRP` resource form are recognised and
-  open in the Binary Inspector, not in the metadata viewer. A block whose type
-  names neither a structure nor a pool keeps its bytes and is reported as
-  unsupported rather than guessed at.
+- Metadata containers whose instance data is not decoded still open, and say so.
+  A `PMAP` container carries the `PSIN` signature, so it opens in the metadata
+  viewer, which reports the `PMAP` family and that its instance data is not
+  decoded; the bytes stay reachable through File → Open in Binary Inspector.
+  An `RBF0` payload and the `0DRP` resource form are not metadata containers;
+  they are recognised by signature and open in the Binary Inspector directly.
+  A block whose type names neither a structure nor a pool keeps its bytes and
+  is reported as unsupported rather than guessed at.
 - Vertex semantics. A drawable's bounds, layout codes, declaration bytes, index
   descriptor fields and material parameter values are reported as stored values.
   No vertex position, triangle, mesh or texture reference is reconstructed, and
@@ -242,6 +251,13 @@ clean-machine test.
   renderer demo is a debug-only tool.
 - A recovered entry can be partial or unverified. The status is shown, and an
   export keeps the caveat, but the bytes are not proof of an original file.
+- A metadata container is read into memory before it is decoded, so a decoded
+  container larger than the 64 MiB materialisation cap is refused with the
+  existing message rather than opened. The largest decoded container observed
+  is 17,406,784 bytes.
+- The metadata viewer is not covered by a GUI test. The tree, the routing rule,
+  the canonical window title and the decoder are unit tested; the rendered
+  window was not inspected interactively.
 
 ## User-visible failure behaviour
 
