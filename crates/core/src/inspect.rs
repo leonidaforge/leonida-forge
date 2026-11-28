@@ -7,8 +7,10 @@
 //! whose meaning the research does not establish is reported as the number it
 //! stores, and an unknown region as a range.
 //!
-//! `PSIN` is reported as a recognised magic only. Nothing relates it to a
-//! confirmed PSO format, and this module does not claim otherwise.
+//! `PSIN` is recognised by its magic and walked by its own framing. The
+//! `LSCH` family also carries a self-describing schema and instance data,
+//! which is decoded into a typed document; the `PMAP` family is reported as a
+//! recognised framing with no decoded structure.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lforge_rage9::gfx;
 use lforge_rage9::rbf0;
 use lforge_rage9::rds5::{self, Container, Storage};
+use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::{adat, edup, kb2, psin};
 use serde_json::{Map, Value, json};
 
@@ -24,8 +27,8 @@ use serde_json::{Map, Value, json};
 /// meaning.
 pub const SCHEMA: &str = "leonida-forge.format-inspection/2";
 
-/// Bytes read to recognise a format.
-pub const SIGNATURE_LEN: usize = 16;
+/// Bytes read to recognise a format. The metadata resource tag sits at `+0x10`.
+pub const SIGNATURE_LEN: usize = 0x14;
 /// Blocks and entries shown by default.
 pub const DEFAULT_SAMPLE: usize = 8;
 /// The largest sample a caller may request.
@@ -63,7 +66,14 @@ pub const PSIN: FormatInfo = FormatInfo {
     id: "psin",
     name: "PSIN",
     support: "structural",
-    detail: "the section walk, the LSCH and PMAP families, the block and section tables and the CHKS checksum; no field meaning",
+    detail: "the section walk, the LSCH schema and instance blocks, the PMAP and PSCH tables and the CHKS checksum",
+};
+
+pub const META_RESOURCE: FormatInfo = FormatInfo {
+    id: "meta-resource",
+    name: "metadata resource",
+    support: "recognition",
+    detail: "the `0DRP` tag and the object type byte; the self-describing tables are not decoded here",
 };
 
 pub const EDUP: FormatInfo = FormatInfo {
@@ -175,6 +185,8 @@ pub enum Summary {
         sections: usize,
         /// `verified`, `mismatched` or `unsupported`.
         checksum: &'static str,
+        /// What the `LSCH` family decoded, when it decoded.
+        decoded: Option<crate::pso::Counts>,
     },
     Edup {
         count: u32,
@@ -208,6 +220,10 @@ pub enum Summary {
         /// Top-level tags, then nested records.
         tags: usize,
         max_depth: usize,
+    },
+    /// The `0DRP` form of the same metadata, which this build does not decode.
+    MetaResource {
+        object_type: u8,
     },
     Rpf9,
 }
@@ -244,6 +260,8 @@ pub fn recognise(head: &[u8]) -> Option<FormatInfo> {
         Some(GFX)
     } else if psin::is_psin(head) {
         Some(PSIN)
+    } else if head.get(0x10..0x14) == Some(b"0DRP") {
+        Some(META_RESOURCE)
     } else if edup::is_edup(head) {
         Some(EDUP)
     } else if adat::is_adat(head) {
@@ -266,6 +284,18 @@ pub fn inspect<R: Read + Seek>(
     options: &Options,
     cancel: &AtomicBool,
 ) -> Result<Report, String> {
+    inspect_with_names(source, len, options, None, cancel)
+}
+
+/// Inspects `source`, naming the metadata structure and field hashes that
+/// `names` reproduces.
+pub fn inspect_with_names<R: Read + Seek>(
+    source: &mut R,
+    len: u64,
+    options: &Options,
+    names: Option<&Names>,
+    cancel: &AtomicBool,
+) -> Result<Report, String> {
     let signature =
         lforge_binary::read_at(source, 0, SIGNATURE_LEN).map_err(|err| err.to_string())?;
     let format = recognise(&signature);
@@ -273,10 +303,11 @@ pub fn inspect<R: Read + Seek>(
         Some(format) if format == RDS5 => rds5_structure(source, len, options, cancel),
         Some(format) if format == RBF0 => rbf0_structure(source, len, options, cancel),
         Some(format) if format == GFX => gfx_structure(source, len, options, cancel),
-        Some(format) if format == PSIN => psin_structure(source, len, options, cancel),
+        Some(format) if format == PSIN => psin_structure(source, len, options, names, cancel),
         Some(format) if format == EDUP => edup_structure(source, len, options, cancel),
         Some(format) if format == ADAT => adat_structure(source, len, options, cancel),
         Some(format) if format == KB2 => kb2_structure(source, len, options, cancel),
+        Some(format) if format == META_RESOURCE => meta_resource_structure(source, cancel),
         Some(format) if format == RPF9 => (rpf9_structure(), Some(Summary::Rpf9), None),
         _ => (Value::Null, None, None),
     };
@@ -1025,6 +1056,7 @@ fn psin_structure<R: Read + Seek>(
     source: &mut R,
     len: u64,
     options: &Options,
+    names: Option<&Names>,
     cancel: &AtomicBool,
 ) -> (Value, Option<Summary>, Option<Failure>) {
     let bytes = match read_bounded(source, len, cancel) {
@@ -1043,6 +1075,33 @@ fn psin_structure<R: Read + Seek>(
     match psin::parse(&bytes) {
         Ok(report) => {
             let sample = options.sample.clamp(1, MAX_SAMPLE);
+            // The instance data of the `LSCH` family decodes into typed
+            // structures. The other families stop at the framing.
+            let empty = Names::empty();
+            let names = names.unwrap_or(&empty);
+            let (metadata, decoded) = match psin::pso::decode(&bytes) {
+                Ok(document) => {
+                    let counts = crate::pso::counts(&document);
+                    let shown = if options.blocks { usize::MAX } else { sample };
+                    (
+                        json!({
+                            "status": "decoded",
+                            "document": crate::pso::document_json(&document, names, shown),
+                        }),
+                        Some(counts),
+                    )
+                }
+                Err(psin::pso::Error::Unsupported { family, first_tag }) => (
+                    json!({
+                        "status": "unsupported",
+                        "family": family,
+                        "firstTag": first_tag,
+                        "reason": "the container is recognised but its family has no decoded structure here",
+                    }),
+                    None,
+                ),
+                Err(err) => (json!({ "status": "failed", "error": err.to_string() }), None),
+            };
             let sections: Vec<Value> = report
                 .sections
                 .iter()
@@ -1129,6 +1188,7 @@ fn psin_structure<R: Read + Seek>(
                     psin::Checksum::Unsupported => json!({ "status": "unsupported" }),
                 },
                 "issues": report.issues,
+                "metadata": metadata,
                 "unknown_regions": [
                     { "field": "PSCH value contents", "reason": "bounded by offsets, not decoded" },
                     { "field": "LSCH marker fields and tail", "reason": "no field meaning is established" },
@@ -1137,7 +1197,7 @@ fn psin_structure<R: Read + Seek>(
                 ],
                 "limitations": [
                     "the two families share a tag vocabulary, not a grammar; every result names its family",
-                    "no tag, field, block or value is assigned a semantic meaning",
+                    "the LSCH family decodes its own schema; the PMAP family is framing only",
                     "the checksum is reported separately from the structural parse",
                     "the trailing NUL of the id-1 block is an observation, not a requirement",
                 ],
@@ -1146,6 +1206,7 @@ fn psin_structure<R: Read + Seek>(
                 family: report.family.name(),
                 sections: report.sections.len(),
                 checksum: report.checksum.name(),
+                decoded,
             };
             (structure, Some(summary), None)
         }
@@ -1519,6 +1580,46 @@ fn rpf9_structure() -> Value {
             "a nested archive is traversed with `--enter`, not parsed here",
         ],
     })
+}
+
+/// Reads the `0DRP` tag and the object type byte of the resource form of the
+/// metadata. The self-describing tables that follow are a separate layout from
+/// the `PSIN` container, and this build does not decode them.
+fn meta_resource_structure<R: Read + Seek>(
+    source: &mut R,
+    cancel: &AtomicBool,
+) -> (Value, Option<Summary>, Option<Failure>) {
+    let head = match lforge_binary::read_at(source, 0, 0x15) {
+        Ok(head) => head,
+        Err(err) => {
+            return (
+                json!({ "valid": false, "error": err.to_string() }),
+                None,
+                Some(Failure {
+                    stage: "header",
+                    message: err.to_string(),
+                }),
+            );
+        }
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return (Value::Null, None, None);
+    }
+    let object_type = head.get(0x14).copied();
+    let structure = json!({
+        "valid": true,
+        "tag": "0DRP",
+        "object_type": object_type,
+        "limitations": [
+            "the self-describing tables of the resource form are not decoded; the PSIN container of the same metadata is",
+            "no field, block or value of this form is assigned a meaning",
+        ],
+    });
+    (
+        structure,
+        object_type.map(|object_type| Summary::MetaResource { object_type }),
+        None,
+    )
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ pub mod archive;
 pub mod classify;
 pub mod dictionary;
 pub mod inspect;
+pub mod pso;
 pub mod registry;
 pub mod resource;
 pub mod zip;
