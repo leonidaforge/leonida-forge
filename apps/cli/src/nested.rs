@@ -167,14 +167,7 @@ impl Resolved {
         self.chain
             .last()
             .map(|level| level.resource.clone())
-            .unwrap_or_else(|| {
-                ResourcePath::root(
-                    self.root
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| self.root.display().to_string()),
-                )
-            })
+            .unwrap_or_else(|| ResourcePath::root(crate::rows::table_name(&self.root)))
     }
 
     /// The provenance block of an inspection document.
@@ -261,11 +254,7 @@ pub fn resolve_with(
     let mut current = Current {
         path: file.to_path_buf(),
         format: root_format,
-        resource: ResourcePath::root(
-            file.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| file.display().to_string()),
-        ),
+        resource: ResourcePath::root(crate::rows::table_name(file)),
         temp: None,
     };
     let mut chain = Vec::with_capacity(enters.len());

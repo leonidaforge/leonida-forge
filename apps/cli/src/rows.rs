@@ -323,9 +323,9 @@ impl Listing {
     }
 }
 
-/// How a file on disk is named in output: its own file name, so a search over
-/// an installation reports the archives the user would name.
-fn table_name(path: &Path) -> String {
+/// How a file on disk is named in output: its own file name, so every command
+/// and the desktop agree about the file a resource was read from.
+pub(crate) fn table_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -664,8 +664,42 @@ struct Pending {
     chain: Vec<u32>,
     /// How many archives it was reached through; a file on disk is 0.
     depth: usize,
+    /// The path of the root file as the scan found it, for `--archive`.
+    locator: String,
     /// An archive already opened, or `None` for a file on disk not yet opened.
     opened: Option<Box<Opened>>,
+}
+
+/// The root name of every scanned archive: its file name, except where two
+/// archives of the scan share one, which is then qualified by the directory
+/// below the search root.
+fn root_names(archives: &[PathBuf], root: &Path) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for archive in archives {
+        *counts.entry(table_name(archive)).or_default() += 1;
+    }
+    archives
+        .iter()
+        .map(|archive| {
+            let name = table_name(archive);
+            match counts.get(&name) {
+                Some(&1) | None => name,
+                _ => locator(archive, root, false),
+            }
+        })
+        .collect()
+}
+
+/// Where the scan found a root file, relative to the search root.
+fn locator(archive: &Path, root: &Path, single: bool) -> String {
+    if single {
+        return table_name(archive);
+    }
+    archive
+        .strip_prefix(root)
+        .unwrap_or(archive)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Whether `entry` declares the archive type, so a search may enter it.
@@ -699,27 +733,21 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         .archive
         .as_ref()
         .map(|filter| filter.to_ascii_lowercase());
-    // A file on disk is named by its path under the search root, so `--archive`
-    // keeps selecting by directory; a single file is named by its file name.
-    let name_of = |archive: &Path| {
-        if single {
-            table_name(archive)
-        } else {
-            archive
-                .strip_prefix(&root)
-                .unwrap_or(archive)
-                .to_string_lossy()
-                .replace('\\', "/")
-        }
-    };
+    // A root file is named by its file name, as the canonical path contract
+    // requires and as the desktop names the file it opens. Two archives of one
+    // scan that share a name would then collide, so those few are qualified by
+    // the directory that tells them apart.
+    let names = root_names(&archives, &root);
     // Files on disk first, in scan order, then the archives inside them in row
     // order, so the output order does not depend on how the walk is scheduled.
     let mut pending: Vec<Pending> = archives
         .iter()
+        .zip(names)
         .rev()
-        .map(|archive| Pending {
+        .map(|(archive, name)| Pending {
             origin: archive.clone(),
-            path: ResourcePath::root(name_of(archive)),
+            path: ResourcePath::root(name),
+            locator: locator(archive, &root, single),
             chain: Vec::new(),
             depth: 0,
             opened: None,
@@ -729,12 +757,16 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("cancelled".to_string());
         }
+        // A filter selects on the identity or on the directory the root file
+        // was found in, so `--archive pack/story000` keeps working even though
+        // the identity of that file is its name alone.
         if let Some(filter) = &filter
             && !item
                 .path
                 .archive_display()
                 .to_ascii_lowercase()
                 .contains(filter)
+            && !item.locator.to_ascii_lowercase().contains(filter)
         {
             continue;
         }
@@ -839,6 +871,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                     children.push(Pending {
                         origin: item.origin.clone(),
                         path: child,
+                        locator: item.locator.clone(),
                         chain,
                         depth: item.depth + 1,
                         opened: Some(Box::new(nested)),
@@ -1005,6 +1038,48 @@ fn write_line(writer: &mut dyn Write, value: &Value) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_file_is_named_by_its_file_name() {
+        // The canonical contract names a file on disk by its name alone, so a
+        // search agrees with the desktop about the file it opened.
+        let root = Path::new("D:/GAME");
+        let archives = vec![root.join("data.rpf"), root.join("pack/a/story.rpf")];
+        assert_eq!(
+            root_names(&archives, root),
+            vec!["data.rpf".to_string(), "story.rpf".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_shared_file_name_is_qualified_by_its_directory() {
+        // Two archives of one scan that share a name would otherwise claim the
+        // same identity, so those few keep the directory that tells them apart.
+        let root = Path::new("D:/GAME");
+        let archives = vec![
+            root.join("data.rpf"),
+            root.join("pack/a/data.rpf"),
+            root.join("story.rpf"),
+        ];
+        assert_eq!(
+            root_names(&archives, root),
+            vec![
+                "data.rpf".to_string(),
+                "pack/a/data.rpf".to_string(),
+                "story.rpf".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_directory_of_a_root_file_stays_filterable() {
+        // `--archive pack/a` must keep selecting by directory even though the
+        // identity of that file is its name alone.
+        let root = Path::new("D:/GAME");
+        let archive = root.join("pack/a/story.rpf");
+        assert_eq!(locator(&archive, root, false), "pack/a/story.rpf");
+        assert_eq!(locator(&archive, root, true), "story.rpf");
+    }
 
     fn entry(name_hash: Option<u64>, name_key: Option<u32>) -> Entry {
         Entry {
