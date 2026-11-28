@@ -245,6 +245,12 @@ pub(crate) fn scalar_json(scalar: &Scalar, names: &Names) -> Json {
         Scalar::U32(inner) => value["value"] = json!(inner),
         Scalar::I32(inner) => value["value"] = json!(inner),
         Scalar::U64(inner) => value["value"] = json!(inner),
+        Scalar::F16(inner) | Scalar::F32(inner) if !inner.is_finite() => {
+            // A JSON number cannot carry these, and `null` alone would read as
+            // "no value", so the reading is spelled beside it.
+            value["value"] = Json::Null;
+            value["valueText"] = json!(float_text(f64::from(*inner)));
+        }
         Scalar::F16(inner) | Scalar::F32(inner) => value["value"] = json!(inner),
         Scalar::Hash32(inner) => {
             value["value"] = json!(hash32(*inner));
@@ -259,6 +265,20 @@ pub(crate) fn scalar_json(scalar: &Scalar, names: &Names) -> Json {
     value
 }
 
+/// The reading of a number a JSON number cannot carry: `NaN`, `Infinity` or
+/// `-Infinity`. Every finite number reads as itself.
+fn float_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_string()
+    } else if value == f64::INFINITY {
+        "Infinity".to_string()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 pub(crate) fn scalar_text(scalar: &Scalar) -> String {
     match scalar {
         Scalar::Bool(inner) => inner.to_string(),
@@ -269,7 +289,7 @@ pub(crate) fn scalar_text(scalar: &Scalar) -> String {
         Scalar::U32(inner) => inner.to_string(),
         Scalar::I32(inner) => inner.to_string(),
         Scalar::U64(inner) => inner.to_string(),
-        Scalar::F16(inner) | Scalar::F32(inner) => inner.to_string(),
+        Scalar::F16(inner) | Scalar::F32(inner) => float_text(f64::from(*inner)),
         Scalar::Hash32(inner) => hash32(*inner),
         Scalar::Hash64(inner) => hash64(*inner),
         Scalar::Vector { values, count } => values[..usize::from(*count)]
@@ -625,10 +645,21 @@ pub(crate) fn escape(text: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            // A character XML 1.0 cannot carry has no character reference, so
+            // it is spelled out; dropping it would hide that it was there.
+            other if !is_xml_text(other) => {
+                out.push_str(&format!("\\u{{{:X}}}", other as u32));
+            }
             other => out.push(other),
         }
     }
     out
+}
+
+/// Whether XML 1.0 may carry `character` at all.
+fn is_xml_text(character: char) -> bool {
+    matches!(character,
+        '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
 pub(crate) fn attribute(out: &mut String, name: &str, value: impl std::fmt::Display) {

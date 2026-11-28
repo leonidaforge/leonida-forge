@@ -285,3 +285,25 @@ fn a_resolved_name_is_an_attribute_beside_the_hash() {
         "fRainbow"
     );
 }
+
+#[test]
+fn a_character_xml_cannot_carry_is_spelled_out() {
+    let escaped = escape("bell\u{7}tab\ttail");
+    assert_eq!(escaped, "bell\\u{7}tab\ttail");
+    assert!(!escaped.chars().any(|character| character == '\u{7}'));
+}
+
+#[test]
+fn a_number_json_cannot_carry_keeps_its_reading() {
+    use lforge_rage9::psin::pso::Scalar;
+
+    let names = Names::empty();
+    let nan = scalar_json(&Scalar::F32(f32::NAN), &names);
+    assert!(nan["value"].is_null());
+    assert_eq!(nan["valueText"], "NaN");
+    let infinite = scalar_json(&Scalar::F32(f32::NEG_INFINITY), &names);
+    assert_eq!(infinite["valueText"], "-Infinity");
+    let finite = scalar_json(&Scalar::F32(1.5), &names);
+    assert_eq!(finite["value"], 1.5);
+    assert!(finite.get("valueText").is_none());
+}
