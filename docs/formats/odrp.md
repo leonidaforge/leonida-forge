@@ -65,6 +65,9 @@ lie in the system segment and another in the graphics segment.
 A reference is a `u64` of `(byte offset << 20) | block`, the block counted from
 one, zero for null. A reference names a block and an offset in that block; it
 never names a segment directly, which is why one word addresses either segment.
+The offset field is 44 bits wide; an offset wider than 32 bits names no location
+this decoder can address, so it is reported as a fault rather than truncated to
+a smaller offset that would bind somewhere else.
 
 ### Values
 
@@ -93,6 +96,11 @@ A block's type word says what the block holds:
 - A field code whose element width the type table establishes: a pool of
   scalars of that type.
 - Anything else: kept as bytes, counted as unsupported.
+
+A pool whose byte length is not a whole number of its elements, and a text block
+whose last string has no terminator, are also kept as unsupported with the
+reason, rather than read as an empty pool: the block's bytes are accounted for
+and the document reports `partial`.
 
 ## The document model
 
@@ -143,6 +151,11 @@ its segment, so a hostile resource cannot read outside the payload. A block or
 record count above a limit sets `truncated` and reports how many were read; it
 never allocates past the limit.
 
+An embedded record spends the same value budget as a record of a block, so one
+record that embeds the same structure many times cannot multiply the work past
+the document's budget; the resource is refused with a limit error instead. The
+largest observed resource (290,795 records, 14,876,672 bytes) reaches no limit.
+
 ## Shared metadata API
 
 `lforge_core::metadata::decode` returns `Document::Odrp` when the payload
@@ -164,6 +177,22 @@ A `0DRP` document adds to the API surface:
 The JSON keeps a block's type word as a hash with `typeCandidates` beside it,
 states each block's segment and offset, and lists the roots with the records
 each holds. The XML carries the same values with `source` provenance.
+
+Three serialization rules apply to values of either form, because the writers
+are shared:
+
+- A text value the document could not read is `"text": null` with a `note`
+  naming why, never an empty string.
+- A number JSON cannot carry keeps its reading: a non-finite float is
+  `"value": null` with `"valueText"` of `NaN`, `Infinity` or `-Infinity`.
+- A character XML 1.0 cannot represent is written as its `\u{...}` spelling, so
+  the document stays well-formed instead of losing that the character was there.
+  No text value of the population carries one.
+
+Measured on the largest resource: the JSON export is 38.8 MiB, takes 3.2 s and
+peaks at 510 MB of working set. The export builds the whole document in memory
+before writing it, as the `PSIN` path already does; the population walk never
+serializes.
 
 ## CLI
 
@@ -195,7 +224,9 @@ builds rows:
 - `issues` — whatever the decoder reported.
 
 The status line reads `{status} · {rows} rows · {names} hashes named ·
-{texts} text values`, so a resource that reports text values says so.
+{texts} text values`, so a resource that reports text values says so. It also
+reports the decoder's issue count and, when the row cap stops the build, that
+the rows are capped.
 
 ## Validation
 
