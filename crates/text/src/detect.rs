@@ -317,8 +317,8 @@ mod tests {
             detect_bytes(b"caf\xE9\n", None),
             Detection::Binary(BinaryReason::InvalidUtf8)
         );
-        // The user can still open it as Latin-1, which decodes every byte.
-        let (text, malformed) = encoding::decode(b"caf\xE9\n", Encoding::Latin1);
+        // The user can still open it as Windows-1252, which maps every byte.
+        let (text, malformed) = encoding::decode(b"caf\xE9\n", Encoding::WINDOWS_1252);
         assert_eq!(text, "café\n");
         assert_eq!(malformed, 0);
     }

@@ -1,19 +1,24 @@
 //! Line-addressed, read-only access to a text payload of any size.
 //!
 //! A document is built by one sequential pass over the payload that records
-//! where each line starts and how wide it is. The payload itself is never held
-//! in memory: lines are decoded on demand from bounded byte ranges, so a
-//! document of any size opens, and only the lines a caller asks for are
-//! decoded.
+//! where each line starts, how many display columns it occupies and how many
+//! sequences could not be decoded. The payload itself is never held in memory:
+//! lines are decoded on demand from bounded byte ranges, so a document of any
+//! size opens, and only the lines a caller asks for are decoded.
 //!
 //! Lines end at LF, CR or CRLF, in every supported encoding, and the two forms
 //! may be mixed in one payload. A terminator is not part of the line. A final
 //! terminator does not create an empty last line.
+//!
+//! Display columns are terminal cells, not characters: a combining mark takes
+//! no cell, and a wide character takes two. That is what keeps match positions,
+//! the caret and selection aligned on text that is not ASCII.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_binary::Source;
+use unicode_width::UnicodeWidthChar;
 
 use crate::encoding::{self, Encoding};
 
@@ -94,6 +99,10 @@ pub struct Document {
     /// Display columns of each line, with tabs expanded to [`TAB_WIDTH`].
     columns: Vec<u32>,
     max_columns: u32,
+    /// Sequences the index pass could not decode: replacement characters a
+    /// decode produces, and a line of a legacy code page with unmapped bytes
+    /// counts as one.
+    malformed: u64,
 }
 
 impl Document {
@@ -121,8 +130,10 @@ impl Document {
             starts: Vec::new(),
             columns: Vec::new(),
             max_columns: 0,
+            malformed: 0,
             next_start: bom_len,
             columns_so_far: 0,
+            line_bytes: Vec::new(),
             cancel,
         };
         let mut reader = source.clone();
@@ -137,8 +148,8 @@ impl Document {
             if count == 0 {
                 break;
             }
-            progress(bom_len + read + count as u64, len);
             read += count as u64;
+            progress(bom_len + read, len);
             let mut window: Vec<u8> = Vec::with_capacity(carrier.len() + count);
             window.extend_from_slice(&carrier);
             window.extend_from_slice(&buffer[..count]);
@@ -155,6 +166,7 @@ impl Document {
             starts: indexer.starts,
             columns: indexer.columns,
             max_columns: indexer.max_columns,
+            malformed: indexer.malformed,
         })
     }
 
@@ -172,6 +184,12 @@ impl Document {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Sequences the index pass could not decode. A non-zero count means the
+    /// text shown contains replacement characters that the payload does not.
+    pub fn malformed(&self) -> u64 {
+        self.malformed
     }
 
     pub fn line_count(&self) -> usize {
@@ -203,10 +221,22 @@ impl Document {
     /// [`MAX_BLOCK_BYTES`], so a block of short lines does not cause one read
     /// per line.
     pub fn read_lines(&self, first: usize, count: usize) -> Result<Vec<String>, Error> {
+        self.read_lines_cancellable(first, count, &AtomicBool::new(false))
+    }
+
+    /// [`read_lines`] that stops between reads once `cancel` is set, so a
+    /// superseded block does not keep decoding.
+    pub fn read_lines_cancellable(
+        &self,
+        first: usize,
+        count: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<String>, Error> {
         let count = count.min(self.line_count().saturating_sub(first));
         let mut lines = Vec::with_capacity(count);
         let mut line = first;
         while line < first + count {
+            cancelled(cancel)?;
             // Pick the largest run of lines whose bytes fit in one read.
             let mut end = line + 1;
             while end < first + count && self.starts[end] - self.starts[line] <= MAX_BLOCK_BYTES {
@@ -277,7 +307,7 @@ fn strip_terminator(bytes: &[u8], encoding: Encoding) -> &[u8] {
     }
     let is = |at: usize, expected: u16| -> bool {
         match encoding {
-            Encoding::Utf8 | Encoding::Latin1 => bytes[at] as u16 == expected,
+            Encoding::Utf8 | Encoding::Legacy(_) => bytes[at] as u16 == expected,
             Encoding::Utf16Le => {
                 bytes.len() >= at + 2 && u16::from_le_bytes([bytes[at], bytes[at + 1]]) == expected
             }
@@ -300,18 +330,6 @@ fn strip_terminator(bytes: &[u8], encoding: Encoding) -> &[u8] {
     bytes
 }
 
-/// Walks a payload's units and records line starts and widths.
-struct Indexer<'a> {
-    encoding: Encoding,
-    starts: Vec<u64>,
-    columns: Vec<u32>,
-    max_columns: u32,
-    /// Absolute offset of the line being measured.
-    next_start: u64,
-    columns_so_far: u32,
-    cancel: &'a AtomicBool,
-}
-
 /// What one encoded unit is, and how many bytes it occupies.
 #[derive(Clone, Copy)]
 struct Unit {
@@ -319,8 +337,37 @@ struct Unit {
     line_feed: bool,
     carriage_return: bool,
     tab: bool,
-    /// A trailing UTF-16 surrogate is the second half of the previous character.
-    continuation: bool,
+    width: u32,
+    malformed: bool,
+}
+
+impl Unit {
+    fn new(len: usize, width: u32, malformed: bool) -> Self {
+        Self {
+            len,
+            line_feed: false,
+            carriage_return: false,
+            tab: false,
+            width,
+            malformed,
+        }
+    }
+}
+
+/// Walks a payload's units and records line starts and widths.
+struct Indexer<'a> {
+    encoding: Encoding,
+    starts: Vec<u64>,
+    columns: Vec<u32>,
+    max_columns: u32,
+    malformed: u64,
+    /// Absolute offset of the line being measured.
+    next_start: u64,
+    columns_so_far: u32,
+    /// The current line's bytes, for a legacy code page, whose widths are only
+    /// known once the line is decoded.
+    line_bytes: Vec<u8>,
+    cancel: &'a AtomicBool,
 }
 
 impl Indexer<'_> {
@@ -329,49 +376,86 @@ impl Indexer<'_> {
         match self.encoding {
             Encoding::Utf8 => {
                 let lead = *rest.first()?;
+                if lead == b'\n' || lead == b'\r' || lead == b'\t' {
+                    let mut unit = Unit::new(1, 1, false);
+                    unit.line_feed = lead == b'\n';
+                    unit.carriage_return = lead == b'\r';
+                    unit.tab = lead == b'\t';
+                    return Some(unit);
+                }
+                // The length a well-formed sequence needs, from its lead byte.
                 let len = match lead {
                     0x00..=0x7F => 1,
                     0xC2..=0xDF => 2,
                     0xE0..=0xEF => 3,
                     0xF0..=0xF4 => 4,
-                    // A continuation byte or an invalid lead is its own unit.
-                    _ => 1,
+                    _ => {
+                        // A continuation byte or a byte no sequence starts
+                        // with.
+                        return Some(Unit::new(1, 1, true));
+                    }
                 };
+                if len == 1 {
+                    return Some(Unit::new(1, 1, false));
+                }
                 if rest.len() < len {
                     return None;
                 }
-                Some(Unit {
-                    len,
-                    line_feed: lead == b'\n',
-                    carriage_return: lead == b'\r',
-                    tab: lead == b'\t',
-                    continuation: false,
-                })
+                match std::str::from_utf8(&rest[..len]) {
+                    Ok(text) => {
+                        let c = text.chars().next().unwrap_or('\u{FFFD}');
+                        Some(Unit::new(len, column_width(c, 0), false))
+                    }
+                    Err(_) => Some(Unit::new(1, 1, true)),
+                }
             }
-            Encoding::Latin1 => {
+            Encoding::Legacy(_) => {
                 let byte = *rest.first()?;
-                Some(Unit {
-                    len: 1,
-                    line_feed: byte == b'\n',
-                    carriage_return: byte == b'\r',
-                    tab: byte == b'\t',
-                    continuation: false,
-                })
+                if byte == b'\n' || byte == b'\r' || byte == b'\t' {
+                    let mut unit = Unit::new(1, 0, false);
+                    unit.line_feed = byte == b'\n';
+                    unit.carriage_return = byte == b'\r';
+                    unit.tab = byte == b'\t';
+                    return Some(unit);
+                }
+                // One byte, of unknown width until the line is decoded.
+                Some(Unit::new(1, 0, false))
             }
             Encoding::Utf16Le | Encoding::Utf16Be => {
-                let pair = rest.get(..2)?;
-                let unit = if self.encoding == Encoding::Utf16Be {
-                    u16::from_be_bytes([pair[0], pair[1]])
-                } else {
-                    u16::from_le_bytes([pair[0], pair[1]])
+                let big_endian = self.encoding == Encoding::Utf16Be;
+                let read = |pair: &[u8]| {
+                    if big_endian {
+                        u16::from_be_bytes([pair[0], pair[1]])
+                    } else {
+                        u16::from_le_bytes([pair[0], pair[1]])
+                    }
                 };
-                Some(Unit {
-                    len: 2,
-                    line_feed: unit == 0x0A,
-                    carriage_return: unit == 0x0D,
-                    tab: unit == 0x09,
-                    continuation: (0xDC00..0xE000).contains(&unit),
-                })
+                let first = read(rest.get(..2)?);
+                if first == 0x0A || first == 0x0D || first == 0x09 {
+                    let mut unit = Unit::new(2, 1, false);
+                    unit.line_feed = first == 0x0A;
+                    unit.carriage_return = first == 0x0D;
+                    unit.tab = first == 0x09;
+                    return Some(unit);
+                }
+                if (0xD800..0xDC00).contains(&first) {
+                    // A pair is one character; a high surrogate alone is not.
+                    let pair = rest.get(2..4);
+                    let low = pair.map(read);
+                    match low {
+                        Some(low) if (0xDC00..0xE000).contains(&low) => {
+                            Some(Unit::new(4, 1, false))
+                        }
+                        Some(_) => Some(Unit::new(2, 1, true)),
+                        // The second unit has not been read yet.
+                        None => None,
+                    }
+                } else if (0xDC00..0xE000).contains(&first) {
+                    Some(Unit::new(2, 1, true))
+                } else {
+                    let c = char::from_u32(u32::from(first)).unwrap_or('\u{FFFD}');
+                    Some(Unit::new(2, column_width(c, 0), false))
+                }
             }
         }
     }
@@ -404,7 +488,10 @@ impl Indexer<'_> {
                 at += unit.len;
                 continue;
             }
-            self.wide(unit);
+            if self.encoding.is_legacy() {
+                self.line_bytes.extend_from_slice(&bytes[at..at + unit.len]);
+            }
+            self.measure(unit);
             at += unit.len;
         }
         Ok(at)
@@ -428,8 +515,15 @@ impl Indexer<'_> {
                 at += width;
                 continue;
             }
-            self.wide(unit);
+            if self.encoding.is_legacy() {
+                self.line_bytes.extend_from_slice(&bytes[at..at + unit.len]);
+            }
+            self.measure(unit);
             at += unit.len;
+        }
+        if at < bytes.len() {
+            // A truncated sequence at the very end.
+            self.malformed += 1;
         }
         if self.next_start < len {
             self.push_line()?;
@@ -437,14 +531,17 @@ impl Indexer<'_> {
         Ok(())
     }
 
-    fn wide(&mut self, unit: Unit) {
-        if unit.continuation {
+    fn measure(&mut self, unit: Unit) {
+        if unit.malformed {
+            self.malformed += 1;
+        }
+        if self.encoding.is_legacy() {
             return;
         }
         if unit.tab {
             self.columns_so_far += TAB_WIDTH - self.columns_so_far % TAB_WIDTH;
         } else {
-            self.columns_so_far += 1;
+            self.columns_so_far += unit.width;
         }
     }
 
@@ -465,12 +562,36 @@ impl Indexer<'_> {
         if self.starts.len().is_multiple_of(4096) {
             cancelled(self.cancel)?;
         }
+        if self.encoding.is_legacy() {
+            let (text, errors) = encoding::decode(&self.line_bytes, self.encoding);
+            self.malformed += errors as u64;
+            self.columns_so_far = display_columns(&text);
+            self.line_bytes.clear();
+        }
         self.starts.push(self.next_start);
         self.columns.push(self.columns_so_far);
         self.max_columns = self.max_columns.max(self.columns_so_far);
         self.columns_so_far = 0;
         Ok(())
     }
+}
+
+/// The columns one character occupies, with tabs advancing to the next stop.
+pub fn column_width(c: char, column: u32) -> u32 {
+    if c == '\t' {
+        TAB_WIDTH - column % TAB_WIDTH
+    } else {
+        c.width().unwrap_or(0) as u32
+    }
+}
+
+/// The display columns of `text`, with tabs expanded.
+pub fn display_columns(text: &str) -> u32 {
+    let mut column = 0;
+    for c in text.chars() {
+        column += column_width(c, column);
+    }
+    column
 }
 
 /// The display column a byte offset falls on, with tabs expanded.
@@ -480,30 +601,60 @@ pub fn column_at_byte(text: &str, byte: usize, tab_width: u32) -> u32 {
         if at >= byte {
             return column;
         }
-        column += if c == '\t' {
-            tab_width - column % tab_width
-        } else {
-            1
-        };
+        column += width_at(c, column, tab_width);
     }
     column
 }
 
 /// The byte offset of the character at a display column, or the end of the
-/// line when the column is beyond it.
+/// line when the column is beyond it. A column inside a wide character maps to
+/// that character's first byte, and a zero-width character maps to the one it
+/// is drawn over.
 pub fn byte_index_at_column(text: &str, column: u32, tab_width: u32) -> usize {
     let mut at_column = 0;
     for (at, c) in text.char_indices() {
-        if at_column >= column {
+        let width = width_at(c, at_column, tab_width);
+        if width == 0 {
+            continue;
+        }
+        if at_column + width > column {
             return at;
         }
-        at_column += if c == '\t' {
-            tab_width - at_column % tab_width
-        } else {
-            1
-        };
+        at_column += width;
     }
     text.len()
+}
+
+/// The text shown from `start` columns, taking at most `width` columns.
+///
+/// The returned string may start before `start` when `start` falls inside a
+/// wide character, and the second value is the column it really starts on. A
+/// zero-width character at the start of the slice stays with the character it
+/// belongs to, which is on the previous row when a line wraps.
+pub fn slice_columns(text: &str, start: u32, width: u32) -> (String, u32) {
+    let mut from = byte_index_at_column(text, start, TAB_WIDTH);
+    if start > 0 {
+        while let Some(c) = text[from..].chars().next() {
+            if c.width().is_some_and(|width| width == 0) {
+                from += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    let actual = column_at_byte(text, from, TAB_WIDTH);
+    let limit = actual + width;
+    let mut slice = String::new();
+    let mut column = actual;
+    for c in text[from..].chars() {
+        if column >= limit {
+            break;
+        }
+        let advance = column_width(c, column);
+        slice.push(c);
+        column += advance;
+    }
+    (slice, actual)
 }
 
 /// The text as it is shown: tabs replaced by the spaces they advance over.
@@ -520,10 +671,18 @@ pub fn expand_tabs(text: &str, tab_width: u32) -> String {
             column += spaces;
         } else {
             out.push(c);
-            column += 1;
+            column += width_at(c, column, tab_width);
         }
     }
     out
+}
+
+fn width_at(c: char, column: u32, tab_width: u32) -> u32 {
+    if c == '\t' {
+        tab_width - column % tab_width
+    } else {
+        c.width().unwrap_or(0) as u32
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +746,23 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_of_only_a_mark_has_no_lines() {
+        let document = open(b"\xEF\xBB\xBF", Encoding::Utf8);
+        assert_eq!(document.line_count(), 0);
+        assert_eq!(document.bom_len(), 3);
+        assert_eq!(document.len(), 3);
+        assert_eq!(document.malformed(), 0);
+    }
+
+    #[test]
+    fn a_short_file_is_one_line() {
+        let document = open(b"x", Encoding::Utf8);
+        assert_eq!(document.line_count(), 1);
+        assert_eq!(document.line_columns(0), 1);
+        assert_eq!(document.read_line(0).unwrap(), "x");
+    }
+
+    #[test]
     fn utf16_without_a_mark_splits_on_its_own_terminators() {
         let bytes: Vec<u8> = "alpha\r\nbeta"
             .encode_utf16()
@@ -614,6 +790,42 @@ mod tests {
     }
 
     #[test]
+    fn combining_marks_take_no_column() {
+        // "e" followed by U+0301 is one cell.
+        let text = "e\u{301}x";
+        assert_eq!(display_columns(text), 2);
+        assert_eq!(column_at_byte(text, 3, TAB_WIDTH), 1);
+        assert_eq!(byte_index_at_column(text, 1, TAB_WIDTH), 3);
+        let (slice, start) = slice_columns(text, 1, 1);
+        assert_eq!(slice, "x");
+        assert_eq!(start, 1);
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns() {
+        let text = "中a";
+        assert_eq!(display_columns(text), 3);
+        assert_eq!(column_at_byte(text, 3, TAB_WIDTH), 2);
+        assert_eq!(byte_index_at_column(text, 1, TAB_WIDTH), 0);
+        let (slice, start) = slice_columns(text, 1, 2);
+        assert_eq!(slice, "中");
+        assert_eq!(start, 0);
+    }
+
+    #[test]
+    fn slice_columns_reads_only_the_window() {
+        let text = "abcdef";
+        let (slice, start) = slice_columns(text, 2, 3);
+        assert_eq!(slice, "cde");
+        assert_eq!(start, 2);
+        let (slice, start) = slice_columns(text, 4, 10);
+        assert_eq!(slice, "ef");
+        assert_eq!(start, 4);
+        let (slice, _) = slice_columns(text, 9, 4);
+        assert!(slice.is_empty());
+    }
+
+    #[test]
     fn a_block_crossing_chunk_boundaries_is_identical() {
         let mut text = String::new();
         for index in 0..20_000 {
@@ -636,6 +848,60 @@ mod tests {
         assert_eq!(document.line_count(), 1);
         let text = document.read_line(0).unwrap();
         assert!(text.starts_with("ab"));
+        assert_eq!(document.malformed(), 1);
+    }
+
+    #[test]
+    fn malformed_sequences_are_counted_wherever_they_are() {
+        // A valid prefix followed by an invalid byte far into the payload.
+        let mut bytes = vec![b'a'; 100_000];
+        bytes.extend_from_slice(b"\nvalid\n");
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        bytes.extend_from_slice(b"\nend\n");
+        let document = open(&bytes, Encoding::Utf8);
+        assert_eq!(document.line_count(), 4);
+        assert!(
+            document.malformed() >= 3,
+            "three invalid bytes were counted as {}",
+            document.malformed()
+        );
+    }
+
+    #[test]
+    fn an_unpaired_utf16_surrogate_is_malformed() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&[0x00, 0xD8]); // high surrogate alone
+        bytes.extend_from_slice(&[0x0A, 0x00]);
+        bytes.extend_from_slice(&[0x41, 0x00]);
+        let document = open(&bytes, Encoding::Utf16Le);
+        assert_eq!(document.malformed(), 1);
+        assert_eq!(document.line_count(), 2);
+    }
+
+    #[test]
+    fn a_legacy_code_page_is_decoded_per_line() {
+        // Shift_JIS "\u{3042}" (two bytes, two columns), a tab to column 4, then "x".
+        let document = open(
+            &[0x82, 0xA0, b'\t', b'x', b'\r', b'\n'],
+            Encoding::SHIFT_JIS,
+        );
+        assert_eq!(document.line_count(), 1);
+        assert_eq!(document.line_columns(0), 5);
+        assert_eq!(document.read_line(0).unwrap(), "あ\tx");
+        assert_eq!(document.malformed(), 0);
+    }
+
+    #[test]
+    fn the_same_bytes_index_differently_in_two_encodings() {
+        let mut bytes = Vec::new();
+        bytes.extend("ab\r\ncd".encode_utf16().flat_map(u16::to_le_bytes));
+        let utf16 = open(&bytes, Encoding::Utf16Le);
+        assert_eq!(utf16.line_count(), 2);
+        assert_eq!(utf16.line_columns(0), 2);
+        // Read as UTF-8 the same bytes hold NULs and split on the same bytes.
+        let utf8 = open(&bytes, Encoding::Utf8);
+        assert_ne!(utf8.line_count(), utf16.line_count());
+        assert_ne!(utf8.line_columns(0), utf16.line_columns(0));
     }
 
     #[test]
@@ -646,6 +912,16 @@ mod tests {
         let cancel = AtomicBool::new(true);
         assert!(matches!(
             Document::load(source, Encoding::Utf8, &cancel, |_, _| {}),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_block_read_stops() {
+        let document = open(b"one\ntwo\n", Encoding::Utf8);
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            document.read_lines_cancellable(0, 2, &cancel),
             Err(Error::Cancelled)
         ));
     }
