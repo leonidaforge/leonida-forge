@@ -468,7 +468,8 @@ pub fn open_nested(
             }
         },
     };
-    let nested = open_metadata_at(source, name, MAX_METADATA, executable, cancel).map_err(failed)?;
+    let nested =
+        open_metadata_at(source, name, MAX_METADATA, executable, cancel).map_err(failed)?;
     Ok((nested, spooled))
 }
 

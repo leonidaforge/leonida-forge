@@ -27,7 +27,8 @@ impl Builder {
     }
 
     fn structure(mut self, name: u32, size: u32, fields: Vec<Field>) -> Self {
-        self.structures.push((name, 0x5a5a_5a5a, 0x300, size, fields));
+        self.structures
+            .push((name, 0x5a5a_5a5a, 0x300, size, fields));
         self
     }
 
@@ -253,10 +254,7 @@ fn decodes_records_and_values() {
     // Offsets are container-relative, so the second record follows the first
     // by the structure's size.
     assert_eq!(records[1].offset, records[0].offset + 8);
-    assert_eq!(
-        records[1].fields[0].value,
-        Value::Scalar(Scalar::F32(2.5))
-    );
+    assert_eq!(records[1].fields[0].value, Value::Scalar(Scalar::F32(2.5)));
     assert_eq!(
         records[1].fields[1].value,
         Value::Scalar(Scalar::Hash32(0xcafe_babe))
@@ -270,10 +268,7 @@ fn decodes_records_and_values() {
         panic!("the first field embeds a structure");
     };
     assert_eq!(embedded.structure, VECTOR);
-    assert_eq!(
-        embedded.fields[0].value,
-        Value::Scalar(Scalar::F32(3.5))
-    );
+    assert_eq!(embedded.fields[0].value, Value::Scalar(Scalar::F32(3.5)));
     let Value::Reference(reference) = &record.fields[1].value else {
         panic!("the second field is a reference");
     };
@@ -361,7 +356,11 @@ fn resolves_enumeration_members() {
     let mut record = Vec::new();
     record.extend_from_slice(&7u32.to_le_bytes());
     let payload = Builder::new()
-        .structure(ROOT, 4, vec![field(0xcccc_0001, 0, TYPE_ENUM32, ENUMERATION)])
+        .structure(
+            ROOT,
+            4,
+            vec![field(0xcccc_0001, 0, TYPE_ENUM32, ENUMERATION)],
+        )
         .enumeration(ENUMERATION, vec![(0, 0x0100), (7, 0x0200)])
         .block(ROOT, record)
         .build();
@@ -481,16 +480,16 @@ fn truncates_an_oversized_block_and_says_so() {
         ..Limits::default()
     };
     let document = decode_with(&payload, limits).expect("decodes the first record");
-    let Content::Records {
-        total, records, ..
-    } = &document.blocks[0].content
-    else {
+    let Content::Records { total, records, .. } = &document.blocks[0].content else {
         panic!("a structure block");
     };
     assert_eq!(*total, 2);
     assert_eq!(records.len(), 1);
     assert!(
-        document.issues.iter().any(|issue| issue.contains("records")),
+        document
+            .issues
+            .iter()
+            .any(|issue| issue.contains("records")),
         "{:?}",
         document.issues
     );
@@ -623,7 +622,10 @@ fn a_record_count_that_does_not_fit_its_structure_is_reported() {
         .block(ROOT, vec![0u8; 12])
         .build();
     let document = decode(&payload).expect("the container decodes");
-    assert!(matches!(document.blocks[0].content, Content::Unsupported(_)));
+    assert!(matches!(
+        document.blocks[0].content,
+        Content::Unsupported(_)
+    ));
 }
 
 #[test]

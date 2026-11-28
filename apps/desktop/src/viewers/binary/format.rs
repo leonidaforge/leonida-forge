@@ -184,10 +184,7 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
                         ));
                     }
                 }
-                None => fields.push((
-                    "Schema",
-                    "not decoded for this family".to_string(),
-                )),
+                None => fields.push(("Schema", "not decoded for this family".to_string())),
             }
             fields
         }

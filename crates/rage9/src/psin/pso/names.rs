@@ -139,10 +139,7 @@ mod tests {
     #[test]
     fn a_name_resolves_by_its_own_hash() {
         let names = Names::from_table(&table("fMass\n"));
-        assert_eq!(
-            names.lookup(metadata_hash(b"fMass")),
-            ["fMass".to_string()]
-        );
+        assert_eq!(names.lookup(metadata_hash(b"fMass")), ["fMass".to_string()]);
         assert!(!names.resolves(metadata_hash(b"fmass")));
     }
 

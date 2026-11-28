@@ -159,9 +159,7 @@ fn a_resolved_name_is_shown_beside_the_hash() {
     let row = tree
         .rows
         .iter()
-        .find(|row| {
-            row.label.contains(&format!("0x{hash:08X}")) && row.detail.contains("hash32")
-        })
+        .find(|row| row.label.contains(&format!("0x{hash:08X}")) && row.detail.contains("hash32"))
         .expect("the value row");
     assert!(row.label.contains("fRainbow"), "{}", row.label);
     assert_eq!(row.tone, Tone::Accent);

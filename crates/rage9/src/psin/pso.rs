@@ -117,8 +117,14 @@ pub fn type_width(code: u16, upper: u16) -> Option<u32> {
             _ => return None,
         },
         TYPE_VEC3_12 => 12,
-        TYPE_VEC3_16 | TYPE_VEC4 | TYPE_STRING | TYPE_BITSET | TYPE_INLINE_ARRAY
-        | TYPE_ARRAY | TYPE_ARRAY_LENGTH_FIRST | TYPE_MAP_LENGTH_FIRST => 16,
+        TYPE_VEC3_16
+        | TYPE_VEC4
+        | TYPE_STRING
+        | TYPE_BITSET
+        | TYPE_INLINE_ARRAY
+        | TYPE_ARRAY
+        | TYPE_ARRAY_LENGTH_FIRST
+        | TYPE_MAP_LENGTH_FIRST => 16,
         TYPE_MAP => 24,
         _ => return None,
     })
@@ -372,7 +378,10 @@ pub enum Scalar {
     /// A 64-bit hash or identifier.
     Hash64(u64),
     /// Three or four single-precision components.
-    Vector { values: [f32; 4], count: u8 },
+    Vector {
+        values: [f32; 4],
+        count: u8,
+    },
 }
 
 impl Scalar {
@@ -568,7 +577,9 @@ pub enum Value {
     Map(Box<MapValue>),
     Bitset(Bitset),
     /// A text field: 16 bytes whose text storage is not established.
-    TextSlot { raw: [u8; 16] },
+    TextSlot {
+        raw: [u8; 16],
+    },
     /// An array or map element, key or value descriptor. It describes the
     /// element's type and occupies no storage.
     Descriptor {
@@ -846,7 +857,12 @@ pub fn decode_with(payload: &[u8], limits: Limits) -> Result<Document, Error> {
                 position + 1
             ));
         }
-        layout.push((position as u32 + 1, descriptor.word, at as u32, descriptor.len));
+        layout.push((
+            position as u32 + 1,
+            descriptor.word,
+            at as u32,
+            descriptor.len,
+        ));
         at = padded;
     }
     if at != body_len {
@@ -1275,15 +1291,15 @@ fn read_record(
         )));
     }
     if active.contains(&(structure.name, at)) {
-        return Err(malformed(format!(
-            "the structure at {at:#x} embeds itself"
-        )));
+        return Err(malformed(format!("the structure at {at:#x} embeds itself")));
     }
     active.push((structure.name, at));
     let mut fields = Vec::with_capacity(structure.fields.len());
     for field in &structure.fields {
         let extent = structure.extent(field);
-        let value = read_value(payload, document, structure, field, at, budget, active, depth)?;
+        let value = read_value(
+            payload, document, structure, field, at, budget, active, depth,
+        )?;
         fields.push(FieldValue {
             field: *field,
             extent,
@@ -1319,7 +1335,10 @@ fn read_value(
             code,
             upper: field.upper(),
             auxiliary: field.auxiliary,
-            raw: payload.get(start as usize..end).unwrap_or_default().to_vec(),
+            raw: payload
+                .get(start as usize..end)
+                .unwrap_or_default()
+                .to_vec(),
         }
     };
     if field.is_descriptor() {
@@ -1355,9 +1374,11 @@ fn read_value(
         },
         TYPE_ARRAY | TYPE_ARRAY_LENGTH_FIRST | TYPE_MAP | TYPE_MAP_LENGTH_FIRST => {
             match read_span(payload, start, code) {
-                Some(words) if matches!(code, TYPE_ARRAY | TYPE_ARRAY_LENGTH_FIRST) => Ok(
-                    Value::Array(read_array(payload, document, structure, field, words, budget)),
-                ),
+                Some(words) if matches!(code, TYPE_ARRAY | TYPE_ARRAY_LENGTH_FIRST) => {
+                    Ok(Value::Array(read_array(
+                        payload, document, structure, field, words, budget,
+                    )))
+                }
                 Some(words) => Ok(Value::Map(Box::new(read_map(
                     payload, document, field, words, budget,
                 )))),
@@ -1914,10 +1935,7 @@ fn read_inline_array(
     budget.spend(count)?;
     let mut links = Vec::with_capacity(count);
     for chunk in bytes.as_chunks::<8>().0.iter().take(count) {
-        links.push(bind_reference(
-            document,
-            u64::from_le_bytes(*chunk),
-        ));
+        links.push(bind_reference(document, u64::from_le_bytes(*chunk)));
     }
     Ok(Value::Array(ArrayValue {
         span: Span {

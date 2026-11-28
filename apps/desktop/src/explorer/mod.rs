@@ -2201,7 +2201,10 @@ fn opens_as_metadata(classification: Option<&lforge_core::classify::Classificati
 /// A format this build reads structurally never does, even when a byte-level
 /// check would accept it: a `PSIN` container carries printable names, and the
 /// structured view is the honest one.
-fn opens_as_text(capability: Option<lforge_core::classify::Capability>, bytes_are_text: bool) -> bool {
+fn opens_as_text(
+    capability: Option<lforge_core::classify::Capability>,
+    bytes_are_text: bool,
+) -> bool {
     match capability {
         Some(lforge_core::classify::Capability::Text) => true,
         Some(lforge_core::classify::Capability::Archive)

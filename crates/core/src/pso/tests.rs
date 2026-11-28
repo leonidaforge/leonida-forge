@@ -3,8 +3,8 @@
 
 use super::*;
 use lforge_rage9::psin::pso::{
-    Block, Content, Document, Enumeration, EnumValue, Field, FieldValue, PoolEntry, Record,
-    Scalar, Structure, Value,
+    Block, Content, Document, EnumValue, Enumeration, Field, FieldValue, PoolEntry, Record, Scalar,
+    Structure, Value,
 };
 use lforge_rage9::rpf::names::StringTable;
 
@@ -49,7 +49,10 @@ fn document() -> Document {
             64,
             vec![
                 (structure.fields[0], Value::Scalar(Scalar::F32(1.5))),
-                (structure.fields[1], Value::Scalar(Scalar::Hash32(0xdead_beef))),
+                (
+                    structure.fields[1],
+                    Value::Scalar(Scalar::Hash32(0xdead_beef)),
+                ),
                 (
                     structure.fields[2],
                     Value::Unresolved {
@@ -65,7 +68,10 @@ fn document() -> Document {
             76,
             vec![
                 (structure.fields[0], Value::Scalar(Scalar::F32(-2.0))),
-                (structure.fields[1], Value::Scalar(Scalar::Hash32(0x1234_5678))),
+                (
+                    structure.fields[1],
+                    Value::Scalar(Scalar::Hash32(0x1234_5678)),
+                ),
                 (
                     structure.fields[2],
                     Value::Unresolved {
@@ -109,7 +115,10 @@ fn document() -> Document {
                 content: Content::Pool {
                     kind: lforge_rage9::psin::pso::PoolKind::Hash32,
                     total: 2,
-                    entries: vec![PoolEntry::Hash32(0xaaaa_aaaa), PoolEntry::Hash32(0xbbbb_bbbb)],
+                    entries: vec![
+                        PoolEntry::Hash32(0xaaaa_aaaa),
+                        PoolEntry::Hash32(0xbbbb_bbbb),
+                    ],
                 },
             },
         ],
@@ -175,7 +184,10 @@ fn a_sampled_json_view_keeps_the_counts_but_not_the_records() {
 
 #[test]
 fn the_xml_view_is_well_formed_and_carries_the_same_facts() {
-    let source = [("archive", "example.rpf".to_string()), ("row", "7".to_string())];
+    let source = [
+        ("archive", "example.rpf".to_string()),
+        ("row", "7".to_string()),
+    ];
     let text = document_xml(&document(), usize::MAX, &source);
     let parsed = roxmltree::Document::parse(&text).expect("the XML parses");
     let root = parsed.root_element();
@@ -264,6 +276,12 @@ fn a_resolved_name_is_an_attribute_beside_the_hash() {
     let mut document = document();
     document.structures[0].fields[0].name = hash;
     let value = document_json(&document, &names, usize::MAX);
-    assert_eq!(value["structures"][0]["fields"][0]["name"], format!("0x{hash:08X}"));
-    assert_eq!(value["structures"][0]["fields"][0]["nameCandidates"]["name"], "fRainbow");
+    assert_eq!(
+        value["structures"][0]["fields"][0]["name"],
+        format!("0x{hash:08X}")
+    );
+    assert_eq!(
+        value["structures"][0]["fields"][0]["nameCandidates"]["name"],
+        "fRainbow"
+    );
 }

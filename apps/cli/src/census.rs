@@ -866,7 +866,10 @@ impl Engine<'_> {
             }
             Err(native::NestedError::SpoolBudget { .. }) => {
                 self.stop("max_spool_bytes");
-                Err(format!("row {} would exceed the --max-spool-bytes limit", entry.row))
+                Err(format!(
+                    "row {} would exceed the --max-spool-bytes limit",
+                    entry.row
+                ))
             }
             Err(err) => Err(err.to_string()),
         }
@@ -1199,4 +1202,3 @@ fn hex(bytes: &[u8]) -> String {
     }
     text
 }
-

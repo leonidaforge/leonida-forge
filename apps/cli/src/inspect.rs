@@ -657,7 +657,11 @@ fn write_metadata(
     let document = lforge_rage9::psin::pso::decode(&bytes).map_err(|err| err.to_string())?;
     let empty = Names::empty();
     let names = options.metadata_names.as_ref().unwrap_or(&empty);
-    let sample = if options.blocks { usize::MAX } else { options.sample };
+    let sample = if options.blocks {
+        usize::MAX
+    } else {
+        options.sample
+    };
     let source = [
         ("archive", path_string(origin)),
         ("row", row.to_string()),
@@ -683,7 +687,10 @@ fn write_metadata(
     ];
     let provenance = json!({
         "archive": path_string(origin),
-        "read_from": path_string(read),
+        // An entered archive is decompressed into temporary storage, and that
+        // path names nothing a reader could open, so it is never recorded. The
+        // canonical resource path already names the chain.
+        "read_from": resolved.chain.is_empty().then(|| path_string(read)),
         "resource": resource,
         "row": row,
         "name_hash": entry.name_hash.clone().ok().flatten().map(|hash| format!("0x{hash:016X}")),

@@ -70,9 +70,8 @@ impl MetadataViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let title = identity(&path, resource.as_deref());
-        let filter = cx.new(|cx| {
-            ui::text_field::TextField::new("Filter structures, fields, values", cx)
-        });
+        let filter =
+            cx.new(|cx| ui::text_field::TextField::new("Filter structures, fields, values", cx));
         let decode = cx.background_spawn({
             let path = path.clone();
             async move { decode(&path, &access) }
@@ -162,8 +161,7 @@ impl MetadataViewer {
         if visible.is_empty() {
             return;
         }
-        let next = (self.selected as isize + delta)
-            .clamp(0, visible.len() as isize - 1) as usize;
+        let next = (self.selected as isize + delta).clamp(0, visible.len() as isize - 1) as usize;
         self.select(next, cx);
     }
 
@@ -335,7 +333,12 @@ impl Render for MetadataViewer {
         let focused = self.focus.is_focused(window);
         let visible = self.visible(cx);
         let (status, summary, source, names) = match &self.state {
-            State::Loading => ("loading", "Reading the container…".to_string(), String::new(), 0),
+            State::Loading => (
+                "loading",
+                "Reading the container…".to_string(),
+                String::new(),
+                0,
+            ),
             State::Failed(err) => ("failed", err.clone(), String::new(), 0),
             State::Ready(ready) => (
                 ready.tree.status,
@@ -344,17 +347,16 @@ impl Render for MetadataViewer {
                 ready.names,
             ),
         };
-        let issues = self
-            .ready()
-            .map_or(0, |ready| ready.tree.issues.len());
+        let issues = self.ready().map_or(0, |ready| ready.tree.issues.len());
         let truncated = self.ready().is_some_and(|ready| ready.tree.truncated);
         let row_count = self.ready().map_or(0, |ready| ready.tree.rows.len());
 
         let content: AnyElement = match &self.state {
             State::Loading => ui::centered_message("Reading the metadata container.", None),
-            State::Failed(err) => {
-                ui::centered_message("This metadata container cannot be decoded.", Some(err.clone()))
-            }
+            State::Failed(err) => ui::centered_message(
+                "This metadata container cannot be decoded.",
+                Some(err.clone()),
+            ),
             State::Ready(_) => uniform_list(
                 "metadata-rows",
                 visible.len(),

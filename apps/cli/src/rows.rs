@@ -74,7 +74,13 @@ impl Listing {
     ) -> Result<Self, String> {
         let opened = native::open_metadata_cancellable(path, MAX_METADATA, executable, cancel)?;
         let root = table_name(path);
-        Self::from_opened(path, ResourcePath::root(root), Vec::new(), opened, name_files)
+        Self::from_opened(
+            path,
+            ResourcePath::root(root),
+            Vec::new(),
+            opened,
+            name_files,
+        )
     }
 
     /// Resolves the rows of an archive already read from `origin`, a file on
@@ -284,11 +290,12 @@ impl Listing {
         // The rows entered to reach this archive, so a caller can select it
         // again with `--enter`. A row index addresses an entry only inside one
         // archive; it is never the resource identity.
-        record["entered"] = json!(self
-            .chain
-            .iter()
-            .map(|row| format!("row:{row}"))
-            .collect::<Vec<String>>());
+        record["entered"] = json!(
+            self.chain
+                .iter()
+                .map(|row| format!("row:{row}"))
+                .collect::<Vec<String>>()
+        );
         if let Some(resource) = self.resource(position) {
             record["resource"] = json!({
                 "display": resource.display(),
@@ -723,7 +730,11 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             return Err("cancelled".to_string());
         }
         if let Some(filter) = &filter
-            && !item.path.archive_display().to_ascii_lowercase().contains(filter)
+            && !item
+                .path
+                .archive_display()
+                .to_ascii_lowercase()
+                .contains(filter)
         {
             continue;
         }
@@ -791,7 +802,9 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
             let entry = &listing.entries[position];
             if !is_archive(
                 entry,
-                entry.type_id().and_then(|type_id| listing.extension(type_id)),
+                entry
+                    .type_id()
+                    .and_then(|type_id| listing.extension(type_id)),
             ) {
                 continue;
             }

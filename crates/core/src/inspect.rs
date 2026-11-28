@@ -16,9 +16,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lforge_rage9::gfx;
+use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::rbf0;
 use lforge_rage9::rds5::{self, Container, Storage};
-use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::{adat, edup, kb2, psin};
 use serde_json::{Map, Value, json};
 
@@ -1100,7 +1100,10 @@ fn psin_structure<R: Read + Seek>(
                     }),
                     None,
                 ),
-                Err(err) => (json!({ "status": "failed", "error": err.to_string() }), None),
+                Err(err) => (
+                    json!({ "status": "failed", "error": err.to_string() }),
+                    None,
+                ),
             };
             let sections: Vec<Value> = report
                 .sections

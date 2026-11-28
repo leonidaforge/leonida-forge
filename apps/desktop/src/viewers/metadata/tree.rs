@@ -116,9 +116,7 @@ impl Tree {
         if depth == 0 {
             return None;
         }
-        self.rows[..index]
-            .iter()
-            .rposition(|row| row.depth < depth)
+        self.rows[..index].iter().rposition(|row| row.depth < depth)
     }
 
     /// The rows a structure or block row folds away.
@@ -220,7 +218,10 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
             match scalar {
                 Scalar::Hash32(inner) => match names.lookup(*inner) {
                     [] => (format!("hash32 {text}"), Tone::Muted),
-                    _ => (format!("hash32 {text}{}", name_of(names, *inner)), Tone::Accent),
+                    _ => (
+                        format!("hash32 {text}{}", name_of(names, *inner)),
+                        Tone::Accent,
+                    ),
                 },
                 _ => (format!("{} {text}", scalar.type_name()), Tone::Normal),
             }
@@ -274,10 +275,7 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
                     Tone::Normal,
                 ),
                 Ok(ArrayElements::Reference { links }) => (
-                    format!(
-                        "{head} of references  \u{00B7}  {} bound",
-                        bound(links)
-                    ),
+                    format!("{head} of references  \u{00B7}  {} bound", bound(links)),
                     Tone::Normal,
                 ),
                 Ok(ArrayElements::Hash32 { values }) => (
@@ -288,10 +286,7 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
                     enumeration,
                     values,
                 }) => (
-                    format!(
-                        "{head} of enum {} values {values:?}",
-                        hash32(*enumeration)
-                    ),
+                    format!("{head} of enum {} values {values:?}", hash32(*enumeration)),
                     Tone::Normal,
                 ),
             }
@@ -316,9 +311,10 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
                 .filter(|bit| bitset.bits & (1 << bit) != 0)
                 .map(|bit| bit.to_string())
                 .collect();
-            let count = bitset
-                .bit_count
-                .map_or_else(|| "unknown count".to_string(), |count| format!("{count} bits"));
+            let count = bitset.bit_count.map_or_else(
+                || "unknown count".to_string(),
+                |count| format!("{count} bits"),
+            );
             (
                 format!(
                     "bitset {count}  \u{00B7}  set: {}",
@@ -347,7 +343,10 @@ fn value_text(value: &Value, names: &Names) -> (String, Tone) {
 }
 
 fn bound(links: &[Reference]) -> usize {
-    links.iter().filter(|reference| reference.target.is_some()).count()
+    links
+        .iter()
+        .filter(|reference| reference.target.is_some())
+        .count()
 }
 
 fn sample_hashes(values: &[u32], names: &Names) -> String {
@@ -610,7 +609,10 @@ impl<'a> Walker<'a> {
 
     fn value_rows(&mut self, depth: usize, field: &FieldValue) {
         let label = if field.field.is_descriptor() {
-            format!("element descriptor  \u{00B7}  field {}", hash32(field.field.name))
+            format!(
+                "element descriptor  \u{00B7}  field {}",
+                hash32(field.field.name)
+            )
         } else {
             field_label(&field.field, self.names)
         };
@@ -639,7 +641,11 @@ impl<'a> Walker<'a> {
                     for link in links.iter().take(MAX_CHILDREN) {
                         self.group(
                             depth + 1,
-                            format!("[{index}] block {block}", index = link.index, block = link.target.block),
+                            format!(
+                                "[{index}] block {block}",
+                                index = link.index,
+                                block = link.target.block
+                            ),
                             format!(
                                 "record {} @{}  \u{00B7}  {}",
                                 link.target.record,
@@ -709,7 +715,10 @@ impl<'a> Walker<'a> {
                 Ok(ArrayElements::Enum32 { values, .. }) => !values.is_empty(),
                 Err(_) => false,
             },
-            Value::Map(map) => map.entries.as_ref().is_ok_and(|(_, records)| !records.is_empty()),
+            Value::Map(map) => map
+                .entries
+                .as_ref()
+                .is_ok_and(|(_, records)| !records.is_empty()),
             _ => false,
         }
     }
@@ -738,7 +747,10 @@ pub fn build(document: &Document, names: &Names) -> Tree {
     walker.group(
         0,
         "instances".to_string(),
-        format!("{} blocks, {records} records decoded", document.blocks.len()),
+        format!(
+            "{} blocks, {records} records decoded",
+            document.blocks.len()
+        ),
         !document.blocks.is_empty(),
     );
     for block in &document.blocks {
@@ -746,7 +758,12 @@ pub fn build(document: &Document, names: &Names) -> Tree {
     }
     let issues = document.issues.clone();
     if !issues.is_empty() {
-        walker.group(0, "issues".to_string(), format!("{} reported", issues.len()), true);
+        walker.group(
+            0,
+            "issues".to_string(),
+            format!("{} reported", issues.len()),
+            true,
+        );
         for issue in &issues {
             walker.push(Row {
                 depth: 1,

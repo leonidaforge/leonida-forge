@@ -10,11 +10,11 @@
 //! full. Every other block is still described: its type, extent, record count
 //! and decoded count. Pass [`usize::MAX`] to write every block.
 
+use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::psin::pso::{
     ArrayElements, Content, Document, EnumValueMatch, Field, PoolEntry, Record, Reference,
     ReferenceFault, Resolution, Scalar, Structure, Target, Value,
 };
-use lforge_rage9::psin::pso::names::Names;
 use serde_json::{Map, Value as Json, json};
 
 /// What the document holds, for a summary line.
@@ -59,9 +59,7 @@ pub fn counts(document: &Document) -> Counts {
     };
     for block in &document.blocks {
         match &block.content {
-            Content::Records {
-                total, records, ..
-            } => {
+            Content::Records { total, records, .. } => {
                 counts.structure_blocks += 1;
                 counts.records += *total as usize;
                 counts.records_decoded += records.len();
@@ -887,7 +885,11 @@ pub fn document_xml(document: &Document, sample: usize, source: &[(&str, String)
         attribute(&mut out, "structures", header.structures);
         attribute(&mut out, "enums", header.enums);
         attribute(&mut out, "blocks", header.blocks);
-        attribute(&mut out, "countsMatch", document.header_matches() == Some(true));
+        attribute(
+            &mut out,
+            "countsMatch",
+            document.header_matches() == Some(true),
+        );
         out.push_str("/>\n");
     }
 
