@@ -2643,6 +2643,7 @@ dependencies = [
  "lforge-rage9",
  "lforge-renderer",
  "lforge-scene",
+ "lforge-text",
  "lforge-texture",
  "log",
  "serde",
@@ -2703,6 +2704,14 @@ name = "lforge-scene"
 version = "0.1.0"
 dependencies = [
  "glam",
+]
+
+[[package]]
+name = "lforge-text"
+version = "0.1.0"
+dependencies = [
+ "lforge-binary",
+ "tempfile",
 ]
 
 [[package]]

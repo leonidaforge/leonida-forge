@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/model", "crates/renderer", "crates/rage9", "crates/scene", "crates/texture"]
+members = ["apps/cli", "apps/desktop", "crates/binary", "crates/core", "crates/model", "crates/renderer", "crates/rage9", "crates/scene", "crates/text", "crates/texture"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,6 +17,7 @@ lforge-model = { path = "crates/model" }
 lforge-renderer = { path = "crates/renderer" }
 lforge-rage9 = { path = "crates/rage9" }
 lforge-scene = { path = "crates/scene" }
+lforge-text = { path = "crates/text" }
 lforge-texture = { path = "crates/texture" }
 
 bcdec_rs = "0.2.1"
