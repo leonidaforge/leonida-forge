@@ -127,9 +127,18 @@ so a pose cannot outlive the member it belongs to.
 | `crates/model/src/influence/tests.rs` | The five encodings, weight totals, range rejection, inferred single-bone |
 | `crates/renderer/tests/skinning.rs` | GPU against CPU for positions, normals and tangents; a 596-bone palette; the influence view; a tangent-free primitive rendered through both pipelines |
 | `apps/desktop` `reports_deformation_measurements` | Real chains: propagation, per-root independence, CPU/GPU and pixel comparison, reset, timings, memory, previews |
+| `apps/desktop` `reports_canonical_resource_paths` | The canonical path, identity, declared type and decoded member of each row chain, through the explorer's own path model |
 
-The desktop harness is ignored by default. Run it with `LF_DEFORM_CASES` naming a
-case list, `LF_TEST_GAME_ROOT`, `LF_TEST_EXECUTABLE` and optionally `LF_DEFORM_OUT`.
+The desktop harnesses are ignored by default. Run the first with `LF_DEFORM_CASES`
+naming a case list, `LF_TEST_GAME_ROOT`, `LF_TEST_EXECUTABLE` and optionally
+`LF_DEFORM_OUT`. Run the second with `LF_PATH_CASES` naming a list of row chains
+and the same two installation variables; it reports the paths and identities that
+`docs/manual-acceptance.md` quotes.
+
+A resource is named by its canonical path, which is what the window shows: the
+root file name, then the stored entry name of each archive on the chain,
+separated by `!`. `docs/manual-acceptance.md` lists the path and the row chain of
+every resource used for hand acceptance.
 
 ## Consumer example
 
