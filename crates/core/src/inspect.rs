@@ -830,7 +830,7 @@ fn rbf0_header(header: &rbf0::Header, digest: Option<&[u8; 32]>) -> Value {
     value
 }
 
-fn rbf0_summary(document: &rbf0::Document) -> Summary {
+fn rbf0_summary(document: &rbf0::Statistics) -> Summary {
     Summary::Rbf0 {
         versioned: document.header.versioned,
         version: document.header.version,
@@ -860,7 +860,7 @@ fn text_stats(stats: rbf0::TextStats) -> Value {
     }
 }
 
-fn rbf0_document(document: &rbf0::Document, options: &Options) -> Value {
+fn rbf0_document(document: &rbf0::Statistics, options: &Options) -> Value {
     let sample = options.sample.clamp(1, MAX_SAMPLE);
     let definitions: Vec<Value> = document
         .definitions
