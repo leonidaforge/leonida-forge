@@ -652,6 +652,7 @@ fn is_archive(entry: &Entry, extension: Option<&str>) -> bool {
     entry.type_id().is_some()
         && extension.is_some_and(|extension| extension.eq_ignore_ascii_case("rpf"))
 }
+
 pub fn run_search(options: SearchOptions) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     let root = options.path.clone();
@@ -711,6 +712,10 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         {
             continue;
         }
+        if companions_resolved >= options.max_archives {
+            stopped = Some("max_archives");
+            break;
+        }
         let opened = match item.opened {
             Some(opened) => *opened,
             None => {
@@ -768,6 +773,12 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 entry.type_id().and_then(|type_id| listing.extension(type_id)),
             ) {
                 continue;
+            }
+            // The budget counts what has been opened, so check it before the
+            // next archive is read rather than after the whole listing is done.
+            if companions_resolved + children.len() >= options.max_archives {
+                stopped = Some("max_archives");
+                break;
             }
             let identity = chain_name(&item.identity, &[entry.row]);
             let limits = native::NestedLimits {

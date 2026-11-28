@@ -254,7 +254,7 @@ pub enum Command {
         #[arg(long, value_name = "BOOL", value_parser = clap::value_parser!(bool))]
         transformed: Option<bool>,
         /// A case-insensitive substring of an archive's path under the search
-        /// root
+        /// root, or of the chain a nested archive was reached through
         #[arg(long)]
         archive: Option<String>,
         #[arg(long, default_value_t = 0)]
@@ -263,7 +263,8 @@ pub enum Command {
         limit: usize,
         #[arg(long, default_value_t = 32)]
         max_depth: usize,
-        #[arg(long, default_value_t = 64)]
+        /// Archives opened, roots included
+        #[arg(long, default_value_t = 4096)]
         max_archives: usize,
         /// Enter archives stored inside an archive, and search their rows too
         #[arg(long)]
