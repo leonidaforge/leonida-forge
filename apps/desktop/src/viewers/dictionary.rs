@@ -774,13 +774,18 @@ impl DictionaryViewer {
         if selected.is_some() {
             metadata = self.bones.metadata(skeleton, viewport_state.associations());
         }
+        // The hierarchy list is a flex child with a zero basis, so the section
+        // must have a definite height for the list to receive any of it. A
+        // content-sized section gives the list nothing and the rows disappear.
+        let pose_open = viewport_state.pose_supported() && viewport_state.is_pose_mode();
+        let height = if pose_open { 460. } else { 320. };
         let _ = viewport_state;
 
         let mut section = div()
             .flex()
             .flex_col()
             .flex_none()
-            .max_h(px(300.))
+            .h(px(height))
             .border_b_1()
             .border_color(rgb(theme::BORDER))
             .child(
