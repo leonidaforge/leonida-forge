@@ -102,6 +102,18 @@ pushed.
   and move into place only after the whole payload decodes. A failed or
   cancelled export leaves no partial final file. The source and its companion
   are revalidated when export begins.
+- Open a metadata container or a text payload in its own window. A `PSIN`
+  container opens in the metadata viewer: the tree walks the schema and the
+  instance blocks, a row expands and collapses, a filter keeps the rows that
+  match and the ancestors that hold them, and a row copies as text. The stored
+  hash stays the identity and a resolved name is shown beside it. A payload the
+  classification reads as text opens in the text viewer instead, so a metadata
+  container is never claimed by a byte-level text check: `PSIN` and `RBF0`
+  payloads carry thousands of zero bytes in their first 64 KiB, and the text
+  check refuses any payload containing one.
+- The window names the resource by its canonical path, the same string the CLI
+  reports, so a row inside a nested archive shows the whole chain and never the
+  temporary file it was decompressed into.
 
 ## Unsupported functionality
 
@@ -121,6 +133,12 @@ pushed.
   codec, decodes no audio and does not materialise packets; KB2 decodes no frame
   and names no codec; texture dictionaries expose their records but decode no
   pixel and resolve no texture reference.
+- Metadata containers that are not the `LSCH` family get no viewer. A `PMAP`
+  container is reported as the family it is and its instance data is not
+  decoded; an `RBF0` payload and the `0DRP` resource form are recognised and
+  open in the Binary Inspector, not in the metadata viewer. A block whose type
+  names neither a structure nor a pool keeps its bytes and is reported as
+  unsupported rather than guessed at.
 - Vertex semantics. A drawable's bounds, layout codes, declaration bytes, index
   descriptor fields and material parameter values are reported as stored values.
   No vertex position, triangle, mesh or texture reference is reconstructed, and
