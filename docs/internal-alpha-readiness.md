@@ -212,6 +212,17 @@ recorded here. They were not repeated for this package.
   entry unavailable. Native extraction refused the archive and wrote no file.
 - A non-existent recovery id produced a clear error and no output file.
 
+A recursive classification census of `data.rpf` ran for this review against the
+same installation, through the CLI, which shares the decode and classification
+path with the desktop. `archive census data.rpf --recursive --entries` opened 42
+archives, enumerated and probed all 23,075 entries and finished with
+`completion.complete = true`, no failed archive and nothing stopped by a limit.
+Classified from the decoded head only, 5,321 of those entries are the metadata
+resource type, in 31 of the 42 archives: 2,573 carry the `PSIN` signature, 1,462
+are `RBF0` payloads and 1,286 are the `0DRP` resource form. The census counts
+what each entry is; it does not deserialize a metadata document, so a `.zmt` row
+it calls `psin` may still hold either `PSIN` family.
+
 ## Test coverage
 
 Automated, run for this package:
