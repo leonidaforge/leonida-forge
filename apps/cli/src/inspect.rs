@@ -176,7 +176,9 @@ pub fn archive(
     let row = selection.row.or_else(|| {
         (enters.is_empty() && selection.row.is_none() && selection.zip.is_none()).then_some(0)
     });
-    let report = archive_report(file, executable, enters, selection, &options);
+    let cancel = AtomicBool::new(false);
+    let resolved = nested::resolve(file, executable, enters, &cancel)?;
+    let report = archive_report(file, executable, enters, &resolved, selection, &options);
     let Some(output) = options.metadata_output.clone() else {
         return report;
     };
@@ -184,26 +186,20 @@ pub fn archive(
     let Some(row) = row else {
         return Err("a metadata document comes from one native row; give --row".to_string());
     };
-    if !enters.is_empty() {
-        return Err(
-            "a metadata document is written for an archive reached without --enter".to_string(),
-        );
-    }
-    write_metadata(file, executable, row, &options, &output)
+    write_metadata(file, &resolved.path, executable, row, &options, &output)
 }
 
 fn archive_report(
     file: &Path,
     executable: Option<&Path>,
     enters: &[Selector],
+    resolved: &nested::Resolved,
     selection: &Selection,
     options: &Options,
 ) -> Result<(), String> {
     if selection.row.is_some() && selection.zip.is_some() {
         return Err("--row and --zip select different entries; give one".to_string());
     }
-    let cancel = AtomicBool::new(false);
-    let resolved = nested::resolve(file, executable, enters, &cancel)?;
     // `archive inspect FILE` without any selection keeps reading row 0, as it
     // always has. With `--enter`, a missing selection inspects the entered
     // archive itself.
@@ -252,7 +248,7 @@ fn archive_report(
                 ));
             }
             inspect_row(
-                &resolved,
+                resolved,
                 row,
                 executable,
                 selection.raw,
@@ -269,7 +265,7 @@ fn archive_report(
                 ));
             }
             inspect_zip(
-                &resolved,
+                resolved,
                 index,
                 selection.raw,
                 source,
@@ -611,15 +607,18 @@ fn emit_payload(
 /// and the row's stored keys, so a decoded document can be traced back to the
 /// bytes it came from.
 fn write_metadata(
-    archive: &Path,
+    origin: &Path,
+    read: &Path,
     executable: Option<&Path>,
     row: u32,
     options: &Options,
     output: &Path,
 ) -> Result<(), String> {
-    let opened = native::open_metadata(archive, MAX_METADATA, executable)?;
+    let opened = native::open_metadata(read, MAX_METADATA, executable)?;
     let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
-    let alternates = Alternates::resolve(archive, &opened.metadata);
+    // Companions sit beside the file the chain starts at, not beside the
+    // temporary file an entered archive was decompressed into.
+    let alternates = Alternates::resolve(origin, &opened.metadata);
     let mut payload = match entry.payload(&opened.source, alternates.sources()) {
         Ok(payload) => payload,
         Err(err) => {
@@ -652,7 +651,7 @@ fn write_metadata(
     let names = options.metadata_names.as_ref().unwrap_or(&empty);
     let sample = if options.blocks { usize::MAX } else { options.sample };
     let source = [
-        ("archive", path_string(archive)),
+        ("archive", path_string(origin)),
         ("row", row.to_string()),
         (
             "nameHash64",
@@ -675,7 +674,8 @@ fn write_metadata(
         ("namesIndexed", names.len().to_string()),
     ];
     let provenance = json!({
-        "archive": path_string(archive),
+        "archive": path_string(origin),
+        "read_from": path_string(read),
         "row": row,
         "name_hash": entry.name_hash.clone().ok().flatten().map(|hash| format!("0x{hash:016X}")),
         "name_key": entry.name_key.clone().ok().flatten().map(|key| format!("0x{key:08X}")),
@@ -683,7 +683,7 @@ fn write_metadata(
         "names": options.names.iter().map(|path| path_string(path)).collect::<Vec<String>>(),
         "blocks_written": if options.blocks { Value::Null } else { json!(sample) },
     });
-    crate::output::ensure_not_input(output, &[archive])?;
+    crate::output::ensure_not_input(output, &[origin, read])?;
     let written = crate::output::write_file(output, options.overwrite, |writer| {
         if options.metadata_xml {
             let text = pso_report::document_xml(&document, sample, &source);
