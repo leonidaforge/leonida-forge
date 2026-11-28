@@ -6,6 +6,7 @@ mod dictionary;
 mod image;
 mod model;
 mod renderer_demo;
+pub mod text;
 pub mod texture;
 mod viewport;
 

@@ -560,6 +560,21 @@ pub fn classify(
     Ok(classify_head(&head.0, entry_type, inner.extension()))
 }
 
+/// The first `limit` decoded bytes of a file in an archive, for callers that
+/// inspect a head larger than [`HEAD_LEN`], such as the text check.
+pub fn read_head(archive: &Archive, inner: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let mut head = Bounded {
+        bytes: Vec::with_capacity(usize::try_from(limit.min(64 * 1024)).unwrap_or(0)),
+        limit,
+    };
+    match copy(archive, inner, &mut head, MAX_READ) {
+        Ok(_) => {}
+        Err(err) if err.get_ref().is_some_and(|inner| inner.is::<HeadFull>()) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(head.bytes)
+}
+
 /// [`classify`] for the first bytes of a file, wherever they were read.
 pub fn classify_head(
     head: &[u8],
@@ -591,7 +606,6 @@ impl std::error::Error for HeadFull {}
 
 /// Collects the first [`HEAD_LEN`] bytes, then stops the copy.
 struct Head(Vec<u8>);
-
 impl Write for Head {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let room = HEAD_LEN - self.0.len();
@@ -600,6 +614,28 @@ impl Write for Head {
         }
         let n = buf.len().min(room);
         self.0.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Collects at most `limit` bytes, then stops the copy the same way.
+struct Bounded {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+
+impl Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let room = self.limit - self.bytes.len() as u64;
+        if room == 0 {
+            return Err(io::Error::other(HeadFull));
+        }
+        let n = buf.len().min(usize::try_from(room).unwrap_or(usize::MAX));
+        self.bytes.extend_from_slice(&buf[..n]);
         Ok(n)
     }
 

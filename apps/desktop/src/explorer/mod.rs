@@ -915,6 +915,7 @@ impl Explorer {
             .detach();
             return;
         }
+        let name = entry.name.clone();
         let sniff = kind.is_some();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
@@ -934,6 +935,18 @@ impl Explorer {
                 files::model::classify_resource(&path, &access, &AtomicBool::new(false)).ok()
             })
         });
+        // The text check reads more than a signature, so an unnamed payload
+        // whose bytes are text opens as text without a declared name.
+        let text = cx.background_spawn({
+            let (path, access) = (path.clone(), access.clone());
+            async move {
+                let head = files::read_head_with(&path, &access, 64 * 1024).ok()?;
+                let extension = path
+                    .extension()
+                    .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+                lforge_text::detect(&head, extension.as_deref()).text_info()
+            }
+        });
         cx.spawn(async move |this, cx| {
             let identified = identified.await;
             let classified = classified.await;
@@ -941,6 +954,7 @@ impl Explorer {
                 Some(model) => model.await,
                 None => None,
             };
+            let text = text.await;
             this.update(cx, |this, cx| {
                 let classification = classified.as_ref().cloned();
                 let capability = classification.as_ref().map(|value| value.capability);
@@ -958,6 +972,15 @@ impl Explorer {
                     }
                     // Opening it explains why it is not a valid archive.
                     Ok(Identified::Invalid { .. }) => this.navigate(path, cx),
+                    // A payload the classification reads as a text document, or
+                    // whose own bytes are text, opens in the text viewer. This
+                    // is decided before any resource decode is attempted.
+                    Ok(Identified::Unknown)
+                        if capability == Some(lforge_core::classify::Capability::Text)
+                            || text.is_some() =>
+                    {
+                        crate::viewers::text::open(path, Some(name), access, cx)
+                    }
                     // A drawable resource is a model before it is a container.
                     Ok(Identified::Unknown) if model.is_some() => {
                         if let Some(model) = model {
@@ -2039,7 +2062,11 @@ impl Explorer {
     }
 }
 
-fn window_options(title: &str, window_size: gpui::Size<Pixels>, cx: &App) -> WindowOptions {
+pub(crate) fn window_options(
+    title: &str,
+    window_size: gpui::Size<Pixels>,
+    cx: &App,
+) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,

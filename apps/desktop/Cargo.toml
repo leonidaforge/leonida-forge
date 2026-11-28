@@ -27,6 +27,7 @@ lforge-model.workspace = true
 lforge-renderer.workspace = true
 lforge-rage9.workspace = true
 lforge-scene.workspace = true
+lforge-text.workspace = true
 lforge-texture.workspace = true
 log.workspace = true
 serde.workspace = true

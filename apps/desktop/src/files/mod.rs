@@ -18,7 +18,7 @@ mod zip;
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
@@ -269,6 +269,22 @@ pub fn split_location(path: &Path) -> Option<(&Path, &Path)> {
     let file = path.ancestors().find(|ancestor| ancestor.is_file())?;
     let inner = path.strip_prefix(file).ok()?;
     (!inner.as_os_str().is_empty()).then_some((file, inner))
+}
+
+/// Reads the first `limit` decoded bytes of a file, wherever it is stored.
+/// Used to decide whether a payload is text without decoding all of it.
+pub fn read_head_with(path: &Path, access: &Access, limit: u64) -> io::Result<Vec<u8>> {
+    match archive::locate_prepared_with(path, access)? {
+        Location::Inside(archive, inner) if archive::is_file(&archive, &inner)? => {
+            archive::read_head(&archive, &inner, limit)
+        }
+        Location::Plain if path.is_file() => {
+            let mut bytes = Vec::new();
+            fs::File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        Location::Archive(_) | Location::Inside(..) | Location::Plain => Ok(Vec::new()),
+    }
 }
 
 /// Reads a whole file, which may be inside an archive, without an executable.

@@ -135,6 +135,10 @@ impl Explorer {
                     .selected_entry()
                     .filter(|entry| entry.kind == EntryKind::File)
                     .cloned();
+                let as_text = self
+                    .selected_entry()
+                    .filter(|entry| entry.kind == EntryKind::File)
+                    .map(|entry| (entry.path.clone(), entry.name.clone()));
                 panel
                     .child(
                         ui::menu_item("set-gta", "Set GTA VI Folder…", false, true, None).on_click(
@@ -186,6 +190,28 @@ impl Explorer {
                                             cx,
                                         )
                                     }
+                                },
+                                cx,
+                            ))
+                        }),
+                    )
+                    .child(
+                        ui::menu_item(
+                            "open-as-text",
+                            "Open as Text",
+                            false,
+                            as_text.is_some(),
+                            None,
+                        )
+                        .when_some(as_text, |el, (path, name)| {
+                            el.on_click(self.menu_action(
+                                move |this, _, cx| {
+                                    crate::viewers::text::open_as_text(
+                                        path.clone(),
+                                        Some(name.clone()),
+                                        this.access(),
+                                        cx,
+                                    )
                                 },
                                 cx,
                             ))
