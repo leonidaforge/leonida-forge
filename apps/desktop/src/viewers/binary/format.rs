@@ -157,11 +157,40 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             family,
             sections,
             checksum,
-        }) => vec![
-            ("Family", (*family).to_string()),
-            ("Sections", sections.to_string()),
-            ("Integrity", (*checksum).to_string()),
-        ],
+            decoded,
+        }) => {
+            let mut fields = vec![
+                ("Family", (*family).to_string()),
+                ("Sections", sections.to_string()),
+                ("Integrity", (*checksum).to_string()),
+            ];
+            match decoded {
+                Some(counts) => {
+                    fields.push((
+                        "Schema",
+                        format!("{} structures, {} fields", counts.structures, counts.fields),
+                    ));
+                    fields.push((
+                        "Instances",
+                        format!(
+                            "{} blocks, {}/{} records",
+                            counts.blocks, counts.records_decoded, counts.records
+                        ),
+                    ));
+                    if counts.unsupported_blocks > 0 {
+                        fields.push((
+                            "Unsupported",
+                            format!("{} blocks", counts.unsupported_blocks),
+                        ));
+                    }
+                }
+                None => fields.push((
+                    "Schema",
+                    "not decoded for this family".to_string(),
+                )),
+            }
+            fields
+        }
         Some(Summary::Edup {
             count,
             first_distinct,
@@ -212,6 +241,14 @@ fn fields(summary: Option<&Summary>) -> Vec<(&'static str, String)> {
             ("Audio tracks", tracks.to_string()),
             ("Issues", issues.to_string()),
             ("Video", "container only; no decode".to_string()),
+        ],
+        Some(Summary::MetaResource { object_type }) => vec![
+            ("Tag", "0DRP".to_string()),
+            ("Object type", format!("0x{object_type:02X}")),
+            (
+                "Structure",
+                "the resource form; its tables are not decoded".to_string(),
+            ),
         ],
         Some(Summary::Rpf9) | None => Vec::new(),
     }
