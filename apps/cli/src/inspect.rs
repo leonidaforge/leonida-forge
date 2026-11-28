@@ -19,7 +19,6 @@ use std::sync::atomic::AtomicBool;
 use lforge_binary::Source;
 use lforge_core::archive::Format;
 use lforge_core::inspect as recognition;
-use lforge_core::pso as pso_report;
 use lforge_core::resource::{EntryId, Locator, ResourcePath};
 use lforge_core::zip as zip_archive;
 use lforge_rage9::psin::pso::names::Names;
@@ -654,7 +653,8 @@ fn write_metadata(
             Err(err) => return Err(format!("row {row} cannot be decoded: {err}")),
         }
     }
-    let document = lforge_rage9::psin::pso::decode(&bytes).map_err(|err| err.to_string())?;
+    let document = lforge_core::metadata::decode(&bytes)
+        .map_err(|err| format!("row {row} holds no metadata document this build decodes: {err}"))?;
     let empty = Names::empty();
     let names = options.metadata_names.as_ref().unwrap_or(&empty);
     let sample = if options.blocks {
@@ -697,21 +697,29 @@ fn write_metadata(
         "name_key": entry.name_key.clone().ok().flatten().map(|key| format!("0x{key:08X}")),
         "names_indexed": names.len(),
         "names": options.names.iter().map(|path| path_string(path)).collect::<Vec<String>>(),
-        "blocks_written": if options.blocks { Value::Null } else { json!(sample) },
+        "format": document.format(),
+        "status": document.status(),
+        // An RBF0 document is a tree and is always written whole, so there is
+        // no block sample to report.
+        "blocks_written": if options.blocks || document.format() == "rbf0" {
+            Value::Null
+        } else {
+            json!(sample)
+        },
     });
     crate::output::ensure_not_input(output, &[origin, read])?;
     let written = crate::output::write_file(output, options.overwrite, |writer| {
         if options.metadata_xml {
-            let text = pso_report::document_xml(&document, sample, &source);
+            let text = document.document_xml(sample, &source);
             writer
                 .write_all(text.as_bytes())
                 .map_err(|err| crate::output::write_error(output, err))?;
             return Ok(text.len() as u64);
         }
         let export = json!({
-            "schema": "leonida-forge.psin-document/1",
+            "schema": document.schema(),
             "source": provenance,
-            "document": pso_report::document_json(&document, names, sample),
+            "document": document.document_json(names, sample),
         });
         let text = serde_json::to_vec_pretty(&export)
             .map_err(|err| format!("cannot serialise the document: {err}"))?;
@@ -727,10 +735,9 @@ fn write_metadata(
         .flatten()
         .map_or_else(|| format!("row {row}"), |hash| format!("{hash:#018X}"));
     println!(
-        "decoded {identity}: {} structures, {} blocks, {} records; {written} bytes to {}",
-        document.structures.len(),
-        document.blocks.len(),
-        document.record_count(),
+        "decoded {identity} as {}: {}; {written} bytes to {}",
+        document.format(),
+        document.summary(),
         output.display()
     );
     Ok(())
