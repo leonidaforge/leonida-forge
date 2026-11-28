@@ -247,6 +247,39 @@ fn two_u32_indices_are_read_at_their_own_width() {
     assert_eq!(influences.bones, vec![5, 338]);
 }
 
+/// A wide index that fits the declared bone count but not a 16-bit skeleton
+/// position is reported, never truncated into a different bone.
+#[test]
+fn a_wide_index_beyond_sixteen_bits_is_reported() {
+    let mut blob = vec![0u8; 0x100];
+    blob[0x20..0x24].copy_from_slice(&[255, 0, 0, 0]);
+    blob[0x40..0x44].copy_from_slice(&70_000u32.to_le_bytes());
+    let buffer = buffer(
+        &[
+            Decl {
+                slot: 6,
+                format: 0x26,
+                offset: 0x20,
+                size: 4,
+            },
+            Decl {
+                slot: 8,
+                format: 0x8c,
+                offset: 0x40,
+                size: 16,
+            },
+        ],
+        1,
+        blob.len(),
+    );
+    let mut diagnostics = Vec::new();
+    let reason = unsupported(decode(&buffer, &blob, 1, Some(70_001), &mut diagnostics));
+    assert!(
+        reason.contains("70000") && reason.contains("16-bit"),
+        "unexpected reason: {reason}"
+    );
+}
+
 #[test]
 fn a_single_u8_index_carries_an_implicit_unit_weight() {
     let mut blob = vec![0u8; 0x40];

@@ -270,8 +270,15 @@ fn decode_weighted(
                     ),
                 };
             }
+            let Ok(bone) = u16::try_from(index) else {
+                return InfluenceDecode::Unsupported {
+                    reason: format!(
+                        "vertex {vertex} names bone {index}, which a {bones}-bone skeleton cannot address with a 16-bit index"
+                    ),
+                };
+            };
             lanes[lane] = VertexInfluence {
-                bone: index as u16,
+                bone,
                 weight: weight as f32 / denominator as f32,
             };
             used.insert(index as usize);
@@ -417,11 +424,15 @@ fn decode_single_index(
                 ),
             };
         }
-        let mut lanes = [VertexInfluence::NONE; MAX_INFLUENCES];
-        lanes[0] = VertexInfluence {
-            bone: index as u16,
-            weight: 1.0,
+        let Ok(bone) = u16::try_from(index) else {
+            return InfluenceDecode::Unsupported {
+                reason: format!(
+                    "vertex {vertex} names bone {index}, which a {bones}-bone skeleton cannot address with a 16-bit index"
+                ),
+            };
         };
+        let mut lanes = [VertexInfluence::NONE; MAX_INFLUENCES];
+        lanes[0] = VertexInfluence { bone, weight: 1.0 };
         used.insert(index as usize);
         per_vertex.push(lanes);
     }
