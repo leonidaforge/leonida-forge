@@ -87,13 +87,19 @@ pub struct VertexInfluences {
     pub bones: Vec<usize>,
     /// Whether at least one vertex blends more than one bone.
     pub weighted: bool,
-    /// The lane count the declaration carries before padding (1, 2 or 4).
+    /// The lane count the declaration carries before padding (1, 2 or 4), or
+    /// zero for an inferred association that has no influence attribute.
     pub lanes: u8,
     /// The largest number of non-zero lanes one vertex uses.
     pub max_influences: u8,
     /// How the stored indices reach the skeleton.
     pub resolution: BoneResolution,
     pub status: InfluenceStatus,
+    /// Whether the association was inferred from a one-bone geometry that
+    /// declares no influence attribute, rather than read from an influence
+    /// stream. An inferred set deforms, but it is reported apart from a decoded
+    /// one because the geometry record states no bone reference.
+    pub inferred: bool,
 }
 
 impl VertexInfluences {
@@ -102,9 +108,32 @@ impl VertexInfluences {
         self.status == InfluenceStatus::Complete
     }
 
-    /// Whether every vertex is bound to exactly one bone with weight one.
-    pub fn rigid(&self) -> bool {
+    /// Whether every vertex uses exactly one influence. This is single-influence
+    /// vertex skinning: the bone may still differ per vertex, so the primitive is
+    /// not necessarily one rigid piece.
+    pub fn single_influence(&self) -> bool {
         self.max_influences <= 1
+    }
+
+    /// Whether the whole primitive follows one bone. Distinct from
+    /// [`Self::single_influence`], which allows a different bone per vertex.
+    pub fn rigid_attachment(&self) -> bool {
+        self.single_influence() && self.bones.len() == 1
+    }
+
+    /// Whether this association is inferred rather than decoded.
+    pub fn inferred(&self) -> bool {
+        self.inferred
+    }
+
+    /// The status line a viewer prints. An inferred association is named
+    /// separately so it never reads as a decoded one.
+    pub fn status_name(&self) -> String {
+        if self.inferred {
+            format!("{} (inferred single bone)", self.status.name())
+        } else {
+            self.status.name().to_string()
+        }
     }
 
     /// The weight the given skeleton bone has on one vertex, if any.

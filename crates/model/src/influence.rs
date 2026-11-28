@@ -142,7 +142,7 @@ pub fn decode(
             decode_single_bone_weights(blob, vertex_count, weights, diagnostics)
         }
         (None, Some(form)) if form.lanes == 1 => {
-            decode_rigid_index(buffer, blob, vertex_count, bones, form)
+            decode_single_index(buffer, blob, vertex_count, bones, form)
         }
         (None, Some(form)) => InfluenceDecode::Unsupported {
             reason: format!(
@@ -150,8 +150,38 @@ pub fn decode(
                 form.lanes
             ),
         },
+        (None, None) if bones == 1 => decode_implicit_single_bone(vertex_count),
         (None, None) => InfluenceDecode::NotDeclared,
     }
+}
+
+/// A geometry that declares no influence attribute on a one-bone skeleton.
+///
+/// The geometry record states one bone and the skeleton holds one, but the
+/// record states no bone reference. The association is therefore inferred
+/// rather than decoded, and it is reported as such: it deforms, but a caller
+/// can tell it apart from a verified influence stream.
+fn decode_implicit_single_bone(vertex_count: usize) -> InfluenceDecode {
+    if vertex_count == 0 {
+        return InfluenceDecode::Unsupported {
+            reason: "the geometry holds no vertex".to_string(),
+        };
+    }
+    let mut lanes = [VertexInfluence::NONE; MAX_INFLUENCES];
+    lanes[0] = VertexInfluence {
+        bone: 0,
+        weight: 1.0,
+    };
+    InfluenceDecode::Decoded(VertexInfluences {
+        per_vertex: vec![lanes; vertex_count],
+        bones: vec![0],
+        weighted: false,
+        lanes: 0,
+        max_influences: 1,
+        resolution: BoneResolution::DirectSkeleton,
+        status: InfluenceStatus::Complete,
+        inferred: true,
+    })
 }
 
 fn decode_weighted(
@@ -265,6 +295,7 @@ fn decode_weighted(
             max_influences,
             resolution: BoneResolution::DirectSkeleton,
             status: InfluenceStatus::Unnormalised { vertex, total },
+            inferred: false,
         });
     }
     InfluenceDecode::Decoded(VertexInfluences {
@@ -275,6 +306,7 @@ fn decode_weighted(
         max_influences,
         resolution: BoneResolution::DirectSkeleton,
         status: InfluenceStatus::Complete,
+        inferred: false,
     })
 }
 
@@ -341,6 +373,7 @@ fn decode_single_bone_weights(
             max_influences: 1,
             resolution: BoneResolution::DirectSkeleton,
             status: InfluenceStatus::Unnormalised { vertex, total },
+            inferred: false,
         });
     }
     InfluenceDecode::Decoded(VertexInfluences {
@@ -351,11 +384,14 @@ fn decode_single_bone_weights(
         max_influences: 1,
         resolution: BoneResolution::DirectSkeleton,
         status: InfluenceStatus::Complete,
+        inferred: false,
     })
 }
 
-/// A single stored index per vertex, with the weight the form implies.
-fn decode_rigid_index(
+/// A single stored index per vertex, with the weight the form implies. The
+/// index may differ per vertex, so this is single-influence skinning rather than
+/// a whole-primitive attachment.
+fn decode_single_index(
     buffer: &VertexBuffer,
     blob: &[u8],
     vertex_count: usize,
@@ -397,6 +433,7 @@ fn decode_rigid_index(
         max_influences: 1,
         resolution: BoneResolution::DirectSkeleton,
         status: InfluenceStatus::Complete,
+        inferred: false,
     })
 }
 

@@ -264,7 +264,12 @@ fn a_single_u8_index_carries_an_implicit_unit_weight() {
     let mut diagnostics = Vec::new();
     let influences = decoded(decode(&buffer, &blob, 4, Some(32), &mut diagnostics));
     assert_eq!(influences.status, InfluenceStatus::Complete);
-    assert!(influences.rigid());
+    assert!(influences.single_influence());
+    // Four vertices name four different bones, so this is single-influence
+    // vertex skinning, not one rigid piece.
+    assert!(!influences.rigid_attachment());
+    assert_eq!(influences.bones, vec![7, 8, 9, 10]);
+    assert!(!influences.inferred());
     assert_eq!(influences.lanes, 1);
     for (vertex, expected) in [7u16, 8, 9, 10].into_iter().enumerate() {
         assert_eq!(
@@ -352,6 +357,28 @@ fn a_one_bone_skeleton_needs_no_index_stream() {
     let influences = decoded(decode(&buffer, &blob, 1, Some(1), &mut diagnostics));
     assert_eq!(influences.bones, vec![0]);
     assert_eq!(influences.per_vertex[0][0].weight, 1.0);
+    // A weight stream with no index stream on a one-bone skeleton is decoded,
+    // not inferred: the record states the bone count and the weights.
+    assert!(!influences.inferred());
+}
+
+/// A geometry that declares no influence attribute at all on a one-bone
+/// skeleton is an inferred association: it deforms, but the record states no
+/// bone reference, so it is reported apart from a decoded one.
+#[test]
+fn a_one_bone_geometry_without_attributes_is_inferred() {
+    let buffer = buffer(&[], 1, 0x40);
+    let blob = vec![0u8; 0x40];
+    let mut diagnostics = Vec::new();
+    let influences = match decode(&buffer, &blob, 1, Some(1), &mut diagnostics) {
+        InfluenceDecode::Decoded(influences) => influences,
+        other => panic!("expected an inferred association, got {other:?}"),
+    };
+    assert!(influences.inferred());
+    assert!(influences.deformable());
+    assert!(influences.rigid_attachment());
+    assert_eq!(influences.per_vertex[0][0].weight, 1.0);
+    assert_eq!(influences.status_name(), "complete (inferred single bone)");
 }
 
 #[test]

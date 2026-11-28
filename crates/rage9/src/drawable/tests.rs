@@ -632,6 +632,83 @@ fn an_absent_attribute_does_not_end_the_declaration_table() {
 }
 
 #[test]
+fn a_gap_between_populated_slots_keeps_every_semantic_in_place() {
+    let (mut system, mut graphics) = drawable();
+    // Three attributes at new offsets, declared at slots 2, 6 and 8. The layout
+    // numbers its own entries 0, 4 and 5, so a declaration slot and a layout
+    // slot with the same attribute differ.
+    layout(
+        &mut system,
+        0x700,
+        32,
+        &[
+            (0, 0x80, 8, 0x10),
+            (4, 0x1A0, 16, 0x03),
+            (5, 0x1C0, 4, 0x28),
+        ],
+    );
+    for slot in 0..DECLARATION_SLOTS {
+        put_u32(&mut graphics, 0x100 + 4 * slot, 0);
+    }
+    put_u32(&mut graphics, 0x100 + 4 * 2, (0x80 / 2) << 8 | 0x21);
+    put_u32(&mut graphics, 0x100 + 4 * 6, (0x1C0 / 2) << 8 | 0x26);
+    put_u32(&mut graphics, 0x100 + 4 * 8, (0x1A0 / 2) << 8 | 0x8C);
+    let report = inspect(&system, &graphics).unwrap();
+    let buffer = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    let slots = buffer
+        .declarations
+        .iter()
+        .map(|entry| entry.slot)
+        .collect::<Vec<_>>();
+    assert_eq!(slots, [2, 6, 8]);
+    assert!(buffer.declarations.iter().all(|entry| entry.matches_layout));
+    // The offset still resolves to the right layout entry, and the layout's own
+    // slot number is not the declaration's.
+    assert_eq!(buffer.attribute_at(0x80).map(|entry| entry.size), Some(8));
+    assert_eq!(buffer.attribute_at(0x1C0).map(|entry| entry.size), Some(4));
+    assert_eq!(buffer.attribute_at(0x1A0).map(|entry| entry.size), Some(16));
+    assert_eq!(buffer.attribute_at(0x1C0).map(|entry| entry.slot), Some(5));
+    assert_eq!(buffer.declaration(6).map(|entry| entry.format), Some(0x26));
+    assert_eq!(buffer.declaration(8).map(|entry| entry.format), Some(0x8C));
+    assert_eq!(buffer.declaration(0), None);
+    assert_eq!(buffer.declaration(7), None);
+    assert!(!report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Arithmetic {
+            field: "declaration table",
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_declaration_table_past_the_graphics_segment_is_reported_and_stops() {
+    let (mut system, mut graphics) = drawable();
+    // The table starts eight bytes before the end of the segment, so only one
+    // word fits. The read must stop there and never index past the segment.
+    put_u64(&mut system, 0x518, graphics_ptr(0x5F8));
+    put_u32(&mut graphics, 0x5F8, (0x80 / 2) << 8 | 0x42);
+    let report = inspect(&system, &graphics).unwrap();
+    let buffer = report.lod[0].models[0].geometries[0]
+        .vertex_buffer
+        .as_ref()
+        .expect("a vertex buffer");
+    assert_eq!(buffer.declarations.len(), 1);
+    assert_eq!(buffer.declarations[0].slot, 0);
+    assert_eq!(buffer.declaration_end, None);
+    assert!(report.issues.iter().any(|issue| matches!(
+        issue,
+        Issue::Bounds {
+            field: "declaration table",
+            ..
+        }
+    )));
+}
+
+#[test]
 fn a_texture_slot_outside_the_declared_count_is_invalid() {
     let (mut system, graphics) = drawable();
     // The second texture parameter selects slot 9 with only two declared.

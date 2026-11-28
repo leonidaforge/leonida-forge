@@ -132,6 +132,7 @@ fn influences(per_vertex: Vec<Vec<(u16, f32)>>) -> VertexInfluences {
         max_influences,
         resolution: crate::BoneResolution::DirectSkeleton,
         status: InfluenceStatus::Complete,
+        inferred: false,
     }
 }
 
@@ -409,4 +410,61 @@ fn a_directly_built_bone_has_a_valid_inverse_bind() {
     let bone = bone(0, None, Vec3::new(1.0, 2.0, 3.0), Quat::IDENTITY, Vec3::ONE);
     let matrix = bone.inverse_bind.unwrap();
     assert!((matrix.transform_point3(Vec3::new(1.0, 2.0, 3.0)) - Vec3::ZERO).length() < 1e-6);
+}
+
+/// A pose that moves geometry far outside its authored bounds must frame the
+/// posed geometry, and the authored bounds must stay unchanged.
+#[test]
+fn posed_bounds_follow_a_pose_that_leaves_the_authored_bounds() {
+    let skeleton = skeleton_of(vec![(None, Vec3::ZERO, Quat::IDENTITY)]);
+    let mut primitive = primitive(vec![vertex([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])]);
+    primitive.indices = vec![0, 0, 0];
+    let influences = influences(vec![vec![(0, 1.0)]]);
+    let authored = Aabb::from_points([Vec3::new(0.0, 1.0, 0.0)]);
+
+    let mut pose = Pose::new(1);
+    // 180 degrees about the bone's own X axis sends the vertex to -Y.
+    pose.set_rotation(0, Quat::from_rotation_x(std::f32::consts::PI))
+        .unwrap();
+    let matrices = SkinningMatrices::build(&skeleton, &pose).unwrap();
+    let deformed = deform_primitive(&primitive, &influences, &matrices).unwrap();
+    let bounds = deformed_bounds(&primitive, &influences, &matrices)
+        .unwrap()
+        .sanitized();
+    assert!(
+        (Vec3::from(deformed.positions[0]) - Vec3::new(0.0, -1.0, 0.0)).length() < 1e-5,
+        "{:?}",
+        deformed.positions[0]
+    );
+    assert!(bounds.min.y <= -1.0 + 1e-4 && bounds.max.y >= -1.0 - 1e-4);
+    // The authored bounds hold the original vertex and not the deformed one.
+    let inside = |point: Vec3| point.cmpge(authored.min).all() && point.cmple(authored.max).all();
+    assert!(inside(Vec3::new(0.0, 1.0, 0.0)));
+    assert!(!inside(Vec3::new(0.0, -1.0, 0.0)));
+
+    let mut scene = crate::Scene::new();
+    let mut mesh = crate::Mesh::new("posed");
+    mesh.primitives.push(primitive);
+    scene.meshes.push(mesh);
+    scene.materials.push(crate::Material::default());
+    scene.skeleton = Some(skeleton);
+    scene.associations.push(crate::PrimitiveBones {
+        mesh: 0,
+        primitive: 0,
+        bones: vec![0],
+        weighted: false,
+        declared_bone_count: Some(1),
+    });
+    scene.influences.push(crate::PrimitiveInfluences {
+        mesh: 0,
+        primitive: 0,
+        influences,
+    });
+    scene.recompute_bounds();
+    let posed = scene
+        .posed_bounds(&pose)
+        .expect("posed bounds")
+        .expect("a posed box");
+    assert!(posed.min.y < 0.0, "{posed:?}");
+    assert!(scene.bounds.max.y >= 1.0, "{:?}", scene.bounds);
 }
