@@ -19,8 +19,10 @@ use std::sync::atomic::AtomicBool;
 use lforge_binary::Source;
 use lforge_core::archive::Format;
 use lforge_core::inspect as recognition;
+use lforge_core::pso as pso_report;
 use lforge_core::resource::{EntryId, Locator, ResourcePath};
 use lforge_core::zip as zip_archive;
+use lforge_rage9::psin::pso::names::Names;
 use lforge_rage9::rpf::metadata::transform::Algorithm;
 use lforge_rage9::rpf::metadata::{Entry, Payload};
 use lforge_rage9::rpf::names::Types;
@@ -51,6 +53,15 @@ pub struct Options {
     /// Replace the output file if it already exists.
     pub overwrite: bool,
     pub json: bool,
+    /// Name tables for metadata structure and field hashes. Empty means the
+    /// archive's own `<archive>.names.txt` when it exists.
+    pub names: Vec<PathBuf>,
+    /// The index built from `names`, and from the built-in tables.
+    pub metadata_names: Option<Names>,
+    /// Where the decoded metadata document is written.
+    pub metadata_output: Option<PathBuf>,
+    /// Write the metadata document as XML instead of JSON.
+    pub metadata_xml: bool,
 }
 
 impl Options {
@@ -147,8 +158,41 @@ pub fn file(path: &Path, options: &Options) -> Result<(), String> {
 }
 
 /// Inspects a native row or ZIP entry of an archive, after descending through
-/// `enters`.
+/// `enters`, and writes the decoded metadata document when asked for.
 pub fn archive(
+    file: &Path,
+    executable: Option<&Path>,
+    enters: &[Selector],
+    selection: &Selection,
+    options: &Options,
+) -> Result<(), String> {
+    let mut options = options.clone();
+    // Metadata names come from the archive's table or the ones given.
+    if let Ok(tables) = crate::native::load_name_tables(file, &options.names)
+        && !tables.table.entries().is_empty()
+    {
+        options.metadata_names = Some(Names::from_table(&tables.table));
+    }
+    let row = selection.row.or_else(|| {
+        (enters.is_empty() && selection.row.is_none() && selection.zip.is_none()).then_some(0)
+    });
+    let report = archive_report(file, executable, enters, selection, &options);
+    let Some(output) = options.metadata_output.clone() else {
+        return report;
+    };
+    report?;
+    let Some(row) = row else {
+        return Err("a metadata document comes from one native row; give --row".to_string());
+    };
+    if !enters.is_empty() {
+        return Err(
+            "a metadata document is written for an archive reached without --enter".to_string(),
+        );
+    }
+    write_metadata(file, executable, row, &options, &output)
+}
+
+fn archive_report(
     file: &Path,
     executable: Option<&Path>,
     enters: &[Selector],
@@ -560,6 +604,116 @@ fn emit_payload(
     emit(&mut payload, len, context, options)
 }
 
+/// Writes the decoded metadata document of one native row.
+///
+/// The document keeps every stored hash, so a name the table resolves is an
+/// addition, never a replacement. The provenance names the archive, the row
+/// and the row's stored keys, so a decoded document can be traced back to the
+/// bytes it came from.
+fn write_metadata(
+    archive: &Path,
+    executable: Option<&Path>,
+    row: u32,
+    options: &Options,
+    output: &Path,
+) -> Result<(), String> {
+    let opened = native::open_metadata(archive, MAX_METADATA, executable)?;
+    let entry = opened.metadata.entry(row).map_err(|err| err.to_string())?;
+    let alternates = Alternates::resolve(archive, &opened.metadata);
+    let mut payload = match entry.payload(&opened.source, alternates.sources()) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let Some(stream) = opened.stream.as_ref() else {
+                return Err(format!("row {row} cannot be read: {err}"));
+            };
+            native::transformed_payload(&entry, &opened.source, &alternates, stream)?
+        }
+    };
+    let cancel = AtomicBool::new(false);
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0u8; crate::output::BUFFER];
+    loop {
+        match payload.read_cancellable(&mut buffer, &cancel) {
+            Ok(0) => break,
+            Ok(read) => {
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.len() as u64 > crate::output::MAX_OUTPUT {
+                    return Err(format!(
+                        "row {row} decodes to more than the {} byte limit",
+                        crate::output::MAX_OUTPUT
+                    ));
+                }
+            }
+            Err(err) => return Err(format!("row {row} cannot be decoded: {err}")),
+        }
+    }
+    let document = lforge_rage9::psin::pso::decode(&bytes).map_err(|err| err.to_string())?;
+    let empty = Names::empty();
+    let names = options.metadata_names.as_ref().unwrap_or(&empty);
+    let sample = if options.blocks { usize::MAX } else { options.sample };
+    let source = [
+        ("archive", path_string(archive)),
+        ("row", row.to_string()),
+        (
+            "nameHash64",
+            entry
+                .name_hash
+                .clone()
+                .ok()
+                .flatten()
+                .map_or_else(String::new, |hash| format!("0x{hash:016X}")),
+        ),
+        (
+            "nameKey32",
+            entry
+                .name_key
+                .clone()
+                .ok()
+                .flatten()
+                .map_or_else(String::new, |key| format!("0x{key:08X}")),
+        ),
+        ("namesIndexed", names.len().to_string()),
+    ];
+    let provenance = json!({
+        "archive": path_string(archive),
+        "row": row,
+        "name_hash": entry.name_hash.clone().ok().flatten().map(|hash| format!("0x{hash:016X}")),
+        "name_key": entry.name_key.clone().ok().flatten().map(|key| format!("0x{key:08X}")),
+        "names_indexed": names.len(),
+        "names": options.names.iter().map(|path| path_string(path)).collect::<Vec<String>>(),
+        "blocks_written": if options.blocks { Value::Null } else { json!(sample) },
+    });
+    crate::output::ensure_not_input(output, &[archive])?;
+    let written = crate::output::write_file(output, options.overwrite, |writer| {
+        if options.metadata_xml {
+            let text = pso_report::document_xml(&document, sample, &source);
+            writer
+                .write_all(text.as_bytes())
+                .map_err(|err| crate::output::write_error(output, err))?;
+            return Ok(text.len() as u64);
+        }
+        let export = json!({
+            "schema": "leonida-forge.psin-document/1",
+            "source": provenance,
+            "document": pso_report::document_json(&document, names, sample),
+        });
+        let text = serde_json::to_vec_pretty(&export)
+            .map_err(|err| format!("cannot serialise the document: {err}"))?;
+        writer
+            .write_all(&text)
+            .map_err(|err| crate::output::write_error(output, err))?;
+        Ok(text.len() as u64)
+    })?;
+    println!(
+        "decoded row {row}: {} structures, {} blocks, {} records; {written} bytes to {}",
+        document.structures.len(),
+        document.blocks.len(),
+        document.record_count(),
+        output.display()
+    );
+    Ok(())
+}
+
 fn emit_failure(
     source: Value,
     provenance: Value,
@@ -605,8 +759,15 @@ fn emit<R: Read + Seek>(
     options: &Options,
 ) -> Result<(), String> {
     let cancellation = AtomicBool::new(false);
-    let report = recognition::inspect(source, len, &options.recognition(), &cancellation)
-        .map_err(|err| format!("cannot read the signature: {err}"))?;
+    let recognition_options = options.recognition();
+    let report = recognition::inspect_with_names(
+        source,
+        len,
+        &recognition_options,
+        options.metadata_names.as_ref(),
+        &cancellation,
+    )
+    .map_err(|err| format!("cannot read the signature: {err}"))?;
     let failure_stage = report.failure.as_ref().map(|failure| failure.stage);
     let mut document = Map::new();
     document.insert("schema".into(), json!(SCHEMA));

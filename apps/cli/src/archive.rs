@@ -178,6 +178,20 @@ pub enum Command {
         /// Decode every decodable block and report what fails
         #[arg(long)]
         verify: bool,
+        /// A local name table used to name metadata structure and field
+        /// hashes. Repeatable. Defaults to `<archive>.names.txt` when it
+        /// exists, and the built-in tables always apply
+        #[arg(long = "name-file", visible_alias = "candidates")]
+        candidates: Vec<PathBuf>,
+        /// Write the decoded metadata document of the selected row here
+        #[arg(long = "metadata-output")]
+        metadata_output: Option<PathBuf>,
+        /// Write the metadata document as XML instead of JSON
+        #[arg(long = "metadata-xml", requires = "metadata_output")]
+        metadata_xml: bool,
+        /// Replace the metadata document if it already exists
+        #[arg(long, requires = "metadata_output")]
+        overwrite: bool,
         /// Print as JSON
         #[arg(long)]
         json: bool,
@@ -653,6 +667,10 @@ pub fn run(command: Command) -> Result<(), String> {
             sample,
             blocks,
             verify,
+            candidates,
+            metadata_output,
+            metadata_xml,
+            overwrite,
             json,
         } => crate::inspect::archive(
             &file,
@@ -665,8 +683,12 @@ pub fn run(command: Command) -> Result<(), String> {
                 verify,
                 texture: None,
                 output: None,
-                overwrite: false,
+                overwrite,
                 json,
+                names: candidates,
+                metadata_names: None,
+                metadata_output,
+                metadata_xml,
             },
         ),
         Command::Ls {

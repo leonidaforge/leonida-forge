@@ -177,6 +177,10 @@ pub fn run(command: Command) -> Result<(), String> {
                 output,
                 overwrite,
                 json,
+                names: Vec::new(),
+                metadata_names: None,
+                metadata_output: None,
+                metadata_xml: false,
             },
         ),
     }
