@@ -704,8 +704,14 @@ fn write_metadata(
             .map_err(|err| crate::output::write_error(output, err))?;
         Ok(text.len() as u64)
     })?;
+    let identity = entry
+        .name_hash
+        .clone()
+        .ok()
+        .flatten()
+        .map_or_else(|| format!("row {row}"), |hash| format!("{hash:#018X}"));
     println!(
-        "decoded row {row}: {} structures, {} blocks, {} records; {written} bytes to {}",
+        "decoded {identity}: {} structures, {} blocks, {} records; {written} bytes to {}",
         document.structures.len(),
         document.blocks.len(),
         document.record_count(),
