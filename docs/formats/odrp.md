@@ -287,9 +287,9 @@ covered by tests.
 - A `0x44` text slot's layout is unknown, so its 16 bytes are kept and not read
   as text.
 - Four blocks in one resource cannot be divided; their bytes are kept.
-- A structure or field name stays the 32-bit hash the schema stores. The
-  viewer names 9,804 of row 476's hashes through the existing dictionary; the
-  rest stay hashes.
+- A structure or field name stays the 32-bit hash the schema stores. The name
+  index the viewer builds from the archives holds 9,804 hashes for row 476, and
+  a stored hash a name reproduces shows that name beside it.
 - No observed resource used a graphics page, so that path is untested against
   real data.
 - Semantics. The decoder reports storage, not meaning: a field means what its
