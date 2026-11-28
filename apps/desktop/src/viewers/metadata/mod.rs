@@ -553,3 +553,38 @@ fn names_for(path: &Path) -> Names {
     }
     Names::from_table(&table)
 }
+
+#[cfg(test)]
+mod tests {
+    use lforge_core::resource::{EntryId, ResourcePath};
+    use lforge_rage9::rpf::names::Key;
+
+    use super::identity;
+
+    fn named(key: u64, name: &'static str, type_id: u8) -> EntryId {
+        EntryId::new(
+            Some(Key::Hash64(key)),
+            Some(type_id),
+            Some(name.to_string()),
+        )
+    }
+
+    #[test]
+    fn a_window_names_the_row_by_its_canonical_path() {
+        let path = ResourcePath::root("data.rpf")
+            .push(named(0x11, "packs/camera.rpf", 0))
+            .with_entry(named(0x22, "packs/camera/cam.zmt", 11));
+        assert_eq!(
+            identity(std::path::Path::new("/tmp/spool-1234"), Some(&path)),
+            "data.rpf!packs/camera.rpf!packs/camera/cam.zmt"
+        );
+    }
+
+    #[test]
+    fn a_payload_without_a_resource_path_is_named_by_its_file() {
+        assert_eq!(
+            identity(std::path::Path::new("C:/game/data/thing.zmt"), None),
+            "thing.zmt"
+        );
+    }
+}
