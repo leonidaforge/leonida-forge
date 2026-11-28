@@ -210,6 +210,7 @@ struct Request {
     pose: Option<Arc<PoseFrame>>,
     pose_active: bool,
     influence_view: bool,
+    policy: lforge_scene::DeformationPolicy,
 }
 
 #[derive(Clone, Copy)]
@@ -623,6 +624,28 @@ impl Viewport {
         }
     }
 
+    /// Includes or excludes inferred single-bone associations. Switches the
+    /// renderer policy and nothing else: no reload, no re-decode, no upload.
+    pub fn set_include_inferred(&mut self, include: bool, cx: &mut Context<Self>) {
+        if let Some(pose) = &mut self.pose {
+            pose.set_include_inferred(include);
+            self.pose_cache = None;
+            self.request_frame();
+            cx.notify();
+        }
+    }
+
+    /// How many primitives are associated only by inference.
+    pub fn scene_inferred_primitive_count(&self) -> usize {
+        self.scene.inferred_primitive_count()
+    }
+
+    pub fn include_inferred(&self) -> bool {
+        self.pose
+            .as_ref()
+            .is_some_and(|pose| pose.include_inferred())
+    }
+
     pub fn pose_rotation_degrees(&self, bone: usize) -> Option<[f32; 3]> {
         self.pose.as_ref()?.rotation_degrees(bone)
     }
@@ -651,13 +674,10 @@ impl Viewport {
     /// influence attribute, so its single bone is an inference from the
     /// one-bone count rather than a decoded stream.
     pub fn deformation_report(&self) -> String {
-        let deformable = self.scene.deformable_primitive_count();
-        let inferred = self
-            .scene
-            .influences
-            .iter()
-            .filter(|entry| entry.influences.deformable() && entry.influences.inferred())
-            .count();
+        let include_inferred = self.include_inferred();
+        let policy = lforge_scene::DeformationPolicy { include_inferred };
+        let deformable = self.scene.deformable_primitive_count_under(policy);
+        let inferred = self.scene.inferred_primitive_count();
         let total: usize = self
             .scene
             .meshes
@@ -666,10 +686,10 @@ impl Viewport {
             .sum();
         match &self.scene.skeleton {
             Some(skeleton) => {
-                let inferred = if inferred > 0 {
-                    format!(" ({inferred} inferred single-bone)")
-                } else {
-                    String::new()
+                let inferred = match (inferred, include_inferred) {
+                    (0, _) => String::new(),
+                    (count, true) => format!(" ({count} inferred single-bone included)"),
+                    (count, false) => format!(" ({count} inferred single-bone excluded)"),
                 };
                 format!(
                     "{deformable} of {total} primitive(s) deform{inferred}; {} bone(s)",
@@ -824,6 +844,11 @@ impl Viewport {
         self.next_generation = self.next_generation.wrapping_add(1);
         let pose_active = pose.as_ref().is_some_and(|frame| frame.active);
         let influence_view = pose.as_ref().is_some_and(|frame| frame.influence);
+        let policy = pose
+            .as_ref()
+            .map_or(lforge_scene::DeformationPolicy::EXPLICIT, |frame| {
+                frame.policy
+            });
         let request = Request {
             generation: self.next_generation,
             size: self.size,
@@ -834,6 +859,7 @@ impl Viewport {
             pose,
             pose_active,
             influence_view,
+            policy,
         };
         if !requests.submit(request) {
             self.requests = None;
@@ -1070,6 +1096,7 @@ fn spawn_render_thread(
                 if request.pose.is_none() {
                     applied_pose = None;
                 }
+                gpu_scene.set_policy(request.policy);
                 gpu_scene.set_pose_active(request.pose_active);
                 gpu_scene.set_influence_view(request.influence_view);
                 gpu_scene.set_skeleton_visible(request.skeleton);

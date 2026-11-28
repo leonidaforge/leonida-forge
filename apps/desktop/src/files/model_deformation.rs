@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use glam::{Quat, Vec3};
 use lforge_renderer::{Background, GpuScene, OrbitCamera, Overlay, Renderer, SkinProbeVertex};
-use lforge_scene::{Pose, Scene, SkinningMatrices, deform_primitive};
+use lforge_scene::{Pose, Scene, SkinningMatrices};
 
 use super::*;
 use crate::files::Executable;
@@ -40,6 +40,8 @@ struct Case {
     degrees: f32,
     translation: Vec3,
     label: String,
+    /// Whether inferred single-bone associations take part.
+    include_inferred: bool,
 }
 
 fn cases(path: &Path) -> Vec<Case> {
@@ -59,6 +61,7 @@ fn cases(path: &Path) -> Vec<Case> {
                 degrees: 30.0,
                 translation: Vec3::ZERO,
                 label: String::new(),
+                include_inferred: false,
             };
             for part in parts {
                 let (key, value) = part.split_once('=')?;
@@ -81,6 +84,7 @@ fn cases(path: &Path) -> Vec<Case> {
                         }
                     }
                     "label" => case.label = value.replace('_', " "),
+                    "inferred" => case.include_inferred = value == "1" || value == "true",
                     _ => {}
                 }
             }
@@ -208,11 +212,17 @@ fn worst4(a: [f32; 4], b: [f32; 4]) -> f32 {
 
 /// Renders the CPU-deformed scene through the static pipeline so the skinned
 /// pipeline can be compared with it pixel by pixel.
-fn cpu_reference_scene(scene: &Scene, matrices: &SkinningMatrices) -> Scene {
+fn cpu_reference_scene(
+    scene: &Scene,
+    matrices: &SkinningMatrices,
+    policy: lforge_scene::DeformationPolicy,
+) -> Scene {
     let mut reference = scene.clone();
     for entry in &scene.influences {
         let primitive = &scene.meshes[entry.mesh].primitives[entry.primitive];
-        let Ok(deformed) = deform_primitive(primitive, &entry.influences, matrices) else {
+        let Ok(deformed) =
+            lforge_scene::deform_primitive_with(primitive, &entry.influences, matrices, policy)
+        else {
             continue;
         };
         let target = &mut reference.meshes[entry.mesh].primitives[entry.primitive];
@@ -362,6 +372,37 @@ fn reports_deformation_measurements() {
                 }
             }
             highest_index = highest_index.max(indices.iter().copied().max().unwrap_or(0));
+            // The declaration table is the authority here: a stream the old
+            // reader dropped is visible as a populated attribute below.
+            let units = primitive
+                .vertices
+                .iter()
+                .filter(|vertex| {
+                    let normal = Vec3::from(vertex.normal);
+                    (normal.length() - 1.0).abs() < 1e-3
+                })
+                .count();
+            let zeros = primitive
+                .vertices
+                .iter()
+                .filter(|vertex| Vec3::from(vertex.normal).length() < 1e-6)
+                .count();
+            let (u_min, u_max) = primitive
+                .vertices
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), vertex| {
+                    (min.min(vertex.uv0[0]), max.max(vertex.uv0[0]))
+                });
+            let tangents = primitive
+                .vertices
+                .iter()
+                .filter(|vertex| vertex.tangent.is_some())
+                .count();
+            println!(
+                "    attributes: normals {units}/{} unit, {zeros} zero, uv0 u {u_min:.4}..{u_max:.4}, tangents {tangents}/{}",
+                primitive.vertices.len(),
+                primitive.vertices.len()
+            );
             if influences.inferred() {
                 inferred += 1;
             }
@@ -410,17 +451,28 @@ fn reports_deformation_measurements() {
         for (encoding, count) in &encodings {
             println!("  encoding: {count} x {encoding}");
         }
-        if !scene.supports_deformation() {
+        let policy = lforge_scene::DeformationPolicy {
+            include_inferred: case.include_inferred,
+        };
+        if !scene.supports_deformation_under(policy) {
             println!("  no deformable primitive; stopping here");
             continue;
         }
 
         // The bone to pose: the caller's choice, else the largest weight total in
         // the widest influence set.
+        println!(
+            "  policy: {}",
+            if policy.include_inferred {
+                "explicit and inferred"
+            } else {
+                "explicit only"
+            }
+        );
         let widest = scene
             .influences
             .iter()
-            .filter(|entry| entry.influences.deformable())
+            .filter(|entry| policy.admits(&entry.influences))
             .max_by_key(|entry| {
                 let vertices = scene.meshes[entry.mesh].primitives[entry.primitive]
                     .vertices
@@ -541,12 +593,17 @@ fn reports_deformation_measurements() {
         let mut worst_tangent = 0.0f32;
         let mut deformed: Vec<(usize, usize, lforge_scene::DeformedPrimitive)> = Vec::new();
         for entry in &scene.influences {
-            if !entry.influences.deformable() {
+            if !policy.admits(&entry.influences) {
                 continue;
             }
             let primitive = &scene.meshes[entry.mesh].primitives[entry.primitive];
-            let result =
-                deform_primitive(primitive, &entry.influences, &matrices).expect("deformation");
+            let result = lforge_scene::deform_primitive_with(
+                primitive,
+                &entry.influences,
+                &matrices,
+                policy,
+            )
+            .expect("deformation");
             for (index, vertex) in primitive.vertices.iter().enumerate() {
                 let delta =
                     (Vec3::from(result.positions[index]) - Vec3::from(vertex.position)).length();
@@ -621,12 +678,17 @@ fn reports_deformation_measurements() {
         let mut probe_tangents = 0.0f32;
         let mut compared = 0usize;
         for entry in &scene.influences {
-            if !entry.influences.deformable() {
+            if !policy.admits(&entry.influences) {
                 continue;
             }
             let primitive = &scene.meshes[entry.mesh].primitives[entry.primitive];
-            let result =
-                deform_primitive(primitive, &entry.influences, &matrices).expect("deformation");
+            let result = lforge_scene::deform_primitive_with(
+                primitive,
+                &entry.influences,
+                &matrices,
+                policy,
+            )
+            .expect("deformation");
             let probes = probe_vertices(primitive, &entry.influences);
             let samples = renderer
                 .probe_skinning(matrices.matrices(), &probes)
@@ -651,13 +713,13 @@ fn reports_deformation_measurements() {
 
         // Raster comparison: the CPU-deformed scene through the static pipeline
         // against the authored scenes through the skinned pipeline.
-        let cpu_scene = cpu_reference_scene(&scene, &matrices);
+        let cpu_scene = cpu_reference_scene(&scene, &matrices, policy);
         let cpu_gpu = renderer
             .upload_scene(&cpu_scene)
             .expect("upload cpu reference");
         let authored_bounds = scene.bounds.sanitized();
         let posed_bounds = scene
-            .posed_bounds(&pose)
+            .posed_bounds_under(&pose, policy)
             .expect("posed bounds")
             .map_or(authored_bounds, |bounds| bounds.sanitized());
         let camera = OrbitCamera::framing(authored_bounds.union(posed_bounds), 900.0f32 / 700.0f32);
@@ -670,6 +732,7 @@ fn reports_deformation_measurements() {
         let started = Instant::now();
         let reference_frame = render(&mut renderer, &cpu_gpu, &camera, Overlay::NONE);
         let reference_time = started.elapsed();
+        gpu.set_policy(policy);
         gpu.set_pose_active(true);
         let started = Instant::now();
         let skinned_frame = render(&mut renderer, &gpu, &camera, Overlay::NONE);

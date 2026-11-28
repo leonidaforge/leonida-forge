@@ -170,3 +170,45 @@ fn the_reference_frame_restores_the_authored_skeleton() {
     assert_eq!(frame.matrices.len(), skeleton.bones.len());
     assert_eq!(frame.bone_positions[1], Vec3::new(0.0, 2.0, 0.0));
 }
+
+/// The Pose Inspector excludes inferred single-bone associations until the
+/// person asks for them, and the frame carries the choice to the renderer.
+#[test]
+fn a_session_excludes_inferred_associations_until_the_opt_in() {
+    let skeleton = reference_skeleton();
+    let mut session = PoseSession::new(skeleton.bones.len());
+    assert!(!session.include_inferred());
+    assert!(!session.frame(&skeleton).unwrap().policy.include_inferred);
+
+    let before = session.revision();
+    session.set_include_inferred(true);
+    assert!(
+        session.revision() > before,
+        "the change must invalidate the frame"
+    );
+    assert!(session.include_inferred());
+    assert!(session.frame(&skeleton).unwrap().policy.include_inferred);
+
+    // The choice survives a reset: it is a policy, not a pose.
+    session.adjust_rotation(0, 2, 4).unwrap();
+    session.reset_all();
+    assert!(session.is_reference());
+    assert!(session.include_inferred());
+
+    session.set_include_inferred(false);
+    assert!(!session.frame(&skeleton).unwrap().policy.include_inferred);
+    // A repeated write changes nothing, so the cache is not invalidated.
+    let revision = session.revision();
+    session.set_include_inferred(false);
+    assert_eq!(session.revision(), revision);
+}
+
+/// The reference frame, which is what leaving pose mode sends, is explicit-only:
+/// it never asks the renderer to draw inferred geometry.
+#[test]
+fn the_reference_frame_carries_the_explicit_policy() {
+    let skeleton = reference_skeleton();
+    let frame = super::PoseFrame::reference(&skeleton).unwrap();
+    assert!(!frame.policy.include_inferred);
+    assert!(!frame.active);
+}

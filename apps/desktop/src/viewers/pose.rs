@@ -13,7 +13,7 @@
 //! scaling is not offered.
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use lforge_scene::{Pose, PoseError, Skeleton, SkinningMatrices};
+use lforge_scene::{DeformationPolicy, Pose, PoseError, Skeleton, SkinningMatrices};
 
 /// Degrees one rotation button adds.
 pub const ROTATION_STEP_DEGREES: f32 = 5.0;
@@ -49,6 +49,8 @@ pub struct PoseFrame {
     pub active: bool,
     /// Whether the selected-bone influence view is on.
     pub influence: bool,
+    /// Which associations the renderer may draw skinned.
+    pub policy: DeformationPolicy,
 }
 
 impl PoseFrame {
@@ -67,6 +69,7 @@ impl PoseFrame {
                 .collect(),
             active: false,
             influence: false,
+            policy: DeformationPolicy::EXPLICIT,
         })
     }
 }
@@ -80,6 +83,7 @@ pub struct PoseSession {
     translations: Vec<Vec3>,
     display: PoseDisplay,
     influence: bool,
+    policy: DeformationPolicy,
     revision: u64,
 }
 
@@ -91,6 +95,7 @@ impl PoseSession {
             translations: vec![Vec3::ZERO; bone_count],
             display: PoseDisplay::Posed,
             influence: false,
+            policy: DeformationPolicy::EXPLICIT,
             revision: 0,
         }
     }
@@ -114,6 +119,23 @@ impl PoseSession {
 
     pub fn influence_view(&self) -> bool {
         self.influence
+    }
+
+    /// Whether inferred single-bone associations are included.
+    pub fn include_inferred(&self) -> bool {
+        self.policy.include_inferred
+    }
+
+    /// Includes or excludes inferred single-bone associations. The default
+    /// excludes them: the geometry record states no bone reference, so the
+    /// association is an inference.
+    pub fn set_include_inferred(&mut self, include: bool) {
+        if self.policy.include_inferred != include {
+            self.policy = DeformationPolicy {
+                include_inferred: include,
+            };
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
     /// Changes the displayed geometry. The pose is kept, so switching back to
@@ -243,6 +265,7 @@ impl PoseSession {
                     .collect(),
                 active: false,
                 influence: false,
+                policy: self.policy,
             });
         }
         let matrices = SkinningMatrices::build(skeleton, &self.pose)?;
@@ -253,6 +276,7 @@ impl PoseSession {
             bone_positions: posed.into_iter().map(|bone| bone.model_position).collect(),
             active: true,
             influence: self.influence,
+            policy: self.policy,
         })
     }
 }

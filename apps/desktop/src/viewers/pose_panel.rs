@@ -21,7 +21,7 @@ pub fn pose_section<V: 'static>(viewport: Entity<Viewport>, cx: &Context<V>) -> 
     if !viewport.read(cx).pose_supported() {
         return div().into_any_element();
     }
-    let (active, report, display, influence) = {
+    let (active, report, display, influence, include_inferred, inferred_count) = {
         let state = viewport.read(cx);
         let edited = state.pose().is_some_and(|pose| !pose.is_reference());
         (
@@ -39,6 +39,8 @@ pub fn pose_section<V: 'static>(viewport: Entity<Viewport>, cx: &Context<V>) -> 
                 .pose()
                 .map_or(PoseDisplay::Posed, |pose| pose.display()),
             state.pose().is_some_and(|pose| pose.influence_view()),
+            state.include_inferred(),
+            state.scene_inferred_primitive_count(),
         )
     };
     let mut section = div()
@@ -128,6 +130,54 @@ pub fn pose_section<V: 'static>(viewport: Entity<Viewport>, cx: &Context<V>) -> 
             })),
     );
     section = section.child(display_row);
+    if inferred_count > 0 {
+        let mut policy_row = div().flex().items_center().gap_1().child(
+            div()
+                .w(px(58.))
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Inferred"),
+        );
+        policy_row = policy_row.child(
+            ui::small_button(
+                "pose-include-inferred",
+                if include_inferred {
+                    "Single-bone included"
+                } else {
+                    "Single-bone excluded"
+                },
+            )
+            .when(include_inferred, |el| {
+                el.bg(rgb(theme::SELECTION))
+                    .border_color(rgb(theme::SELECTION_BORDER))
+            })
+            .on_click(cx.listener({
+                let viewport = viewport.clone();
+                move |_this, _, _, cx| {
+                    let include = !viewport.read(cx).include_inferred();
+                    viewport.clone().update(cx, |viewport, cx| {
+                        viewport.set_include_inferred(include, cx)
+                    });
+                }
+            })),
+        );
+        section = section.child(policy_row);
+        section = section.child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(if include_inferred {
+                    format!(
+                        "{inferred_count} primitive(s) are included by inference: the geometry declares no influence attribute and its one bone is inferred from the bone count, not decoded"
+                    )
+                } else {
+                    format!(
+                        "{inferred_count} primitive(s) stay authored: their single-bone association is inferred, not verified"
+                    )
+                }),
+        );
+    }
 
     let selected = viewport.read(cx).selected_bone();
     if let Some(bone) = selected {
