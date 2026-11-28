@@ -579,6 +579,30 @@ mod tests {
     }
 
     #[test]
+    fn an_entered_row_keeps_its_ancestors() {
+        // A search that enters a row must push it as an archive, not replace
+        // the path's final component: three levels deep, all of them show.
+        let level_one = ResourcePath::root("data.rpf").push(EntryId::new(
+            Some(Key::Hash64(hash64(b"one"))),
+            Some(0),
+            Some("one.rpf".to_string()),
+        ));
+        let level_two = level_one.push(EntryId::new(
+            Some(Key::Hash64(hash64(b"two"))),
+            Some(0),
+            Some("two.rpf".to_string()),
+        ));
+        let leaf = level_two.with_entry(EntryId::new(
+            Some(Key::Hash64(hash64(b"leaf"))),
+            Some(11),
+            Some("leaf.zmt".to_string()),
+        ));
+        assert_eq!(leaf.display(), "data.rpf!one.rpf!two.rpf!leaf.zmt");
+        assert_eq!(leaf.archive_display(), "data.rpf!one.rpf!two.rpf");
+        assert_eq!(leaf.limitations(), Vec::<&'static str>::new());
+    }
+
+    #[test]
     fn a_zip_name_is_authoritative_and_has_a_technical_identity() {
         let entry = EntryId::named("scripts/main.gfx", Some(66), Locator::Zip(3));
         assert_eq!(entry.display(), "scripts/main.gfx");

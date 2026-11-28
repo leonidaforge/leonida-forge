@@ -42,6 +42,8 @@ pub struct Listing {
     archive: PathBuf,
     /// The canonical path of the archive itself, without its entry.
     path: ResourcePath,
+    /// The rows entered to reach this archive, for `--enter` on one of them.
+    chain: Vec<u32>,
     opened: Opened,
     types: Types,
     resolved: ResolutionSet,
@@ -72,16 +74,18 @@ impl Listing {
     ) -> Result<Self, String> {
         let opened = native::open_metadata_cancellable(path, MAX_METADATA, executable, cancel)?;
         let root = table_name(path);
-        Self::from_opened(path, ResourcePath::root(root), opened, name_files)
+        Self::from_opened(path, ResourcePath::root(root), Vec::new(), opened, name_files)
     }
 
     /// Resolves the rows of an archive already read from `origin`, a file on
-    /// disk, whose canonical path is `path`. An archive stored inside another
-    /// one takes its name table from `origin`, because the table beside a
-    /// `.rpf` file describes every archive in that file.
+    /// disk, whose canonical path is `path` and which was reached by entering
+    /// `chain`. An archive stored inside another one takes its name table from
+    /// `origin`, because the table beside a `.rpf` file describes every archive
+    /// in that file.
     pub fn from_opened(
         origin: &Path,
         path: ResourcePath,
+        chain: Vec<u32>,
         opened: Opened,
         name_files: &[PathBuf],
     ) -> Result<Self, String> {
@@ -112,6 +116,7 @@ impl Listing {
         Ok(Self {
             archive: origin.to_path_buf(),
             path,
+            chain,
             opened,
             types,
             resolved: ResolutionSet {
@@ -128,6 +133,15 @@ impl Listing {
         self.entry_ids
             .get(position)
             .map(|entry| self.path.with_entry(entry.clone()))
+    }
+
+    /// The canonical path of the row at `position`, for a caller that enters
+    /// it as another archive. The row becomes an ancestor, so the rows of the
+    /// archive inside it continue the same hierarchy.
+    pub fn nested(&self, position: usize) -> Option<ResourcePath> {
+        self.entry_ids
+            .get(position)
+            .map(|entry| self.path.push(entry.clone()))
     }
 
     /// The canonical identity of the row at `position`, for a caller that
@@ -267,6 +281,14 @@ impl Listing {
             "authentication": self.opened.authentication.status(),
         });
         record["archive"] = json!(self.path.archive_display());
+        // The rows entered to reach this archive, so a caller can select it
+        // again with `--enter`. A row index addresses an entry only inside one
+        // archive; it is never the resource identity.
+        record["entered"] = json!(self
+            .chain
+            .iter()
+            .map(|row| format!("row:{row}"))
+            .collect::<Vec<String>>());
         if let Some(resource) = self.resource(position) {
             record["resource"] = json!({
                 "display": resource.display(),
@@ -631,6 +653,8 @@ struct Pending {
     origin: PathBuf,
     /// The canonical path of the archive itself.
     path: ResourcePath,
+    /// The rows entered to reach it, from the root file.
+    chain: Vec<u32>,
     /// How many archives it was reached through; a file on disk is 0.
     depth: usize,
     /// An archive already opened, or `None` for a file on disk not yet opened.
@@ -689,6 +713,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         .map(|archive| Pending {
             origin: archive.clone(),
             path: ResourcePath::root(name_of(archive)),
+            chain: Vec::new(),
             depth: 0,
             opened: None,
         })
@@ -730,6 +755,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
         let listing = match Listing::from_opened(
             &item.origin,
             item.path.clone(),
+            item.chain.clone(),
             opened,
             &options.candidates,
         ) {
@@ -775,7 +801,7 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 stopped = Some("max_archives");
                 break;
             }
-            let Some(child) = listing.resource(position) else {
+            let Some(child) = listing.nested(position) else {
                 continue;
             };
             let limits = native::NestedLimits {
@@ -795,9 +821,12 @@ pub fn run_search(options: SearchOptions) -> Result<(), String> {
                 Ok((nested, spent)) => {
                     spooled += spent;
                     nested_opened += 1;
+                    let mut chain = item.chain.clone();
+                    chain.push(entry.row);
                     children.push(Pending {
                         origin: item.origin.clone(),
                         path: child,
+                        chain,
                         depth: item.depth + 1,
                         opened: Some(Box::new(nested)),
                     });

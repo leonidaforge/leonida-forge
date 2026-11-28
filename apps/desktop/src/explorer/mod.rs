@@ -967,19 +967,8 @@ impl Explorer {
                     .is_some_and(|value| value.is_texture_dictionary());
                 // A row that starts with the `PSIN` container magic holds a
                 // self-describing metadata document, which has its own view.
-                let metadata = classification
-                    .as_ref()
-                    .is_some_and(|value| value.format_id() == Some("psin"));
-                // A format this build reads structurally is never re-read as
-                // text. A `PSIN` container carries printable names and strings,
-                // so a byte-level text check alone would accept it.
-                let unclaimed = matches!(
-                    capability,
-                    None | Some(lforge_core::classify::Capability::Bytes)
-                        | Some(lforge_core::classify::Capability::Unprobed)
-                );
-                let text_document = capability == Some(lforge_core::classify::Capability::Text)
-                    || (unclaimed && text.is_some());
+                let metadata = opens_as_metadata(classification.as_ref());
+                let text_document = opens_as_text(capability, text.is_some());
                 match identified {
                     Ok(Identified::Archive(_)) => {
                         this.mark_archive(&path);
@@ -2196,6 +2185,33 @@ enum ModelEntryKind {
     Sniff,
 }
 
+/// Whether the classification recognises a payload as a metadata container
+/// this build decodes, so it opens in the metadata viewer.
+///
+/// The format comes from the container's own signature, never from the file
+/// extension, so a metadata container keeps its viewer whoever named it.
+fn opens_as_metadata(classification: Option<&lforge_core::classify::Classification>) -> bool {
+    classification.is_some_and(|value| value.format_id() == Some("psin"))
+}
+
+/// Whether a payload opens in the text viewer.
+///
+/// A validated text document always does. An unclaimed payload does when its
+/// own bytes are text, which is how an unnamed payload opens as what it holds.
+/// A format this build reads structurally never does, even when a byte-level
+/// check would accept it: a `PSIN` container carries printable names, and the
+/// structured view is the honest one.
+fn opens_as_text(capability: Option<lforge_core::classify::Capability>, bytes_are_text: bool) -> bool {
+    match capability {
+        Some(lforge_core::classify::Capability::Text) => true,
+        Some(lforge_core::classify::Capability::Archive)
+        | Some(lforge_core::classify::Capability::Resource)
+        | Some(lforge_core::classify::Capability::Structural(_))
+        | Some(lforge_core::classify::Capability::Unavailable(_)) => false,
+        _ => bytes_are_text,
+    }
+}
+
 fn model_entry_kind(entry: &Entry) -> Option<ModelEntryKind> {
     // The declared asset class chooses the candidate. It does not decide what
     // the payload is: the decoded segments do that, so a declared model row
@@ -2511,5 +2527,35 @@ mod export_tests {
             None,
         );
         assert_eq!(model_entry_kind(&folder), None);
+    }
+
+    #[test]
+    fn a_text_check_never_claims_a_format_this_build_reads() {
+        use lforge_core::classify::Capability;
+        // A `PSIN` container carries printable structure and field names, and a
+        // byte-level text check can accept it. The structured view must win.
+        for capability in [
+            Capability::Structural("psin"),
+            Capability::Structural("rbf0"),
+            Capability::Archive,
+            Capability::Resource,
+            Capability::Unavailable("the payload transform needs key material"),
+        ] {
+            assert!(
+                !opens_as_text(Some(capability), true),
+                "{capability:?} must not open as text"
+            );
+        }
+    }
+
+    #[test]
+    fn text_opens_as_text_and_unclaimed_bytes_only_when_they_are_text() {
+        use lforge_core::classify::Capability;
+        assert!(opens_as_text(Some(Capability::Text), false));
+        assert!(opens_as_text(Some(Capability::Bytes), true));
+        assert!(opens_as_text(Some(Capability::Unprobed), true));
+        assert!(opens_as_text(None, true));
+        assert!(!opens_as_text(Some(Capability::Bytes), false));
+        assert!(!opens_as_text(None, false));
     }
 }
