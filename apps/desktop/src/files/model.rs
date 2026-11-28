@@ -3810,3 +3810,9 @@ mod tests {
 #[cfg(test)]
 #[path = "model_survey.rs"]
 mod survey;
+
+/// The deformation probe lives beside the loader so it can reuse the archive
+/// walk and the renderer. It is test-only: nothing in the application calls it.
+#[cfg(test)]
+#[path = "model_deformation.rs"]
+mod deformation;

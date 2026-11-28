@@ -85,6 +85,9 @@ struct WidthReading {
     max: u32,
     nonzero: usize,
     out_of_range: usize,
+    /// Lanes whose weight is non-zero and whose value is at or above the
+    /// declared bone count. This is what the decoder rejects on.
+    active_out_of_range: usize,
 }
 
 /// Decoded bounds of one position stream and their agreement with the box the
@@ -252,6 +255,7 @@ fn wide_index(
     count: usize,
     stride: usize,
     bones: usize,
+    weights: Option<usize>,
 ) -> Option<WideIndexFacts> {
     let bytes = blob.get(at..at.checked_add(count.checked_mul(stride)?)?)?;
     let mut widths = Vec::new();
@@ -260,6 +264,7 @@ fn wide_index(
         let mut max = 0u32;
         let mut nonzero = 0usize;
         let mut out_of_range = 0usize;
+        let mut active_out_of_range = 0usize;
         for vertex in 0..count {
             let start = vertex * stride;
             for lane in 0..lanes {
@@ -277,6 +282,15 @@ fn wide_index(
                         out_of_range += 1;
                     }
                 }
+                if let Some(weights) = weights
+                    && width == 4
+                    && blob
+                        .get(weights + vertex * 4 + lane)
+                        .is_some_and(|w| *w != 0)
+                    && usize::try_from(value).is_ok_and(|value| value >= bones)
+                {
+                    active_out_of_range += 1;
+                }
                 max = max.max(value);
             }
         }
@@ -286,6 +300,7 @@ fn wide_index(
             max,
             nonzero,
             out_of_range,
+            active_out_of_range,
         });
     }
     Some(WideIndexFacts { stride, widths })
@@ -543,6 +558,9 @@ fn geometry_facts(
     }
 
     // The forms the current decoder does not read, measured rather than named.
+    let weight_offset = weight_entry
+        .filter(|entry| entry.format == 0x26)
+        .map(|entry| entry.offset as usize);
     if let Some(entry) = index_entry {
         let at = entry.offset as usize;
         let bones = usize::from(geometry.bone_count.max(1));
@@ -555,10 +573,10 @@ fn geometry_facts(
                 byte_index = byte_index_counted(blob, at, count, width, bones);
             }
             0x8c => {
-                wide_index = wide_index_stride(blob, at, count, 16, bones);
+                wide_index = wide_index_stride(blob, at, count, 16, bones, weight_offset);
             }
             0x4a => {
-                wide_index = wide_index_stride(blob, at, count, 4, bones);
+                wide_index = wide_index_stride(blob, at, count, 4, bones, weight_offset);
             }
             _ => {}
         }
@@ -656,8 +674,9 @@ fn wide_index_stride(
     count: usize,
     stride: usize,
     bones: usize,
+    weights: Option<usize>,
 ) -> Option<WideIndexFacts> {
-    wide_index(blob, at, count, stride, bones)
+    wide_index(blob, at, count, stride, bones, weights)
 }
 
 #[derive(Default)]

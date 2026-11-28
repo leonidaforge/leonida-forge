@@ -646,8 +646,18 @@ impl Viewport {
     }
 
     /// A short report of what deforms and what stays authored.
+    ///
+    /// An inferred association is counted apart: the geometry declares no
+    /// influence attribute, so its single bone is an inference from the
+    /// one-bone count rather than a decoded stream.
     pub fn deformation_report(&self) -> String {
         let deformable = self.scene.deformable_primitive_count();
+        let inferred = self
+            .scene
+            .influences
+            .iter()
+            .filter(|entry| entry.influences.deformable() && entry.influences.inferred())
+            .count();
         let total: usize = self
             .scene
             .meshes
@@ -655,10 +665,17 @@ impl Viewport {
             .map(|mesh| mesh.primitives.len())
             .sum();
         match &self.scene.skeleton {
-            Some(skeleton) => format!(
-                "{deformable} of {total} primitive(s) deform; {} bone(s)",
-                skeleton.bones.len()
-            ),
+            Some(skeleton) => {
+                let inferred = if inferred > 0 {
+                    format!(" ({inferred} inferred single-bone)")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{deformable} of {total} primitive(s) deform{inferred}; {} bone(s)",
+                    skeleton.bones.len()
+                )
+            }
             None => "no skeleton".to_string(),
         }
     }
@@ -1098,6 +1115,59 @@ fn to_render_image(frame: Frame) -> Arc<RenderImage> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// A burst of pose changes leaves one pending request, and it is the last
+    /// one. This is what keeps rapid button presses from queuing work: the
+    /// render thread wakes once per idle turn and takes the newest value.
+    #[test]
+    fn a_burst_of_pose_requests_keeps_only_the_latest() {
+        let (sender, state) = LatestSender::new();
+        for revision in 0..200u64 {
+            assert!(sender.submit(revision), "submission {revision}");
+        }
+        assert_eq!(state.next(), Some(199));
+        // Nothing is queued behind the value that was taken.
+        drop(sender);
+        assert_eq!(state.next(), None);
+    }
+
+    #[test]
+    fn a_closed_request_queue_rejects_further_work() {
+        let (sender, state) = LatestSender::new();
+        assert!(sender.submit(1u64));
+        drop(sender);
+        assert_eq!(state.next(), None);
+    }
+
+    #[test]
+    fn completed_frames_keep_only_the_newest_and_never_drop_lifecycle_messages() {
+        let (queue, _receiver) = ResponseQueue::new();
+        queue.send(Response::Ready {
+            adapter: "adapter".into(),
+            backend: "backend".into(),
+        });
+        for generation in 0..50 {
+            queue.send(Response::Frame {
+                generation,
+                frame: Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![generation as u8; 4],
+                },
+            });
+        }
+        queue.send(Response::Failed("later".into()));
+        let first = queue.take().expect("a response");
+        assert!(matches!(first, Response::Ready { .. }));
+        let second = queue.take().expect("a response");
+        match second {
+            Response::Frame { generation, .. } => assert_eq!(generation, 49),
+            Response::Failed(reason) => panic!("expected the newest frame, got {reason}"),
+            Response::Ready { .. } => panic!("expected the newest frame, got the ready message"),
+        }
+        assert!(matches!(queue.take(), Some(Response::Failed(_))));
+        assert_eq!(queue.len(), 0);
+    }
 
     #[test]
     fn a_component_toggle_hides_every_mesh_it_owns() {
