@@ -346,6 +346,167 @@ pub enum RawState {
     Unavailable { reason: String },
 }
 
+/// Bytes copied per read while spooling a nested archive.
+const COPY_BUFFER: usize = 1024 * 1024;
+/// A chunk stored with this method is a zlib stream, so the entry is not
+/// contiguous.
+const ZLIB_METHOD: u8 = 3;
+/// The largest metadata area a nested archive read may take.
+const MAX_METADATA: u64 = 256 * 1024 * 1024;
+
+/// What a walk may spend on nested archives.
+#[derive(Debug, Clone, Copy)]
+pub struct NestedLimits {
+    /// The largest archive one row may store.
+    pub max_nested_bytes: u64,
+    /// The most spooled bytes one run may borrow.
+    pub max_spool_bytes: u64,
+    /// The bytes this run has spooled so far.
+    pub spooled: u64,
+}
+
+/// Why an entry that should hold an archive could not be opened as one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedError {
+    /// The row could not be read as an archive. The message names the row.
+    Failed(String),
+    /// Opening it needs more temporary storage than the run may use.
+    SpoolBudget { size: u64 },
+}
+
+impl std::fmt::Display for NestedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NestedError::Failed(reason) => f.write_str(reason),
+            NestedError::SpoolBudget { size } => write!(
+                f,
+                "opening this archive needs {size} more spooled bytes than the run may use"
+            ),
+        }
+    }
+}
+
+/// The archive-relative range of an entry whose chunks are all copies, so its
+/// bytes can be read where they lie. `None` when any chunk is compressed,
+/// padded or shorter than it is stored, and for storage that is not a sequence
+/// of chunks.
+pub fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
+    if matches!(entry.payload_transform, Ok(true)) {
+        return None;
+    }
+    let location = match &entry.location {
+        Ok(Some(location)) => *location,
+        _ => return None,
+    };
+    if location.mode != 0 {
+        return None;
+    }
+    let table = match &entry.chunks {
+        Ok(Some(table)) => table,
+        _ => return None,
+    };
+    let mut stored = 0u64;
+    let mut logical = 0u64;
+    for chunk in &table.chunks {
+        if chunk.method == ZLIB_METHOD
+            || chunk.padding != 0
+            || chunk.stored_len != chunk.logical_len
+        {
+            return None;
+        }
+        stored = stored.checked_add(u64::from(chunk.stored_len))?;
+        logical = logical.checked_add(u64::from(chunk.logical_len))?;
+    }
+    if logical != location.logical_len {
+        return None;
+    }
+    // Encoding 2 always starts its chunks after a 16-byte prefix. Encoding 4
+    // stores the same prefix for resource-page payloads and none otherwise, so
+    // the prefix length depends on the entry's stored size.
+    let prefix = table.stored_prefix(location.stored_len).ok()?;
+    Some((location.payload_offset.checked_add(prefix)?, stored))
+}
+
+/// Opens the archive `entry` holds, in place when its bytes are stored as they
+/// are and through temporary storage otherwise. Returns the spooled bytes it
+/// borrowed, so a caller can account for the run's budget.
+pub fn open_nested(
+    entry: &Entry,
+    opened: &Opened,
+    alternates: &[Option<Source>],
+    name: &str,
+    limits: NestedLimits,
+    executable: Option<&Path>,
+    cancel: &AtomicBool,
+) -> Result<(Opened, u64), NestedError> {
+    let failed = NestedError::Failed;
+    let in_place = contiguous(entry);
+    let mut spooled = 0u64;
+    let source = match in_place {
+        Some((offset, len)) => opened
+            .source
+            .slice(offset, len)
+            .map_err(|err| failed(format!("row {}: {err}", entry.row)))?,
+        None => match entry.raw_source(&opened.source, alternates) {
+            Ok(source) => source,
+            Err(_) => {
+                let mut payload = entry
+                    .payload(&opened.source, alternates)
+                    .map_err(|err| failed(format!("row {}: {err}", entry.row)))?;
+                let size = payload.len();
+                if size > limits.max_nested_bytes {
+                    return Err(failed(format!(
+                        "row {} stores an archive of {size} bytes, over the nested-archive limit",
+                        entry.row
+                    )));
+                }
+                if limits.spooled.saturating_add(size) > limits.max_spool_bytes {
+                    return Err(NestedError::SpoolBudget { size });
+                }
+                spooled = size;
+                spool(&mut payload, entry.row, cancel, size).map_err(failed)?
+            }
+        },
+    };
+    let nested = open_metadata_at(source, name, MAX_METADATA, executable, cancel).map_err(failed)?;
+    Ok((nested, spooled))
+}
+
+/// Copies a decoded payload into temporary storage and opens a source over it.
+fn spool(
+    payload: &mut Payload,
+    row: u32,
+    cancel: &AtomicBool,
+    size: u64,
+) -> Result<Source, String> {
+    use std::io::Write;
+
+    let mut file = tempfile::tempfile()
+        .map_err(|err| format!("row {row}: cannot create temporary storage: {err}"))?;
+    let mut buffer = vec![0u8; COPY_BUFFER];
+    let mut copied = 0u64;
+    loop {
+        let read = payload
+            .read_cancellable(&mut buffer, cancel)
+            .map_err(|err| format!("row {row}: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|err| format!("row {row}: cannot write temporary storage: {err}"))?;
+        copied += read as u64;
+    }
+    if copied != size {
+        return Err(format!(
+            "row {row}: the payload is {copied} bytes, not the {size} the table declares"
+        ));
+    }
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|err| format!("row {row}: {err}"))?;
+    Source::from_file(file).map_err(|err| format!("row {row}: {err}"))
+}
+
 pub fn raw_state(entry: &Entry, source: &Source, alternates: &[Option<Source>]) -> RawState {
     match entry.raw_source(source, alternates) {
         Ok(view) => RawState::Available { size: view.len() },

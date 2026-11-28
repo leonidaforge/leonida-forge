@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,7 +30,6 @@ const SAMPLE_HEAD: usize = 32;
 const SAMPLE_ARCHIVES: usize = 8;
 /// Rejected archive candidates kept as evidence; the rest are counted.
 const REJECTION_SAMPLES: usize = 8;
-const COPY_BUFFER: usize = 1024 * 1024;
 
 /// What a census is allowed to do.
 #[derive(Debug, Clone, Copy)]
@@ -847,68 +846,30 @@ impl Engine<'_> {
         alternates: &[Option<Source>],
         selector: &str,
     ) -> Result<Opened, String> {
-        let source = match contiguous(entry) {
-            Some((offset, len)) => opened
-                .source
-                .slice(offset, len)
-                .map_err(|err| format!("row {}: {err}", entry.row))?,
-            None => match entry.raw_source(&opened.source, alternates) {
-                Ok(source) => source,
-                Err(_) => self.spool(entry, opened, alternates)?,
-            },
+        let limits = native::NestedLimits {
+            max_nested_bytes: self.options.limits.max_nested_bytes,
+            max_spool_bytes: self.options.limits.max_spool_bytes,
+            spooled: self.spooled,
         };
-        native::open_metadata_at(
-            source,
+        match native::open_nested(
+            entry,
+            opened,
+            alternates,
             selector,
-            MAX_METADATA,
+            limits,
             self.options.executable.as_deref(),
             self.cancel,
-        )
-    }
-
-    fn spool(
-        &mut self,
-        entry: &Entry,
-        opened: &Opened,
-        alternates: &[Option<Source>],
-    ) -> Result<Source, String> {
-        let mut payload = entry
-            .payload(&opened.source, alternates)
-            .map_err(|err| format!("row {}: {err}", entry.row))?;
-        let size = payload.len();
-        if size > self.options.limits.max_nested_bytes {
-            return Err(format!(
-                "row {} stores an archive of {size} bytes, over the --max-nested-bytes limit",
-                entry.row
-            ));
-        }
-        if self.spooled + size > self.options.limits.max_spool_bytes {
-            self.stop("max_spool_bytes");
-            return Err(format!(
-                "row {} would exceed the --max-spool-bytes limit",
-                entry.row
-            ));
-        }
-        let mut file = tempfile::tempfile()
-            .map_err(|err| format!("row {}: cannot create temporary storage: {err}", entry.row))?;
-        let mut buffer = vec![0u8; COPY_BUFFER];
-        let mut copied = 0u64;
-        loop {
-            let read = payload
-                .read(&mut buffer)
-                .map_err(|err| format!("row {}: {err}", entry.row))?;
-            if read == 0 {
-                break;
+        ) {
+            Ok((nested, spooled)) => {
+                self.spooled += spooled;
+                Ok(nested)
             }
-            file.write_all(&buffer[..read]).map_err(|err| {
-                format!("row {}: cannot write temporary storage: {err}", entry.row)
-            })?;
-            copied += read as u64;
+            Err(native::NestedError::SpoolBudget { .. }) => {
+                self.stop("max_spool_bytes");
+                Err(format!("row {} would exceed the --max-spool-bytes limit", entry.row))
+            }
+            Err(err) => Err(err.to_string()),
         }
-        self.spooled += copied;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|err| format!("row {}: {err}", entry.row))?;
-        Source::from_file(file).map_err(|err| format!("row {}: {err}", entry.row))
     }
 
     /// Adds one entry to an archive's own map and counters, so the archive's
@@ -1239,45 +1200,3 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-/// The chunk method that holds a zlib stream. Every other method copies.
-const ZLIB_METHOD: u8 = 3;
-
-/// The archive-relative range of an entry whose chunks are all copies, so its
-/// bytes can be read where they lie. `None` when any chunk is compressed,
-/// padded or shorter than it is stored, and for storage that is not a sequence
-/// of chunks.
-pub(crate) fn contiguous(entry: &Entry) -> Option<(u64, u64)> {
-    if matches!(entry.payload_transform, Ok(true)) {
-        return None;
-    }
-    let location = match &entry.location {
-        Ok(Some(location)) => *location,
-        _ => return None,
-    };
-    if location.mode != 0 {
-        return None;
-    }
-    let table = match &entry.chunks {
-        Ok(Some(table)) => table,
-        _ => return None,
-    };
-    let mut stored = 0u64;
-    let mut logical = 0u64;
-    for chunk in &table.chunks {
-        if chunk.method == ZLIB_METHOD
-            || chunk.padding != 0
-            || chunk.stored_len != chunk.logical_len
-        {
-            return None;
-        }
-        stored = stored.checked_add(u64::from(chunk.stored_len))?;
-        logical = logical.checked_add(u64::from(chunk.logical_len))?;
-    }
-    if logical != location.logical_len {
-        return None;
-    }
-    // Encoding 2 always starts its chunks after a 16-byte prefix. Encoding 4
-    // stores the same prefix for resource-page payloads and none otherwise,
-    let prefix = table.stored_prefix(location.stored_len).ok()?;
-    Some((location.payload_offset.checked_add(prefix)?, stored))
-}

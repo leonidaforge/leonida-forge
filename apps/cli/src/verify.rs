@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -26,7 +26,6 @@ use lforge_rage9::rpf::metadata::{Entry, Error};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::census::contiguous;
 use crate::native::{self, Alternates, Opened};
 
 /// The schema of every record this command writes.
@@ -578,68 +577,33 @@ impl Engine<'_> {
         alternates: &[Option<Source>],
         selector: &str,
     ) -> Result<Opened, String> {
-        let source = match contiguous(entry) {
-            Some((offset, len)) => opened
-                .source
-                .slice(offset, len)
-                .map_err(|err| format!("row {}: {err}", entry.row))?,
-            None => match entry.raw_source(&opened.source, alternates) {
-                Ok(source) => source,
-                Err(_) => self.spool(entry, opened, alternates)?,
-            },
+        let limits = native::NestedLimits {
+            max_nested_bytes: self.options.limits.max_nested_bytes,
+            max_spool_bytes: self.options.limits.max_spool_bytes,
+            spooled: self.spooled,
         };
-        native::open_metadata_at(
-            source,
+        match native::open_nested(
+            entry,
+            opened,
+            alternates,
             selector,
-            MAX_METADATA,
+            limits,
             self.options.executable.as_deref(),
             self.cancel,
-        )
-    }
-
-    fn spool(
-        &mut self,
-        entry: &Entry,
-        opened: &Opened,
-        alternates: &[Option<Source>],
-    ) -> Result<Source, String> {
-        let mut payload = entry
-            .payload(&opened.source, alternates)
-            .map_err(|err| format!("row {}: {err}", entry.row))?;
-        let size = payload.len();
-        if size > self.options.limits.max_nested_bytes {
-            return Err(format!(
-                "row {} stores an archive of {size} bytes, over the --max-nested-bytes limit",
-                entry.row
-            ));
-        }
-        if self.spooled + size > self.options.limits.max_spool_bytes {
-            self.stop("max_spool_bytes");
-            return Err(format!(
-                "row {} would exceed the --max-spool-bytes limit",
-                entry.row
-            ));
-        }
-        let mut file = tempfile::tempfile()
-            .map_err(|err| format!("row {}: cannot create temporary storage: {err}", entry.row))?;
-        let mut buffer = vec![0u8; COPY_BUFFER];
-        let mut copied = 0u64;
-        loop {
-            let read = payload
-                .read_cancellable(&mut buffer, self.cancel)
-                .map_err(|err| format!("row {}: {err}", entry.row))?;
-            if read == 0 {
-                break;
+        ) {
+            Ok((nested, spooled)) => {
+                self.spooled += spooled;
+                Ok(nested)
             }
-            file.write_all(&buffer[..read]).map_err(|err| {
-                format!("row {}: cannot write temporary storage: {err}", entry.row)
-            })?;
-            copied += read as u64;
+            Err(native::NestedError::SpoolBudget { .. }) => {
+                self.stop("max_spool_bytes");
+                Err(format!(
+                    "row {} would exceed the --max-spool-bytes limit",
+                    entry.row
+                ))
+            }
+            Err(err) => Err(err.to_string()),
         }
-        self.spooled += copied;
-        file.seek(SeekFrom::Start(0))
-            .map_err(|err| format!("row {}: {err}", entry.row))?;
-        Source::from_file(file).map_err(|err| format!("row {}: {err}", entry.row))
     }
 
     /// Decodes one entry in full and records what happened.
