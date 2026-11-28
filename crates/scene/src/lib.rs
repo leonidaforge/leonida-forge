@@ -693,6 +693,36 @@ impl Scene {
         Ok(evaluated.then_some(bounds))
     }
 
+    /// Authored bounds of the primitives `policy` does not deform.
+    ///
+    /// A pose moves admitted geometry only, so every other primitive stays
+    /// where it was authored: a primitive with unsupported influences, one the
+    /// policy excludes by inference, and one that declares no influences at
+    /// all. A posed view that framed itself on the deformed bounds alone would
+    /// crop them.
+    pub fn authored_bounds_outside(&self, policy: DeformationPolicy) -> Aabb {
+        let mut bounds = Aabb::EMPTY;
+        for (mesh_index, mesh) in self.meshes.iter().enumerate() {
+            for (primitive_index, primitive) in mesh.primitives.iter().enumerate() {
+                let deforms = self.influences.iter().any(|entry| {
+                    entry.mesh == mesh_index
+                        && entry.primitive == primitive_index
+                        && policy.admits(&entry.influences)
+                });
+                if deforms {
+                    continue;
+                }
+                bounds = bounds.union(Aabb::from_points(
+                    primitive
+                        .vertices
+                        .iter()
+                        .map(|vertex| Vec3::from(vertex.position)),
+                ));
+            }
+        }
+        bounds
+    }
+
     /// Drops primitives whose material index or indices are out of range.
     pub fn validate(&mut self) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -765,6 +795,61 @@ mod tests {
                 .to_vec(),
             indices: vec![0, 1, 2],
         }
+    }
+
+    /// One primitive's influence set: three vertices on bone 0 at unit weight.
+    fn one_bone(inferred: bool) -> VertexInfluences {
+        let mut lanes = [VertexInfluence::NONE; MAX_INFLUENCES];
+        lanes[0] = VertexInfluence {
+            bone: 0,
+            weight: 1.0,
+        };
+        VertexInfluences {
+            per_vertex: vec![lanes; 3],
+            bones: vec![0],
+            weighted: false,
+            lanes: if inferred { 0 } else { 1 },
+            max_influences: 1,
+            resolution: BoneResolution::DirectSkeleton,
+            status: InfluenceStatus::Complete,
+            inferred,
+        }
+    }
+
+    /// Framing a posed view must keep the geometry the pose cannot move.
+    #[test]
+    fn authored_bounds_outside_holds_the_primitives_a_pose_does_not_move() {
+        let mut scene = Scene::new();
+        let mut mesh = Mesh::new("pair");
+        // Primitive 0 deforms; primitive 1 sits far away and has no influence.
+        mesh.primitives.push(triangle([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ]));
+        mesh.primitives.push(triangle([
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [10.0, 1.0, 0.0],
+        ]));
+        scene.meshes.push(mesh);
+        scene.influences.push(PrimitiveInfluences {
+            mesh: 0,
+            primitive: 0,
+            influences: one_bone(false),
+        });
+        let outside = scene.authored_bounds_outside(DeformationPolicy::EXPLICIT);
+        assert_eq!(outside.min, Vec3::new(10.0, 0.0, 0.0));
+        assert_eq!(outside.max, Vec3::new(11.0, 1.0, 0.0));
+
+        // An inferred association is outside the default policy, so both
+        // primitives keep their authored bounds until inference is asked for.
+        scene.influences[0].influences = one_bone(true);
+        let outside = scene.authored_bounds_outside(DeformationPolicy::EXPLICIT);
+        assert_eq!(outside.min, Vec3::ZERO);
+        assert_eq!(outside.max, Vec3::new(11.0, 1.0, 0.0));
+        let outside = scene.authored_bounds_outside(DeformationPolicy::WITH_INFERRED);
+        assert_eq!(outside.min, Vec3::new(10.0, 0.0, 0.0));
     }
 
     #[test]

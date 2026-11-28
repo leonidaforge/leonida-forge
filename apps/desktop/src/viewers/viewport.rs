@@ -19,7 +19,7 @@ use gpui::{
 };
 use image::{Frame as ImageFrame, RgbaImage};
 use lforge_renderer::{Background, Frame, OrbitCamera, Overlay, Renderer};
-use lforge_scene::{Aabb, Scene};
+use lforge_scene::{Aabb, DeformationPolicy, Scene};
 
 use super::pose::{PoseDisplay, PoseFrame, PoseSession};
 use crate::ui::theme;
@@ -742,6 +742,12 @@ impl Viewport {
             return None;
         }
         let mut bounds = self.scene.posed_bounds(session.pose()).ok().flatten()?;
+        // Framing includes the primitives the pose does not move. Their
+        // authored bounds are where they still are, so leaving them out would
+        // crop them.
+        bounds = bounds.union(self.scene.authored_bounds_outside(DeformationPolicy {
+            include_inferred: session.include_inferred(),
+        }));
         if self.skeleton_visible
             && let Some(skeleton) = self.scene.skeleton.as_ref()
             && let Ok(globals) = session.pose().globals(skeleton)
