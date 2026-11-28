@@ -397,19 +397,25 @@ struct Walker<'a> {
     names: &'a Names,
     rows: Vec<Row>,
     truncated: bool,
+    max_rows: usize,
 }
 
 impl<'a> Walker<'a> {
     fn new(names: &'a Names) -> Self {
+        Self::with_max_rows(names, MAX_ROWS)
+    }
+
+    fn with_max_rows(names: &'a Names, max_rows: usize) -> Self {
         Self {
             names,
             rows: Vec::new(),
             truncated: false,
+            max_rows,
         }
     }
 
     fn push(&mut self, row: Row) -> bool {
-        if self.rows.len() >= MAX_ROWS {
+        if self.rows.len() >= self.max_rows {
             self.truncated = true;
             return false;
         }
@@ -959,7 +965,17 @@ pub fn build(document: &Document, names: &Names) -> Tree {
 /// decoder's notes. A block expands to its records; a record expands to its
 /// fields; a text value shows the string its reference names.
 pub fn build_odrp(document: &lforge_rage9::odrp::Document, names: &Names) -> Tree {
-    let mut walker = Walker::new(names);
+    build_odrp_with(document, names, MAX_ROWS)
+}
+
+/// [`build_odrp`] with an explicit row cap, so truncation can be exercised
+/// without building a document large enough to hit the real one.
+fn build_odrp_with(
+    document: &lforge_rage9::odrp::Document,
+    names: &Names,
+    max_rows: usize,
+) -> Tree {
+    let mut walker = Walker::with_max_rows(names, max_rows);
     let header = document.header;
     walker.group(
         0,
@@ -1107,7 +1123,9 @@ pub fn build_odrp(document: &lforge_rage9::odrp::Document, names: &Names) -> Tre
         status: document.status(),
         summary,
         issues,
-        truncated: document.truncated,
+        // A row cap hides records just as a decoder limit does, so the status
+        // bar says so in either case.
+        truncated: document.truncated || walker.truncated,
     }
 }
 

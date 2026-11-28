@@ -705,3 +705,13 @@ fn a_resource_block_names_its_segment_and_offset() {
         .expect("a block row");
     assert!(block.label.contains("system 0x80"), "{}", block.label);
 }
+
+#[test]
+fn a_resource_row_cap_is_reported_as_truncation() {
+    let tree = build_odrp_with(&resource_document(), &Names::empty(), 2);
+    assert!(
+        tree.truncated,
+        "the status bar must say the rows are capped"
+    );
+    assert_eq!(tree.rows.len(), 2);
+}
