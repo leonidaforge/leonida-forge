@@ -18,6 +18,7 @@ use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Pixels, Point,
     ScrollEvent, SharedString, Subscription, Task, Window, actions, prelude::*,
 };
+use lforge_core::resource::ResourcePath;
 use lforge_text::document::{self, TAB_WIDTH};
 use lforge_text::syntax::{self, Checkpoints, Span, State as LexState};
 use lforge_text::{
@@ -202,11 +203,13 @@ pub(super) struct Notice {
 }
 pub struct TextViewer {
     path: PathBuf,
-    /// The entry's visible name: a resolved name, or the stored hash. Never the
-    /// archive's internal row number.
-    name: String,
-    /// The archive file the payload is stored in, when it is in one.
-    container: Option<String>,
+    /// The canonical resource path, when the payload comes from an archive.
+    /// The Explorer builds it from the stored keys and verified names, so the
+    /// viewer never derives an identity of its own.
+    resource: Option<Arc<ResourcePath>>,
+    /// The name for a payload that is a file on disk, or that was reached
+    /// without a resource path.
+    file_name: String,
     access: Access,
     encoding: Encoding,
     bom: bool,
@@ -245,19 +248,24 @@ pub struct TextViewer {
 
 /// Opens a payload found by content, falling back to the Binary Inspector when
 /// the bytes turn out not to be text.
-pub fn open(path: PathBuf, name: Option<String>, access: Access, cx: &mut App) {
-    prepare_and_open(path, name, access, false, cx);
+pub fn open(path: PathBuf, resource: Option<Arc<ResourcePath>>, access: Access, cx: &mut App) {
+    prepare_and_open(path, resource, access, false, cx);
 }
 
 /// Opens a payload because the user asked for it, whatever the check says, and
 /// explains a decode that is only a guess.
-pub fn open_as_text(path: PathBuf, name: Option<String>, access: Access, cx: &mut App) {
-    prepare_and_open(path, name, access, true, cx);
+pub fn open_as_text(
+    path: PathBuf,
+    resource: Option<Arc<ResourcePath>>,
+    access: Access,
+    cx: &mut App,
+) {
+    prepare_and_open(path, resource, access, true, cx);
 }
 
 fn prepare_and_open(
     path: PathBuf,
-    name: Option<String>,
+    resource: Option<Arc<ResourcePath>>,
     access: Access,
     explicit: bool,
     cx: &mut App,
@@ -304,7 +312,7 @@ fn prepare_and_open(
             Detection::Binary(_) => None,
         };
         cx.update(|cx| match prepared {
-            Some(prepared) => open_window(path, name, access, prepared, cx),
+            Some(prepared) => open_window(path, resource, access, prepared, cx),
             None => crate::explorer::open_binary_inspector(path, access, cx),
         });
     })
@@ -313,18 +321,18 @@ fn prepare_and_open(
 
 fn open_window(
     path: PathBuf,
-    name: Option<String>,
+    resource: Option<Arc<ResourcePath>>,
     access: Access,
     prepared: Prepared,
     cx: &mut App,
 ) {
-    let title = display_name(&path, name.as_deref());
+    let title = window_name(&path, resource.as_deref());
     let mut options =
         crate::explorer::window_options(&title, gpui::size(gpui::px(1100.), gpui::px(760.)), cx);
     options.window_min_size = Some(gpui::size(gpui::px(480.), gpui::px(320.)));
     if let Err(err) = cx.open_window(options, |window, cx| {
         crate::ui::close_through_gpui(window, cx);
-        let viewer = cx.new(|cx| TextViewer::new(path, name, access, prepared, window, cx));
+        let viewer = cx.new(|cx| TextViewer::new(path, resource, access, prepared, window, cx));
         let focus_handle = viewer.read(cx).focus_handle().clone();
         focus_handle.focus(window, cx);
         viewer
@@ -334,7 +342,7 @@ fn open_window(
 }
 
 fn open_failed(path: PathBuf, reason: String, cx: &mut App) {
-    let title = display_name(&path, None);
+    let title = window_name(&path, None);
     let mut options =
         crate::explorer::window_options(&title, gpui::size(gpui::px(640.), gpui::px(320.)), cx);
     options.window_min_size = Some(gpui::size(gpui::px(400.), gpui::px(240.)));
@@ -346,28 +354,18 @@ fn open_failed(path: PathBuf, reason: String, cx: &mut App) {
     }
 }
 
-/// The name a payload is identified by. The caller supplies the entry's label,
-/// which is the resolved name or stored hash the Explorer shows; this function
-/// never derives an identity from the archive's internal row path.
-fn display_name(path: &Path, name: Option<&str>) -> String {
-    if let Some(name) = name.filter(|name| !name.is_empty()) {
-        return name.to_string();
+/// The window title: the entry's own label from its canonical resource path,
+/// or the file name of a payload on disk.
+fn window_name(path: &Path, resource: Option<&ResourcePath>) -> String {
+    if let Some(resource) = resource {
+        return resource.entry().map_or_else(
+            || resource.root_name().to_string(),
+            |entry| entry.file_label(),
+        );
     }
-    // No label was supplied: the archive, or the file itself, is all there is.
-    container_name(path)
-        .or_else(|| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-/// The archive file a payload is stored in, if it is stored in one. This is a
-/// real path on disk, not a virtual one.
-fn container_name(path: &Path) -> Option<String> {
-    let (file, _) = files::split_location(path)?;
-    file.file_name()
+    path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// A window that only says why nothing could be read.
@@ -387,14 +385,13 @@ impl Render for FailedView {
 impl TextViewer {
     fn new(
         path: PathBuf,
-        name: Option<String>,
+        resource: Option<Arc<ResourcePath>>,
         access: Access,
         prepared: Prepared,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let name = display_name(&path, name.as_deref());
-        let container = container_name(&path);
+        let file_name = window_name(&path, resource.as_deref());
         let find_field = cx.new(|cx| TextField::new("Find", cx));
         let goto_field = cx.new(|cx| TextField::new("Line", cx));
         let subscriptions = vec![
@@ -417,8 +414,8 @@ impl TextViewer {
         ];
         let mut viewer = Self {
             path,
-            name,
-            container,
+            resource,
+            file_name,
             access,
             encoding: prepared.encoding,
             bom: false,

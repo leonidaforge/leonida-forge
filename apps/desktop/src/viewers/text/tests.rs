@@ -5,11 +5,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use lforge_core::resource::{EntryId, Locator, ResourcePath};
 use lforge_text::syntax::State;
 use lforge_text::{Document, Language};
 
 use super::render::styled_line;
-use super::{ColoredSpan, PageLine, display_name, page_line, spans_to_columns};
+use super::{ColoredSpan, PageLine, page_line, spans_to_columns, window_name};
 use crate::files::{self, Access, Entry, EntryKind};
 
 fn prepare(raw: &str, language: Language) -> PageLine {
@@ -142,22 +143,38 @@ fn matches_are_clipped_to_the_row() {
 }
 
 #[test]
-fn the_payload_is_identified_by_its_name_not_its_row() {
+fn a_payload_is_identified_by_its_canonical_resource_path() {
     let path = Path::new(r"D:\GTA VI\common.rpf\Unnamed Entries\Row 00382");
+    let named = ResourcePath::root("common.rpf").with_entry(EntryId::named(
+        "CCombatInfoMgr.xml",
+        Some(30),
+        Locator::Row(382),
+    ));
+    // The window is titled with the entry's own label, never the row path.
+    assert_eq!(window_name(path, Some(&named)), "CCombatInfoMgr.xml");
     assert_eq!(
-        display_name(path, Some("CCombatInfoMgr.xml")),
-        "CCombatInfoMgr.xml"
+        named.display(),
+        "common.rpf!CCombatInfoMgr.xml",
+        "the full path is the one the Explorer shows"
     );
+    assert!(!named.display().contains("Row"));
+
+    // An entry the table of contents only knows by key keeps its type, and the
+    // row number stays a technical locator, out of the label.
+    let keyed = ResourcePath::root("common.rpf").with_entry(EntryId::from_stored(
+        Some(0x1F2E_3D4C_0A0B_0C0D),
+        None,
+        Some(30),
+        None,
+    ));
     assert_eq!(
-        display_name(path, Some("0x1F2E3D4C.zxml")),
-        "0x1F2E3D4C.zxml"
+        window_name(path, Some(&keyed)),
+        keyed.entry().unwrap().file_label()
     );
-    // With no label the archive identifies the entry, never the row path.
-    assert_eq!(display_name(path, None), "common.rpf");
-    assert_eq!(
-        display_name(Path::new(r"D:\x\notes.txt"), None),
-        "notes.txt"
-    );
+    assert!(!window_name(path, Some(&keyed)).contains("Row"));
+
+    // A file on disk has no resource path: its own name identifies it.
+    assert_eq!(window_name(Path::new(r"D:\x\notes.txt"), None), "notes.txt");
 }
 
 /// Opens real text rows of GTA VI through the archive path, read only.
@@ -289,7 +306,24 @@ fn opens_every_text_payload_of_an_archive() {
     let mut malformed = 0u64;
     let mut lines = 0u64;
     let mut bytes = 0u64;
+    let mut unlabelled = Vec::new();
+    let mut row_labelled = Vec::new();
+    let mut samples = Vec::new();
     for entry in candidates {
+        // What the viewer is told to show: the canonical resource path the
+        // Explorer carries, never the archive's internal row path.
+        match entry.resource.as_ref() {
+            Some(resource) => {
+                let label = window_name(&entry.path, Some(resource));
+                if label.contains("Row ") {
+                    row_labelled.push(label.clone());
+                }
+                if samples.len() < 3 {
+                    samples.push(format!("{} -> {label}", resource.display()));
+                }
+            }
+            None => unlabelled.push(entry.name.clone()),
+        }
         let head = match files::read_head_with(&entry.path, &access, 64 * 1024) {
             Ok(head) => head,
             Err(err) => {
@@ -338,8 +372,23 @@ fn opens_every_text_payload_of_an_archive() {
     for note in failed.iter().take(20) {
         eprintln!("  failed: {note}");
     }
+    for sample in &samples {
+        eprintln!("  label: {sample}");
+    }
     assert!(!failed.is_empty() || text > 0, "no text payload was found");
     assert!(failed.is_empty(), "{} text payloads failed", failed.len());
+    assert!(
+        unlabelled.is_empty(),
+        "{} entries carry no resource path, first: {:?}",
+        unlabelled.len(),
+        unlabelled.first()
+    );
+    assert!(
+        row_labelled.is_empty(),
+        "{} entries are labelled by a row path, first: {:?}",
+        row_labelled.len(),
+        row_labelled.first()
+    );
 }
 
 /// Every file entry of a prepared archive, to a fixed depth.

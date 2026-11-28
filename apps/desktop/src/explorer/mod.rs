@@ -915,7 +915,7 @@ impl Explorer {
             .detach();
             return;
         }
-        let name = entry.name.clone();
+        let resource = entry.resource.clone();
         let sniff = kind.is_some();
         let identified = cx.background_spawn({
             let (path, access) = (path.clone(), access.clone());
@@ -979,7 +979,7 @@ impl Explorer {
                         if capability == Some(lforge_core::classify::Capability::Text)
                             || text.is_some() =>
                     {
-                        crate::viewers::text::open(path, Some(name), access, cx)
+                        crate::viewers::text::open(path, resource, access, cx)
                     }
                     // A drawable resource is a model before it is a container.
                     Ok(Identified::Unknown) if model.is_some() => {

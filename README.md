@@ -65,13 +65,13 @@ Known formats are the RDS5 container, whose header, record array, ETPF chunk ext
 
 ## Text viewer
 
-Double-click a payload whose bytes are text, and it opens read-only with line numbers, syntax colours, find and go to line. The bytes decide: UTF-8, UTF-8 with a byte-order mark, UTF-16 LE or BE, no zero bytes and no control characters at a density text does not have. The extension only names the language of a payload that already passed. A text payload the Explorer cannot name still opens as text, and is identified by a resolved name or stored hash, never by the archive's internal row number.
+Double-click a payload whose bytes are text, and it opens read-only with line numbers, syntax colours, find and go to line. The bytes decide: UTF-8, UTF-8 with a byte-order mark, UTF-16 LE or BE, no zero bytes and no control characters at a density text does not have. The extension only names the language of a payload that already passed. A text payload the Explorer cannot name still opens as text. The window shows the payload's canonical resource path, the same one the file views show, which is a verified name or a stored key; the archive's internal row number is never part of it.
 
 Right-click any file and choose **Open as Text** to open it whatever the check says. The viewer then says why the bytes are not text and shows them with the encoding that was chosen. **View** offers UTF-8, UTF-16 LE/BE and the legacy code pages Windows-1252, Windows-1251, ISO-8859-15, Shift_JIS, GBK, Big5 and EUC-KR; changing it reindexes the payload. Sequences a decode cannot read are counted in the status bar instead of being presented as text.
 
 Colours cover XML, HTML, JSON, YAML, INI, TOML, CSV and TSV, Lua and JavaScript, and a comment, template string, long string or YAML block scalar keeps its colour on every line it covers. Columns are terminal cells: a combining mark takes none and a wide character takes two, so the caret, the selection and the match columns agree on text that is not ASCII.
 
-Find matches without regard to ASCII case only; it lower-cases Unicode, so `Σ` matches `σ` and a mapping that changes length still points at the character it came from. **F3** steps through every match, including matches beyond the 50,000 kept in memory: the next chunk is read on demand. A selection copies up to 32 MB and says so when it is larger. A payload with more than 10,000,000 lines, or a line over 64 MiB, is refused with the reason rather than truncated.
+Find folds case over Unicode, not only ASCII: `Σ` matches `σ`, and a fold that changes length still points at the character it came from. **F3** steps through every match, including matches beyond the 50,000 kept in memory: the next chunk is read on demand. A selection copies up to 32 MB and says so when it is larger. A payload with more than 10,000,000 lines, or a line over 64 MiB, is refused with the reason rather than truncated.
 
 ## Texture viewer
 

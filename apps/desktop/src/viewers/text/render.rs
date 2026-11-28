@@ -241,11 +241,12 @@ impl TextViewer {
             .child(div().text_color(rgb(theme::TEXT_MUTED)).child(self.title()))
     }
 
-    /// The entry's name, with the archive it is stored in when it is in one.
+    /// The canonical resource path of the payload, exactly as the Explorer and
+    /// the file views show it, or the file name of a standalone file.
     fn title(&self) -> String {
-        match &self.container {
-            Some(container) => format!("{}  ·  in {container}", self.name),
-            None => self.name.clone(),
+        match &self.resource {
+            Some(resource) => resource.display(),
+            None => self.file_name.clone(),
         }
     }
 
