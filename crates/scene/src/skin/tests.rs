@@ -9,7 +9,8 @@ use crate::{
 };
 
 use super::{
-    MAX_INFLUENCES, SkinningMatrices, deform_primitive, deformed_bounds, influenced_centroid,
+    MAX_INFLUENCES, SkinningMatrices, deform_primitive, deform_primitive_with, deformed_bounds,
+    influenced_centroid,
 };
 
 fn bone(
@@ -467,4 +468,119 @@ fn posed_bounds_follow_a_pose_that_leaves_the_authored_bounds() {
         .expect("a posed box");
     assert!(posed.min.y < 0.0, "{posed:?}");
     assert!(scene.bounds.max.y >= 1.0, "{:?}", scene.bounds);
+}
+
+/// The default policy deforms decoded associations and leaves inferred ones on
+/// the authored path, and the opt-in changes exactly that.
+#[test]
+fn the_default_policy_excludes_inferred_associations_and_the_opt_in_includes_them() {
+    let skeleton = skeleton_of(vec![
+        (None, Vec3::ZERO, Quat::IDENTITY),
+        (Some(0), Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY),
+    ]);
+    let primitive = primitive(vec![
+        vertex([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        vertex([0.5, 0.0, 0.0], [0.0, 0.0, 1.0]),
+    ]);
+    let mut pose = Pose::new(2);
+    pose.set_rotation(1, Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+        .unwrap();
+    let matrices = SkinningMatrices::build(&skeleton, &pose).unwrap();
+
+    // Explicit: bone 1 only, weight 1.
+    let explicit = influences(vec![vec![(1, 1.0)], vec![(1, 1.0)]]);
+    let deformed = deform_primitive(&primitive, &explicit, &matrices).unwrap();
+    // S = T(0,1,0) * Rz(90) * T(0,-1,0) sends the origin to (1, 1, 0).
+    assert!(
+        (Vec3::from(deformed.positions[0]) - Vec3::new(1.0, 1.0, 0.0)).length() < 1e-5,
+        "{:?}",
+        deformed.positions[0]
+    );
+
+    // The same data marked inferred is refused by the default policy and
+    // accepted by the opt-in, with identical numbers.
+    let mut inferred = explicit.clone();
+    inferred.inferred = true;
+    assert_eq!(
+        deform_primitive(&primitive, &inferred, &matrices),
+        Err(crate::DeformError::InferredExcluded)
+    );
+    assert_eq!(
+        deformed_bounds(&primitive, &inferred, &matrices),
+        Err(crate::DeformError::InferredExcluded)
+    );
+    let allowed = deform_primitive_with(
+        &primitive,
+        &inferred,
+        &matrices,
+        crate::DeformationPolicy::WITH_INFERRED,
+    )
+    .unwrap();
+    assert_eq!(allowed.positions, deformed.positions);
+
+    // An unsupported set is refused under either policy, and the reason says so.
+    let mut unsupported = explicit.clone();
+    unsupported.status = InfluenceStatus::Unsupported {
+        reason: "declared form is not supported".into(),
+    };
+    assert!(matches!(
+        deform_primitive_with(
+            &primitive,
+            &unsupported,
+            &matrices,
+            crate::DeformationPolicy::WITH_INFERRED,
+        ),
+        Err(crate::DeformError::UnsupportedInfluences(_))
+    ));
+}
+
+/// The scene counts and the posed bounds follow the policy.
+#[test]
+fn the_scene_counts_and_bounds_follow_the_policy() {
+    let skeleton = skeleton_of(vec![(None, Vec3::ZERO, Quat::IDENTITY)]);
+    let mut primitive = primitive(vec![vertex([0.0, 1.0, 0.0], [0.0, 1.0, 0.0])]);
+    primitive.indices = vec![0, 0, 0];
+    let mut inferred = influences(vec![vec![(0, 1.0)]]);
+    inferred.inferred = true;
+    let mut explicit = influences(vec![vec![(0, 1.0)]]);
+    explicit.inferred = false;
+
+    let mut scene = crate::Scene::new();
+    let mut mesh = crate::Mesh::new("mixed");
+    mesh.primitives.push(primitive.clone());
+    mesh.primitives.push(primitive);
+    scene.meshes.push(mesh);
+    scene.materials.push(crate::Material::default());
+    scene.skeleton = Some(skeleton);
+    scene.influences.push(crate::PrimitiveInfluences {
+        mesh: 0,
+        primitive: 0,
+        influences: explicit,
+    });
+    scene.influences.push(crate::PrimitiveInfluences {
+        mesh: 0,
+        primitive: 1,
+        influences: inferred,
+    });
+    scene.recompute_bounds();
+
+    assert_eq!(scene.deformable_primitive_count(), 1);
+    assert_eq!(
+        scene.deformable_primitive_count_under(crate::DeformationPolicy::WITH_INFERRED),
+        2
+    );
+    assert_eq!(scene.inferred_primitive_count(), 1);
+
+    let mut pose = Pose::new(1);
+    pose.set_rotation(0, Quat::from_rotation_x(std::f32::consts::PI))
+        .unwrap();
+    let explicit_bounds = scene.posed_bounds(&pose).expect("bounds").expect("a box");
+    let all_bounds = scene
+        .posed_bounds_under(&pose, crate::DeformationPolicy::WITH_INFERRED)
+        .expect("bounds")
+        .expect("a box");
+    // One primitive deforms under the default policy and both under the opt-in,
+    // and the union of two identical deformations is the same box.
+    assert!((explicit_bounds.min.y + 1.0).abs() < 1e-4);
+    assert!((all_bounds.min.y + 1.0).abs() < 1e-4);
 }

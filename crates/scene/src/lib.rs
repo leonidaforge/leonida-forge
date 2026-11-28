@@ -11,9 +11,9 @@ use glam::{Mat4, Quat, Vec3};
 
 pub use pose::{Pose, PoseDelta, PoseError, PosedBone, bind_transform, check_supported};
 pub use skin::{
-    BoneResolution, DeformError, DeformedPrimitive, InfluenceStatus, MAX_INFLUENCES,
-    SkinningMatrices, VertexInfluence, VertexInfluences, deform_primitive, deformed_bounds,
-    influenced_centroid,
+    BoneResolution, DeformError, DeformationPolicy, DeformedPrimitive, InfluenceStatus,
+    MAX_INFLUENCES, SkinningMatrices, VertexInfluence, VertexInfluences, deform_primitive,
+    deform_primitive_with, deformed_bounds, deformed_bounds_with, influenced_centroid,
 };
 
 /// One bone of a decoded skeleton, in model space.
@@ -610,20 +610,39 @@ impl Scene {
             .map(|entry| &entry.influences)
     }
 
-    /// Whether any primitive can be deformed by a pose.
+    /// Whether any primitive can be deformed by a pose under the default policy,
+    /// which admits decoded associations only.
     pub fn supports_deformation(&self) -> bool {
+        self.supports_deformation_under(DeformationPolicy::EXPLICIT)
+    }
+
+    /// Whether any primitive can be deformed by a pose under `policy`.
+    pub fn supports_deformation_under(&self, policy: DeformationPolicy) -> bool {
         self.skeleton.is_some()
             && self
                 .influences
                 .iter()
-                .any(|entry| entry.influences.deformable())
+                .any(|entry| policy.admits(&entry.influences))
     }
 
-    /// The number of primitives with verified, deformable influences.
+    /// The number of primitives the default policy admits.
     pub fn deformable_primitive_count(&self) -> usize {
+        self.deformable_primitive_count_under(DeformationPolicy::EXPLICIT)
+    }
+
+    /// The number of primitives `policy` admits.
+    pub fn deformable_primitive_count_under(&self, policy: DeformationPolicy) -> usize {
         self.influences
             .iter()
-            .filter(|entry| entry.influences.deformable())
+            .filter(|entry| policy.admits(&entry.influences))
+            .count()
+    }
+
+    /// The number of primitives associated only by inference.
+    pub fn inferred_primitive_count(&self) -> usize {
+        self.influences
+            .iter()
+            .filter(|entry| entry.influences.deformable() && entry.influences.inferred())
             .count()
     }
 
@@ -633,6 +652,15 @@ impl Scene {
     /// skips primitives that are not deformable and returns `None` when nothing
     /// could be evaluated.
     pub fn posed_bounds(&self, pose: &Pose) -> Result<Option<Aabb>, (usize, usize, DeformError)> {
+        self.posed_bounds_under(pose, DeformationPolicy::EXPLICIT)
+    }
+
+    /// [`Scene::posed_bounds`] under an explicit policy.
+    pub fn posed_bounds_under(
+        &self,
+        pose: &Pose,
+        policy: DeformationPolicy,
+    ) -> Result<Option<Aabb>, (usize, usize, DeformError)> {
         let Some(skeleton) = self.skeleton.as_ref() else {
             return Ok(None);
         };
@@ -649,13 +677,16 @@ impl Scene {
             let Some(primitive) = mesh.primitives.get(entry.primitive) else {
                 continue;
             };
-            match skin::deformed_bounds(primitive, &entry.influences, &matrices) {
+            match skin::deformed_bounds_with(primitive, &entry.influences, &matrices, policy) {
                 Ok(primitive_bounds) => {
                     if !primitive_bounds.is_empty() {
                         bounds = bounds.union(primitive_bounds);
                         evaluated = true;
                     }
                 }
+                // A primitive the policy excludes is not an error: it simply
+                // stays on the authored path.
+                Err(DeformError::InferredExcluded) => continue,
                 Err(err) => return Err((entry.mesh, entry.primitive, err)),
             }
         }

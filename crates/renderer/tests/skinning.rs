@@ -370,6 +370,94 @@ fn a_primitive_without_tangents_skins_like_the_cpu_reference() {
     );
 }
 
+/// The GPU applies the same policy as the CPU: an inferred association stays on
+/// the authored path by default and deforms once the policy includes it, with no
+/// re-upload between the two renders.
+#[test]
+fn the_gpu_applies_the_same_inferred_policy_as_the_cpu() {
+    let Some(mut renderer) = renderer() else {
+        return;
+    };
+    let skeleton = skeleton_of(vec![
+        (None, Vec3::ZERO, Quat::IDENTITY),
+        (Some(0), Vec3::new(0.0, 1.0, 0.0), Quat::IDENTITY),
+    ]);
+    let primitive = Primitive {
+        material: 0,
+        vertices: vec![
+            vertex([-0.5, 0.0, 0.0], [0.0, 0.0, 1.0], None),
+            vertex([0.5, 0.0, 0.0], [0.0, 0.0, 1.0], None),
+            vertex([0.0, 1.5, 0.0], [0.0, 0.0, 1.0], None),
+        ],
+        indices: vec![0, 1, 2],
+    };
+    let mut influences = influences(vec![vec![(1, 1.0)], vec![(1, 1.0)], vec![(1, 1.0)]]);
+    influences.inferred = true;
+    let scene = scene_with(skeleton, primitive, influences);
+    let skeleton = scene.skeleton.as_ref().unwrap();
+    let mut pose = Pose::reference(skeleton);
+    pose.set_rotation(1, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+        .unwrap();
+    let matrices = SkinningMatrices::build(skeleton, &pose).unwrap();
+    let positions: Vec<Vec3> = pose
+        .globals(skeleton)
+        .unwrap()
+        .iter()
+        .map(|bone| bone.model_position)
+        .collect();
+    // The CPU refuses it under the default policy and accepts it under the opt-in.
+    assert!(
+        lforge_scene::deform_primitive(
+            &scene.meshes[0].primitives[0],
+            &scene.influences[0].influences,
+            &matrices
+        )
+        .is_err()
+    );
+
+    let camera = OrbitCamera::framing(scene.bounds, 1.0);
+    let authored_gpu = renderer.upload_scene(&scene).expect("upload");
+    let authored = renderer
+        .render(&authored_gpu, &camera, 256, 256, Background::DARK)
+        .expect("authored render");
+
+    let mut gpu = renderer.upload_scene(&scene).expect("upload");
+    renderer
+        .update_pose(&mut gpu, matrices.matrices(), &positions)
+        .expect("pose upload");
+    gpu.set_pose_active(true);
+    let excluded = renderer
+        .render(&gpu, &camera, 256, 256, Background::DARK)
+        .expect("excluded render");
+    assert_eq!(
+        differing_pixels(&authored.pixels, &excluded.pixels),
+        0,
+        "an inferred association must stay authored under the default policy"
+    );
+
+    gpu.set_policy(lforge_scene::DeformationPolicy::WITH_INFERRED);
+    let included = renderer
+        .render(&gpu, &camera, 256, 256, Background::DARK)
+        .expect("included render");
+    let differing = differing_pixels(&authored.pixels, &included.pixels);
+    eprintln!("inferred opt-in changes {differing} pixels");
+    assert!(
+        differing > 100,
+        "the opt-in must deform the primitive, {differing} pixels changed"
+    );
+
+    // Switching back restores the authored frame without an upload.
+    gpu.set_policy(lforge_scene::DeformationPolicy::EXPLICIT);
+    let restored = renderer
+        .render(&gpu, &camera, 256, 256, Background::DARK)
+        .expect("restored render");
+    assert_eq!(
+        differing_pixels(&authored.pixels, &restored.pixels),
+        0,
+        "turning the option off must restore the authored frame"
+    );
+}
+
 #[test]
 fn gpu_handles_a_596_bone_palette() {
     let Some(renderer) = renderer() else {

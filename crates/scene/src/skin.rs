@@ -25,6 +25,34 @@ pub const MAX_INFLUENCES: usize = 4;
 /// The largest scale deviation from one accepted for deformation.
 const SCALE_TOLERANCE: f32 = 1e-4;
 
+/// Which associations a caller lets deform geometry.
+///
+/// The default admits only associations that were decoded from an influence
+/// stream. A geometry that declares no influence attribute on a one-bone
+/// skeleton is associated by inference, because the record states one bone and
+/// the skeleton holds one; that reading is plausible but unverified, so it stays
+/// out unless the caller asks for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeformationPolicy {
+    pub include_inferred: bool,
+}
+
+impl DeformationPolicy {
+    /// Decoded associations only. This is the default everywhere.
+    pub const EXPLICIT: Self = Self {
+        include_inferred: false,
+    };
+    /// Decoded associations plus inferred single-bone associations.
+    pub const WITH_INFERRED: Self = Self {
+        include_inferred: true,
+    };
+
+    /// Whether this policy admits the given association.
+    pub fn admits(&self, influences: &VertexInfluences) -> bool {
+        influences.deformable() && (self.include_inferred || !influences.inferred())
+    }
+}
+
 /// One bone and its weight for one vertex.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VertexInfluence {
@@ -124,6 +152,11 @@ impl VertexInfluences {
     /// Whether this association is inferred rather than decoded.
     pub fn inferred(&self) -> bool {
         self.inferred
+    }
+
+    /// Whether `policy` admits this association.
+    pub fn deformable_under(&self, policy: DeformationPolicy) -> bool {
+        policy.admits(self)
     }
 
     /// The status line a viewer prints. An inferred association is named
@@ -241,6 +274,8 @@ impl SkinningMatrices {
 pub enum DeformError {
     /// The primitive has no verified influence set.
     UnsupportedInfluences(InfluenceStatus),
+    /// The primitive is associated by inference and the policy excludes it.
+    InferredExcluded,
     /// The influence array and the vertex array disagree.
     CountMismatch { vertices: usize, influences: usize },
     /// An active lane names a bone outside the matrix array.
@@ -261,6 +296,10 @@ impl std::fmt::Display for DeformError {
             DeformError::UnsupportedInfluences(status) => {
                 write!(f, "the primitive's influences are {}", status.name())
             }
+            DeformError::InferredExcluded => write!(
+                f,
+                "the primitive's single-bone association is inferred and the policy excludes inferred associations"
+            ),
             DeformError::CountMismatch {
                 vertices,
                 influences,
@@ -308,17 +347,31 @@ impl DeformedPrimitive {
     }
 }
 
-/// Linear blend skinning of one primitive. Every call starts from `primitive`'s
+/// Linear blend skinning of one primitive under the default policy, which
+/// admits decoded associations only. Every call starts from `primitive`'s
 /// authored vertices, so evaluating a pose twice never compounds a deformation.
 pub fn deform_primitive(
     primitive: &Primitive,
     influences: &VertexInfluences,
     matrices: &SkinningMatrices,
 ) -> Result<DeformedPrimitive, DeformError> {
+    deform_primitive_with(primitive, influences, matrices, DeformationPolicy::EXPLICIT)
+}
+
+/// [`deform_primitive`] with an explicit policy.
+pub fn deform_primitive_with(
+    primitive: &Primitive,
+    influences: &VertexInfluences,
+    matrices: &SkinningMatrices,
+    policy: DeformationPolicy,
+) -> Result<DeformedPrimitive, DeformError> {
     if !influences.deformable() {
         return Err(DeformError::UnsupportedInfluences(
             influences.status.clone(),
         ));
+    }
+    if !policy.admits(influences) {
+        return Err(DeformError::InferredExcluded);
     }
     if influences.per_vertex.len() != primitive.vertices.len() {
         return Err(DeformError::CountMismatch {
@@ -399,10 +452,23 @@ pub fn deformed_bounds(
     influences: &VertexInfluences,
     matrices: &SkinningMatrices,
 ) -> Result<Aabb, DeformError> {
+    deformed_bounds_with(primitive, influences, matrices, DeformationPolicy::EXPLICIT)
+}
+
+/// [`deformed_bounds`] with an explicit policy.
+pub fn deformed_bounds_with(
+    primitive: &Primitive,
+    influences: &VertexInfluences,
+    matrices: &SkinningMatrices,
+    policy: DeformationPolicy,
+) -> Result<Aabb, DeformError> {
     if !influences.deformable() {
         return Err(DeformError::UnsupportedInfluences(
             influences.status.clone(),
         ));
+    }
+    if !policy.admits(influences) {
+        return Err(DeformError::InferredExcluded);
     }
     if influences.per_vertex.len() != primitive.vertices.len() {
         return Err(DeformError::CountMismatch {

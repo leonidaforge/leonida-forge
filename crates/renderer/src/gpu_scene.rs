@@ -127,6 +127,9 @@ pub(crate) struct GpuPrimitive {
     pub(crate) visible: bool,
     /// Present only when the primitive carries verified, deformable influences.
     pub(crate) skin: Option<GpuSkin>,
+    /// Whether the association was inferred rather than decoded. The policy
+    /// decides whether such a primitive is drawn skinned.
+    pub(crate) inferred: bool,
 }
 
 #[derive(Debug)]
@@ -190,6 +193,8 @@ pub struct GpuScene {
     pub(crate) joint_count: usize,
     /// Whether influenced primitives are drawn through the skinned pipeline.
     pub(crate) pose_active: bool,
+    /// Which associations may be drawn skinned.
+    pub(crate) policy: lforge_scene::DeformationPolicy,
     /// `0` material shading, `1` selected-bone influence visualisation.
     pub(crate) view: u32,
     pub(crate) highlight_bone: Option<usize>,
@@ -427,6 +432,7 @@ impl GpuScene {
             pose_bind_group,
             joint_count,
             pose_active: false,
+            policy: lforge_scene::DeformationPolicy::EXPLICIT,
             view: 0,
             highlight_bone: None,
             warnings,
@@ -444,6 +450,25 @@ impl GpuScene {
 
     pub fn pose_active(&self) -> bool {
         self.pose_active
+    }
+
+    /// Which associations the skinned pipeline may draw.
+    pub fn policy(&self) -> lforge_scene::DeformationPolicy {
+        self.policy
+    }
+
+    /// Sets the deformation policy. This writes no buffer and rebuilds nothing:
+    /// the draw list consults the policy per primitive, so switching it costs one
+    /// frame and no upload.
+    pub fn set_policy(&mut self, policy: lforge_scene::DeformationPolicy) {
+        self.policy = policy;
+    }
+
+    /// Whether `primitive` is drawn through the skinned pipeline right now.
+    pub(crate) fn draws_skinned(&self, primitive: &GpuPrimitive) -> bool {
+        self.pose_active
+            && primitive.skin.is_some()
+            && (self.policy.include_inferred || !primitive.inferred)
     }
 
     /// Selects the skinned pipeline for influenced primitives. Turning it off
@@ -675,9 +700,14 @@ fn upload_mesh(
             contents: bytemuck::cast_slice(&primitive.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let skin = scene
+        let influences = scene
             .influences_for(mesh_index, primitive_index)
-            .filter(|influences| influences.deformable())
+            .filter(|influences| influences.deformable());
+        // The skinned buffer is uploaded for an inferred association too, so the
+        // policy can be switched at any time without re-uploading the scene; the
+        // draw decision consults the policy per frame.
+        let inferred = influences.is_some_and(|influences| influences.inferred());
+        let skin = influences
             .map(|influences| upload_skin(device, queue, &mesh.name, &vertices, influences));
         out.push(GpuPrimitive {
             vertices: vertex_buffer,
@@ -688,6 +718,7 @@ fn upload_mesh(
             mesh: mesh_index,
             visible: true,
             skin,
+            inferred,
         });
     }
 }

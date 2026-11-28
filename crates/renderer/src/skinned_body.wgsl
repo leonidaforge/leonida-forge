@@ -1,31 +1,8 @@
-// The skinned counterpart of shader.wgsl. The skinning functions live in
-// skinning.wgsl; this file is concatenated after it.
-
-struct Camera {
-    view_projection: mat4x4<f32>,
-    camera_position: vec4<f32>,
-    light_direction: vec4<f32>,
-}
-
-@group(0) @binding(0)
-var<uniform> camera: Camera;
-
-struct Material {
-    base_color: vec4<f32>,
-    // x = bumpiness, y = alpha cutoff, z = normal map present, w = BC5 normal
-    params: vec4<f32>,
-}
-
-@group(1) @binding(0)
-var<uniform> material: Material;
-@group(1) @binding(1)
-var diffuse_texture: texture_2d<f32>;
-@group(1) @binding(2)
-var normal_texture: texture_2d<f32>;
-@group(1) @binding(3)
-var specular_texture: texture_2d<f32>;
-@group(1) @binding(4)
-var texture_sampler: sampler;
+// The skinned counterpart of shader.wgsl. The camera, the material and the
+// shading model come from shading.wgsl and the skinning helpers from
+// skinning.wgsl, both concatenated before this file. Only the vertex stage and
+// the influence-view branch live here, so posed geometry is shaded by exactly
+// the same model as authored geometry.
 
 struct SkinnedVertexInput {
     @location(0) position: vec3<f32>,
@@ -75,27 +52,6 @@ fn vs_skinned(input: SkinnedVertexInput) -> VertexOutput {
     return output;
 }
 
-fn sample_normal(input: VertexOutput) -> vec3<f32> {
-    let geometric = normalize(input.normal);
-    if (material.params.z < 0.5) {
-        return geometric;
-    }
-    let tangent_length = length(input.tangent.xyz);
-    if (tangent_length < 0.5) {
-        return geometric;
-    }
-    let tangent = normalize(input.tangent.xyz);
-    let bitangent = normalize(cross(geometric, tangent)) * input.tangent.w;
-    let encoded = textureSample(normal_texture, texture_sampler, input.uv).xyz * 2.0 - vec3<f32>(1.0);
-    var local = encoded;
-    if (material.params.w > 0.5) {
-        local.z = sqrt(max(0.0, 1.0 - local.x * local.x - local.y * local.y));
-    }
-    local.y = -local.y;
-    let normal = tangent * local.x + bitangent * local.y + geometric * local.z;
-    return normalize(normal);
-}
-
 @fragment
 fn fs_skinned(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     if (pose_state.view == 1u) {
@@ -106,24 +62,5 @@ fn fs_skinned(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
         }
         return vec4<f32>(colour, 1.0);
     }
-    let base_sample = textureSample(diffuse_texture, texture_sampler, input.uv);
-    let alpha = base_sample.a * material.base_color.a;
-    if (material.params.y > 0.0 && alpha < material.params.y) {
-        discard;
-    }
-    var normal = sample_normal(input);
-    if (!front_facing) {
-        normal = -normal;
-    }
-    let light = normalize(-camera.light_direction.xyz);
-    let fill = normalize(vec3<f32>(-light.y, light.x, 0.25));
-    let view = normalize(camera.camera_position.xyz - input.world_position);
-    let diffuse = max(dot(normal, light), 0.0);
-    let fill_diffuse = max(dot(normal, fill), 0.0) * 0.18;
-    let half_vector = normalize(light + view);
-    let specular_sample = textureSample(specular_texture, texture_sampler, input.uv).rgb;
-    let specular = pow(max(dot(normal, half_vector), 0.0), 48.0) * specular_sample * 0.35;
-    let tint = material.base_color.rgb * base_sample.rgb;
-    let lit = tint * (0.32 + 0.78 * diffuse + fill_diffuse) + specular;
-    return vec4<f32>(lit, alpha);
+    return shade(input.world_position, input.normal, input.tangent, input.uv, front_facing);
 }

@@ -21,7 +21,9 @@ use std::process::ExitCode;
 use glam::{Quat, Vec3};
 use lforge_model::NoTextures;
 use lforge_renderer::{Background, GpuScene, OrbitCamera, Overlay, Renderer, SkinProbeVertex};
-use lforge_scene::{Pose, Scene, SkinningMatrices, VertexInfluences, deform_primitive};
+use lforge_scene::{
+    DeformationPolicy, Pose, Scene, SkinningMatrices, VertexInfluences, deform_primitive_with,
+};
 
 struct Options {
     resource: PathBuf,
@@ -31,6 +33,8 @@ struct Options {
     translation: Vec3,
     compare: bool,
     render: Option<PathBuf>,
+    /// Whether inferred single-bone associations may deform. Off by default.
+    include_inferred: bool,
 }
 
 fn usage() -> String {
@@ -42,7 +46,9 @@ fn usage() -> String {
          --degrees <deg>        rotation about model Z, default 30\n\
          --translate <x,y,z>    translation in the bone's parent space, metres\n\
          --compare              compare the GPU probe with the CPU reference\n\
-         --render <file>        render the posed model to a PNG file\n",
+         --render <file>        render the posed model to a PNG file\n\
+         --include-inferred     also deform single-bone associations that were\n\
+         \x20                      inferred from the bone count, not decoded\n",
     );
     text.push_str(
         "\nThe example reads bytes, not archives: run `lforge extract` first. \
@@ -84,6 +90,7 @@ fn parse(
             options.translation = Vec3::from_slice(&parts);
         }
         "--compare" => options.compare = true,
+        "--include-inferred" => options.include_inferred = true,
         "--render" => {
             options.render = Some(PathBuf::from(args.next().ok_or("--render needs a file")?));
         }
@@ -112,6 +119,7 @@ fn run() -> Result<(), String> {
         translation: Vec3::ZERO,
         compare: false,
         render: None,
+        include_inferred: false,
     };
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().is_none() {
@@ -146,11 +154,23 @@ fn run() -> Result<(), String> {
         return Err("the resource carries no skeleton".into());
     };
     let primitives: usize = scene.meshes.iter().map(|mesh| mesh.primitives.len()).sum();
+    let policy = DeformationPolicy {
+        include_inferred: options.include_inferred,
+    };
     println!(
-        "skeleton: {} bone(s), {} primitive(s), {} deformable",
+        "skeleton: {} bone(s), {} primitive(s), {} deformable under the {} policy",
         skeleton.bones.len(),
         primitives,
-        scene.deformable_primitive_count()
+        scene.deformable_primitive_count_under(policy),
+        if options.include_inferred {
+            "inferred-inclusive"
+        } else {
+            "explicit-only"
+        }
+    );
+    println!(
+        "  inferred single-bone association(s): {}",
+        scene.inferred_primitive_count()
     );
     for entry in &scene.influences {
         println!(
@@ -160,17 +180,21 @@ fn run() -> Result<(), String> {
             entry.influences.bones.len(),
             entry.influences.max_influences,
             entry.influences.weighted,
-            entry.influences.status.name()
+            entry.influences.status_name()
         );
     }
-    if !scene.supports_deformation() {
-        return Err("no primitive of this resource has a verified influence set".into());
+    if !scene.supports_deformation_under(policy) {
+        return Err(
+            "no primitive of this resource deforms under this policy; a geometry whose only \
+             association is inferred needs --include-inferred"
+                .into(),
+        );
     }
 
     let entry = scene
         .influences
         .iter()
-        .filter(|entry| entry.influences.deformable())
+        .filter(|entry| policy.admits(&entry.influences))
         .max_by_key(|entry| entry.influences.max_influences)
         .ok_or("no deformable primitive")?;
     let bone = match &options.bone {
@@ -214,8 +238,17 @@ fn run() -> Result<(), String> {
 
     for entry in &scene.influences {
         let primitive = &scene.meshes[entry.mesh].primitives[entry.primitive];
-        let deformed = deform_primitive(primitive, &entry.influences, &matrices)
-            .map_err(|err| format!("deformation: {err:?}"))?;
+        let deformed = match deform_primitive_with(primitive, &entry.influences, &matrices, policy)
+        {
+            Ok(deformed) => deformed,
+            Err(err) => {
+                println!(
+                    "  mesh {} primitive {}: stays authored ({err})",
+                    entry.mesh, entry.primitive
+                );
+                continue;
+            }
+        };
         let mut moved = 0;
         let mut worst = 0.0f32;
         for (index, vertex) in primitive.vertices.iter().enumerate() {
@@ -242,10 +275,11 @@ fn run() -> Result<(), String> {
             entry.primitive,
             &entry.influences,
             &matrices,
+            policy,
         )?;
     }
     if let Some(path) = &options.render {
-        render(&scene, &pose, &matrices, &positions, path)?;
+        render(&scene, &pose, &matrices, &positions, path, policy)?;
     }
     Ok(())
 }
@@ -274,9 +308,10 @@ fn compare(
     primitive: usize,
     influences: &VertexInfluences,
     matrices: &SkinningMatrices,
+    policy: DeformationPolicy,
 ) -> Result<(), String> {
     let primitive = &scene.meshes[mesh].primitives[primitive];
-    let cpu = deform_primitive(primitive, influences, matrices)
+    let cpu = deform_primitive_with(primitive, influences, matrices, policy)
         .map_err(|err| format!("deformation: {err:?}"))?;
     let probes: Vec<SkinProbeVertex> = primitive
         .vertices
@@ -328,11 +363,12 @@ fn render(
     matrices: &SkinningMatrices,
     positions: &[Vec3],
     path: &PathBuf,
+    policy: DeformationPolicy,
 ) -> Result<(), String> {
     let (width, height) = (900u32, 700u32);
     let authored = scene.bounds.sanitized();
     let deformed = scene
-        .posed_bounds(pose)
+        .posed_bounds_under(pose, policy)
         .map_err(|(_, _, err)| format!("posed bounds: {err:?}"))?
         .unwrap_or(authored)
         .sanitized();
@@ -344,6 +380,7 @@ fn render(
     renderer
         .update_pose(&mut gpu, matrices.matrices(), positions)
         .map_err(|err| format!("pose upload: {err}"))?;
+    gpu.set_policy(policy);
     gpu.set_pose_active(true);
     let frame = renderer
         .render_with_overlay(

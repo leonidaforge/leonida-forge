@@ -458,7 +458,14 @@ impl Renderer {
             ..Default::default()
         });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene shading"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
+                "{}\n{}",
+                include_str!("shading.wgsl"),
+                include_str!("shader.wgsl")
+            ))),
+        });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene"),
             bind_group_layouts: &[Some(&camera_layout), Some(&material_layout)],
@@ -501,7 +508,8 @@ impl Renderer {
         let skinned_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("skinned scene"),
             source: wgpu::ShaderSource::Wgsl(Cow::Owned(format!(
-                "{}\n{}",
+                "{}\n{}\n{}",
+                include_str!("shading.wgsl"),
                 include_str!("skinning.wgsl"),
                 include_str!("skinned_body.wgsl")
             ))),
@@ -691,7 +699,7 @@ impl Renderer {
                 continue;
             }
             let material = &scene.materials[primitive.material];
-            let skinned = scene.pose_active && primitive.skin.is_some();
+            let skinned = scene.draws_skinned(primitive);
             let pipeline = if skinned {
                 if material.alpha_mode == lforge_scene::AlphaMode::Blend {
                     &self.pipelines.skinned_blend
