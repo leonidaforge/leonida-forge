@@ -14,6 +14,7 @@ use lforge_rage9::psin::pso::{
     ArrayElements, Block, Content, Document, Field, FieldValue, PoolEntry, Record, Reference,
     Scalar, Value,
 };
+use lforge_rage9::rbf0 as rbf;
 
 /// The most rows a view builds. A very large container reports the limit
 /// instead of exhausting memory.
@@ -801,6 +802,308 @@ pub fn build(document: &Document, names: &Names) -> Tree {
         summary,
         issues,
         truncated: walker.truncated,
+    }
+}
+
+/// The most characters of one text value a row shows.
+const MAX_RBF0_TEXT: usize = 160;
+
+/// Builds the rows of one decoded `RBF0` document.
+///
+/// The rows follow the document: the root element, then its attributes, then
+/// its body in the order the payload stores it. Repeated sibling elements are
+/// the document's own way of writing a list, so they are kept as they are
+/// rather than folded into an array the payload does not have.
+pub fn build_rbf0(document: &rbf::Document) -> Tree {
+    let mut walker = Rbf0Walker {
+        document,
+        rows: Vec::new(),
+        truncated: false,
+    };
+    walker.group(
+        0,
+        "document".to_string(),
+        format!(
+            "{}  \u{00B7}  {} names  \u{00B7}  depth {}  \u{00B7}  {}",
+            if document.header.versioned {
+                format!("versioned, number width {}", document.header.number_len())
+            } else {
+                format!("versionless, number width {}", document.header.number_len())
+            },
+            document.names.len(),
+            document.depth(),
+            document.status()
+        ),
+    );
+    walker.element_rows(1, &document.root);
+    let base = 1;
+    if !document.names.is_empty() {
+        walker.group(
+            base,
+            "name table".to_string(),
+            format!("{} defined", document.names.len()),
+        );
+        for (index, name) in document.names.iter().enumerate() {
+            // A name is payload text: one that is not UTF-8 has no characters
+            // to show, and saying so is not the same as showing "".
+            let shown = name
+                .clone()
+                .unwrap_or_else(|| "(not valid UTF-8)".to_string());
+            walker.push(Row {
+                depth: base + 1,
+                label: format!("[{index}] {shown}"),
+                detail: String::new(),
+                copy: name.clone().unwrap_or_default(),
+                expandable: false,
+                tone: Tone::Muted,
+            });
+            if walker.truncated {
+                break;
+            }
+        }
+    }
+    if !document.diagnostics.is_empty() {
+        walker.group(
+            base,
+            "notes".to_string(),
+            format!("{} reported", document.diagnostics.len()),
+        );
+        for diagnostic in &document.diagnostics {
+            walker.push(Row {
+                depth: base + 1,
+                label: diagnostic.message.to_string(),
+                detail: format!("offset {}", diagnostic.offset),
+                copy: format!("{} @{}", diagnostic.message, diagnostic.offset),
+                expandable: false,
+                tone: Tone::Warning,
+            });
+            if walker.truncated {
+                break;
+            }
+        }
+    }
+    let mut issues: Vec<String> = document
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.to_string())
+        .collect();
+    if let Some(failure) = &document.failure {
+        issues.push(failure.to_string());
+        walker.push(Row {
+            depth: 1,
+            label: format!("the parse stopped: {:?}", failure.kind),
+            detail: failure.to_string(),
+            copy: failure.to_string(),
+            expandable: false,
+            tone: Tone::Warning,
+        });
+    }
+    if document.trailing != 0 {
+        let note = format!("{} bytes follow the root element", document.trailing);
+        issues.push(note.clone());
+        walker.push(Row {
+            depth: 1,
+            label: note.clone(),
+            detail: String::new(),
+            copy: note,
+            expandable: false,
+            tone: Tone::Warning,
+        });
+    }
+    Tree {
+        rows: walker.rows,
+        status: document.status(),
+        summary: format!(
+            "{} elements  \u{00B7}  {} names  \u{00B7}  depth {}",
+            document.elements(),
+            document.names.len(),
+            document.depth()
+        ),
+        issues,
+        truncated: walker.truncated,
+    }
+}
+
+struct Rbf0Walker<'a> {
+    document: &'a rbf::Document,
+    rows: Vec<Row>,
+    truncated: bool,
+}
+
+impl<'a> Rbf0Walker<'a> {
+    fn push(&mut self, row: Row) -> bool {
+        if self.rows.len() >= MAX_ROWS {
+            self.truncated = true;
+            return false;
+        }
+        self.rows.push(row);
+        true
+    }
+
+    fn group(&mut self, depth: usize, label: String, detail: String) {
+        self.push(Row {
+            depth,
+            copy: format!("{label}  {detail}"),
+            label,
+            detail,
+            expandable: false,
+            tone: Tone::Normal,
+        });
+    }
+
+    fn name(&self, index: u16) -> String {
+        match self.document.name(index) {
+            Some(name) => name.to_string(),
+            None => format!("#{index}"),
+        }
+    }
+
+    fn element_rows(&mut self, depth: usize, element: &rbf::Element) {
+        let label = self.name(element.index);
+        let detail = format!(
+            "{} attributes  \u{00B7}  {} children  \u{00B7}  offset {}..{}",
+            element.attributes.len(),
+            element.children.len(),
+            element.offset,
+            element.end
+        );
+        let expandable = !element.attributes.is_empty() || !element.children.is_empty();
+        if !self.push(Row {
+            depth,
+            copy: format!("<{label}>  {detail}"),
+            label,
+            detail,
+            expandable,
+            tone: Tone::Accent,
+        }) {
+            return;
+        }
+        if !expandable {
+            return;
+        }
+        let mut shown = 0usize;
+        for attribute in &element.attributes {
+            if shown >= MAX_CHILDREN {
+                break;
+            }
+            shown += 1;
+            let name = self.name(attribute.index);
+            let (detail, tone) = self.value_text(&attribute.value);
+            if !self.push(Row {
+                depth: depth + 1,
+                label: format!("@{name}"),
+                copy: format!("@{name} = {detail}"),
+                detail,
+                expandable: false,
+                tone,
+            }) {
+                return;
+            }
+        }
+        for node in &element.children {
+            if shown >= MAX_CHILDREN {
+                break;
+            }
+            shown += 1;
+            match node {
+                rbf::Node::Element(child) => self.element_rows(depth + 1, child),
+                rbf::Node::Field(field) => {
+                    let name = self.name(field.index);
+                    let (detail, tone) = self.value_text(&field.value);
+                    if !self.push(Row {
+                        depth: depth + 1,
+                        label: name.clone(),
+                        copy: format!("{name} = {detail}"),
+                        detail,
+                        expandable: false,
+                        tone,
+                    }) {
+                        return;
+                    }
+                }
+                rbf::Node::Text(text) => {
+                    let (detail, tone) = match text.text() {
+                        Some((value, _)) => {
+                            let mut shown: String = value.chars().take(MAX_RBF0_TEXT).collect();
+                            if value.chars().count() > MAX_RBF0_TEXT {
+                                shown.push('…');
+                            }
+                            (shown, Tone::Normal)
+                        }
+                        // Bytes the read budget dropped are not the same as
+                        // bytes that are not text.
+                        None if text.bytes.len() < text.declared => {
+                            (format!("{} bytes, not kept", text.declared), Tone::Warning)
+                        }
+                        None => (format!("{} bytes, not text", text.declared), Tone::Warning),
+                    };
+                    if !self.push(Row {
+                        depth: depth + 1,
+                        label: "text".to_string(),
+                        copy: detail.clone(),
+                        detail,
+                        expandable: false,
+                        tone,
+                    }) {
+                        return;
+                    }
+                }
+            }
+            if self.truncated {
+                return;
+            }
+        }
+        if element.children.len() + element.attributes.len() > shown {
+            self.group(
+                depth + 1,
+                format!(
+                    "… {} more rows",
+                    element.children.len() + element.attributes.len() - shown
+                ),
+                String::new(),
+            );
+        }
+    }
+
+    /// The detail text of one value, with the reading its class establishes.
+    fn value_text(&self, value: &rbf::Value) -> (String, Tone) {
+        match value {
+            rbf::Value::Bytes { declared, .. } => match value.text() {
+                Some((text, _)) => {
+                    let mut shown: String = text.chars().take(MAX_RBF0_TEXT).collect();
+                    if text.chars().count() > MAX_RBF0_TEXT {
+                        shown.push('…');
+                    }
+                    (shown, Tone::Accent)
+                }
+                // Bytes the read budget dropped are not the same as bytes that
+                // are not text.
+                None if value.bytes().len() < *declared => {
+                    (format!("{declared} bytes, not kept"), Tone::Warning)
+                }
+                None => (
+                    format!(
+                        "{declared} bytes, not text  \u{00B7}  {}",
+                        bytes_text(value.bytes())
+                    ),
+                    Tone::Warning,
+                ),
+            },
+            rbf::Value::Number { code: 1, .. } => match value.integer() {
+                Some(integer) => (format!("{integer}  \u{00B7}  integer"), Tone::Normal),
+                None => (bytes_text(value.bytes()), Tone::Muted),
+            },
+            rbf::Value::Number { code: 4, .. } => match value.float() {
+                Some(float) => (format!("{float}  \u{00B7}  double"), Tone::Normal),
+                None => (bytes_text(value.bytes()), Tone::Muted),
+            },
+            rbf::Value::Number { .. } => (bytes_text(value.bytes()), Tone::Muted),
+            rbf::Value::Zero { code } => (
+                format!("no value bytes  \u{00B7}  class {code}  \u{00B7}  meaning unknown"),
+                Tone::Muted,
+            ),
+            rbf::Value::Fixed { bytes, .. } => (bytes_text(bytes), Tone::Warning),
+        }
     }
 }
 

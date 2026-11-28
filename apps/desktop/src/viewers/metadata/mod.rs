@@ -1,12 +1,15 @@
-//! A read-only view of a decoded `PSIN` metadata container.
+//! A read-only view of a decoded metadata document.
 //!
-//! The rows are a pre-order walk of the schema and the instance blocks, built
-//! by [`tree`] on a background thread so the window never stalls on a large
-//! container. A row expands and collapses, a filter keeps the rows that match
-//! and the ancestors that hold them, and a row can be copied as text.
+//! Both encodings the census found open here: a `PSIN` container (its schema
+//! and instance blocks) and an `RBF0` payload (its name table and element
+//! tree). The rows are a pre-order walk of the decoded document, built by
+//! [`tree`] on a background thread so the window never stalls on a large one. A
+//! row expands and collapses, a filter keeps the rows that match and the
+//! ancestors that hold them, and a row can be copied as text.
 //!
-//! The stored hashes stay the identity: a name the name table reproduces is
-//! shown beside its hash, never in place of it.
+//! A `PSIN` container keeps its stored hashes as the identity: a name the name
+//! table reproduces is shown beside its hash, never in place of it. An `RBF0`
+//! payload stores its names, and they are shown as they are.
 
 mod tree;
 
@@ -43,8 +46,9 @@ struct Ready {
     tree: tree::Tree,
     /// The path the container was read from, for the status bar.
     source: String,
-    /// How many hashes the name table can name.
-    names: usize,
+    /// What naming the document offers: the hashes a name table resolves, or
+    /// the names the payload itself defines.
+    names: String,
 }
 
 /// A window over one metadata container.
@@ -335,16 +339,16 @@ impl Render for MetadataViewer {
         let (status, summary, source, names) = match &self.state {
             State::Loading => (
                 "loading",
-                "Reading the container…".to_string(),
+                "Reading the document…".to_string(),
                 String::new(),
-                0,
+                String::new(),
             ),
-            State::Failed(err) => ("failed", err.clone(), String::new(), 0),
+            State::Failed(err) => ("failed", err.clone(), String::new(), String::new()),
             State::Ready(ready) => (
                 ready.tree.status,
                 ready.tree.summary.clone(),
                 ready.source.clone(),
-                ready.names,
+                ready.names.clone(),
             ),
         };
         let issues = self.ready().map_or(0, |ready| ready.tree.issues.len());
@@ -352,9 +356,9 @@ impl Render for MetadataViewer {
         let row_count = self.ready().map_or(0, |ready| ready.tree.rows.len());
 
         let content: AnyElement = match &self.state {
-            State::Loading => ui::centered_message("Reading the metadata container.", None),
+            State::Loading => ui::centered_message("Reading the metadata document.", None),
             State::Failed(err) => ui::centered_message(
-                "This metadata container cannot be decoded.",
+                "This metadata document cannot be decoded.",
                 Some(err.clone()),
             ),
             State::Ready(_) => uniform_list(
@@ -413,25 +417,28 @@ impl Render for MetadataViewer {
                             cx.notify();
                         },
                     )))
-                    .child(ui::button("meta-collapse", "Collapse").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            let Some(ready) = this.ready() else {
-                                return;
-                            };
-                            this.collapsed = ready
-                                .tree
-                                .rows
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, row)| row.expandable)
-                                .map(|(index, _)| index)
-                                .collect();
-                            cx.notify();
-                        },
-                    )))
-                    .child(ui::button("meta-copy", "Copy Row").on_click(
-                        cx.listener(|this, _, _, cx| this.copy_row(cx)),
-                    )),
+                    .child(
+                        ui::button("meta-collapse", "Collapse").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                let Some(ready) = this.ready() else {
+                                    return;
+                                };
+                                this.collapsed = ready
+                                    .tree
+                                    .rows
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, row)| row.expandable)
+                                    .map(|(index, _)| index)
+                                    .collect();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        ui::button("meta-copy", "Copy Row")
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_row(cx))),
+                    ),
             )
             .child(
                 div()
@@ -465,14 +472,22 @@ impl Render for MetadataViewer {
                             }),
                     )
                     .child(format!(
-                        "{status}  \u{00B7}  {row_count} rows  \u{00B7}  {names} hashes named{}{}{}",
+                        "{status}  \u{00B7}  {row_count} rows  \u{00B7}  {names}{}{}{}",
                         if issues > 0 {
                             format!("  \u{00B7}  {issues} issues")
                         } else {
                             String::new()
                         },
-                        if truncated { "  \u{00B7}  row limit reached" } else { "" },
-                        if focused { "" } else { "  \u{00B7}  click to use the keyboard" },
+                        if truncated {
+                            "  \u{00B7}  row limit reached"
+                        } else {
+                            ""
+                        },
+                        if focused {
+                            ""
+                        } else {
+                            "  \u{00B7}  click to use the keyboard"
+                        },
                     )),
             )
     }
@@ -511,14 +526,25 @@ pub(crate) fn open(
     }
 }
 
-/// Reads and decodes `path`, and indexes the names a table offers.
-fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, usize), String> {
+/// Reads and decodes `path`.
+///
+/// The format comes from the payload's own signature: a `PSIN` container is
+/// decoded by its schema, an `RBF0` payload by its grammar, and both become the
+/// same rows. What names the document is what its status line reports.
+fn decode(path: &Path, access: &Access) -> Result<(tree::Tree, String), String> {
     let bytes = crate::files::read_with(path, access).map_err(|err| err.to_string())?;
-    let document = lforge_rage9::psin::pso::decode(&bytes).map_err(|err| err.to_string())?;
+    let document = lforge_core::metadata::decode(&bytes).map_err(|err| err.to_string())?;
     let names = names_for(path);
-    let indexed = names.len();
-    let built = tree::build(&document, &names);
-    Ok((built, indexed))
+    match &document {
+        lforge_core::metadata::Document::Pso(document) => Ok((
+            tree::build(document, &names),
+            format!("{} hashes named", names.len()),
+        )),
+        lforge_core::metadata::Document::Rbf0(document) => Ok((
+            tree::build_rbf0(document),
+            format!("{} names in the document", document.names.len()),
+        )),
+    }
 }
 
 /// How the viewer names what it shows: the canonical resource path when the

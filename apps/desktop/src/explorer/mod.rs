@@ -965,7 +965,7 @@ impl Explorer {
                 let texture_dictionary = classification
                     .as_ref()
                     .is_some_and(|value| value.is_texture_dictionary());
-                // A row that starts with the `PSIN` container magic holds a
+                // A row that starts with a metadata container's magic holds a
                 // self-describing metadata document, which has its own view.
                 let metadata = opens_as_metadata(classification.as_ref());
                 let text_document = opens_as_text(capability, text.is_some());
@@ -2185,13 +2185,15 @@ enum ModelEntryKind {
     Sniff,
 }
 
-/// Whether the classification recognises a payload as a metadata container
-/// this build decodes, so it opens in the metadata viewer.
+/// Whether the classification recognises a payload as a metadata document this
+/// build decodes, so it opens in the metadata viewer.
 ///
 /// The format comes from the container's own signature, never from the file
-/// extension, so a metadata container keeps its viewer whoever named it.
+/// extension, so a metadata document keeps its viewer whoever named it. Both
+/// metadata encodings the census found open here: the `PSIN` container and the
+/// `RBF0` payload.
 fn opens_as_metadata(classification: Option<&lforge_core::classify::Classification>) -> bool {
-    classification.is_some_and(|value| value.format_id() == Some("psin"))
+    classification.is_some_and(|value| matches!(value.format_id(), Some("psin") | Some("rbf0")))
 }
 
 /// Whether a payload opens in the text viewer.
@@ -2619,6 +2621,39 @@ mod export_tests {
         assert!(
             !opens_as_text(Some(classification.capability), true),
             "a recognised container is never claimed by the byte check"
+        );
+    }
+
+    /// A synthetic fixture, not game content: a row whose declared type is the
+    /// metadata resource type and whose payload is an `RBF0` document. It is
+    /// the second metadata encoding the census found, and it must open in the
+    /// same viewer as the first.
+    #[test]
+    fn an_rbf0_payload_keeps_the_metadata_viewer() {
+        use lforge_core::classify::{self, Capability, Inputs, PayloadState, Storage};
+
+        let mut head = b"RBF0\xFB\xFF\x01\x00".to_vec();
+        head.resize(64, 0);
+        let classification = classify::classify(Inputs {
+            entry_type: Some(11),
+            original_extension: Some("zmt"),
+            storage: Some(Storage {
+                mode: 0,
+                encoding: Some(2),
+                transform: false,
+            }),
+            payload: PayloadState::Decoded,
+            head: Some(&head),
+        });
+        assert_eq!(classification.format_id(), Some("rbf0"));
+        assert_eq!(classification.capability, Capability::Structural("rbf0"));
+        assert!(
+            opens_as_metadata(Some(&classification)),
+            "an RBF0 document has its metadata view"
+        );
+        assert!(
+            !opens_as_text(Some(classification.capability), true),
+            "its names are payload text, but the structured view is the honest one"
         );
     }
 }

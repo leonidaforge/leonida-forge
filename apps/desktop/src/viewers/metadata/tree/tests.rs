@@ -227,3 +227,131 @@ fn issues_are_reported_as_rows() {
             .any(|row| row.label.contains("alignment padding"))
     );
 }
+
+/// A synthetic RBF0 payload: `screen` with a `kind` attribute, a text node,
+/// an integer field and a nested `row`.
+fn rbf0_bytes() -> Vec<u8> {
+    fn u16v(value: u16) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+    fn token(code: u8, index: u16) -> Vec<u8> {
+        u16v(u16::from(code) << 12 | index)
+    }
+    fn named(name: &[u8]) -> Vec<u8> {
+        let mut bytes = u16v(name.len() as u16);
+        bytes.extend_from_slice(name);
+        bytes
+    }
+    let mut count = token(1, 3);
+    count.extend_from_slice(&named(b"count"));
+    count.extend_from_slice(&3_i64.to_le_bytes());
+    let mut row = token(0, 2);
+    row.extend_from_slice(&named(b"row"));
+    row.extend_from_slice(&[0; 4]);
+    row.extend_from_slice(&u16v(0));
+    row.extend_from_slice(&count);
+    row.extend_from_slice(&u16v(0xFFFF));
+    let mut body = u16v(0xFFFD);
+    body.extend_from_slice(&5u32.to_le_bytes());
+    body.extend_from_slice(b"note\0");
+    body.extend_from_slice(&row);
+    let mut attribute = token(6, 1);
+    attribute.extend_from_slice(&named(b"kind"));
+    attribute.extend_from_slice(&u16v(8));
+    attribute.extend_from_slice(b"uiScreen");
+    let mut root = token(0, 0);
+    root.extend_from_slice(&named(b"screen"));
+    root.extend_from_slice(&[0; 4]);
+    root.extend_from_slice(&u16v(1));
+    root.extend_from_slice(&attribute);
+    root.extend_from_slice(&body);
+    root.extend_from_slice(&u16v(0xFFFF));
+    let mut bytes = b"RBF0".to_vec();
+    bytes.extend_from_slice(&u16v(0xFFFB));
+    bytes.extend_from_slice(&u16v(1));
+    bytes.extend_from_slice(&root);
+    bytes
+}
+
+fn rbf0_document() -> rbf::Document {
+    rbf::decode(
+        &rbf0_bytes(),
+        &rbf::Limits::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("a readable payload")
+}
+
+#[test]
+fn an_rbf0_document_shows_elements_attributes_and_values() {
+    let tree = build_rbf0(&rbf0_document());
+    let labels: Vec<&str> = tree.rows.iter().map(|row| row.label.as_str()).collect();
+    assert_eq!(labels[0], "document");
+    assert_eq!(labels[1], "screen");
+    assert_eq!(labels[2], "@kind");
+    assert_eq!(labels[3], "text");
+    assert_eq!(labels[4], "row");
+    assert_eq!(labels[5], "count");
+    assert_eq!(labels[6], "name table");
+    assert!(labels[7].starts_with("[0] "));
+    assert_eq!(tree.status, "decoded");
+    assert!(!tree.truncated);
+
+    let depths: Vec<usize> = tree.rows.iter().map(|row| row.depth).collect();
+    assert_eq!(depths, [0, 1, 2, 2, 2, 3, 1, 2, 2, 2, 2]);
+
+    let attribute = tree
+        .rows
+        .iter()
+        .find(|row| row.label == "@kind")
+        .expect("the attribute row");
+    assert_eq!(attribute.detail, "uiScreen");
+    assert_eq!(attribute.tone, Tone::Accent);
+
+    let count = tree
+        .rows
+        .iter()
+        .find(|row| row.label == "count")
+        .expect("the field row");
+    assert!(count.detail.starts_with('3'), "{}", count.detail);
+    assert!(count.detail.contains("integer"), "{}", count.detail);
+}
+
+#[test]
+fn an_rbf0_row_copies_a_value_and_finds_it_by_filter() {
+    let tree = build_rbf0(&rbf0_document());
+    let attribute = tree
+        .rows
+        .iter()
+        .find(|row| row.label == "@kind")
+        .expect("the attribute row");
+    assert_eq!(attribute.copy, "@kind = uiScreen");
+    // A filter keeps the matching row and the elements that hold it.
+    let shown = tree.visible(&HashSet::new(), "note");
+    let labels: Vec<&str> = shown
+        .iter()
+        .map(|index| tree.rows[*index].label.as_str())
+        .collect();
+    assert_eq!(labels, ["document", "screen", "text"]);
+}
+
+#[test]
+fn an_rbf0_document_that_stopped_reports_it_as_a_warning_row() {
+    let mut bytes = rbf0_bytes();
+    bytes.truncate(bytes.len() - 1);
+    let document = rbf::decode(
+        &bytes,
+        &rbf::Limits::default(),
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .expect("a readable header");
+    let tree = build_rbf0(&document);
+    assert_eq!(tree.status, "failed");
+    assert!(!tree.issues.is_empty());
+    let warning = tree
+        .rows
+        .iter()
+        .find(|row| row.label.starts_with("the parse stopped"))
+        .expect("the failure row");
+    assert_eq!(warning.tone, Tone::Warning);
+}
