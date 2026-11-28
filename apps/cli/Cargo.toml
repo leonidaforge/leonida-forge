@@ -29,5 +29,6 @@ tempfile.workspace = true
 
 [dev-dependencies]
 flate2.workspace = true
+roxmltree.workspace = true
 tempfile.workspace = true
 zip.workspace = true

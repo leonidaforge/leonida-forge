@@ -653,7 +653,28 @@ fn write_metadata(
             Err(err) => return Err(format!("row {row} cannot be decoded: {err}")),
         }
     }
-    let document = lforge_core::metadata::decode(&bytes)
+    // A `0DRP` resource stores a graphics segment after its system pages. The
+    // row's page table says where the second segment starts; the page map then
+    // says how many pages belong to each.
+    let split = if lforge_rage9::odrp::is_odrp(&bytes) {
+        opened
+            .metadata
+            .chunk_table(row)
+            .ok()
+            .flatten()
+            .and_then(|table| {
+                lforge_rage9::rpf::resource::page_split(
+                    &mut std::io::Cursor::new(bytes.as_slice()),
+                    bytes.len() as u64,
+                    &table,
+                    lforge_rage9::rpf::RESOURCE_SYSTEM_LIMIT,
+                )
+                .ok()
+            })
+    } else {
+        None
+    };
+    let document = lforge_core::metadata::decode_with_split(&bytes, split)
         .map_err(|err| format!("row {row} holds no metadata document this build decodes: {err}"))?;
     let empty = Names::empty();
     let names = options.metadata_names.as_ref().unwrap_or(&empty);
