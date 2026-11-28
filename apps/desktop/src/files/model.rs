@@ -1176,6 +1176,93 @@ mod tests {
         assert_eq!(members_rendered, dictionaries * 2);
     }
 
+    /// Reads a real texture dictionary through the shared reader, which is the
+    /// parse the texture dictionary viewer shows. The shape is asserted, not
+    /// the record count, so the test works for any native dictionary.
+    ///
+    /// Ignored by default. `LF_TEST_ARCHIVE` is the archive that holds the
+    /// nested archive, `LF_TEST_NESTED_ROW` its row there, `LF_TEST_TEXTURE_ROW`
+    /// the row to read inside it, and `LF_TEST_EXECUTABLE` the local input.
+    #[test]
+    #[ignore = "requires LF_TEST_ARCHIVE, LF_TEST_NESTED_ROW, LF_TEST_TEXTURE_ROW and LF_TEST_EXECUTABLE"]
+    fn reads_a_native_texture_dictionary() {
+        let archive = std::env::var("LF_TEST_ARCHIVE").expect("LF_TEST_ARCHIVE");
+        let nested_row: usize = std::env::var("LF_TEST_NESTED_ROW")
+            .expect("LF_TEST_NESTED_ROW")
+            .parse()
+            .expect("a row index");
+        let texture_row: usize = std::env::var("LF_TEST_TEXTURE_ROW")
+            .expect("LF_TEST_TEXTURE_ROW")
+            .parse()
+            .expect("a row index");
+        let executable = std::env::var("LF_TEST_EXECUTABLE").expect("LF_TEST_EXECUTABLE");
+        let access = Access::with(Arc::new(
+            Executable::open(Path::new(&executable)).expect("executable"),
+        ));
+        crate::files::archive::prepare_with(
+            Path::new(&archive),
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("prepare archive");
+        let nested_path = find_row(Path::new(&archive), &access, nested_row)
+            .unwrap_or_else(|| panic!("no row {nested_row} in {archive}"));
+        let nested =
+            crate::files::list_with(nested_path.parent().expect("a parent folder"), &access)
+                .expect("list")
+                .into_iter()
+                .find(|entry| entry.path == nested_path)
+                .expect("the nested archive");
+        crate::files::archive::prepare_with(
+            &nested.path,
+            &access,
+            true,
+            &crate::files::archive::Stage::default(),
+            &lforge_rage9::rpf::Progress::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("prepare the nested archive");
+        let rows = crate::files::list_with(&nested.path, &access).expect("list nested");
+        let row = rows
+            .iter()
+            .find(|entry| entry.resource_row == u32::try_from(texture_row).ok())
+            .unwrap_or_else(|| panic!("no row {texture_row} in the nested archive"));
+        let cancel = AtomicBool::new(false);
+        let bytes = read_resource_with_cancel(&row.path, &access, &cancel).expect("a resource");
+        let graphics_len = bytes.graphics().len() as u64;
+        assert!(
+            lforge_core::dictionary::recognise(bytes.system(), graphics_len),
+            "{} is not a texture dictionary",
+            row.name
+        );
+        let report = lforge_rage9::dictionary::parse(
+            bytes.system(),
+            graphics_len,
+            &lforge_rage9::dictionary::Limits::default(),
+        )
+        .expect("a texture dictionary");
+        let matched = report
+            .records
+            .iter()
+            .filter(|record| record.name_check == lforge_rage9::dictionary::NameCheck::Matched)
+            .count();
+        eprintln!(
+            "{}: {} record(s), {} hash(es) of capacity {}, partition {}, {} name(s) matched",
+            row.name,
+            report.records.len(),
+            report.hash_count,
+            report.value_count,
+            report.checks.partition_ok,
+            matched
+        );
+        assert!(!report.empty, "the dictionary holds records");
+        assert!(!report.records.is_empty(), "the dictionary lists records");
+        assert!(report.checks.partition_ok, "the allocation partition holds");
+    }
+
     #[test]
     fn a_source_permit_is_charged_and_released_with_its_owner() {
         let budget = Arc::new(MemoryBudget::new(100));
